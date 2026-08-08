@@ -30,6 +30,9 @@ class PipelineTests(unittest.TestCase):
                 def translate(self, cues):
                     return [Cue(cue.start, cue.end, "你好") for cue in cues]
 
+                def translate_metadata(self, title, description):
+                    return "中文标题", "中文简介"
+
             config = AppConfig(work_dir=root / "work", upload=UploadConfig(enabled=True))
             with patch("subtitle_pipeline.pipeline.download_youtube", return_value=downloaded), patch(
                 "subtitle_pipeline.pipeline.llm_api_key", return_value="secret"
@@ -45,6 +48,9 @@ class PipelineTests(unittest.TestCase):
             self.assertFalse(result.uploaded)
             self.assertEqual(result.translated_subtitle.read_text(encoding="utf-8").count("你好"), 1)
             self.assertTrue((result.job_dir / "manifest.json").is_file())
+            metadata = result.translated_metadata.read_text(encoding="utf-8")
+            self.assertIn("中文标题", metadata)
+            self.assertIn("中文简介", metadata)
             whisper.assert_not_called()
             upload.assert_not_called()
 

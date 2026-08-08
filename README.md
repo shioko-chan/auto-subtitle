@@ -16,16 +16,19 @@ YouTube URL
   → 无字幕时 faster-whisper 本地转写
   → 按句末标点、停顿、时长和字符上限进行语义合并
   → OpenAI 兼容 /chat/completions API 分批翻译
+  → 用同一 LLM 翻译投稿标题和简介
   → 输出 SRT，并由 ffmpeg 烧录硬字幕
   → biliup 上传（可选，默认关闭）
 ```
 
-每个 URL 使用固定哈希作为工作目录名，最终产物包括源字幕、译文 SRT、压制后的
-MP4 和 `manifest.json`。LLM 密钥只从环境变量读取。
+每个 URL 使用固定哈希作为工作目录名，最终产物包括源字幕、译文 SRT、译后的
+`translated.metadata.json`、压制后的 MP4 和 `manifest.json`。LLM 密钥默认从 `pass`
+读取。
 
 ## 环境要求
 
 - Python 3.11+
+- [`uv`](https://docs.astral.sh/uv/)；负责 Python、虚拟环境、依赖和锁文件
 - `ffmpeg`，构建时需包含 `libass` 字幕滤镜
 - B 站上传时需要 `biliup`
 - 首次 Whisper 回退会下载所选模型；`small` 的 CPU 模式也可运行，GPU 更快
@@ -33,15 +36,14 @@ MP4 和 `manifest.json`。LLM 密钥只从环境变量读取。
 安装项目及 Whisper 回退：
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e '.[whisper]'
+uv sync --extra whisper
 cp config.example.toml config.toml
 ```
 
+`uv` 会根据 `.python-version` 准备 Python 3.11，并严格按照 `uv.lock` 创建 `.venv`；
 `yt-dlp` 会随项目安装。Ubuntu/Debian 可用 `apt install ffmpeg fonts-noto-cjk`；macOS
-可用 `brew install ffmpeg`。如果只处理始终带字幕的视频，可以先不安装 Whisper extra，
-但遇到无字幕视频时管线会明确报错。
+可用 `brew install ffmpeg`。如果只处理始终带字幕的视频，可执行 `uv sync` 而不安装
+Whisper extra，但遇到无字幕视频时管线会明确报错。
 
 ## 配置 LLM
 
@@ -75,18 +77,19 @@ model = "deepseek-chat"
 检查依赖：
 
 ```bash
-subtitle-pipeline --config config.toml check
+uv run --extra whisper subtitle-pipeline --config config.toml check
 ```
 
 下载、翻译并压制，但不上传：
 
 ```bash
-subtitle-pipeline --config config.toml run --no-upload 'https://www.youtube.com/watch?v=...'
+uv run --extra whisper subtitle-pipeline --config config.toml run --no-upload 'https://www.youtube.com/watch?v=...'
 ```
 
 结果位于 `work/<URL哈希>/translated.mp4`，译文位于
-`work/<URL哈希>/translated.zh-CN.srt`。先抽查专名、数字、断句和 Whisper 可能出现的
-幻觉，再启用上传。
+`work/<URL哈希>/translated.zh-CN.srt`，投稿标题和简介位于
+`work/<URL哈希>/translated.metadata.json`。先抽查专名、数字、断句和 Whisper 可能
+出现的幻觉，再启用上传。
 
 年龄限制、地区限制或需要登录的视频，可以在 `[download]` 配置
 `cookies_from_browser = "chrome"`，或配置 Netscape 格式的 `cookies_file`。
@@ -104,10 +107,10 @@ biliup login
 
 ```bash
 # 单次强制上传
-subtitle-pipeline --config config.toml run --upload 'https://www.youtube.com/watch?v=...'
+uv run --extra whisper subtitle-pipeline --config config.toml run --upload 'https://www.youtube.com/watch?v=...'
 
 # 或设置 [upload] enabled = true 后正常运行
-subtitle-pipeline --config config.toml run 'https://www.youtube.com/watch?v=...'
+uv run --extra whisper subtitle-pipeline --config config.toml run 'https://www.youtube.com/watch?v=...'
 ```
 
 默认 `copyright = 2` 表示转载，来源自动使用 YouTube URL；若 `source` 非空则使用配置值。
@@ -122,6 +125,8 @@ subtitle-pipeline --config config.toml run 'https://www.youtube.com/watch?v=...'
 - `segmentation.max_gap_seconds`：超过该停顿不跨 cue 合并。
 - `segmentation.max_duration_seconds` / `max_source_chars`：语义句缺少标点时的硬边界。
 - `llm.batch_size`：字幕很长或模型上下文较小时调低。
+- `llm.translate_metadata`：是否翻译 YouTube 标题和简介。
+- `llm.metadata_description_max_chars`：发送给 LLM 的源简介字符上限。
 - `render.font_name`：必须是机器上已安装且包含中文字形的字体。
 - `upload.enabled`：生产环境才建议开启；命令行 `--no-upload` 始终优先关闭上传。
 
@@ -130,9 +135,12 @@ subtitle-pipeline --config config.toml run 'https://www.youtube.com/watch?v=...'
 测试完全离线，不会下载、调用 LLM 或上传：
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests -v
-python -m compileall -q src tests
+uv run python -m unittest discover -s tests -v
+uv run python -m compileall -q src tests
 ```
+
+修改依赖时使用 `uv add <package>`，可选依赖使用
+`uv add --optional whisper <package>`，并提交同步更新的 `pyproject.toml` 和 `uv.lock`。
 
 外部命令均通过参数数组调用，不经 shell 展开；工作目录、API 密钥和 Cookie 已加入
 `.gitignore`。真实端到端测试需要自行提供 URL、API 凭据及转载授权。

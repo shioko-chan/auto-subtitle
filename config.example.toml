@@ -31,6 +31,9 @@ timeout_seconds = 120
 max_retries = 3
 # Set false if an OpenAI-compatible provider rejects response_format=json_object.
 json_mode = true
+translate_metadata = true
+# Only this many source-description characters are sent to the LLM.
+metadata_description_max_chars = 6000
 
 [render]
 font_name = "Noto Sans CJK SC"

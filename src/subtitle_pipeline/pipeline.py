@@ -20,6 +20,7 @@ class PipelineResult:
     source_video: Path
     source_subtitle: Path
     translated_subtitle: Path
+    translated_metadata: Path
     rendered_video: Path
     uploaded: bool
 
@@ -55,12 +56,33 @@ def run_pipeline(
     translated_path = job_dir / "translated.zh-CN.srt"
     write_srt(translated, translated_path)
 
+    source_title = str(downloaded.metadata.get("title") or "YouTube video")
+    source_description = str(downloaded.metadata.get("description") or "")
+    title, description = source_title, source_description
+    if config.llm.translate_metadata:
+        logging.info("translating video title and description")
+        title, description = translator.translate_metadata(source_title, source_description)
+    metadata_path = job_dir / "translated.metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "source_title": source_title,
+                "source_description": source_description,
+                "translated_title": title,
+                "translated_description": description,
+                "source_url": url,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
     rendered_path = job_dir / "translated.mp4"
     render_subtitles(downloaded.video, translated_path, rendered_path, config.render)
 
     should_upload = config.upload.enabled if upload_override is None else upload_override
-    title = str(downloaded.metadata.get("title") or "YouTube video")
-    description = str(downloaded.metadata.get("description") or "")
     if should_upload:
         upload_to_bilibili(
             rendered_path,
@@ -75,6 +97,7 @@ def run_pipeline(
         source_video=downloaded.video,
         source_subtitle=source_subtitle,
         translated_subtitle=translated_path,
+        translated_metadata=metadata_path,
         rendered_video=rendered_path,
         uploaded=should_upload,
     )

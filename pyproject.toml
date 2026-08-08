@@ -12,7 +12,6 @@ dependencies = ["yt-dlp>=2025.1.15"]
 
 [project.optional-dependencies]
 whisper = ["faster-whisper>=1.1,<2"]
-dev = ["pytest>=8,<9"]
 
 [project.scripts]
 subtitle-pipeline = "subtitle_pipeline.cli:main"

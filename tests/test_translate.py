@@ -36,6 +36,26 @@ class TranslationTests(unittest.TestCase):
         parsed = _parse_json_object('```json\n{"translations": []}\n```')
         self.assertEqual(parsed, {"translations": []})
 
+    def test_translates_title_and_description_together(self):
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(metadata_description_max_chars=13), "secret"
+        )
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"title":"中文标题","description":"中文简介\\nhttps://example.com"}'
+                    }
+                }
+            ]
+        }
+        with patch.object(translator, "_request", return_value=response) as request:
+            result = translator.translate_metadata("Original", "A very long description")
+        self.assertEqual(result, ("中文标题", "中文简介\nhttps://example.com"))
+        body = request.call_args.args[0]
+        prompt = body["messages"][1]["content"]
+        self.assertIn('"description": "A very long d"', prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

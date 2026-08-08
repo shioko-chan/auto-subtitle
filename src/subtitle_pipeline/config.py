@@ -48,6 +48,8 @@ class LLMConfig:
     timeout_seconds: int = 120
     max_retries: int = 3
     json_mode: bool = True
+    translate_metadata: bool = True
+    metadata_description_max_chars: int = 6000
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,8 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("llm.batch_size must be at least 1")
     if config.llm.max_retries < 1:
         raise ConfigError("llm.max_retries must be at least 1")
+    if config.llm.metadata_description_max_chars < 0:
+        raise ConfigError("llm.metadata_description_max_chars cannot be negative")
     if config.segmentation.max_gap_seconds < 0:
         raise ConfigError("segmentation.max_gap_seconds cannot be negative")
     if config.segmentation.max_duration_seconds <= 0:
