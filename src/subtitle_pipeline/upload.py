@@ -12,6 +12,7 @@ def upload_to_bilibili(
     title: str,
     description: str,
     source_url: str,
+    tags: list[str],
     config: UploadConfig,
 ) -> None:
     biliup = require_command("biliup")
@@ -35,7 +36,7 @@ def upload_to_bilibili(
         "--desc",
         (description + config.description_suffix)[:2000],
         "--tag",
-        ",".join(config.tags),
+        ",".join(tags),
         "--limit",
         str(config.limit),
     ]

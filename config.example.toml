@@ -38,6 +38,11 @@ json_mode = true
 translate_metadata = true
 # Only this many source-description characters are sent to the LLM.
 metadata_description_max_chars = 6000
+# Number of Bilibili tags generated in the same metadata request.
+metadata_tag_count = 5
+# Beginning/middle/end subtitle evidence supplied to metadata analysis.
+metadata_subtitle_max_chars = 4000
+# ip_aliases_file = "ip_aliases.json"
 
 [render]
 font_name = "Noto Sans CJK SC"
@@ -53,6 +58,9 @@ cookie_file = "cookies.json"
 copyright = 2
 tid = 171
 tags = ["中文字幕", "YouTube"]
+max_tags = 10
+# Import a tag/heat catalog obtained through an authorized source.
+# tag_catalog_file = "bilibili-tags.json"
 source = ""
 title_prefix = "【中字】"
 description_suffix = "\n\n字幕由自动化工具生成，请以原视频为准。"

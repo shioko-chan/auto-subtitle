@@ -23,12 +23,13 @@ class UploadTests(unittest.TestCase):
                     title="A title",
                     description="Description",
                     source_url="https://youtube.test/watch?v=1",
+                    tags=["中字", "自动生成"],
                     config=config,
                 )
             command = run.call_args.args[0]
             self.assertEqual(command[:4], ["/bin/biliup", "--user-cookie", str(cookie), "upload"])
             self.assertIn("https://youtube.test/watch?v=1", command)
-            self.assertIn("中字,科技", command)
+            self.assertIn("中字,自动生成", command)
             self.assertEqual(command[-1], str(video))
 
 

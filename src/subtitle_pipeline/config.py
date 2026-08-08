@@ -52,6 +52,9 @@ class LLMConfig:
     json_mode: bool = True
     translate_metadata: bool = True
     metadata_description_max_chars: int = 6000
+    metadata_tag_count: int = 5
+    metadata_subtitle_max_chars: int = 4000
+    ip_aliases_file: str | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,8 @@ class UploadConfig:
     copyright: int = 2
     tid: int = 171
     tags: list[str] = field(default_factory=lambda: ["中文字幕"])
+    max_tags: int = 10
+    tag_catalog_file: str | None = None
     source: str = ""
     title_prefix: str = ""
     description_suffix: str = ""
@@ -123,6 +128,10 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("llm.max_retries must be at least 1")
     if config.llm.metadata_description_max_chars < 0:
         raise ConfigError("llm.metadata_description_max_chars cannot be negative")
+    if not 1 <= config.llm.metadata_tag_count <= 10:
+        raise ConfigError("llm.metadata_tag_count must be between 1 and 10")
+    if config.llm.metadata_subtitle_max_chars < 0:
+        raise ConfigError("llm.metadata_subtitle_max_chars cannot be negative")
     if config.segmentation.max_gap_seconds < 0:
         raise ConfigError("segmentation.max_gap_seconds cannot be negative")
     if config.segmentation.max_duration_seconds <= 0:
@@ -131,6 +140,8 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("segmentation.max_source_chars must be at least 1")
     if config.upload.copyright not in (1, 2):
         raise ConfigError("upload.copyright must be 1 (original) or 2 (repost)")
+    if not 1 <= config.upload.max_tags <= 10:
+        raise ConfigError("upload.max_tags must be between 1 and 10")
     return config
 
 

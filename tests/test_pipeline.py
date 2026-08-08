@@ -5,11 +5,55 @@ from unittest.mock import patch
 
 from subtitle_pipeline.config import AppConfig, UploadConfig, WhisperConfig
 from subtitle_pipeline.media import DownloadResult
-from subtitle_pipeline.pipeline import normalize_youtube_url, run_pipeline
+from subtitle_pipeline.pipeline import (
+    _canonicalize_catalog_tags,
+    _merge_tags,
+    _subtitle_evidence,
+    _youtube_metadata_context,
+    normalize_youtube_url,
+    run_pipeline,
+)
 from subtitle_pipeline.subtitles import Cue, write_srt
 
 
 class PipelineTests(unittest.TestCase):
+    def test_builds_rich_youtube_context_and_subtitle_evidence(self):
+        context = _youtube_metadata_context(
+            {
+                "channel": "BanG Dream Channel☆",
+                "uploader": "Bushiroad",
+                "categories": ["Gaming"],
+                "series": "Girls Band Party",
+                "unrelated": "ignored",
+            }
+        )
+        self.assertEqual(context["channel"], "BanG Dream Channel☆")
+        self.assertEqual(context["series"], "Girls Band Party")
+        self.assertNotIn("unrelated", context)
+        evidence = _subtitle_evidence(
+            [Cue(0, 1, "beginning"), Cue(1, 2, "middle"), Cue(2, 3, "ending")],
+            20,
+        )
+        self.assertLessEqual(len(evidence), 20)
+        self.assertIn("begin", evidence)
+
+    def test_catalog_alias_resolves_to_hottest_canonical_tag(self):
+        tags, matches = _canonicalize_catalog_tags(
+            ["バンドリ"],
+            {
+                "BanG Dream": {"heat": 100, "aliases": ["バンドリ"]},
+                "邦邦": {"heat": 20, "aliases": ["バンドリ"]},
+            },
+        )
+        self.assertEqual(tags, ["BanG Dream"])
+        self.assertEqual(matches[0]["heat"], 100)
+
+    def test_merges_fixed_and_generated_tags_without_duplicates(self):
+        self.assertEqual(
+            _merge_tags(["中文字幕", "#动画"], ["动画", "音乐企划"], 10),
+            ["中文字幕", "动画", "音乐企划"],
+        )
+
     def test_normalizes_shell_escaped_youtube_query(self):
         self.assertEqual(
             normalize_youtube_url(r"https://www.youtube.com/watch\?v\=abc"),
@@ -56,8 +100,9 @@ class PipelineTests(unittest.TestCase):
                 def translate(self, cues):
                     return [Cue(cue.start, cue.end, "你好") for cue in cues]
 
-                def translate_metadata(self, title, description):
-                    return "中文标题", "中文简介"
+                def translate_metadata(self, title, description, **context):
+                    self.context = context
+                    return "中文标题", "中文简介", "内容摘要", ["动画", "音乐企划"]
 
             config = AppConfig(work_dir=root / "work", upload=UploadConfig(enabled=True))
             with patch("subtitle_pipeline.pipeline.download_youtube", return_value=downloaded), patch(
@@ -81,6 +126,8 @@ class PipelineTests(unittest.TestCase):
             metadata = result.translated_metadata.read_text(encoding="utf-8")
             self.assertIn("中文标题", metadata)
             self.assertIn("中文简介", metadata)
+            self.assertIn("内容摘要", metadata)
+            self.assertIn("音乐企划", metadata)
             whisper.assert_not_called()
             upload.assert_not_called()
 

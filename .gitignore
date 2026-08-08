@@ -1,5 +1,7 @@
 .env
 config.toml
+ip_aliases.json
+bilibili-tags.json
 .venv/
 __pycache__/
 .pytest_cache/

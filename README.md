@@ -16,7 +16,7 @@ YouTube URL
   → 无字幕时 faster-whisper 本地转写
   → 按句末标点、停顿、时长和字符上限进行语义合并
   → OpenAI 兼容 /chat/completions API 分批翻译
-  → 用同一 LLM 翻译投稿标题和简介
+  → 用同一 LLM 翻译投稿标题和简介，并生成 B 站标签
   → 输出 SRT，并由 ffmpeg 烧录硬字幕
   → biliup 上传（可选，默认关闭）
 ```
@@ -103,7 +103,7 @@ URL 放在单引号中时不要再写 `\?` 或 `\=`。为兼容常见的复制�
 备用或翻译轨道，默认为空，因此不会主动下载英文、韩文等翻译字幕。
 
 结果位于 `work/<URL哈希>/translated.mp4`，译文位于
-`work/<URL哈希>/translated.zh-CN.srt`，投稿标题和简介位于
+`work/<URL哈希>/translated.zh-CN.srt`，投稿标题、简介和最终标签位于
 `work/<URL哈希>/translated.metadata.json`。先抽查专名、数字、断句和 Whisper 可能
 出现的幻觉，再启用上传。
 
@@ -144,8 +144,38 @@ uv run --extra whisper subtitle-pipeline --config config.toml run 'https://www.y
 - `llm.batch_size`：字幕很长或模型上下文较小时调低。
 - `llm.translate_metadata`：是否翻译 YouTube 标题和简介。
 - `llm.metadata_description_max_chars`：发送给 LLM 的源简介字符上限。
+- `llm.metadata_tag_count`：同一次元数据翻译请求生成的 B 站标签数量。
+- `llm.metadata_subtitle_max_chars`：用于识别内容/IP 的字幕首、中、尾证据字符上限。
+- `llm.ip_aliases_file`：已知 IP 的规范名及中英日别名 JSON 文件。
 - `render.font_name`：必须是机器上已安装且包含中文字形的字体。
 - `upload.enabled`：生产环境才建议开启；命令行 `--no-upload` 始终优先关闭上传。
+- `upload.tags`：始终保留的固定标签；会与自动标签去重合并。
+- `upload.max_tags`：投稿使用的固定标签与自动标签总数上限。
+- `upload.tag_catalog_file`：经授权获取或人工维护的 B 站规范标签与热度目录。
+
+IP 别名文件格式参考 `ip_aliases.example.json`：
+
+```json
+{
+  "BanG Dream!": ["BanG Dream", "バンドリ", "邦邦"]
+}
+```
+
+B 站标签目录格式参考 `bilibili-tags.example.json`：
+
+```json
+{
+  "BanG Dream": {
+    "heat": 100000,
+    "aliases": ["BanG Dream!", "バンドリ", "邦邦"]
+  }
+}
+```
+
+标签分析会综合频道名、上传者、YouTube 分类/标签、系列/季度/剧集字段、音乐元数据、
+字幕首中尾摘要、IP 别名和上述 B 站目录。目录中的别名会规范化为正式标签；同一别名
+匹配多个标签时选择热度更高者。公开 B 站搜索会对自动请求返回验证码，项目不会调用
+未公开搜索接口；实时热度应通过已获授权的开放平台应用导出后更新本地目录。
 
 ## 开发与测试
 
