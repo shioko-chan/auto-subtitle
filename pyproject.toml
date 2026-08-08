@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "youtube-bilibili-pipeline"
+version = "0.1.0"
+description = "Download YouTube videos, translate/generate subtitles, and upload to Bilibili"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["yt-dlp>=2025.1.15"]
+
+[project.optional-dependencies]
+whisper = ["faster-whisper>=1.1,<2"]
+dev = ["pytest>=8,<9"]
+
+[project.scripts]
+subtitle-pipeline = "subtitle_pipeline.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/subtitle_pipeline"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

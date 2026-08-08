@@ -1,0 +1,53 @@
+work_dir = "work"
+
+[download]
+subtitle_languages = ["en.*", "ja.*", "ko.*"]
+# cookies_from_browser = "chrome"
+# cookies_file = "/path/to/youtube-cookies.txt"
+
+[whisper]
+model = "small"
+device = "auto"
+compute_type = "auto"
+# language = "en"
+# initial_prompt = "Names and specialist vocabulary used in the video."
+
+[segmentation]
+enabled = true
+# Do not merge across a noticeable pause, even when punctuation is missing.
+max_gap_seconds = 0.8
+# Hard limits prevent one merged subtitle from staying on screen for too long.
+max_duration_seconds = 10.0
+max_source_chars = 180
+
+[llm]
+base_url = "https://api.deepseek.com"
+api_key_pass_entry = "api/deepseek"
+api_key_env = "DEEPSEEK_API_KEY"
+model = "deepseek-chat"
+target_language = "简体中文"
+batch_size = 30
+timeout_seconds = 120
+max_retries = 3
+# Set false if an OpenAI-compatible provider rejects response_format=json_object.
+json_mode = true
+
+[render]
+font_name = "Noto Sans CJK SC"
+font_size = 18
+margin_vertical = 32
+crf = 20
+preset = "medium"
+
+[upload]
+# Keep false until `biliup login` has produced the cookie file and a dry run succeeds.
+enabled = false
+cookie_file = "cookies.json"
+copyright = 2
+tid = 171
+tags = ["中文字幕", "YouTube"]
+source = ""
+title_prefix = "【中字】"
+description_suffix = "\n\n字幕由自动化工具生成，请以原视频为准。"
+# line = "kodo"
+limit = 3
