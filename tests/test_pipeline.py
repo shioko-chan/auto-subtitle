@@ -5,11 +5,21 @@ from unittest.mock import patch
 
 from subtitle_pipeline.config import AppConfig, UploadConfig
 from subtitle_pipeline.media import DownloadResult
-from subtitle_pipeline.pipeline import run_pipeline
+from subtitle_pipeline.pipeline import normalize_youtube_url, run_pipeline
 from subtitle_pipeline.subtitles import Cue, write_srt
 
 
 class PipelineTests(unittest.TestCase):
+    def test_normalizes_shell_escaped_youtube_query(self):
+        self.assertEqual(
+            normalize_youtube_url(r"https://www.youtube.com/watch\?v\=abc"),
+            "https://www.youtube.com/watch?v=abc",
+        )
+
+    def test_rejects_non_youtube_url(self):
+        with self.assertRaisesRegex(ValueError, "supported YouTube"):
+            normalize_youtube_url("https://example.com/watch?v=abc")
+
     def test_uses_existing_subtitle_and_respects_no_upload_override(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -43,7 +53,11 @@ class PipelineTests(unittest.TestCase):
             ), patch("subtitle_pipeline.pipeline.transcribe_with_whisper") as whisper, patch(
                 "subtitle_pipeline.pipeline.upload_to_bilibili"
             ) as upload:
-                result = run_pipeline("https://youtube.test/1", config, upload_override=False)
+                result = run_pipeline(
+                    "https://www.youtube.com/watch?v=1",
+                    config,
+                    upload_override=False,
+                )
 
             self.assertFalse(result.uploaded)
             self.assertEqual(result.translated_subtitle.read_text(encoding="utf-8").count("你好"), 1)

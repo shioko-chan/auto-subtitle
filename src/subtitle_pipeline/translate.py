@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import ssl
 import time
 import urllib.error
 import urllib.request
+
+import certifi
 
 from .config import LLMConfig
 from .subtitles import Cue, apply_translations, translation_payload
@@ -18,6 +21,7 @@ class OpenAICompatibleTranslator:
     def __init__(self, config: LLMConfig, api_key: str):
         self.config = config
         self.api_key = api_key
+        self.ssl_context = _create_ssl_context()
 
     def translate(self, cues: list[Cue]) -> list[Cue]:
         translated: list[Cue] = []
@@ -158,7 +162,9 @@ class OpenAICompatibleTranslator:
         )
         try:
             with urllib.request.urlopen(
-                request, timeout=self.config.timeout_seconds
+                request,
+                timeout=self.config.timeout_seconds,
+                context=self.ssl_context,
             ) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
@@ -177,3 +183,10 @@ def _parse_json_object(content: object) -> dict[str, object]:
     if not isinstance(parsed, dict):
         raise ValueError("LLM response must be a JSON object")
     return parsed
+
+
+def _create_ssl_context() -> ssl.SSLContext:
+    """Trust platform/user CAs and supplement them with certifi's CA bundle."""
+    context = ssl.create_default_context()
+    context.load_verify_locations(cafile=certifi.where())
+    return context

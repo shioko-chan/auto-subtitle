@@ -6,6 +6,7 @@ import logging
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .config import AppConfig, llm_api_key
 from .media import download_youtube, render_subtitles, transcribe_with_whisper
@@ -31,6 +32,7 @@ def run_pipeline(
     *,
     upload_override: bool | None = None,
 ) -> PipelineResult:
+    url = normalize_youtube_url(url)
     job_id = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
     job_dir = config.work_dir.resolve() / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -103,6 +105,28 @@ def run_pipeline(
     )
     _write_manifest(result, url, title)
     return result
+
+
+def normalize_youtube_url(url: str) -> str:
+    candidate = url.strip()
+    for escaped, literal in ((r"\?", "?"), (r"\=", "="), (r"\&", "&")):
+        candidate = candidate.replace(escaped, literal)
+    if "\\" in candidate:
+        raise ValueError("YouTube URL contains an unexpected backslash")
+    parsed = urlsplit(candidate)
+    hostname = (parsed.hostname or "").lower()
+    supported_host = (
+        hostname == "youtu.be"
+        or hostname == "youtube.com"
+        or hostname.endswith(".youtube.com")
+        or hostname == "youtube-nocookie.com"
+        or hostname.endswith(".youtube-nocookie.com")
+    )
+    if parsed.scheme not in {"http", "https"} or not supported_host:
+        raise ValueError(f"not a supported YouTube URL: {url}")
+    if candidate != url:
+        logging.info("normalized escaped YouTube URL: %s", candidate)
+    return candidate
 
 
 def _write_manifest(result: PipelineResult, url: str, title: str) -> None:

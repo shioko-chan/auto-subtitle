@@ -2,6 +2,8 @@ work_dir = "work"
 
 [download]
 subtitle_languages = ["en.*", "ja.*", "ko.*"]
+# Automatically use Deno, Node or QuickJS when available; set "" to disable.
+js_runtime = "auto"
 # cookies_from_browser = "chrome"
 # cookies_file = "/path/to/youtube-cookies.txt"
 

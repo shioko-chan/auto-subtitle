@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from .commands import require_command, run
+from .commands import CommandError, require_command, run
 from .config import DownloadConfig, RenderConfig, WhisperConfig
 from .subtitles import Cue, write_srt
 
@@ -21,31 +22,20 @@ def download_youtube(url: str, directory: Path, config: DownloadConfig) -> Downl
     yt_dlp = require_command("yt-dlp")
     directory.mkdir(parents=True, exist_ok=True)
     output = directory / "source.%(ext)s"
-    command = [
-        yt_dlp,
-        "--no-playlist",
+    common = [yt_dlp, "--no-playlist", *_runtime_arguments(config)]
+    common.extend(_authentication_arguments(config))
+    video_command = [
+        *common,
         "--write-info-json",
-        "--write-subs",
-        "--write-auto-subs",
-        "--sub-langs",
-        ",".join(config.subtitle_languages),
-        "--sub-format",
-        "srt/vtt/best",
-        "--convert-subs",
-        "srt",
         "--format",
         "bv*+ba/b",
         "--merge-output-format",
         "mp4",
         "--output",
         str(output),
+        url,
     ]
-    if config.cookies_from_browser:
-        command.extend(["--cookies-from-browser", config.cookies_from_browser])
-    if config.cookies_file:
-        command.extend(["--cookies", config.cookies_file])
-    command.append(url)
-    run(command)
+    run(video_command)
 
     info_path = directory / "source.info.json"
     if not info_path.exists():
@@ -60,14 +50,162 @@ def download_youtube(url: str, directory: Path, config: DownloadConfig) -> Downl
     if not candidates:
         raise RuntimeError("yt-dlp completed but no downloaded video was found")
     video = max(candidates, key=lambda path: path.stat().st_size)
-    subtitles = sorted(directory.glob("source.*.srt"))
-    if not subtitles:
-        subtitles = sorted(directory.glob("source.*.vtt"))
-    subtitle = subtitles[0] if subtitles else None
+
+    subtitle = _find_subtitle(directory, metadata)
+    if subtitle is None or not _is_original_subtitle(subtitle, metadata):
+        subtitle_command = [
+            *common,
+            "--skip-download",
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-langs",
+            ",".join(_subtitle_languages(config, metadata)),
+            "--sub-format",
+            "srt/vtt/best",
+            "--convert-subs",
+            "srt",
+            "--output",
+            str(output),
+            url,
+        ]
+        try:
+            run(subtitle_command)
+        except CommandError as exc:
+            logging.warning(
+                "YouTube subtitle download failed (%s); falling back to Whisper",
+                exc,
+            )
+        subtitle = _find_subtitle(directory, metadata)
+
     logging.info("downloaded video: %s", video)
     if subtitle:
         logging.info("using YouTube subtitle: %s", subtitle.name)
     return DownloadResult(video, subtitle, metadata)
+
+
+def _authentication_arguments(config: DownloadConfig) -> list[str]:
+    arguments: list[str] = []
+    if config.cookies_from_browser:
+        arguments.extend(["--cookies-from-browser", config.cookies_from_browser])
+    if config.cookies_file:
+        arguments.extend(["--cookies", config.cookies_file])
+    return arguments
+
+
+def _runtime_arguments(config: DownloadConfig) -> list[str]:
+    runtime = config.js_runtime
+    if not runtime:
+        return []
+    if runtime == "auto":
+        for name in ("deno", "node", "qjs"):
+            path = shutil.which(name)
+            if path:
+                runtime_name = "quickjs" if name == "qjs" else name
+                return ["--js-runtimes", f"{runtime_name}:{path}"]
+        logging.warning(
+            "no supported JavaScript runtime found; install Deno 2.3+ or Node 22+"
+        )
+        return []
+    return ["--js-runtimes", runtime]
+
+
+def _find_subtitle(
+    directory: Path, metadata: dict[str, object]
+) -> Path | None:
+    subtitles = [
+        path for path in directory.glob("source.*.srt") if path.stat().st_size > 0
+    ]
+    if not subtitles:
+        subtitles = [
+            path for path in directory.glob("source.*.vtt") if path.stat().st_size > 0
+        ]
+    if not subtitles:
+        return None
+
+    originals = _original_language_variants(metadata)
+    manual = metadata.get("subtitles")
+    manual_tags = (
+        {str(tag).lower() for tag in manual} if isinstance(manual, dict) else set()
+    )
+
+    def priority(path: Path) -> tuple[int, str]:
+        tag = _subtitle_tag(path)
+        normalized = tag.lower()
+        matches_original = any(
+            normalized == original or normalized.startswith(f"{original}-")
+            for original in originals
+        )
+        if normalized in manual_tags and matches_original:
+            rank = 0
+        elif any(normalized == f"{original}-orig" for original in originals):
+            rank = 1
+        elif matches_original:
+            rank = 2
+        elif normalized.endswith("-orig"):
+            rank = 3
+        elif normalized in manual_tags:
+            rank = 4
+        else:
+            rank = 5
+        return rank, normalized
+
+    return min(subtitles, key=priority)
+
+
+def _subtitle_languages(
+    config: DownloadConfig, metadata: dict[str, object]
+) -> list[str]:
+    requested: list[str] = []
+    for original in _original_language_variants(metadata):
+        requested.extend([f"{original}-orig", original])
+    for language in config.subtitle_languages:
+        if language not in requested:
+            requested.append(language)
+    return requested
+
+
+def _original_language(metadata: dict[str, object]) -> str | None:
+    language = metadata.get("language")
+    if isinstance(language, str) and language:
+        normalized = language.lower()
+        if all(character.isalnum() or character in "_-" for character in normalized):
+            return normalized
+    automatic = metadata.get("automatic_captions")
+    if isinstance(automatic, dict):
+        original_tags = sorted(
+            tag[:-5].lower()
+            for tag in automatic
+            if isinstance(tag, str) and tag.lower().endswith("-orig")
+        )
+        if original_tags:
+            return original_tags[0]
+    return None
+
+
+def _original_language_variants(metadata: dict[str, object]) -> list[str]:
+    original = _original_language(metadata)
+    if not original:
+        return []
+    variants = [original]
+    base = original.split("-", 1)[0].split("_", 1)[0]
+    if base not in variants:
+        variants.append(base)
+    return variants
+
+
+def _subtitle_tag(path: Path) -> str:
+    name = path.name
+    prefix = "source."
+    suffix = path.suffix
+    return name[len(prefix) : -len(suffix)]
+
+
+def _is_original_subtitle(path: Path, metadata: dict[str, object]) -> bool:
+    tag = _subtitle_tag(path).lower()
+    originals = _original_language_variants(metadata)
+    if originals:
+        return any(tag == original or tag == f"{original}-orig" for original in originals)
+    return tag.endswith("-orig")
 
 
 def transcribe_with_whisper(

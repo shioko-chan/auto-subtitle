@@ -45,6 +45,10 @@ cp config.example.toml config.toml
 可用 `brew install ffmpeg`。如果只处理始终带字幕的视频，可执行 `uv sync` 而不安装
 Whisper extra，但遇到无字幕视频时管线会明确报错。
 
+完整的 YouTube 格式解析还需要 JavaScript runtime。管线会依次自动寻找 Deno、Node
+和 QuickJS；推荐安装 Deno 2.3+，Node 则需 22+。PyPI 依赖已启用 yt-dlp 的 EJS 和
+`curl-cffi` extras。
+
 ## 配置 LLM
 
 默认使用 DeepSeek 的 OpenAI 兼容 Chat Completions 接口，并从 password-store 读取
@@ -66,6 +70,9 @@ model = "deepseek-chat"
 
 如需改用环境变量，将 `api_key_pass_entry = ""`，再通过 `api_key_env` 指定变量名。
 
+LLM HTTPS 请求会在系统 CA 基础上补充 `certifi` CA bundle，兼容 uv 独立 Python、
+NixOS、macOS 和 Windows，同时保留 `SSL_CERT_FILE` 等自定义 CA 配置。
+
 若兼容服务不接受 `response_format = json_object`，设置 `json_mode = false`；管线仍会
 解析并严格校验返回的 JSON。
 
@@ -85,6 +92,14 @@ uv run --extra whisper subtitle-pipeline --config config.toml check
 ```bash
 uv run --extra whisper subtitle-pipeline --config config.toml run --no-upload 'https://www.youtube.com/watch?v=...'
 ```
+
+URL 放在单引号中时不要再写 `\?` 或 `\=`。为兼容常见的复制方式，管线会自动移除
+这两个位置的多余反斜杠。视频与字幕采用两个独立下载阶段：字幕遇到 429 或其他网络
+错误时，已下载的视频仍会保留并自动进入 Whisper 转写。
+
+字幕选择优先使用 yt-dlp 元数据标记的原语言：先选 `<语言>-orig`，再选原语言代码，
+之后才考虑其他人工字幕和自动翻译字幕。即使 `download.subtitle_languages` 没有列出原
+语言，管线也会把检测到的原语言动态加入下载请求。
 
 结果位于 `work/<URL哈希>/translated.mp4`，译文位于
 `work/<URL哈希>/translated.zh-CN.srt`，投稿标题和简介位于

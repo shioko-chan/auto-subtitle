@@ -8,7 +8,10 @@ version = "0.1.0"
 description = "Download YouTube videos, translate/generate subtitles, and upload to Bilibili"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["yt-dlp>=2025.1.15"]
+dependencies = [
+    "certifi>=2025.1.31",
+    "yt-dlp[default,curl-cffi]>=2025.1.15",
+]
 
 [project.optional-dependencies]
 whisper = ["faster-whisper>=1.1,<2"]

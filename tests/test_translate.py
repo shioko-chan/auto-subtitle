@@ -7,6 +7,16 @@ from subtitle_pipeline.translate import OpenAICompatibleTranslator, _parse_json_
 
 
 class TranslationTests(unittest.TestCase):
+    def test_ssl_context_combines_platform_and_certifi_ca(self):
+        with patch("subtitle_pipeline.translate.ssl.create_default_context") as create, patch(
+            "subtitle_pipeline.translate.certifi.where", return_value="/ca/certifi.pem"
+        ):
+            translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        self.assertIs(translator.ssl_context, create.return_value)
+        create.return_value.load_verify_locations.assert_called_once_with(
+            cafile="/ca/certifi.pem"
+        )
+
     def test_translates_in_batches_and_preserves_timing(self):
         translator = OpenAICompatibleTranslator(LLMConfig(batch_size=2), "secret")
         responses = [
