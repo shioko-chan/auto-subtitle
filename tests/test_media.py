@@ -18,7 +18,17 @@ class MediaDownloadTests(unittest.TestCase):
                 if "--skip-download" in command:
                     raise CommandError("HTTP 429")
                 (directory / "source.info.json").write_text(
-                    json.dumps({"title": "Video", "language": "ja"}),
+                    json.dumps(
+                        {
+                            "title": "Video",
+                            "language": "ja",
+                            "automatic_captions": {
+                                "en": [],
+                                "ja": [],
+                                "ja-orig": [],
+                            },
+                        }
+                    ),
                     encoding="utf-8",
                 )
                 (directory / "source.mp4").write_bytes(b"video")
@@ -45,7 +55,7 @@ class MediaDownloadTests(unittest.TestCase):
             self.assertIn("--skip-download", subtitle_command)
             self.assertIn("node:/usr/bin/node", video_command)
             languages = subtitle_command[subtitle_command.index("--sub-langs") + 1]
-            self.assertTrue(languages.startswith("ja-orig,ja,"))
+            self.assertEqual(languages, "ja-orig")
 
     def test_existing_nonempty_subtitle_skips_subtitle_request(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -87,6 +97,16 @@ class MediaDownloadTests(unittest.TestCase):
             self.assertEqual(
                 _find_subtitle(directory, metadata), directory / "source.ja-orig.srt"
             )
+
+    def test_manual_original_language_is_requested_before_auto_orig(self):
+        from subtitle_pipeline.media import _subtitle_languages
+
+        metadata = {
+            "language": "ja",
+            "subtitles": {"ja": []},
+            "automatic_captions": {"ja-orig": [], "en": []},
+        }
+        self.assertEqual(_subtitle_languages(DownloadConfig(), metadata), ["ja"])
 
 
 if __name__ == "__main__":

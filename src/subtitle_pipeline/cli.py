@@ -6,7 +6,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from .config import ConfigError, load_config
+from .config import AppConfig, ConfigError, load_config
 from .pipeline import run_pipeline
 
 
@@ -43,7 +43,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         if args.command == "check":
-            return _check(config.upload.enabled)
+            return _check(config)
         override = True if args.upload else False if args.no_upload else None
         result = run_pipeline(args.url, config, upload_override=override)
         logging.info("complete: %s", result.rendered_video)
@@ -54,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
-def _check(upload_enabled: bool) -> int:
+def _check(config: AppConfig) -> int:
     missing = []
     for executable in ("yt-dlp", "ffmpeg"):
         path = shutil.which(executable)
@@ -63,19 +63,24 @@ def _check(upload_enabled: bool) -> int:
         else:
             missing.append(executable)
             logging.error("missing executable: %s", executable)
-    if upload_enabled:
+    if config.upload.enabled:
         path = shutil.which("biliup")
         if path:
             logging.info("found biliup: %s", path)
         else:
             missing.append("biliup")
             logging.error("missing executable: biliup")
-    try:
-        import faster_whisper  # noqa: F401
+    if config.whisper.enabled:
+        try:
+            import faster_whisper  # noqa: F401
 
-        logging.info("found optional faster-whisper fallback")
-    except ImportError:
-        logging.warning("faster-whisper is not installed; videos without subtitles will fail")
+            logging.info("found optional faster-whisper fallback")
+        except ImportError:
+            logging.warning(
+                "Whisper fallback is enabled but faster-whisper is not installed"
+            )
+    else:
+        logging.info("Whisper fallback is disabled by configuration")
     return 1 if missing else 0
 
 

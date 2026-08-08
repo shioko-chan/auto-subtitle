@@ -15,7 +15,7 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class DownloadConfig:
-    subtitle_languages: list[str] = field(default_factory=lambda: ["en.*", "ja.*"])
+    subtitle_languages: list[str] = field(default_factory=list)
     cookies_from_browser: str | None = None
     cookies_file: str | None = None
     js_runtime: str | None = "auto"
@@ -23,6 +23,7 @@ class DownloadConfig:
 
 @dataclass(frozen=True)
 class WhisperConfig:
+    enabled: bool = True
     model: str = "small"
     device: str = "auto"
     compute_type: str = "auto"

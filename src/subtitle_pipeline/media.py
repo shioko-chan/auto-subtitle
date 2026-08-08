@@ -156,12 +156,47 @@ def _subtitle_languages(
     config: DownloadConfig, metadata: dict[str, object]
 ) -> list[str]:
     requested: list[str] = []
-    for original in _original_language_variants(metadata):
-        requested.extend([f"{original}-orig", original])
+    source_language = _source_subtitle_language(metadata)
+    if source_language:
+        requested.append(source_language)
     for language in config.subtitle_languages:
         if language not in requested:
             requested.append(language)
     return requested
+
+
+def _source_subtitle_language(metadata: dict[str, object]) -> str | None:
+    originals = _original_language_variants(metadata)
+    manual = metadata.get("subtitles")
+    manual_tags = (
+        {str(tag).lower() for tag in manual} if isinstance(manual, dict) else set()
+    )
+    automatic = metadata.get("automatic_captions")
+    automatic_tags = (
+        {str(tag).lower() for tag in automatic}
+        if isinstance(automatic, dict)
+        else set()
+    )
+
+    for original in originals:
+        if original in manual_tags:
+            return original
+    for original in originals:
+        original_track = f"{original}-orig"
+        if original_track in automatic_tags:
+            return original_track
+    for original in originals:
+        if original in automatic_tags:
+            return original
+    other_originals = sorted(
+        tag for tag in automatic_tags if tag.endswith("-orig")
+    )
+    if other_originals:
+        return other_originals[0]
+    if originals:
+        # Some extractors omit caption maps; try YouTube's conventional source tag.
+        return f"{originals[0]}-orig"
+    return None
 
 
 def _original_language(metadata: dict[str, object]) -> str | None:

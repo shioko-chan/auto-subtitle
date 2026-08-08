@@ -41,6 +41,10 @@ def run_pipeline(
     downloaded = download_youtube(url, job_dir, config.download)
     source_subtitle = downloaded.subtitle
     if source_subtitle is None:
+        if not config.whisper.enabled:
+            raise RuntimeError(
+                "no usable source-language subtitle was found and Whisper fallback is disabled"
+            )
         source_subtitle = transcribe_with_whisper(
             downloaded.video, job_dir / "source.whisper.srt", config.whisper
         )

@@ -20,6 +20,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.llm.model, "test-model")
             self.assertTrue(config.upload.enabled)
             self.assertEqual(config.whisper.model, "small")
+            self.assertTrue(config.whisper.enabled)
 
     def test_rejects_invalid_batch_size(self):
         with tempfile.TemporaryDirectory() as temp:

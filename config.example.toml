@@ -1,13 +1,15 @@
 work_dir = "work"
 
 [download]
-subtitle_languages = ["en.*", "ja.*", "ko.*"]
+# Extra fallback/translation tracks. The detected original track is added automatically.
+subtitle_languages = []
 # Automatically use Deno, Node or QuickJS when available; set "" to disable.
 js_runtime = "auto"
 # cookies_from_browser = "chrome"
 # cookies_file = "/path/to/youtube-cookies.txt"
 
 [whisper]
+enabled = true
 model = "small"
 device = "auto"
 compute_type = "auto"

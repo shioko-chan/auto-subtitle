@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from subtitle_pipeline.config import AppConfig, UploadConfig
+from subtitle_pipeline.config import AppConfig, UploadConfig, WhisperConfig
 from subtitle_pipeline.media import DownloadResult
 from subtitle_pipeline.pipeline import normalize_youtube_url, run_pipeline
 from subtitle_pipeline.subtitles import Cue, write_srt
@@ -19,6 +19,22 @@ class PipelineTests(unittest.TestCase):
     def test_rejects_non_youtube_url(self):
         with self.assertRaisesRegex(ValueError, "supported YouTube"):
             normalize_youtube_url("https://example.com/watch?v=abc")
+
+    def test_disabled_whisper_fails_before_loading_transcriber(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            video = root / "source.mp4"
+            video.write_bytes(b"video")
+            downloaded = DownloadResult(video=video, subtitle=None, metadata={})
+            config = AppConfig(
+                work_dir=root / "work", whisper=WhisperConfig(enabled=False)
+            )
+            with patch(
+                "subtitle_pipeline.pipeline.download_youtube", return_value=downloaded
+            ), patch("subtitle_pipeline.pipeline.transcribe_with_whisper") as transcribe:
+                with self.assertRaisesRegex(RuntimeError, "fallback is disabled"):
+                    run_pipeline("https://youtu.be/test", config, upload_override=False)
+            transcribe.assert_not_called()
 
     def test_uses_existing_subtitle_and_respects_no_upload_override(self):
         with tempfile.TemporaryDirectory() as temp:
