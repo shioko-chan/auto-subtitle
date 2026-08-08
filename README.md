@@ -147,6 +147,7 @@ uv run --extra whisper subtitle-pipeline --config config.toml run 'https://www.y
 - `llm.metadata_tag_count`：同一次元数据翻译请求生成的 B 站标签数量。
 - `llm.metadata_subtitle_max_chars`：用于识别内容/IP 的字幕首、中、尾证据字符上限。
 - `llm.ip_aliases_file`：已知 IP 的规范名及中英日别名 JSON 文件。
+- `llm.glossary_files`：附加翻译术语表；后加载的自定义译名覆盖内置译名。
 - `render.font_name`：必须是机器上已安装且包含中文字形的字体。
 - `upload.enabled`：生产环境才建议开启；命令行 `--no-upload` 始终优先关闭上传。
 - `upload.tags`：始终保留的固定标签；会与自动标签去重合并。
@@ -176,6 +177,16 @@ B 站标签目录格式参考 `bilibili-tags.example.json`：
 字幕首中尾摘要、IP 别名和上述 B 站目录。目录中的别名会规范化为正式标签；同一别名
 匹配多个标签时选择热度更高者。公开 B 站搜索会对自动请求返回验证码，项目不会调用
 未公开搜索接口；实时热度应通过已获授权的开放平台应用导出后更新本地目录。
+
+项目内置 Bang Dream 翻译术语表，并根据频道、标题、简介及 YouTube 元数据中的
+`BanG Dream`、`バンドリ`、`ガルパ`、乐队名等标识自动启用。命中后，字幕每个
+翻译批次以及标题/简介翻译都会收到作品背景、乐队名、角色名、舞台名和常见声优姓名。
+未命中的普通视频不会收到该术语表。内置资料参考 BanG Dream 官方角色/乐队页面、
+萌娘百科简中条目及 BanG Dream Fandom 角色目录，来源 URL 保存在术语 JSON 中。
+
+可通过 `llm.glossary_files` 添加同格式 JSON；自定义文件在内置术语之后加载，所以
+可覆盖有争议或偏好的译名。设置 `"always": true` 可让某个自定义术语表对所有视频
+启用，否则应提供 `match` 字符串数组用于自动识别。
 
 ## 开发与测试
 

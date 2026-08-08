@@ -43,6 +43,8 @@ metadata_tag_count = 5
 # Beginning/middle/end subtitle evidence supplied to metadata analysis.
 metadata_subtitle_max_chars = 4000
 # ip_aliases_file = "ip_aliases.json"
+# Additional glossary files override matching terms in built-in glossaries.
+glossary_files = []
 
 [render]
 font_name = "Noto Sans CJK SC"

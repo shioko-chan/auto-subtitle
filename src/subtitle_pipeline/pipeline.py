@@ -5,6 +5,7 @@ import json
 import logging
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from importlib import resources
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -13,6 +14,9 @@ from .media import download_youtube, render_subtitles, transcribe_with_whisper
 from .subtitles import Cue, merge_semantic_cues, read_subtitles, write_srt
 from .translate import OpenAICompatibleTranslator
 from .upload import upload_to_bilibili
+
+
+_BUILTIN_GLOSSARY_FILES = ("glossaries/bang-dream.json",)
 
 
 @dataclass(frozen=True)
@@ -57,14 +61,25 @@ def run_pipeline(
         original_cue_count,
         len(cues),
     )
-    translator = OpenAICompatibleTranslator(config.llm, llm_api_key(config.llm))
-    translated = translator.translate(cues)
-    translated_path = job_dir / "translated.zh-CN.srt"
-    write_srt(translated, translated_path)
-
     source_title = str(downloaded.metadata.get("title") or "YouTube video")
     source_description = str(downloaded.metadata.get("description") or "")
     youtube_context = _youtube_metadata_context(downloaded.metadata)
+    translation_context = _translation_context(
+        downloaded.metadata, config.llm.glossary_files
+    )
+    if translation_context:
+        names = [
+            item["name"]
+            for item in translation_context["franchises"]
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        ]
+        logging.info("using translation glossary: %s", ", ".join(names))
+
+    translator = OpenAICompatibleTranslator(config.llm, llm_api_key(config.llm))
+    translated = translator.translate(cues, translation_context=translation_context)
+    translated_path = job_dir / "translated.zh-CN.srt"
+    write_srt(translated, translated_path)
+
     subtitle_evidence = _subtitle_evidence(
         cues, config.llm.metadata_subtitle_max_chars
     )
@@ -84,6 +99,7 @@ def run_pipeline(
             subtitle_evidence=subtitle_evidence,
             ip_aliases=ip_aliases,
             bilibili_tag_catalog=tag_catalog,
+            translation_context=translation_context,
         )
     generated_tags, tag_catalog_matches = _canonicalize_catalog_tags(
         generated_tags, tag_catalog
@@ -98,6 +114,9 @@ def run_pipeline(
                 "translated_title": title,
                 "translated_description": description,
                 "youtube_context": youtube_context,
+                "translation_glossaries": [
+                    item["name"] for item in translation_context.get("franchises", [])
+                ],
                 "content_summary": content_summary,
                 "generated_tags": generated_tags,
                 "tag_catalog_matches": tag_catalog_matches,
@@ -230,6 +249,87 @@ def _load_optional_json_object(path_value: str | None, label: str) -> dict[str, 
         raise ValueError(f"invalid JSON in {label} file {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"{label} file must contain a JSON object: {path}")
+    return value
+
+
+def _translation_context(
+    metadata: dict[str, object], configured_files: list[str]
+) -> dict[str, object]:
+    glossaries: list[dict[str, object]] = []
+    package_root = resources.files("subtitle_pipeline")
+    for relative_path in _BUILTIN_GLOSSARY_FILES:
+        resource = package_root.joinpath(relative_path)
+        value = json.loads(resource.read_text(encoding="utf-8"))
+        glossaries.append(_validate_translation_glossary(value, relative_path))
+    for path_value in configured_files:
+        path = Path(path_value).expanduser()
+        if not path.is_file():
+            raise ValueError(f"translation glossary file not found: {path}")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid translation glossary file {path}: {exc}") from exc
+        glossaries.append(_validate_translation_glossary(value, str(path)))
+
+    identity = {
+        "title": metadata.get("title"),
+        "description": str(metadata.get("description") or "")[:10000],
+        **_youtube_metadata_context(metadata),
+    }
+    evidence = json.dumps(identity, ensure_ascii=False).casefold()
+    franchises: list[dict[str, str]] = []
+    terms: dict[str, str] = {}
+    for glossary in glossaries:
+        matches = glossary["match"]
+        assert isinstance(matches, list)
+        if not glossary.get("always") and not any(
+            isinstance(candidate, str) and candidate.casefold() in evidence
+            for candidate in matches
+        ):
+            continue
+        franchises.append(
+            {
+                "name": str(glossary["name"]),
+                "background": str(glossary["background"]),
+            }
+        )
+        glossary_terms = glossary["terms"]
+        assert isinstance(glossary_terms, dict)
+        terms.update(
+            {
+                source.strip(): target.strip()
+                for source, target in glossary_terms.items()
+                if isinstance(source, str)
+                and isinstance(target, str)
+                and source.strip()
+                and target.strip()
+            }
+        )
+    if not franchises:
+        return {}
+    return {"franchises": franchises, "terms": terms}
+
+
+def _validate_translation_glossary(
+    value: object, label: str
+) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError(f"translation glossary {label} must be a JSON object")
+    if not isinstance(value.get("name"), str) or not value["name"].strip():
+        raise ValueError(f"translation glossary {label} requires a name")
+    if not isinstance(value.get("background"), str):
+        raise ValueError(f"translation glossary {label} requires background text")
+    matches = value.get("match")
+    if not isinstance(matches, list) or not all(
+        isinstance(item, str) and item.strip() for item in matches
+    ):
+        raise ValueError(f"translation glossary {label} requires string match terms")
+    terms = value.get("terms")
+    if not isinstance(terms, dict) or not all(
+        isinstance(source, str) and isinstance(target, str)
+        for source, target in terms.items()
+    ):
+        raise ValueError(f"translation glossary {label} requires string term mappings")
     return value
 
 

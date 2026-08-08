@@ -55,6 +55,7 @@ class LLMConfig:
     metadata_tag_count: int = 5
     metadata_subtitle_max_chars: int = 4000
     ip_aliases_file: str | None = None
+    glossary_files: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -132,6 +133,10 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("llm.metadata_tag_count must be between 1 and 10")
     if config.llm.metadata_subtitle_max_chars < 0:
         raise ConfigError("llm.metadata_subtitle_max_chars cannot be negative")
+    if not isinstance(config.llm.glossary_files, list) or not all(
+        isinstance(path, str) and path.strip() for path in config.llm.glossary_files
+    ):
+        raise ConfigError("llm.glossary_files must be a list of non-empty paths")
     if config.segmentation.max_gap_seconds < 0:
         raise ConfigError("segmentation.max_gap_seconds cannot be negative")
     if config.segmentation.max_duration_seconds <= 0:
