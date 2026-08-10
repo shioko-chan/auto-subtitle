@@ -34,7 +34,7 @@ def upload_to_bilibili(
         "--title",
         (config.title_prefix + title)[:80],
         "--desc",
-        (description + config.description_suffix)[:2000],
+        _truncate_utf16(description + config.description_suffix, 2000),
         "--tag",
         ",".join(tags),
         "--limit",
@@ -46,3 +46,10 @@ def upload_to_bilibili(
         command.extend(["--line", config.line])
     command.append(str(video))
     run(command)
+
+
+def _truncate_utf16(value: str, max_units: int) -> str:
+    encoded = value.encode("utf-16-le")
+    if len(encoded) <= max_units * 2:
+        return value
+    return encoded[: max_units * 2].decode("utf-16-le", errors="ignore")

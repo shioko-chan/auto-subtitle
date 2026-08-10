@@ -25,6 +25,50 @@ _CJK_EDGE_RE = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 _CJK_LEFT_EDGE_RE = re.compile(
     r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af][，、；：—]*$"
 )
+_BRACKETED_MARKER_RE = re.compile(r"[\[［【](?P<label>[^\]］】\r\n]{1,30})[\]］】]")
+_NON_SPEECH_MARKERS = {
+    "applause",
+    "background music",
+    "bgm",
+    "breathing",
+    "cheering",
+    "cheers",
+    "inaudible",
+    "laughter",
+    "laughs",
+    "music",
+    "sigh",
+    "sighs",
+    "silence",
+    "singing",
+    "呼吸声",
+    "呼吸聲",
+    "喝彩",
+    "噪音",
+    "拍手",
+    "掌声",
+    "掌聲",
+    "无声",
+    "无音乐",
+    "歌声",
+    "歌聲",
+    "欢呼",
+    "歡呼",
+    "笑",
+    "笑声",
+    "笑聲",
+    "背景音乐",
+    "背景音樂",
+    "静音",
+    "音樂",
+    "音乐",
+    "息",
+    "歓声",
+    "無音",
+    "笑い",
+    "音楽",
+    "鼻息",
+}
 
 
 def _seconds(value: str) -> float:
@@ -70,6 +114,22 @@ def write_srt(cues: list[Cue], path: Path) -> None:
             f"{index}\n{_timestamp(cue.start)} --> {_timestamp(cue.end)}\n{cue.text.strip()}"
         )
     path.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+
+
+def clean_non_speech_markers(cues: list[Cue]) -> list[Cue]:
+    cleaned: list[Cue] = []
+    for cue in cues:
+        text = _BRACKETED_MARKER_RE.sub(_remove_non_speech_marker, cue.text)
+        lines = [" ".join(line.split()) for line in text.splitlines()]
+        text = "\n".join(line for line in lines if line).strip()
+        if text:
+            cleaned.append(replace(cue, text=text))
+    return cleaned
+
+
+def _remove_non_speech_marker(match: re.Match[str]) -> str:
+    label = " ".join(match.group("label").split()).casefold()
+    return "" if label in _NON_SPEECH_MARKERS else match.group(0)
 
 
 def merge_semantic_cues(cues: list[Cue], config: SegmentationConfig) -> list[Cue]:
@@ -126,14 +186,28 @@ def apply_translations(cues: list[Cue], values: object) -> list[Cue]:
     if not isinstance(values, list):
         raise ValueError("LLM response field 'translations' must be a list")
     mapped: dict[int, str] = {}
+    duplicate_ids: set[int] = set()
     for item in values:
         if not isinstance(item, dict) or not isinstance(item.get("id"), int):
             raise ValueError("every translation must contain an integer id")
         text = item.get("text")
         if not isinstance(text, str) or not text.strip():
             raise ValueError("every translation must contain non-empty text")
-        mapped[item["id"]] = text.strip()
+        item_id = item["id"]
+        if item_id in mapped:
+            duplicate_ids.add(item_id)
+        mapped[item_id] = text.strip()
     expected = set(range(len(cues)))
     if set(mapped) != expected:
-        raise ValueError("LLM response ids do not match the requested subtitle cues")
+        missing = sorted(expected - set(mapped))
+        unexpected = sorted(set(mapped) - expected)
+        raise ValueError(
+            "LLM response ids do not match the requested subtitle cues: "
+            f"missing={missing}, unexpected={unexpected}, duplicates={sorted(duplicate_ids)}"
+        )
+    if duplicate_ids:
+        raise ValueError(
+            "LLM response ids do not match the requested subtitle cues: "
+            f"missing=[], unexpected=[], duplicates={sorted(duplicate_ids)}"
+        )
     return [replace(cue, text=mapped[index]) for index, cue in enumerate(cues)]

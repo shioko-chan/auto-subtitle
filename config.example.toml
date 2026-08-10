@@ -28,13 +28,19 @@ max_source_chars = 180
 base_url = "https://api.deepseek.com"
 api_key_pass_entry = "api/deepseek"
 api_key_env = "DEEPSEEK_API_KEY"
-model = "deepseek-chat"
+model = "deepseek-v4-flash"
 target_language = "简体中文"
 batch_size = 30
 timeout_seconds = 120
-max_retries = 3
+max_retries = 5
+max_tokens = 16384
+context_cues = 3
+# Metadata uses json_object; subtitle translation always uses recoverable NDJSON.
 # Set false if an OpenAI-compatible provider rejects response_format=json_object.
 json_mode = true
+# DeepSeek V4 defaults to thinking mode, which is slow and unreliable for strict JSON.
+# Omit this option for providers that do not implement the DeepSeek thinking parameter.
+thinking = "disabled"
 translate_metadata = true
 # Only this many source-description characters are sent to the LLM.
 metadata_description_max_chars = 6000

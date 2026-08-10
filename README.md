@@ -66,7 +66,10 @@ pass show api/deepseek
 [llm]
 base_url = "https://api.deepseek.com"
 api_key_pass_entry = "api/deepseek"
-model = "deepseek-chat"
+model = "deepseek-v4-flash"
+thinking = "disabled"
+max_tokens = 16384
+max_retries = 5
 ```
 
 如需改用环境变量，将 `api_key_pass_entry = ""`，再通过 `api_key_env` 指定变量名。
@@ -74,11 +77,15 @@ model = "deepseek-chat"
 LLM HTTPS 请求会在系统 CA 基础上补充 `certifi` CA bundle，兼容 uv 独立 Python、
 NixOS、macOS 和 Windows，同时保留 `SSL_CERT_FILE` 等自定义 CA 配置。
 
-若兼容服务不接受 `response_format = json_object`，设置 `json_mode = false`；管线仍会
-解析并严格校验返回的 JSON。
+字幕翻译使用带全局 ID 的 NDJSON，每行是一条可独立校验、缓存和补传的译文；元数据
+翻译仍使用 JSON object。若兼容服务不接受 `response_format = json_object`，可设置
+`json_mode = false`，这只影响元数据请求。
 
-翻译按 cue 批处理，返回的每个 ID 都会校验，时间轴不会交给模型改写。失败批次会
-指数退避重试。
+翻译按 cue 批处理，返回的每个 ID 都会校验，时间轴不会交给模型改写。每条有效 NDJSON
+记录都会原子写入 job 目录的 `translation-cache.json`；重跑或重试时只补缺失 ID，并向
+模型提供相邻源字幕和已缓存译文作为只读上下文。失败集合会指数退避重试，耗尽后自动
+对半拆分，任何字幕缺失都不会进入渲染或上传阶段。翻译前会删除 `[音楽]`、`[歌声]`、
+`[拍手]`、`[笑]`、`[鼻息]` 等非语音标记，并丢弃清理后为空的 cue。
 
 ## 先在本地运行
 
@@ -131,6 +138,17 @@ uv run --extra whisper subtitle-pipeline --config config.toml run 'https://www.y
 
 默认 `copyright = 2` 表示转载，来源自动使用 YouTube URL；若 `source` 非空则使用配置值。
 上传使用 `biliup --user-cookie ... upload`，不会把 Cookie 内容放到命令行。
+B 站简介会按 2000 个 UTF-16 code units 安全截断，避免补充平面字符导致服务端误判超长。
+
+批量处理 2026-07-27 至 2026-08-10 的梦限大MewType公开直播录播：
+
+```bash
+./scripts/upload-recent-yumemita.sh
+```
+
+脚本按日期串行上传，会员限定录播不在队列中。成功投稿的任务会根据工作目录中的
+`manifest.json` 自动跳过，因此中断或部分失败后可以运行同一命令继续。执行日志保存到
+`work/yumemita-2026-08-10-batch.log`。可将其他配置文件作为第一个参数传入。
 
 ## 常用调整
 
@@ -142,6 +160,10 @@ uv run --extra whisper subtitle-pipeline --config config.toml run 'https://www.y
 - `segmentation.max_gap_seconds`：超过该停顿不跨 cue 合并。
 - `segmentation.max_duration_seconds` / `max_source_chars`：语义句缺少标点时的硬边界。
 - `llm.batch_size`：字幕很长或模型上下文较小时调低。
+- `llm.max_tokens`：单次 LLM 响应的输出 token 上限，DeepSeek V4 建议设为 `16384`。
+- `llm.max_retries`：拆分批次前的请求重试次数，建议设为 `5`。
+- `llm.context_cues`：补翻缺失 ID 时附带的前后只读字幕数量，默认每侧 `3` 条。
+- `llm.thinking`：DeepSeek V4 的严格 JSON 翻译应设为 `"disabled"`；其他服务不支持该参数时省略。
 - `llm.translate_metadata`：是否翻译 YouTube 标题和简介。
 - `llm.metadata_description_max_chars`：发送给 LLM 的源简介字符上限。
 - `llm.metadata_tag_count`：同一次元数据翻译请求生成的 B 站标签数量。

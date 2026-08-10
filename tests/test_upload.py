@@ -4,10 +4,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from subtitle_pipeline.config import UploadConfig
-from subtitle_pipeline.upload import upload_to_bilibili
+from subtitle_pipeline.upload import _truncate_utf16, upload_to_bilibili
 
 
 class UploadTests(unittest.TestCase):
+    def test_truncates_description_by_utf16_units_without_splitting_surrogate_pair(self):
+        value = "a" * 1999 + "🎶" + "tail"
+        result = _truncate_utf16(value, 2000)
+        self.assertEqual(result, "a" * 1999)
+        self.assertEqual(len(result.encode("utf-16-le")) // 2, 1999)
+
     def test_builds_repost_command_without_shell_interpolation(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

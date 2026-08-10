@@ -6,6 +6,7 @@ from pathlib import Path
 from subtitle_pipeline.subtitles import (
     Cue,
     apply_translations,
+    clean_non_speech_markers,
     merge_semantic_cues,
     read_subtitles,
     translation_payload,
@@ -44,6 +45,37 @@ class SubtitleTests(unittest.TestCase):
         cues = [Cue(0, 1, "a"), Cue(1, 2, "b")]
         with self.assertRaisesRegex(ValueError, "ids"):
             apply_translations(cues, [{"id": 0, "text": "甲"}])
+
+    def test_translation_validation_reports_id_differences(self):
+        cues = [Cue(0, 1, "a"), Cue(1, 2, "b")]
+        with self.assertRaisesRegex(
+            ValueError,
+            r"missing=\[1\], unexpected=\[2\], duplicates=\[0\]",
+        ):
+            apply_translations(
+                cues,
+                [
+                    {"id": 0, "text": "甲"},
+                    {"id": 0, "text": "重复"},
+                    {"id": 2, "text": "越界"},
+                ],
+            )
+
+    def test_cleans_non_speech_markers_and_drops_empty_cues(self):
+        cues = [
+            Cue(0, 1, "[音楽]"),
+            Cue(1, 2, "好き[歌声]なのよ [拍手]"),
+            Cue(2, 3, "[鼻息] ごめん"),
+            Cue(3, 4, "[Aメロ] は残す"),
+        ]
+        self.assertEqual(
+            clean_non_speech_markers(cues),
+            [
+                Cue(1, 2, "好きなのよ"),
+                Cue(2, 3, "ごめん"),
+                Cue(3, 4, "[Aメロ] は残す"),
+            ],
+        )
 
     def test_merges_fragments_until_sentence_punctuation(self):
         cues = [

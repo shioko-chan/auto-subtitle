@@ -11,7 +11,13 @@ from urllib.parse import urlsplit
 
 from .config import AppConfig, llm_api_key
 from .media import download_youtube, render_subtitles, transcribe_with_whisper
-from .subtitles import Cue, merge_semantic_cues, read_subtitles, write_srt
+from .subtitles import (
+    Cue,
+    clean_non_speech_markers,
+    merge_semantic_cues,
+    read_subtitles,
+    write_srt,
+)
 from .translate import OpenAICompatibleTranslator
 from .upload import upload_to_bilibili
 
@@ -55,6 +61,12 @@ def run_pipeline(
 
     cues = read_subtitles(source_subtitle)
     original_cue_count = len(cues)
+    cues = clean_non_speech_markers(cues)
+    logging.info(
+        "non-speech marker cleanup: %d source cues -> %d spoken cues",
+        original_cue_count,
+        len(cues),
+    )
     cues = merge_semantic_cues(cues, config.segmentation)
     logging.info(
         "semantic segmentation: %d source cues -> %d translation units",
@@ -76,7 +88,11 @@ def run_pipeline(
         logging.info("using translation glossary: %s", ", ".join(names))
 
     translator = OpenAICompatibleTranslator(config.llm, llm_api_key(config.llm))
-    translated = translator.translate(cues, translation_context=translation_context)
+    translated = translator.translate(
+        cues,
+        translation_context=translation_context,
+        cache_path=job_dir / "translation-cache.json",
+    )
     translated_path = job_dir / "translated.zh-CN.srt"
     write_srt(translated, translated_path)
 

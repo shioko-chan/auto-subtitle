@@ -48,8 +48,11 @@ class LLMConfig:
     target_language: str = "简体中文"
     batch_size: int = 30
     timeout_seconds: int = 120
-    max_retries: int = 3
+    max_retries: int = 5
+    max_tokens: int = 16384
+    context_cues: int = 3
     json_mode: bool = True
+    thinking: str | None = None
     translate_metadata: bool = True
     metadata_description_max_chars: int = 6000
     metadata_tag_count: int = 5
@@ -127,6 +130,12 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("llm.batch_size must be at least 1")
     if config.llm.max_retries < 1:
         raise ConfigError("llm.max_retries must be at least 1")
+    if config.llm.max_tokens < 1:
+        raise ConfigError("llm.max_tokens must be at least 1")
+    if config.llm.context_cues < 0:
+        raise ConfigError("llm.context_cues cannot be negative")
+    if config.llm.thinking not in (None, "enabled", "disabled"):
+        raise ConfigError("llm.thinking must be 'enabled' or 'disabled'")
     if config.llm.metadata_description_max_chars < 0:
         raise ConfigError("llm.metadata_description_max_chars cannot be negative")
     if not 1 <= config.llm.metadata_tag_count <= 10:

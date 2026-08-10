@@ -97,7 +97,7 @@ class PipelineTests(unittest.TestCase):
                 def __init__(self, config, api_key):
                     pass
 
-                def translate(self, cues):
+                def translate(self, cues, **context):
                     return [Cue(cue.start, cue.end, "你好") for cue in cues]
 
                 def translate_metadata(self, title, description, **context):

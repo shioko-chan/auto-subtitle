@@ -8,6 +8,14 @@ from subtitle_pipeline.config import ConfigError, llm_api_key, load_config
 
 
 class ConfigTests(unittest.TestCase):
+    def test_rejects_unknown_llm_thinking_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            path.write_text('[llm]\nthinking = "sometimes"\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(ConfigError, "llm.thinking"):
+                load_config(path)
+
     def test_loads_defaults_and_overrides(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.toml"
@@ -27,6 +35,20 @@ class ConfigTests(unittest.TestCase):
             path = Path(temp) / "config.toml"
             path.write_text("[llm]\nbatch_size = 0\n", encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, "batch_size"):
+                load_config(path)
+
+    def test_rejects_invalid_max_tokens(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text("[llm]\nmax_tokens = 0\n", encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "max_tokens"):
+                load_config(path)
+
+    def test_rejects_negative_context_cues(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text("[llm]\ncontext_cues = -1\n", encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "context_cues"):
                 load_config(path)
 
     def test_api_key_comes_from_named_environment_variable_when_pass_is_disabled(self):
