@@ -2,20 +2,40 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .commands import CommandError, require_command, run
-from .config import DownloadConfig, RenderConfig, WhisperConfig
-from .subtitles import Cue, write_srt
+from .commands import require_command, run
+from .config import DownloadConfig, RenderConfig
+from .subtitles import Cue, read_subtitles, text_display_width
 
 
 @dataclass(frozen=True)
 class DownloadResult:
     video: Path
-    subtitle: Path | None
     metadata: dict[str, object]
+
+
+@dataclass(frozen=True)
+class SubtitleLayout:
+    width: int
+    height: int
+    font_size: int
+    margin_horizontal: int
+    margin_vertical: int
+    outline: int
+    max_line_units: float
+
+
+@dataclass(frozen=True)
+class RenderCue:
+    start: float
+    end: float
+    text: str
+    font_size: int
 
 
 def download_youtube(url: str, directory: Path, config: DownloadConfig) -> DownloadResult:
@@ -51,36 +71,8 @@ def download_youtube(url: str, directory: Path, config: DownloadConfig) -> Downl
         raise RuntimeError("yt-dlp completed but no downloaded video was found")
     video = max(candidates, key=lambda path: path.stat().st_size)
 
-    subtitle = _find_subtitle(directory, metadata)
-    if subtitle is None or not _is_original_subtitle(subtitle, metadata):
-        subtitle_command = [
-            *common,
-            "--skip-download",
-            "--write-subs",
-            "--write-auto-subs",
-            "--sub-langs",
-            ",".join(_subtitle_languages(config, metadata)),
-            "--sub-format",
-            "srt/vtt/best",
-            "--convert-subs",
-            "srt",
-            "--output",
-            str(output),
-            url,
-        ]
-        try:
-            run(subtitle_command)
-        except CommandError as exc:
-            logging.warning(
-                "YouTube subtitle download failed (%s); falling back to Whisper",
-                exc,
-            )
-        subtitle = _find_subtitle(directory, metadata)
-
     logging.info("downloaded video: %s", video)
-    if subtitle:
-        logging.info("using YouTube subtitle: %s", subtitle.name)
-    return DownloadResult(video, subtitle, metadata)
+    return DownloadResult(video, metadata)
 
 
 def _authentication_arguments(config: DownloadConfig) -> list[str]:
@@ -109,197 +101,57 @@ def _runtime_arguments(config: DownloadConfig) -> list[str]:
     return ["--js-runtimes", runtime]
 
 
-def _find_subtitle(
-    directory: Path, metadata: dict[str, object]
-) -> Path | None:
-    subtitles = [
-        path for path in directory.glob("source.*.srt") if path.stat().st_size > 0
-    ]
-    if not subtitles:
-        subtitles = [
-            path for path in directory.glob("source.*.vtt") if path.stat().st_size > 0
-        ]
-    if not subtitles:
-        return None
-
-    originals = _original_language_variants(metadata)
-    manual = metadata.get("subtitles")
-    manual_tags = (
-        {str(tag).lower() for tag in manual} if isinstance(manual, dict) else set()
-    )
-
-    def priority(path: Path) -> tuple[int, str]:
-        tag = _subtitle_tag(path)
-        normalized = tag.lower()
-        matches_original = any(
-            normalized == original or normalized.startswith(f"{original}-")
-            for original in originals
-        )
-        if normalized in manual_tags and matches_original:
-            rank = 0
-        elif any(normalized == f"{original}-orig" for original in originals):
-            rank = 1
-        elif matches_original:
-            rank = 2
-        elif normalized.endswith("-orig"):
-            rank = 3
-        elif normalized in manual_tags:
-            rank = 4
-        else:
-            rank = 5
-        return rank, normalized
-
-    return min(subtitles, key=priority)
-
-
-def _subtitle_languages(
-    config: DownloadConfig, metadata: dict[str, object]
-) -> list[str]:
-    requested: list[str] = []
-    source_language = _source_subtitle_language(metadata)
-    if source_language:
-        requested.append(source_language)
-    for language in config.subtitle_languages:
-        if language not in requested:
-            requested.append(language)
-    return requested
-
-
-def _source_subtitle_language(metadata: dict[str, object]) -> str | None:
-    originals = _original_language_variants(metadata)
-    manual = metadata.get("subtitles")
-    manual_tags = (
-        {str(tag).lower() for tag in manual} if isinstance(manual, dict) else set()
-    )
-    automatic = metadata.get("automatic_captions")
-    automatic_tags = (
-        {str(tag).lower() for tag in automatic}
-        if isinstance(automatic, dict)
-        else set()
-    )
-
-    for original in originals:
-        if original in manual_tags:
-            return original
-    for original in originals:
-        original_track = f"{original}-orig"
-        if original_track in automatic_tags:
-            return original_track
-    for original in originals:
-        if original in automatic_tags:
-            return original
-    other_originals = sorted(
-        tag for tag in automatic_tags if tag.endswith("-orig")
-    )
-    if other_originals:
-        return other_originals[0]
-    if originals:
-        # Some extractors omit caption maps; try YouTube's conventional source tag.
-        return f"{originals[0]}-orig"
-    return None
-
-
-def _original_language(metadata: dict[str, object]) -> str | None:
-    language = metadata.get("language")
-    if isinstance(language, str) and language:
-        normalized = language.lower()
-        if all(character.isalnum() or character in "_-" for character in normalized):
-            return normalized
-    automatic = metadata.get("automatic_captions")
-    if isinstance(automatic, dict):
-        original_tags = sorted(
-            tag[:-5].lower()
-            for tag in automatic
-            if isinstance(tag, str) and tag.lower().endswith("-orig")
-        )
-        if original_tags:
-            return original_tags[0]
-    return None
-
-
-def _original_language_variants(metadata: dict[str, object]) -> list[str]:
-    original = _original_language(metadata)
-    if not original:
-        return []
-    variants = [original]
-    base = original.split("-", 1)[0].split("_", 1)[0]
-    if base not in variants:
-        variants.append(base)
-    return variants
-
-
-def _subtitle_tag(path: Path) -> str:
-    name = path.name
-    prefix = "source."
-    suffix = path.suffix
-    return name[len(prefix) : -len(suffix)]
-
-
-def _is_original_subtitle(path: Path, metadata: dict[str, object]) -> bool:
-    tag = _subtitle_tag(path).lower()
-    originals = _original_language_variants(metadata)
-    if originals:
-        return any(tag == original or tag == f"{original}-orig" for original in originals)
-    return tag.endswith("-orig")
-
-
-def transcribe_with_whisper(
-    video: Path, destination: Path, config: WhisperConfig
-) -> Path:
-    try:
-        from faster_whisper import WhisperModel
-    except ImportError as exc:
-        raise RuntimeError(
-            "no YouTube subtitle was found and faster-whisper is not installed; "
-            "install the project with the [whisper] extra"
-        ) from exc
-
-    logging.info("no YouTube subtitle found; transcribing with faster-whisper")
-    model = WhisperModel(
-        config.model,
-        device=config.device,
-        compute_type=config.compute_type,
-    )
-    segments, info = model.transcribe(
-        str(video),
-        language=config.language,
-        initial_prompt=config.initial_prompt,
-        beam_size=5,
-        vad_filter=True,
-        condition_on_previous_text=False,
-    )
-    logging.info(
-        "Whisper language: %s (probability %.3f)",
-        info.language,
-        info.language_probability,
-    )
-    cues = [
-        Cue(float(segment.start), float(segment.end), segment.text.strip())
-        for segment in segments
-        if segment.text.strip()
-    ]
-    if not cues:
-        raise RuntimeError("Whisper did not produce any speech segments")
-    write_srt(cues, destination)
-    return destination
-
-
 def render_subtitles(
-    video: Path, subtitle: Path, destination: Path, config: RenderConfig
+    video: Path,
+    subtitle: Path,
+    destination: Path,
+    config: RenderConfig,
+    *,
+    semantic_segments: dict[int, list[str]] | None = None,
 ) -> Path:
     ffmpeg = require_command("ffmpeg")
+    layout = subtitle_layout(video, config)
+
     # Running in the subtitle directory avoids platform-specific escaping of full paths.
     local_video = video.resolve()
     local_subtitle = subtitle.resolve()
     local_destination = destination.resolve()
     if local_subtitle.parent != local_destination.parent:
         raise ValueError("subtitle and rendered video must share a work directory")
-    style = (
-        f"FontName={config.font_name},FontSize={config.font_size},"
-        f"MarginV={config.margin_vertical},Outline=1,Shadow=0"
+
+    source_cues = read_subtitles(local_subtitle)
+    render_cues = _layout_subtitle_cues(
+        source_cues,
+        max_line_units=layout.max_line_units,
+        font_size=layout.font_size,
+        min_font_scale=config.min_cue_font_scale,
+        semantic_segments=semantic_segments,
     )
-    subtitle_name = local_subtitle.name.replace("'", r"\'").replace(":", r"\:")
-    filter_value = f"subtitles=filename='{subtitle_name}':force_style='{style}'"
+    ass_path = local_subtitle.with_suffix(".render.ass")
+    _write_ass(
+        render_cues,
+        ass_path,
+        width=layout.width,
+        height=layout.height,
+        font_name=config.font_name,
+        font_size=layout.font_size,
+        margin_horizontal=layout.margin_horizontal,
+        margin_vertical=layout.margin_vertical,
+        outline=layout.outline,
+    )
+    logging.info(
+        "adaptive subtitle style: %dx%d font=%d margins=%d/%d outline=%d cues=%d->%d",
+        layout.width,
+        layout.height,
+        layout.font_size,
+        layout.margin_horizontal,
+        layout.margin_vertical,
+        layout.outline,
+        len(source_cues),
+        len(render_cues),
+    )
+    subtitle_name = ass_path.name.replace("'", r"\'").replace(":", r"\:")
+    filter_value = f"subtitles=filename='{subtitle_name}'"
     run(
         [
             ffmpeg,
@@ -323,3 +175,204 @@ def render_subtitles(
         cwd=local_destination.parent,
     )
     return destination
+
+
+def subtitle_layout(video: Path, config: RenderConfig) -> SubtitleLayout:
+    width, height = _video_dimensions(video)
+    font_size = _adaptive_font_size(width, height, config)
+    margin_horizontal = _adaptive_horizontal_margin(width, height, config)
+    usable_width = width - 2 * margin_horizontal
+    return SubtitleLayout(
+        width=width,
+        height=height,
+        font_size=font_size,
+        margin_horizontal=margin_horizontal,
+        margin_vertical=round(height * config.margin_vertical_ratio),
+        outline=max(1, round(min(width, height) * config.outline_ratio)),
+        max_line_units=max(1.0, usable_width / font_size),
+    )
+
+
+def _adaptive_font_size(width: int, height: int, config: RenderConfig) -> int:
+    ratio = (
+        config.portrait_font_size_ratio
+        if height > width
+        else config.font_size_ratio
+    )
+    return max(
+        config.min_font_size,
+        min(config.max_font_size, round(min(width, height) * ratio)),
+    )
+
+
+def _adaptive_horizontal_margin(
+    width: int, height: int, config: RenderConfig
+) -> int:
+    ratio = (
+        config.portrait_margin_horizontal_ratio
+        if height > width
+        else config.margin_horizontal_ratio
+    )
+    return round(width * ratio)
+
+
+def _video_dimensions(video: Path) -> tuple[int, int]:
+    ffprobe = require_command("ffprobe")
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height:stream_tags=rotate:stream_side_data=rotation",
+        "-of",
+        "json",
+        str(video.resolve()),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        payload = json.loads(completed.stdout)
+        stream = payload["streams"][0]
+        width = int(stream["width"])
+        height = int(stream["height"])
+    except (
+        subprocess.CalledProcessError,
+        json.JSONDecodeError,
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise RuntimeError(f"could not determine video dimensions: {video}") from exc
+
+    rotation: float = 0
+    tags = stream.get("tags")
+    if isinstance(tags, dict):
+        try:
+            rotation = float(tags.get("rotate", 0))
+        except (TypeError, ValueError):
+            pass
+    side_data = stream.get("side_data_list")
+    if isinstance(side_data, list):
+        for item in side_data:
+            if isinstance(item, dict) and "rotation" in item:
+                try:
+                    rotation = float(item["rotation"])
+                except (TypeError, ValueError):
+                    pass
+    if round(abs(rotation)) % 180 == 90:
+        width, height = height, width
+    if width < 1 or height < 1:
+        raise RuntimeError(f"video has invalid dimensions: {width}x{height}")
+    return width, height
+
+
+def _layout_subtitle_cues(
+    cues: list[Cue],
+    *,
+    max_line_units: float,
+    font_size: int,
+    min_font_scale: float = 0.85,
+    semantic_segments: dict[int, list[str]] | None = None,
+) -> list[RenderCue]:
+    segments_by_id = semantic_segments or {}
+    minimum_font_size = max(1, math.ceil(font_size * min_font_scale))
+    maximum_units_at_minimum_size = max_line_units * font_size / minimum_font_size
+    rendered: list[RenderCue] = []
+    for index, cue in enumerate(cues):
+        segments = segments_by_id.get(index, [" ".join(cue.text.split())])
+        if not segments or "".join(segments) != " ".join(cue.text.split()):
+            raise ValueError(f"semantic segments do not preserve cue {index}")
+        widths = [text_display_width(segment) for segment in segments]
+        if any(width > maximum_units_at_minimum_size + 1e-9 for width in widths):
+            raise ValueError(f"semantic segment for cue {index} exceeds one line")
+        total_width = sum(widths)
+        elapsed = cue.start
+        for segment_index, (segment, units) in enumerate(zip(segments, widths)):
+            if segment_index == len(segments) - 1 or total_width <= 0:
+                end = cue.end
+            else:
+                end = elapsed + (cue.end - cue.start) * units / total_width
+            event_font_size = min(
+                font_size,
+                max(minimum_font_size, math.floor(font_size * max_line_units / units))
+                if units > 0
+                else font_size,
+            )
+            rendered.append(RenderCue(elapsed, end, segment, event_font_size))
+            elapsed = end
+    return rendered
+
+
+def _write_ass(
+    cues: list[Cue] | list[RenderCue],
+    path: Path,
+    *,
+    width: int,
+    height: int,
+    font_name: str,
+    font_size: int,
+    margin_horizontal: int,
+    margin_vertical: int,
+    outline: int,
+) -> None:
+    safe_font_name = font_name.replace(",", "")
+    style_format = (
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+        "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+        "MarginL, MarginR, MarginV, Encoding"
+    )
+    style = (
+        f"Style: Default,{safe_font_name},{font_size},&H00FFFFFF,&H000000FF,"
+        "&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,"
+        f"{outline},0,2,{margin_horizontal},{margin_horizontal},"
+        f"{margin_vertical},1"
+    )
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {width}\n"
+        f"PlayResY: {height}\n"
+        "WrapStyle: 0\n"
+        "ScaledBorderAndShadow: yes\n"
+        "YCbCr Matrix: TV.709\n\n"
+        "[V4+ Styles]\n"
+        f"{style_format}\n"
+        f"{style}\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+        "Effect, Text\n"
+    )
+    events = [
+        "Dialogue: 0,"
+        f"{_ass_timestamp(cue.start)},{_ass_timestamp(cue.end)},"
+        "Default,,0,0,0,,"
+        f"{{\\fs{getattr(cue, 'font_size', font_size)}}}{_escape_ass_text(cue.text)}"
+        for cue in cues
+        if cue.text.strip() and cue.end > cue.start
+    ]
+    path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
+
+
+def _ass_timestamp(value: float) -> str:
+    centiseconds = max(0, round(value * 100))
+    hours, centiseconds = divmod(centiseconds, 360_000)
+    minutes, centiseconds = divmod(centiseconds, 6_000)
+    seconds, centiseconds = divmod(centiseconds, 100)
+    return f"{hours}:{minutes:02d}:{seconds:02d}.{centiseconds:02d}"
+
+
+def _escape_ass_text(text: str) -> str:
+    return (
+        text.replace("\\", r"\\")
+        .replace("{", r"\{")
+        .replace("}", r"\}")
+        .replace("\n", r"\N")
+    )

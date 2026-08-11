@@ -9,13 +9,14 @@ from importlib import resources
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .asr import transcribe_with_qwen
 from .config import AppConfig, llm_api_key
-from .media import download_youtube, render_subtitles, transcribe_with_whisper
+from .media import download_youtube, render_subtitles, subtitle_layout
 from .subtitles import (
     Cue,
     clean_non_speech_markers,
-    merge_semantic_cues,
     read_subtitles,
+    trim_overlapping_cues,
     write_srt,
 )
 from .translate import OpenAICompatibleTranslator
@@ -49,27 +50,15 @@ def run_pipeline(
     logging.info("job directory: %s", job_dir)
 
     downloaded = download_youtube(url, job_dir, config.download)
-    source_subtitle = downloaded.subtitle
-    if source_subtitle is None:
-        if not config.whisper.enabled:
-            raise RuntimeError(
-                "no usable source-language subtitle was found and Whisper fallback is disabled"
-            )
-        source_subtitle = transcribe_with_whisper(
-            downloaded.video, job_dir / "source.whisper.srt", config.whisper
-        )
+    source_subtitle = transcribe_with_qwen(
+        downloaded.video, job_dir / "source.qwen3-asr.srt", config.asr
+    )
 
     cues = read_subtitles(source_subtitle)
     original_cue_count = len(cues)
     cues = clean_non_speech_markers(cues)
     logging.info(
         "non-speech marker cleanup: %d source cues -> %d spoken cues",
-        original_cue_count,
-        len(cues),
-    )
-    cues = merge_semantic_cues(cues, config.segmentation)
-    logging.info(
-        "semantic segmentation: %d source cues -> %d translation units",
         original_cue_count,
         len(cues),
     )
@@ -86,8 +75,26 @@ def run_pipeline(
             if isinstance(item, dict) and isinstance(item.get("name"), str)
         ]
         logging.info("using translation glossary: %s", ", ".join(names))
-
     translator = OpenAICompatibleTranslator(config.llm, llm_api_key(config.llm))
+    cues = translator.segment_source_cues(
+        cues,
+        config.segmentation,
+        segmentation_context=translation_context,
+        cache_path=job_dir / "source-segments-cache.json",
+    )
+    logging.info(
+        "semantic segmentation: %d source cues -> %d translation units",
+        original_cue_count,
+        len(cues),
+    )
+    overlap_count = sum(
+        current.end > following.start
+        for current, following in zip(cues, cues[1:])
+    )
+    cues = trim_overlapping_cues(cues)
+    logging.info("timing overlap cleanup: adjusted %d cues", overlap_count)
+    write_srt(cues, job_dir / "source.semantic.srt")
+
     translated = translator.translate(
         cues,
         translation_context=translation_context,
@@ -95,6 +102,15 @@ def run_pipeline(
     )
     translated_path = job_dir / "translated.zh-CN.srt"
     write_srt(translated, translated_path)
+
+    layout = subtitle_layout(downloaded.video, config.render)
+    semantic_segments = translator.segment_for_single_line(
+        translated,
+        max_line_units=layout.max_line_units,
+        font_size=layout.font_size,
+        min_font_scale=config.render.min_cue_font_scale,
+        cache_path=job_dir / "display-segments-cache.json",
+    )
 
     subtitle_evidence = _subtitle_evidence(
         cues, config.llm.metadata_subtitle_max_chars
@@ -147,7 +163,13 @@ def run_pipeline(
     )
 
     rendered_path = job_dir / "translated.mp4"
-    render_subtitles(downloaded.video, translated_path, rendered_path, config.render)
+    render_subtitles(
+        downloaded.video,
+        translated_path,
+        rendered_path,
+        config.render,
+        semantic_segments=semantic_segments,
+    )
 
     should_upload = config.upload.enabled if upload_override is None else upload_override
     if should_upload:

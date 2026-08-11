@@ -4,17 +4,144 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from subtitle_pipeline.config import LLMConfig
+from subtitle_pipeline.config import LLMConfig, SegmentationConfig
 from subtitle_pipeline.subtitles import Cue
 from subtitle_pipeline.translate import (
     OpenAICompatibleTranslator,
     TranslationError,
+    _coerce_display_segments,
     _parse_json_object,
     _remove_terminal_period,
+    _validate_display_segments,
 )
 
 
 class TranslationTests(unittest.TestCase):
+    def test_source_segmentation_uses_model_boundaries_for_long_unpunctuated_text(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        cues = [
+            Cue(0, 2, "夢"),
+            Cue(2, 4, "は"),
+            Cue(4, 6, "パワー"),
+            Cue(6, 8, "次"),
+        ]
+        response = {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": '{"id":0,"segments":["夢はパワー","次"]}'
+                    },
+                }
+            ]
+        }
+        with patch.object(translator, "_request", return_value=response) as request:
+            result = translator.segment_source_cues(
+                cues, SegmentationConfig(review_duration_seconds=6)
+            )
+        self.assertEqual(result, [Cue(0, 6, "夢はパワー"), Cue(6, 8, "次")])
+        prompt = request.call_args.args[0]["messages"][1]["content"]
+        self.assertIn("Decision token range: 0-2", prompt)
+        self.assertIn("TARGET:\n夢はパワー次", prompt)
+        self.assertNotIn('"gap_after"', prompt)
+
+    def test_source_segmentation_never_uses_model_window_edges_as_boundaries(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        cues = [Cue(index * 2, index * 2 + 2, text) for index, text in enumerate("甲乙丙丁戊")]
+        target_texts = ["甲乙丙丁", "乙丙丁戊"]
+        responses = [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"id": window_id, "segments": [target_text]},
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+            for window_id, target_text in enumerate(target_texts)
+        ]
+        config = SegmentationConfig(
+            review_duration_seconds=6,
+            model_window_cues=2,
+            model_context_cues=1,
+        )
+        with patch.object(translator, "_request", side_effect=responses) as request:
+            result = translator.segment_source_cues(cues, config)
+        self.assertEqual(result, [Cue(0, 10, "甲乙丙丁戊")])
+        self.assertEqual(request.call_count, 2)
+
+    def test_short_punctuated_source_uses_trusted_boundary_without_model(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        cues = [Cue(0, 1, "そう"), Cue(1, 2, "です。"), Cue(2, 3, "はい")]
+        with patch.object(translator, "_request") as request:
+            result = translator.segment_source_cues(cues, SegmentationConfig())
+        self.assertEqual(result, [Cue(0, 2, "そうです。"), Cue(2, 3, "はい")])
+        request.assert_not_called()
+
+    def test_source_semantic_boundary_inside_aligner_item_snaps_to_item_edge(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        cues = [Cue(0, 2, "はいそう"), Cue(2, 4, "次")]
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"id":0,"segments":["はい","そう次"]}'
+                    }
+                }
+            ]
+        }
+        config = SegmentationConfig(review_source_chars=1)
+        with patch.object(translator, "_request", return_value=response):
+            result = translator.segment_source_cues(cues, config)
+        self.assertEqual(result, cues)
+
+    def test_semantically_splits_only_cues_too_wide_at_85_percent(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        cues = [Cue(0, 4, "短句"), Cue(4, 8, "一二三四五六七八九十甲乙")]
+        response = {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": '{"id":1,"segments":["一二三四","五六七八","九十甲乙"]}'
+                    },
+                }
+            ]
+        }
+        with patch.object(translator, "_request", return_value=response) as request:
+            result = translator.segment_for_single_line(
+                cues,
+                max_line_units=10,
+                font_size=100,
+                min_font_scale=0.85,
+            )
+        self.assertEqual(result, {1: ["一二三四五六七八", "九十甲乙"]})
+        prompt = request.call_args.args[0]["messages"][1]["content"]
+        self.assertIn("Required target IDs: [1]", prompt)
+        self.assertIn('"id": 0', prompt)
+
+    def test_display_segments_must_preserve_text_and_fit(self):
+        self.assertIsNone(_validate_display_segments("甲乙丙丁", ["甲乙", "丙丁"], 2))
+        self.assertIn(
+            "preserve",
+            _validate_display_segments("甲乙丙丁", ["甲乙", "丁"], 2),
+        )
+        self.assertIn(
+            "one-line",
+            _validate_display_segments("甲乙丙丁", ["甲乙丙", "丁"], 2),
+        )
+
+    def test_recovers_semantic_boundaries_without_dropping_original_punctuation(self):
+        segments, error = _coerce_display_segments(
+            "前半句，后半句", ["前半句", "后半句"], 4
+        )
+        self.assertIsNone(error)
+        self.assertEqual(segments, ["前半句，", "后半句"])
+
     def test_ssl_context_combines_platform_and_certifi_ca(self):
         with patch("subtitle_pipeline.translate.ssl.create_default_context") as create, patch(
             "subtitle_pipeline.translate.certifi.where", return_value="/ca/certifi.pem"

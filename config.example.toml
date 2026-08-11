@@ -1,28 +1,34 @@
 work_dir = "work"
 
 [download]
-# Extra fallback/translation tracks. The detected original track is added automatically.
-subtitle_languages = []
 # Automatically use Deno, Node or QuickJS when available; set "" to disable.
 js_runtime = "auto"
 # cookies_from_browser = "chrome"
 # cookies_file = "/path/to/youtube-cookies.txt"
 
-[whisper]
-enabled = true
-model = "small"
-device = "auto"
-compute_type = "auto"
-# language = "en"
-# initial_prompt = "Names and specialist vocabulary used in the video."
+[asr]
+model = "Qwen/Qwen3-ASR-1.7B"
+aligner_model = "Qwen/Qwen3-ForcedAligner-0.6B"
+device = "cuda:0"
+# RTX 20 系显卡不支持 bfloat16，使用 float16。
+dtype = "float16"
+language = "Japanese"
+# context = "BanG Dream!、夢限大みゅーたいぷ、MewTypeに関する日本語配信。"
+# 每块连同两侧上下文必须不超过 forced aligner 的 180 秒限制。
+chunk_seconds = 170.0
+chunk_context_seconds = 2.0
+max_inference_batch_size = 1
+max_new_tokens = 2048
 
 [segmentation]
 enabled = true
-# Do not merge across a noticeable pause, even when punctuation is missing.
-max_gap_seconds = 0.8
-# Hard limits prevent one merged subtitle from staying on screen for too long.
-max_duration_seconds = 10.0
-max_source_chars = 180
+# Punctuation-free regions beyond either threshold are sent to the LLM for review.
+# These values never directly create subtitle boundaries.
+review_duration_seconds = 6.0
+review_source_chars = 35
+# Decision windows overlap for context; window edges are never subtitle boundaries.
+model_window_cues = 300
+model_context_cues = 30
 
 [llm]
 base_url = "https://api.deepseek.com"
@@ -54,8 +60,17 @@ glossary_files = []
 
 [render]
 font_name = "Noto Sans CJK SC"
-font_size = 18
-margin_vertical = 32
+# Font size is this fraction of the video's short edge, clamped below.
+font_size_ratio = 0.066
+portrait_font_size_ratio = 0.077
+min_font_size = 28
+max_font_size = 144
+margin_horizontal_ratio = 0.075
+portrait_margin_horizontal_ratio = 0.025
+margin_vertical_ratio = 0.05
+outline_ratio = 0.002
+# Slightly oversized cues may shrink this far before semantic splitting.
+min_cue_font_scale = 0.85
 crf = 20
 preset = "medium"
 

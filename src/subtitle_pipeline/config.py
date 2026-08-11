@@ -15,28 +15,32 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class DownloadConfig:
-    subtitle_languages: list[str] = field(default_factory=list)
     cookies_from_browser: str | None = None
     cookies_file: str | None = None
     js_runtime: str | None = "auto"
 
 
 @dataclass(frozen=True)
-class WhisperConfig:
-    enabled: bool = True
-    model: str = "small"
-    device: str = "auto"
-    compute_type: str = "auto"
-    language: str | None = None
-    initial_prompt: str | None = None
+class ASRConfig:
+    model: str = "Qwen/Qwen3-ASR-1.7B"
+    aligner_model: str = "Qwen/Qwen3-ForcedAligner-0.6B"
+    device: str = "cuda:0"
+    dtype: str = "float16"
+    language: str = "Japanese"
+    context: str = ""
+    chunk_seconds: float = 170.0
+    chunk_context_seconds: float = 2.0
+    max_inference_batch_size: int = 1
+    max_new_tokens: int = 2048
 
 
 @dataclass(frozen=True)
 class SegmentationConfig:
     enabled: bool = True
-    max_gap_seconds: float = 0.8
-    max_duration_seconds: float = 10.0
-    max_source_chars: int = 180
+    review_duration_seconds: float = 6.0
+    review_source_chars: int = 35
+    model_window_cues: int = 300
+    model_context_cues: int = 30
 
 
 @dataclass(frozen=True)
@@ -64,8 +68,15 @@ class LLMConfig:
 @dataclass(frozen=True)
 class RenderConfig:
     font_name: str = "Noto Sans CJK SC"
-    font_size: int = 18
-    margin_vertical: int = 32
+    font_size_ratio: float = 0.066
+    portrait_font_size_ratio: float = 0.077
+    min_font_size: int = 28
+    max_font_size: int = 144
+    margin_horizontal_ratio: float = 0.075
+    portrait_margin_horizontal_ratio: float = 0.025
+    margin_vertical_ratio: float = 0.05
+    outline_ratio: float = 0.002
+    min_cue_font_scale: float = 0.85
     crf: int = 20
     preset: str = "medium"
 
@@ -90,7 +101,7 @@ class UploadConfig:
 class AppConfig:
     work_dir: Path = Path("work")
     download: DownloadConfig = field(default_factory=DownloadConfig)
-    whisper: WhisperConfig = field(default_factory=WhisperConfig)
+    asr: ASRConfig = field(default_factory=ASRConfig)
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
@@ -117,7 +128,7 @@ def load_config(path: Path) -> AppConfig:
         config = AppConfig(
             work_dir=Path(data.get("work_dir", "work")),
             download=DownloadConfig(**_section(data, "download")),
-            whisper=WhisperConfig(**_section(data, "whisper")),
+            asr=ASRConfig(**_section(data, "asr")),
             segmentation=SegmentationConfig(**_section(data, "segmentation")),
             llm=LLMConfig(**_section(data, "llm")),
             render=RenderConfig(**_section(data, "render")),
@@ -146,12 +157,56 @@ def load_config(path: Path) -> AppConfig:
         isinstance(path, str) and path.strip() for path in config.llm.glossary_files
     ):
         raise ConfigError("llm.glossary_files must be a list of non-empty paths")
-    if config.segmentation.max_gap_seconds < 0:
-        raise ConfigError("segmentation.max_gap_seconds cannot be negative")
-    if config.segmentation.max_duration_seconds <= 0:
-        raise ConfigError("segmentation.max_duration_seconds must be positive")
-    if config.segmentation.max_source_chars < 1:
-        raise ConfigError("segmentation.max_source_chars must be at least 1")
+    if not config.asr.model.strip():
+        raise ConfigError("asr.model cannot be empty")
+    if not config.asr.aligner_model.strip():
+        raise ConfigError("asr.aligner_model cannot be empty")
+    if config.asr.dtype not in {"float16", "bfloat16", "float32"}:
+        raise ConfigError("asr.dtype must be 'float16', 'bfloat16', or 'float32'")
+    if config.asr.chunk_seconds <= 0 or config.asr.chunk_seconds > 175:
+        raise ConfigError("asr.chunk_seconds must be between 0 and 175")
+    if config.asr.chunk_context_seconds < 0:
+        raise ConfigError("asr.chunk_context_seconds cannot be negative")
+    if config.asr.chunk_seconds + 2 * config.asr.chunk_context_seconds > 180:
+        raise ConfigError(
+            "asr chunk plus both context windows cannot exceed 180 seconds"
+        )
+    if config.asr.max_inference_batch_size < 1:
+        raise ConfigError("asr.max_inference_batch_size must be at least 1")
+    if config.asr.max_new_tokens < 1:
+        raise ConfigError("asr.max_new_tokens must be at least 1")
+    if config.segmentation.review_duration_seconds <= 0:
+        raise ConfigError("segmentation.review_duration_seconds must be positive")
+    if config.segmentation.review_source_chars < 1:
+        raise ConfigError("segmentation.review_source_chars must be at least 1")
+    if config.segmentation.model_window_cues < 1:
+        raise ConfigError("segmentation.model_window_cues must be at least 1")
+    if config.segmentation.model_context_cues < 0:
+        raise ConfigError("segmentation.model_context_cues cannot be negative")
+    if config.render.font_size_ratio <= 0:
+        raise ConfigError("render.font_size_ratio must be positive")
+    if config.render.portrait_font_size_ratio <= 0:
+        raise ConfigError("render.portrait_font_size_ratio must be positive")
+    if config.render.min_font_size < 1:
+        raise ConfigError("render.min_font_size must be at least 1")
+    if config.render.max_font_size < config.render.min_font_size:
+        raise ConfigError(
+            "render.max_font_size must be at least render.min_font_size"
+        )
+    if not 0 <= config.render.margin_horizontal_ratio < 0.5:
+        raise ConfigError(
+            "render.margin_horizontal_ratio must be between 0 and 0.5"
+        )
+    if not 0 <= config.render.portrait_margin_horizontal_ratio < 0.5:
+        raise ConfigError(
+            "render.portrait_margin_horizontal_ratio must be between 0 and 0.5"
+        )
+    if not 0 <= config.render.margin_vertical_ratio < 0.5:
+        raise ConfigError("render.margin_vertical_ratio must be between 0 and 0.5")
+    if config.render.outline_ratio < 0:
+        raise ConfigError("render.outline_ratio cannot be negative")
+    if not 0 < config.render.min_cue_font_scale <= 1:
+        raise ConfigError("render.min_cue_font_scale must be between 0 and 1")
     if config.upload.copyright not in (1, 2):
         raise ConfigError("upload.copyright must be 1 (original) or 2 (repost)")
     if not 1 <= config.upload.max_tags <= 10:

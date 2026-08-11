@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
-
-from .config import SegmentationConfig
-
 
 @dataclass(frozen=True)
 class Cue:
@@ -132,29 +130,49 @@ def _remove_non_speech_marker(match: re.Match[str]) -> str:
     return "" if label in _NON_SPEECH_MARKERS else match.group(0)
 
 
-def merge_semantic_cues(cues: list[Cue], config: SegmentationConfig) -> list[Cue]:
-    """Merge display-oriented cues into sentence-oriented translation units."""
-    if not config.enabled or len(cues) < 2:
+def merge_cues_at_boundaries(
+    cues: list[Cue], boundary_after_ids: set[int]
+) -> list[Cue]:
+    """Merge aligned units using only explicitly approved boundary IDs."""
+    if len(cues) < 2:
         return cues.copy()
-
+    invalid = sorted(
+        boundary for boundary in boundary_after_ids if not 0 <= boundary < len(cues)
+    )
+    if invalid:
+        raise ValueError(f"subtitle boundary IDs are out of range: {invalid}")
     merged: list[Cue] = []
     current = cues[0]
-    for following in cues[1:]:
-        gap = following.start - current.end
-        combined_text = _join_fragments(current.text, following.text)
-        forced_boundary = (
-            _ends_sentence(current.text)
-            or gap > config.max_gap_seconds
-            or following.end - current.start > config.max_duration_seconds
-            or len(combined_text) > config.max_source_chars
-        )
-        if forced_boundary:
+    for index, following in enumerate(cues[1:]):
+        if index in boundary_after_ids:
             merged.append(current)
             current = following
         else:
-            current = Cue(current.start, following.end, combined_text)
+            current = Cue(
+                current.start,
+                following.end,
+                _join_fragments(current.text, following.text),
+            )
     merged.append(current)
     return merged
+
+
+def trusted_sentence_boundaries(cues: list[Cue]) -> set[int]:
+    return {index for index, cue in enumerate(cues) if _ends_sentence(cue.text)}
+
+
+def trim_overlapping_cues(cues: list[Cue]) -> list[Cue]:
+    """End each cue when the following cue starts so renderers never stack them."""
+    if len(cues) < 2:
+        return cues.copy()
+
+    trimmed: list[Cue] = []
+    for current, following in zip(cues, cues[1:]):
+        if following.start < current.start:
+            raise ValueError("subtitle cues must be ordered by start time")
+        trimmed.append(replace(current, end=min(current.end, following.start)))
+    trimmed.append(cues[-1])
+    return trimmed
 
 
 def _ends_sentence(text: str) -> bool:
@@ -173,6 +191,21 @@ def _join_fragments(left: str, right: str) -> str:
     if _CJK_LEFT_EDGE_RE.search(left) and _CJK_EDGE_RE.search(right[0]):
         return left + right
     return left + " " + right
+
+
+def text_display_width(text: str) -> float:
+    """Estimate subtitle width in font-size units."""
+    width = 0.0
+    for character in text:
+        if character.isspace():
+            width += 0.35
+        elif unicodedata.combining(character):
+            continue
+        elif unicodedata.east_asian_width(character) in {"W", "F"}:
+            width += 1.0
+        else:
+            width += 0.55
+    return width
 
 
 def translation_payload(cues: list[Cue]) -> str:

@@ -5,11 +5,16 @@ set -uo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_PATH="${1:-$ROOT_DIR/config.toml}"
 WORK_DIR="$ROOT_DIR/work"
-LOG_PATH="$WORK_DIR/yumemita-2026-08-10-batch.log"
+STATUS_PATH="$WORK_DIR/yumemita-2026-08-10-status.log"
+STOP_PATH="$WORK_DIR/yumemita-2026-08-10.stop"
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/auto-subtitle-uv-cache}"
 
-trap 'printf "\nBatch interrupted; rerun this script to resume.\n" >&2; exit 130' INT TERM
+log_status() {
+    printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" >>"$STATUS_PATH"
+}
+
+trap 'log_status "INTERRUPTED"; printf "\nBatch interrupted; rerun this script to resume.\n" >&2; exit 130' INT TERM
 
 require_command() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -35,7 +40,7 @@ if [[ ! -f "$ROOT_DIR/cookies.json" ]]; then
 fi
 
 mkdir -p "$WORK_DIR"
-touch "$LOG_PATH"
+touch "$STATUS_PATH"
 
 printf 'Unlocking the DeepSeek API key...\n'
 if ! pass show api/deepseek >/dev/null; then
@@ -46,7 +51,7 @@ fi
 cd "$ROOT_DIR"
 
 printf 'Checking pipeline dependencies...\n'
-uv run subtitle-pipeline --config "$CONFIG_PATH" check
+uv run --extra asr subtitle-pipeline --config "$CONFIG_PATH" check
 
 printf 'Checking Bilibili login...\n'
 if ! biliup --user-cookie cookies.json list >/dev/null; then
@@ -112,25 +117,31 @@ for index in "${!RECORDS[@]}"; do
     manifest="$WORK_DIR/$job_id/manifest.json"
     position=$((index + 1))
 
+    if [[ -f "$STOP_PATH" ]]; then
+        log_status "STOP before=$position/$total"
+        printf 'Stop marker found; batch paused before [%d/%d].\n' "$position" "$total"
+        printf 'Remove %s before resuming.\n' "$STOP_PATH"
+        exit 0
+    fi
+
     if [[ -f "$manifest" ]] && jq -e '.uploaded == true' "$manifest" >/dev/null; then
         printf '[%d/%d] SKIP %s %s %s (already uploaded)\n' \
             "$position" "$total" "$published" "$channel" "$video_id"
+        log_status "SKIP position=$position/$total published=$published channel=$channel video=$video_id reason=already-uploaded"
         skipped=$((skipped + 1))
         continue
     fi
 
     printf '\n[%d/%d] RUN  %s %s %s\n' \
         "$position" "$total" "$published" "$channel" "$video_id"
-    printf '%s RUN %s %s %s\n' \
-        "$(date --iso-8601=seconds)" "$published" "$channel" "$video_id" >>"$LOG_PATH"
+    log_status "RUN position=$position/$total published=$published channel=$channel video=$video_id"
 
-    if uv run subtitle-pipeline --config "$CONFIG_PATH" run --upload "$url"; then
-        printf '%s OK %s\n' "$(date --iso-8601=seconds)" "$video_id" >>"$LOG_PATH"
+    if uv run --extra asr subtitle-pipeline --config "$CONFIG_PATH" run --upload "$url"; then
+        log_status "OK position=$position/$total video=$video_id"
         succeeded=$((succeeded + 1))
     else
         status=$?
-        printf '%s FAIL %s exit=%d\n' \
-            "$(date --iso-8601=seconds)" "$video_id" "$status" >>"$LOG_PATH"
+        log_status "FAIL position=$position/$total video=$video_id exit=$status"
         printf '[%d/%d] FAILED %s (exit %d); continuing.\n' \
             "$position" "$total" "$video_id" "$status" >&2
         failed=$((failed + 1))
@@ -139,7 +150,8 @@ done
 
 printf '\nBatch complete: %d succeeded, %d skipped, %d failed.\n' \
     "$succeeded" "$skipped" "$failed"
-printf 'Log: %s\n' "$LOG_PATH"
+log_status "COMPLETE succeeded=$succeeded skipped=$skipped failed=$failed"
+printf 'Status log: %s\n' "$STATUS_PATH"
 
 if ((failed > 0)); then
     exit 1

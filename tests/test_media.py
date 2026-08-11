@@ -1,34 +1,30 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from subtitle_pipeline.commands import CommandError
-from subtitle_pipeline.config import DownloadConfig
-from subtitle_pipeline.media import download_youtube
+from subtitle_pipeline.config import DownloadConfig, RenderConfig
+from subtitle_pipeline.media import (
+    _adaptive_font_size,
+    _adaptive_horizontal_margin,
+    _layout_subtitle_cues,
+    _video_dimensions,
+    _write_ass,
+    download_youtube,
+)
+from subtitle_pipeline.subtitles import Cue
 
 
 class MediaDownloadTests(unittest.TestCase):
-    def test_subtitle_failure_falls_back_without_discarding_video(self):
+    def test_downloads_video_and_metadata_without_youtube_subtitles(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
 
-            def fake_run(command):
-                if "--skip-download" in command:
-                    raise CommandError("HTTP 429")
+            def fake_run(_command):
                 (directory / "source.info.json").write_text(
-                    json.dumps(
-                        {
-                            "title": "Video",
-                            "language": "ja",
-                            "automatic_captions": {
-                                "en": [],
-                                "ja": [],
-                                "ja-orig": [],
-                            },
-                        }
-                    ),
+                    json.dumps({"title": "Video", "language": "ja"}),
                     encoding="utf-8",
                 )
                 (directory / "source.mp4").write_bytes(b"video")
@@ -48,16 +44,14 @@ class MediaDownloadTests(unittest.TestCase):
                 )
 
             self.assertEqual(result.video, directory / "source.mp4")
-            self.assertIsNone(result.subtitle)
-            self.assertEqual(run.call_count, 2)
-            video_command, subtitle_command = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(result.metadata["title"], "Video")
+            run.assert_called_once()
+            video_command = run.call_args.args[0]
             self.assertNotIn("--write-subs", video_command)
-            self.assertIn("--skip-download", subtitle_command)
+            self.assertNotIn("--write-auto-subs", video_command)
             self.assertIn("node:/usr/bin/node", video_command)
-            languages = subtitle_command[subtitle_command.index("--sub-langs") + 1]
-            self.assertEqual(languages, "ja-orig")
 
-    def test_existing_nonempty_subtitle_skips_subtitle_request(self):
+    def test_existing_subtitle_is_ignored_by_qwen_pipeline(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
 
@@ -77,36 +71,99 @@ class MediaDownloadTests(unittest.TestCase):
                     DownloadConfig(js_runtime=None),
                 )
 
-            self.assertEqual(result.subtitle, directory / "source.en.srt")
+            self.assertEqual(result.video, directory / "source.mp4")
             run.assert_called_once()
 
-    def test_prefers_original_language_over_english_translation(self):
-        with tempfile.TemporaryDirectory() as temp:
-            directory = Path(temp)
-            for language in ("en", "ja", "ja-orig"):
-                (directory / f"source.{language}.srt").write_text(
-                    language, encoding="utf-8"
-                )
-            metadata = {
-                "language": "ja",
-                "subtitles": {},
-                "automatic_captions": {"en": [], "ja": [], "ja-orig": []},
-            }
-            from subtitle_pipeline.media import _find_subtitle
 
-            self.assertEqual(
-                _find_subtitle(directory, metadata), directory / "source.ja-orig.srt"
+class SubtitleRenderTests(unittest.TestCase):
+    def test_font_size_uses_orientation_specific_short_edge_ratio(self):
+        config = RenderConfig(max_font_size=100)
+        self.assertEqual(_adaptive_font_size(1920, 1080, config), 71)
+        self.assertEqual(_adaptive_font_size(1080, 1920, config), 83)
+
+    def test_horizontal_margin_uses_portrait_ratio(self):
+        config = RenderConfig()
+        self.assertEqual(_adaptive_horizontal_margin(1920, 1080, config), 144)
+        self.assertEqual(_adaptive_horizontal_margin(1080, 1920, config), 27)
+
+    def test_shrinks_slightly_oversized_cue_to_one_line(self):
+        text = "一二三四五六七八九十一"
+        result = _layout_subtitle_cues(
+            [Cue(10, 18, text)], max_line_units=10, font_size=100
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].text, text)
+        self.assertEqual(result[0].font_size, 90)
+        self.assertEqual(result[0].start, 10)
+        self.assertEqual(result[-1].end, 18)
+
+    def test_splits_oversized_cue_into_single_line_semantic_events(self):
+        text = "一二三四五六七八九十甲乙"
+        result = _layout_subtitle_cues(
+            [Cue(10, 18, text)],
+            max_line_units=10,
+            font_size=100,
+            semantic_segments={0: ["一二三四五六", "七八九十甲乙"]},
+        )
+
+        self.assertEqual([cue.text for cue in result], ["一二三四五六", "七八九十甲乙"])
+        self.assertEqual([(cue.start, cue.end) for cue in result], [(10, 14), (14, 18)])
+        self.assertTrue(all("\n" not in cue.text for cue in result))
+
+    def test_rejects_oversized_cue_without_semantic_segments(self):
+        with self.assertRaisesRegex(ValueError, "exceeds one line"):
+            _layout_subtitle_cues(
+                [Cue(0, 1, "一二三四五六七八九十甲乙")],
+                max_line_units=10,
+                font_size=100,
             )
 
-    def test_manual_original_language_is_requested_before_auto_orig(self):
-        from subtitle_pipeline.media import _subtitle_languages
+    def test_ass_uses_video_resolution_and_requested_margins(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "subtitle.ass"
+            _write_ass(
+                [Cue(1, 2, "单行字幕")],
+                path,
+                width=1080,
+                height=1920,
+                font_name="Noto Sans CJK SC",
+                font_size=48,
+                margin_horizontal=81,
+                margin_vertical=96,
+                outline=2,
+            )
+            content = path.read_text(encoding="utf-8")
 
-        metadata = {
-            "language": "ja",
-            "subtitles": {"ja": []},
-            "automatic_captions": {"ja-orig": [], "en": []},
-        }
-        self.assertEqual(_subtitle_languages(DownloadConfig(), metadata), ["ja"])
+        self.assertIn("PlayResX: 1080", content)
+        self.assertIn("PlayResY: 1920", content)
+        self.assertIn(
+            "Style: Default,Noto Sans CJK SC,48,", content
+        )
+        self.assertIn(",2,81,81,96,1", content)
+        self.assertIn(r"{\fs48}单行字幕", content)
+
+    def test_video_dimensions_respect_rotation_metadata(self):
+        response = subprocess.CompletedProcess(
+            ["ffprobe"],
+            0,
+            json.dumps(
+                {
+                    "streams": [
+                        {
+                            "width": 1920,
+                            "height": 1080,
+                            "side_data_list": [{"rotation": -90}],
+                        }
+                    ]
+                }
+            ),
+            "",
+        )
+        with patch(
+            "subtitle_pipeline.media.require_command", return_value="ffprobe"
+        ), patch("subtitle_pipeline.media.subprocess.run", return_value=response):
+            self.assertEqual(_video_dimensions(Path("video.mp4")), (1080, 1920))
 
 
 if __name__ == "__main__":

@@ -70,17 +70,20 @@ def _check(config: AppConfig) -> int:
         else:
             missing.append("biliup")
             logging.error("missing executable: biliup")
-    if config.whisper.enabled:
-        try:
-            import faster_whisper  # noqa: F401
+    try:
+        import torch
+        import qwen_asr  # noqa: F401
 
-            logging.info("found optional faster-whisper fallback")
-        except ImportError:
-            logging.warning(
-                "Whisper fallback is enabled but faster-whisper is not installed"
-            )
-    else:
-        logging.info("Whisper fallback is disabled by configuration")
+        logging.info("found Qwen3-ASR runtime")
+        if config.asr.device.startswith("cuda"):
+            if torch.cuda.is_available():
+                logging.info("found CUDA device: %s", torch.cuda.get_device_name(0))
+            else:
+                missing.append("CUDA")
+                logging.error("Qwen3-ASR is configured for CUDA, but CUDA is unavailable")
+    except ImportError:
+        missing.append("qwen-asr")
+        logging.error("missing Qwen3-ASR runtime; run `uv sync --extra asr`")
     return 1 if missing else 0
 
 

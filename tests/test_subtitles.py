@@ -7,12 +7,13 @@ from subtitle_pipeline.subtitles import (
     Cue,
     apply_translations,
     clean_non_speech_markers,
-    merge_semantic_cues,
+    merge_cues_at_boundaries,
     read_subtitles,
+    trim_overlapping_cues,
     translation_payload,
+    trusted_sentence_boundaries,
     write_srt,
 )
-from subtitle_pipeline.config import SegmentationConfig
 
 
 class SubtitleTests(unittest.TestCase):
@@ -77,13 +78,13 @@ class SubtitleTests(unittest.TestCase):
             ],
         )
 
-    def test_merges_fragments_until_sentence_punctuation(self):
+    def test_merges_aligned_units_only_at_approved_boundaries(self):
         cues = [
             Cue(0, 1, "The model was trained on"),
             Cue(1.1, 2, "more than a million samples."),
             Cue(2.1, 3, "It generalizes well."),
         ]
-        result = merge_semantic_cues(cues, SegmentationConfig())
+        result = merge_cues_at_boundaries(cues, {1})
         self.assertEqual(
             result,
             [
@@ -92,22 +93,42 @@ class SubtitleTests(unittest.TestCase):
             ],
         )
 
-    def test_does_not_merge_across_long_pause(self):
-        cues = [Cue(0, 1, "an unfinished"), Cue(2, 3, "thought")]
-        config = SegmentationConfig(max_gap_seconds=0.5)
-        self.assertEqual(merge_semantic_cues(cues, config), cues)
+    def test_never_creates_boundaries_from_gap_duration_or_length(self):
+        cues = [Cue(0, 1, "夢"), Cue(20, 21, "は"), Cue(40, 60, "パワー")]
+        self.assertEqual(
+            merge_cues_at_boundaries(cues, set()),
+            [Cue(0, 60, "夢はパワー")],
+        )
 
-    def test_hard_duration_limit_prevents_oversized_cue(self):
-        cues = [Cue(0, 4, "one fragment"), Cue(4.1, 8, "another fragment")]
-        config = SegmentationConfig(max_duration_seconds=5)
-        self.assertEqual(merge_semantic_cues(cues, config), cues)
+    def test_finds_only_explicit_sentence_punctuation_boundaries(self):
+        cues = [Cue(0, 1, "続く"), Cue(1, 2, "文。"), Cue(2, 3, "次")]
+        self.assertEqual(trusted_sentence_boundaries(cues), {1})
 
     def test_joins_cjk_without_inserting_a_space(self):
         cues = [Cue(0, 1, "这是一个，"), Cue(1, 2, "完整句子。")]
         self.assertEqual(
-            merge_semantic_cues(cues, SegmentationConfig()),
+            merge_cues_at_boundaries(cues, set()),
             [Cue(0, 2, "这是一个，完整句子。")],
         )
+
+    def test_ends_overlapping_cue_when_following_cue_starts(self):
+        cues = [
+            Cue(0, 5, "first"),
+            Cue(3, 7, "second"),
+            Cue(8, 10, "third"),
+        ]
+        self.assertEqual(
+            trim_overlapping_cues(cues),
+            [
+                Cue(0, 3, "first"),
+                Cue(3, 7, "second"),
+                Cue(8, 10, "third"),
+            ],
+        )
+
+    def test_overlap_cleanup_leaves_non_overlapping_cues_unchanged(self):
+        cues = [Cue(0, 2, "first"), Cue(2, 4, "second")]
+        self.assertEqual(trim_overlapping_cues(cues), cues)
 
 
 if __name__ == "__main__":

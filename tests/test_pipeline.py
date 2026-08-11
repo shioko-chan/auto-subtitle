@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from subtitle_pipeline.config import AppConfig, UploadConfig, WhisperConfig
+from subtitle_pipeline.config import AppConfig, UploadConfig
 from subtitle_pipeline.media import DownloadResult
 from subtitle_pipeline.pipeline import (
     _canonicalize_catalog_tags,
@@ -64,23 +64,7 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "supported YouTube"):
             normalize_youtube_url("https://example.com/watch?v=abc")
 
-    def test_disabled_whisper_fails_before_loading_transcriber(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            video = root / "source.mp4"
-            video.write_bytes(b"video")
-            downloaded = DownloadResult(video=video, subtitle=None, metadata={})
-            config = AppConfig(
-                work_dir=root / "work", whisper=WhisperConfig(enabled=False)
-            )
-            with patch(
-                "subtitle_pipeline.pipeline.download_youtube", return_value=downloaded
-            ), patch("subtitle_pipeline.pipeline.transcribe_with_whisper") as transcribe:
-                with self.assertRaisesRegex(RuntimeError, "fallback is disabled"):
-                    run_pipeline("https://youtu.be/test", config, upload_override=False)
-            transcribe.assert_not_called()
-
-    def test_uses_existing_subtitle_and_respects_no_upload_override(self):
+    def test_uses_qwen_subtitle_and_respects_no_upload_override(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             video = root / "source.mp4"
@@ -89,7 +73,6 @@ class PipelineTests(unittest.TestCase):
             write_srt([Cue(0, 1, "hello")], subtitle)
             downloaded = DownloadResult(
                 video=video,
-                subtitle=subtitle,
                 metadata={"title": "Title", "description": "Description"},
             )
 
@@ -100,20 +83,40 @@ class PipelineTests(unittest.TestCase):
                 def translate(self, cues, **context):
                     return [Cue(cue.start, cue.end, "你好") for cue in cues]
 
+                def segment_source_cues(self, cues, config, **context):
+                    return cues
+
+                def segment_for_single_line(self, cues, **context):
+                    return {}
+
                 def translate_metadata(self, title, description, **context):
                     self.context = context
                     return "中文标题", "中文简介", "内容摘要", ["动画", "音乐企划"]
 
-            config = AppConfig(work_dir=root / "work", upload=UploadConfig(enabled=True))
-            with patch("subtitle_pipeline.pipeline.download_youtube", return_value=downloaded), patch(
+            config = AppConfig(
+                work_dir=root / "work", upload=UploadConfig(enabled=True)
+            )
+            with patch(
+                "subtitle_pipeline.pipeline.download_youtube", return_value=downloaded
+            ), patch(
+                "subtitle_pipeline.pipeline.transcribe_with_qwen",
+                return_value=subtitle,
+            ) as asr, patch(
                 "subtitle_pipeline.pipeline.llm_api_key", return_value="secret"
-            ), patch("subtitle_pipeline.pipeline.OpenAICompatibleTranslator", FakeTranslator), patch(
+            ), patch(
+                "subtitle_pipeline.pipeline.OpenAICompatibleTranslator", FakeTranslator
+            ), patch(
+                "subtitle_pipeline.pipeline.subtitle_layout"
+            ) as layout, patch(
                 "subtitle_pipeline.pipeline.render_subtitles",
-                side_effect=lambda _video, _subtitle, output, _config: output.write_bytes(b"out")
-                or output,
-            ), patch("subtitle_pipeline.pipeline.transcribe_with_whisper") as whisper, patch(
+                side_effect=lambda _video, _subtitle, output, _config, **kwargs: (
+                    output.write_bytes(b"out") or output
+                ),
+            ), patch(
                 "subtitle_pipeline.pipeline.upload_to_bilibili"
             ) as upload:
+                layout.return_value.max_line_units = 12
+                layout.return_value.font_size = 48
                 result = run_pipeline(
                     "https://www.youtube.com/watch?v=1",
                     config,
@@ -121,14 +124,18 @@ class PipelineTests(unittest.TestCase):
                 )
 
             self.assertFalse(result.uploaded)
-            self.assertEqual(result.translated_subtitle.read_text(encoding="utf-8").count("你好"), 1)
+            self.assertEqual(
+                result.translated_subtitle.read_text(encoding="utf-8").count("你好"),
+                1,
+            )
             self.assertTrue((result.job_dir / "manifest.json").is_file())
+            self.assertTrue((result.job_dir / "source.semantic.srt").is_file())
             metadata = result.translated_metadata.read_text(encoding="utf-8")
             self.assertIn("中文标题", metadata)
             self.assertIn("中文简介", metadata)
             self.assertIn("内容摘要", metadata)
             self.assertIn("音乐企划", metadata)
-            whisper.assert_not_called()
+            asr.assert_called_once()
             upload.assert_not_called()
 
 

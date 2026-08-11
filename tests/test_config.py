@@ -27,8 +27,32 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.work_dir, Path("jobs"))
             self.assertEqual(config.llm.model, "test-model")
             self.assertTrue(config.upload.enabled)
-            self.assertEqual(config.whisper.model, "small")
-            self.assertTrue(config.whisper.enabled)
+            self.assertEqual(config.asr.model, "Qwen/Qwen3-ASR-1.7B")
+            self.assertEqual(
+                config.asr.aligner_model, "Qwen/Qwen3-ForcedAligner-0.6B"
+            )
+            self.assertEqual(config.asr.dtype, "float16")
+            self.assertEqual(config.asr.language, "Japanese")
+            self.assertEqual(config.segmentation.review_duration_seconds, 6.0)
+            self.assertEqual(config.segmentation.review_source_chars, 35)
+            self.assertEqual(config.segmentation.model_window_cues, 300)
+            self.assertEqual(config.segmentation.model_context_cues, 30)
+            self.assertEqual(config.render.font_size_ratio, 0.066)
+            self.assertEqual(config.render.portrait_font_size_ratio, 0.077)
+            self.assertEqual(config.render.max_font_size, 144)
+            self.assertEqual(config.render.margin_horizontal_ratio, 0.075)
+            self.assertEqual(config.render.portrait_margin_horizontal_ratio, 0.025)
+            self.assertEqual(config.render.margin_vertical_ratio, 0.05)
+            self.assertEqual(config.render.min_cue_font_scale, 0.85)
+
+    def test_rejects_invalid_minimum_cue_font_scale(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(
+                "[render]\nmin_cue_font_scale = 1.1\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ConfigError, "min_cue_font_scale"):
+                load_config(path)
 
     def test_rejects_invalid_batch_size(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -49,6 +73,16 @@ class ConfigTests(unittest.TestCase):
             path = Path(temp) / "config.toml"
             path.write_text("[llm]\ncontext_cues = -1\n", encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, "context_cues"):
+                load_config(path)
+
+    def test_rejects_asr_chunk_longer_than_aligner_limit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(
+                "[asr]\nchunk_seconds = 175\nchunk_context_seconds = 3\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ConfigError, "180 seconds"):
                 load_config(path)
 
     def test_api_key_comes_from_named_environment_variable_when_pass_is_disabled(self):
