@@ -182,6 +182,10 @@ class TranslationTests(unittest.TestCase):
             self.assertEqual(call.args[0]["thinking"], {"type": "disabled"})
             self.assertEqual(call.args[0]["max_tokens"], 16384)
             self.assertNotIn("response_format", call.args[0])
+            prompt = call.args[0]["messages"][1]["content"]
+            self.assertIn("ASR may substitute homophonic kanji", prompt)
+            self.assertIn("never expand a short name into a full name", prompt)
+            self.assertIn("If the evidence is ambiguous or insufficient, do not guess", prompt)
 
     def test_retries_length_response_and_names_expected_ids(self):
         translator = OpenAICompatibleTranslator(

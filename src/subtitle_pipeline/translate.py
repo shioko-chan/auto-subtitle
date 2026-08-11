@@ -34,7 +34,7 @@ class TranslationError(RuntimeError):
 
 
 _CACHE_VERSION = 1
-_PROMPT_VERSION = 2
+_PROMPT_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -807,6 +807,13 @@ def _subtitle_ndjson_prompt(
     return (
         f"Translate every TARGET subtitle cue into {target_language}. Keep meaning, tone, "
         "names and technical terms natural. REFERENCE is trusted franchise terminology. "
+        "Treat person, character, group, and work names as high priority. A person may be "
+        "mentioned by surname, given name, kana, nickname, or an honorific form, and ASR may "
+        "substitute homophonic kanji. Resolve these forms using REFERENCE, video and channel "
+        "metadata, and CONTEXT. When the identity is clear, use the prescribed target-language "
+        "name while preserving the original mention granularity and honorific tone; never expand "
+        "a short name into a full name. If the evidence is ambiguous or insufficient, do not "
+        "guess. "
         "CONTEXT is read-only neighboring dialogue; use it for continuity, but never output "
         "a context ID. A context translation, when present, is already accepted and must not "
         "be revised. Do not merge, omit, explain, censor, or renumber targets. Do not end cues "

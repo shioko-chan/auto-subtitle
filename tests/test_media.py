@@ -111,6 +111,28 @@ class SubtitleRenderTests(unittest.TestCase):
         self.assertEqual([(cue.start, cue.end) for cue in result], [(10, 14), (14, 18)])
         self.assertTrue(all("\n" not in cue.text for cue in result))
 
+    def test_rendered_lines_drop_plain_terminal_punctuation(self):
+        text = '前半句，后半句。真的吗？太好了！等等...他说：“好的，”'
+        segments = [
+            "前半句，",
+            "后半句。",
+            "真的吗？",
+            "太好了！",
+            "等等...",
+            '他说：“好的，”',
+        ]
+        result = _layout_subtitle_cues(
+            [Cue(0, 12, text)],
+            max_line_units=20,
+            font_size=100,
+            semantic_segments={0: segments},
+        )
+
+        self.assertEqual(
+            [cue.text for cue in result],
+            ["前半句", "后半句", "真的吗？", "太好了！", "等等...", '他说：“好的”'],
+        )
+
     def test_rejects_oversized_cue_without_semantic_segments(self):
         with self.assertRaisesRegex(ValueError, "exceeds one line"):
             _layout_subtitle_cues(

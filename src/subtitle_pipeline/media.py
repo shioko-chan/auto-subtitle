@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -11,6 +12,14 @@ from pathlib import Path
 from .commands import require_command, run
 from .config import DownloadConfig, RenderConfig
 from .subtitles import Cue, read_subtitles, text_display_width
+
+
+_RENDER_TERMINAL_PLAIN_PUNCTUATION_RE = re.compile(
+    r'''[，、；：。．,;:]+(?=["'”’」』）)\]]*$)'''
+)
+_RENDER_TERMINAL_ASCII_PERIOD_RE = re.compile(
+    r'''(?<!\.)\.(?=["'”’」』）)\]]*$)'''
+)
 
 
 @dataclass(frozen=True)
@@ -289,13 +298,14 @@ def _layout_subtitle_cues(
         segments = segments_by_id.get(index, [" ".join(cue.text.split())])
         if not segments or "".join(segments) != " ".join(cue.text.split()):
             raise ValueError(f"semantic segments do not preserve cue {index}")
-        widths = [text_display_width(segment) for segment in segments]
+        display_segments = [_strip_render_terminal_punctuation(item) for item in segments]
+        widths = [text_display_width(segment) for segment in display_segments]
         if any(width > maximum_units_at_minimum_size + 1e-9 for width in widths):
             raise ValueError(f"semantic segment for cue {index} exceeds one line")
         total_width = sum(widths)
         elapsed = cue.start
-        for segment_index, (segment, units) in enumerate(zip(segments, widths)):
-            if segment_index == len(segments) - 1 or total_width <= 0:
+        for segment_index, (segment, units) in enumerate(zip(display_segments, widths)):
+            if segment_index == len(display_segments) - 1 or total_width <= 0:
                 end = cue.end
             else:
                 end = elapsed + (cue.end - cue.start) * units / total_width
@@ -308,6 +318,12 @@ def _layout_subtitle_cues(
             rendered.append(RenderCue(elapsed, end, segment, event_font_size))
             elapsed = end
     return rendered
+
+
+def _strip_render_terminal_punctuation(text: str) -> str:
+    without_plain = _RENDER_TERMINAL_PLAIN_PUNCTUATION_RE.sub("", text)
+    without_period = _RENDER_TERMINAL_ASCII_PERIOD_RE.sub("", without_plain)
+    return without_period if without_period.strip() else text
 
 
 def _write_ass(
