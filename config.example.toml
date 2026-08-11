@@ -36,7 +36,7 @@ timeout_seconds = 120
 max_retries = 5
 max_tokens = 16384
 context_cues = 3
-# Metadata uses json_object; subtitle translation always uses recoverable NDJSON.
+# Joint subtitles and metadata use json_object; legacy per-ID translation keeps NDJSON.
 # Set false if an OpenAI-compatible provider rejects response_format=json_object.
 json_mode = true
 # DeepSeek V4 defaults to thinking mode, which is slow and unreliable for strict JSON.

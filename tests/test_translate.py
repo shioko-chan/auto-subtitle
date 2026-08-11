@@ -15,6 +15,7 @@ from subtitle_pipeline.translate import (
     _joint_translation_signature,
     _load_joint_translation_cache,
     _log_response_usage,
+    _parse_joint_records,
     _parse_json_object,
     _protected_source_boundaries,
     _remove_terminal_period,
@@ -39,8 +40,10 @@ class TranslationTests(unittest.TestCase):
                     "finish_reason": "stop",
                     "message": {
                         "content": (
-                            '{"start_id":0,"end_id":1,"text":"梦想就是力量"}\n'
+                            '{"cues":['
+                            '{"start_id":0,"end_id":1,"text":"梦想就是力量"},'
                             '{"start_id":2,"end_id":2,"text":"Power"}'
+                            "]}"
                         )
                     },
                 }
@@ -69,10 +72,33 @@ class TranslationTests(unittest.TestCase):
         self.assertIn("20 full-width characters", prompt)
         self.assertIn("REFERENCE.characters contains entity instances", prompt)
         self.assertIn("context_only=true", prompt)
+        self.assertIn("Return exactly one JSON object with a cues array", prompt)
         self.assertIn("Never omit, genericize, or paraphrase a source name", prompt)
         self.assertIn("that record's text must explicitly contain the mapped target name", prompt)
         self.assertEqual(request.call_args.args[0]["max_tokens"], 16384)
         self.assertEqual(request.call_args.args[0]["thinking"], {"type": "disabled"})
+        self.assertEqual(
+            request.call_args.args[0]["response_format"], {"type": "json_object"}
+        )
+
+    def test_joint_parser_accepts_legacy_and_equivalent_record_containers(self):
+        records = [
+            {"start_id": 0, "end_id": 1, "text": "甲"},
+            {"start_id": 2, "end_id": 3, "text": "乙"},
+        ]
+        ndjson = "\n".join(json.dumps(record, ensure_ascii=False) for record in records)
+        adjacent = ",".join(json.dumps(record, ensure_ascii=False) for record in records)
+
+        self.assertEqual(_parse_joint_records(json.dumps({"cues": records})), records)
+        self.assertEqual(_parse_joint_records(json.dumps(records)), records)
+        self.assertEqual(_parse_joint_records(ndjson), records)
+        self.assertEqual(_parse_joint_records(adjacent), records)
+
+    def test_joint_parser_rejects_explanatory_text(self):
+        with self.assertRaisesRegex(ValueError, "invalid joint cue JSON"):
+            _parse_joint_records(
+                'Here you go: {"start_id":0,"end_id":0,"text":"甲"}'
+            )
 
     def test_logs_deepseek_cache_usage(self):
         with self.assertLogs(level="INFO") as captured:

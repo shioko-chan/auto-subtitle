@@ -130,10 +130,18 @@ class SubtitleRenderTests(unittest.TestCase):
             ["前半句", "后半句", "真的吗？", "太好了！", "等等...", '他说：“好的”'],
         )
 
-    def test_rejects_oversized_cue_without_semantic_segments(self):
-        with self.assertRaisesRegex(ValueError, "exceeds one line"):
+    def test_wraps_oversized_cue_into_two_balanced_lines(self):
+        result = _layout_subtitle_cues(
+            [Cue(0, 2, "一二三四五六，七八九十甲乙")],
+            max_line_units=10,
+        )
+
+        self.assertEqual(result, [RenderCue(0, 2, "一二三四五六\n七八九十甲乙")])
+
+    def test_rejects_cue_exceeding_two_lines(self):
+        with self.assertRaisesRegex(ValueError, "exceeds two lines"):
             _layout_subtitle_cues(
-                [Cue(0, 1, "一二三四五六七八九十甲乙")],
+                [Cue(0, 1, "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子")],
                 max_line_units=10,
             )
 

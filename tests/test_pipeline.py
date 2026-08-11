@@ -201,7 +201,7 @@ class PipelineTests(unittest.TestCase):
                     pass
 
                 def plan_and_translate(self, cues, config, **context):
-                    self.joint_context = context
+                    FakeTranslator.joint_context = context
                     return CueTranslationResult(
                         cues,
                         [Cue(cue.start, cue.end, "你好") for cue in cues],
@@ -234,6 +234,7 @@ class PipelineTests(unittest.TestCase):
                 "subtitle_pipeline.pipeline.upload_to_bilibili"
             ) as upload:
                 layout.return_value.max_line_units = 12
+                layout.return_value.frame_line_units = 13
                 layout.return_value.font_size = 48
                 result = run_pipeline(
                     "https://www.youtube.com/watch?v=1",
@@ -257,6 +258,9 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("内容摘要", metadata)
             self.assertIn("音乐企划", metadata)
             asr.assert_called_once()
+            self.assertEqual(
+                FakeTranslator.joint_context["hard_max_line_units"], 26
+            )
             upload.assert_not_called()
 
 

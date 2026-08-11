@@ -19,6 +19,7 @@ _RENDER_TERMINAL_PLAIN_PUNCTUATION_RE = re.compile(
 _RENDER_TERMINAL_ASCII_PERIOD_RE = re.compile(
     r'''(?<!\.)\.(?=["'”’」』）)\]]*$)'''
 )
+_WRAP_PUNCTUATION = frozenset("，、；：。！？!?…—,;:")
 
 
 @dataclass(frozen=True)
@@ -147,7 +148,7 @@ def render_subtitles(
     )
     logging.info(
         "adaptive subtitle style: %dx%d font=%d prompt_margin=%d "
-        "ass_margins=1/%d outline=%d cues=%d->%d",
+        "ass_margins=1/%d outline=%d cues=%d->%d wrapped=%d",
         layout.width,
         layout.height,
         layout.font_size,
@@ -156,6 +157,7 @@ def render_subtitles(
         layout.outline,
         len(source_cues),
         len(render_cues),
+        sum("\n" in cue.text for cue in render_cues),
     )
     subtitle_name = ass_path.name.replace("'", r"\'").replace(":", r"\:")
     filter_value = f"subtitles=filename='{subtitle_name}'"
@@ -297,10 +299,17 @@ def _layout_subtitle_cues(
         segments = segments_by_id.get(index, [" ".join(cue.text.split())])
         if not segments or "".join(segments) != " ".join(cue.text.split()):
             raise ValueError(f"semantic segments do not preserve cue {index}")
-        display_segments = [_strip_render_terminal_punctuation(item) for item in segments]
-        widths = [text_display_width(segment) for segment in display_segments]
-        if any(width > hard_limit + 1e-9 for width in widths):
-            raise ValueError(f"semantic segment for cue {index} exceeds one line")
+        display_segments: list[str] = []
+        widths: list[float] = []
+        for segment in segments:
+            display = _strip_render_terminal_punctuation(segment)
+            width = text_display_width(display)
+            if width > hard_limit * 2 + 1e-9:
+                raise ValueError(f"semantic segment for cue {index} exceeds two lines")
+            if width > hard_limit + 1e-9:
+                display = _wrap_two_lines(display, hard_limit)
+            display_segments.append(display)
+            widths.append(width)
         total_width = sum(widths)
         elapsed = cue.start
         for segment_index, (segment, units) in enumerate(zip(display_segments, widths)):
@@ -311,6 +320,42 @@ def _layout_subtitle_cues(
             rendered.append(RenderCue(elapsed, end, segment))
             elapsed = end
     return rendered
+
+
+def _wrap_two_lines(text: str, maximum_units: float) -> str:
+    candidates: list[tuple[float, int, float, int, str, str]] = []
+    for position in range(1, len(text)):
+        left = text[:position].rstrip()
+        right = text[position:].lstrip()
+        if not left or not right:
+            continue
+        left_width = text_display_width(left)
+        right_width = text_display_width(right)
+        if left_width > maximum_units + 1e-9 or right_width > maximum_units + 1e-9:
+            continue
+        if left[-1] in _WRAP_PUNCTUATION:
+            boundary_rank = 0
+        elif text[position - 1].isspace() or text[position].isspace():
+            boundary_rank = 1
+        else:
+            boundary_rank = 2
+        imbalance = abs(left_width - right_width)
+        candidates.append(
+            (
+                imbalance + boundary_rank,
+                boundary_rank,
+                imbalance,
+                position,
+                left,
+                right,
+            )
+        )
+    if not candidates:
+        raise ValueError("subtitle cannot be balanced into two lines")
+    _, _, _, _, left, right = min(candidates)
+    return "\n".join(
+        (_strip_render_terminal_punctuation(left), _strip_render_terminal_punctuation(right))
+    )
 
 
 def _strip_render_terminal_punctuation(text: str) -> str:

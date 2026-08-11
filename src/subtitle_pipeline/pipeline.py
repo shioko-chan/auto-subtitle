@@ -82,7 +82,7 @@ def run_pipeline(
         config.segmentation,
         translation_context=translation_context,
         max_line_units=layout.max_line_units,
-        hard_max_line_units=layout.frame_line_units,
+        hard_max_line_units=layout.frame_line_units * 2,
         cache_path=job_dir / "cue-translation-cache.json",
     )
     logging.info(
