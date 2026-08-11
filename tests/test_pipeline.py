@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,14 +10,133 @@ from subtitle_pipeline.pipeline import (
     _canonicalize_catalog_tags,
     _merge_tags,
     _subtitle_evidence,
+    _translation_context,
     _youtube_metadata_context,
     normalize_youtube_url,
     run_pipeline,
 )
 from subtitle_pipeline.subtitles import Cue, write_srt
+from subtitle_pipeline.translate import CueTranslationResult
 
 
 class PipelineTests(unittest.TestCase):
+    def test_bang_dream_glossary_models_miyako_as_character(self):
+        context = _translation_context(
+            {
+                "title": "夢限大みゅーたいぷ 藤都子",
+                "channel": "藤都子 -Fuji Miyako-",
+            },
+            [],
+        )
+
+        miyako = next(
+            character
+            for character in context["characters"]
+            if character["id"] == "fuji_miyako"
+        )
+        self.assertEqual(miyako["canonical"], "藤都子")
+        self.assertIn("Fuji Miyako", miyako["aliases"])
+        short_names = {
+            item["source"]: item for item in miyako["short_names"]
+        }
+        self.assertEqual(short_names["Miyako"]["target"], "都子")
+        self.assertTrue(short_names["Miyako"]["context_only"])
+        self.assertNotIn("Miyako", context["terms"])
+
+    def test_translation_glossary_keeps_legacy_terms_format_compatible(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "legacy.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "name": "Legacy",
+                        "background": "Legacy glossary",
+                        "match": ["legacy-video"],
+                        "terms": {"旧名": "旧译名"},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            context = _translation_context(
+                {"title": "legacy-video"}, [str(path)]
+            )
+
+        self.assertEqual(context["terms"]["旧名"], "旧译名")
+
+    def test_translation_glossary_accepts_characters_without_terms(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "characters.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "name": "Characters",
+                        "background": "Character glossary",
+                        "match": ["entity-video"],
+                        "characters": [
+                            {
+                                "id": "example",
+                                "canonical": "例子",
+                                "source_name": "れいこ",
+                                "aliases": ["レイコ"],
+                                "short_names": [
+                                    {
+                                        "source": "れい",
+                                        "target": "小例",
+                                        "context_only": True,
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            context = _translation_context(
+                {"title": "entity-video"}, [str(path)]
+            )
+
+        self.assertEqual(context["characters"][-1]["id"], "example")
+        self.assertEqual(context["terms"], {})
+
+    def test_custom_character_overrides_builtin_character_by_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "override.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "name": "Preferred names",
+                        "background": "User-preferred translation",
+                        "match": ["夢限大みゅーたいぷ"],
+                        "characters": [
+                            {
+                                "id": "fuji_miyako",
+                                "canonical": "自定义都子",
+                                "source_name": "藤都子",
+                                "aliases": [],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            context = _translation_context(
+                {"title": "夢限大みゅーたいぷ"}, [str(path)]
+            )
+
+        matches = [
+            character
+            for character in context["characters"]
+            if character["id"] == "fuji_miyako"
+        ]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["canonical"], "自定义都子")
+
     def test_builds_rich_youtube_context_and_subtitle_evidence(self):
         context = _youtube_metadata_context(
             {
@@ -80,14 +200,12 @@ class PipelineTests(unittest.TestCase):
                 def __init__(self, config, api_key):
                     pass
 
-                def translate(self, cues, **context):
-                    return [Cue(cue.start, cue.end, "你好") for cue in cues]
-
-                def segment_source_cues(self, cues, config, **context):
-                    return cues
-
-                def segment_for_single_line(self, cues, **context):
-                    return {}
+                def plan_and_translate(self, cues, config, **context):
+                    self.joint_context = context
+                    return CueTranslationResult(
+                        cues,
+                        [Cue(cue.start, cue.end, "你好") for cue in cues],
+                    )
 
                 def translate_metadata(self, title, description, **context):
                     self.context = context
@@ -130,6 +248,9 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertTrue((result.job_dir / "manifest.json").is_file())
             self.assertTrue((result.job_dir / "source.semantic.srt").is_file())
+            self.assertFalse((result.job_dir / "source-segments-cache.json").exists())
+            self.assertFalse((result.job_dir / "translation-cache.json").exists())
+            self.assertFalse((result.job_dir / "display-segments-cache.json").exists())
             metadata = result.translated_metadata.read_text(encoding="utf-8")
             self.assertIn("中文标题", metadata)
             self.assertIn("中文简介", metadata)

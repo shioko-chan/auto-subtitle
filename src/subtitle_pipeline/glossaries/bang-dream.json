@@ -36,6 +36,142 @@
     "https://moegirl.uk/BanG_Dream!",
     "https://moegirl.uk/BanG_Dream!_Our_Notes"
   ],
+  "characters": [
+    {
+      "id": "nakamachi_arale",
+      "canonical": "仲町阿拉蕾",
+      "source_name": "仲町あられ",
+      "aliases": [
+        "仲町 あられ",
+        "NAKAMACHI ARALE",
+        "Nakamachi Arale"
+      ],
+      "short_names": [
+        {
+          "source": "あられ",
+          "target": "阿拉蕾",
+          "context_only": true
+        }
+      ]
+    },
+    {
+      "id": "miyanaga_nonoka",
+      "canonical": "宫永野乃花",
+      "source_name": "宮永ののか",
+      "aliases": [
+        "宮永 ののか",
+        "MIYANAGA NONOKA",
+        "Miyanaga Nonoka"
+      ],
+      "short_names": [
+        {
+          "source": "ののか",
+          "target": "野乃花",
+          "context_only": true
+        }
+      ]
+    },
+    {
+      "id": "minetsuki_ritsu",
+      "canonical": "峰月律",
+      "source_name": "峰月律",
+      "aliases": [
+        "峰月 律",
+        "峯月律",
+        "MINETSUKI RITSU",
+        "Minetsuki Ritsu"
+      ],
+      "short_names": [
+        {
+          "source": "律",
+          "target": "律",
+          "context_only": true
+        }
+      ]
+    },
+    {
+      "id": "clematis",
+      "canonical": "克蕾玛琪丝",
+      "source_name": "クレマチス",
+      "aliases": [
+        "クレマちス",
+        "CLEMATIS",
+        "Clematis"
+      ]
+    },
+    {
+      "id": "fuji_miyako",
+      "canonical": "藤都子",
+      "source_name": "藤都子",
+      "aliases": [
+        "藤 都子",
+        "ふじみやこ",
+        "フジミヤコ",
+        "FUJI MIYAKO",
+        "Fuji Miyako"
+      ],
+      "short_names": [
+        {
+          "source": "みやこ",
+          "target": "都子",
+          "context_only": true
+        },
+        {
+          "source": "ミヤコ",
+          "target": "都子",
+          "context_only": true
+        },
+        {
+          "source": "miyako",
+          "target": "都子",
+          "context_only": true
+        },
+        {
+          "source": "Miyako",
+          "target": "都子",
+          "context_only": true
+        },
+        {
+          "source": "MIYAKO",
+          "target": "都子",
+          "context_only": true
+        },
+        {
+          "source": "都子",
+          "target": "都子",
+          "context_only": true
+        }
+      ]
+    },
+    {
+      "id": "fujimi_yako",
+      "canonical": "富士见夜子",
+      "source_name": "富士みやこ",
+      "aliases": [
+        "富士 みやこ",
+        "富士み やこ",
+        "FUJIMI YAKO",
+        "FujiMi yako"
+      ]
+    },
+    {
+      "id": "sengoku_yuno",
+      "canonical": "千石由乃",
+      "source_name": "千石ユノ",
+      "aliases": [
+        "千石 ユノ",
+        "SENGOKU YUNO",
+        "Sengoku Yuno"
+      ],
+      "short_names": [
+        {
+          "source": "ユノ",
+          "target": "由乃",
+          "context_only": true
+        }
+      ]
+    }
+  ],
   "terms": {
     "BanG Dream!": "BanG Dream!",
     "バンドリ！": "BanG Dream!",
@@ -163,53 +299,6 @@
     "ティモリス": "Timoris",
     "アモーリス": "Amoris",
     "オブリビオニス": "Oblivionis",
-    "仲町あられ": "仲町阿拉蕾",
-    "仲町 あられ": "仲町阿拉蕾",
-    "NAKAMACHI ARALE": "仲町阿拉蕾",
-    "Nakamachi Arale": "仲町阿拉蕾",
-    "宮永ののか": "宫永野乃花",
-    "宮永 ののか": "宫永野乃花",
-    "MIYANAGA NONOKA": "宫永野乃花",
-    "Miyanaga Nonoka": "宫永野乃花",
-    "峰月律": "峰月律",
-    "峰月 律": "峰月律",
-    "峯月律": "峰月律",
-    "MINETSUKI RITSU": "峰月律",
-    "Minetsuki Ritsu": "峰月律",
-    "クレマチス": "克蕾玛琪丝",
-    "クレマちス": "克蕾玛琪丝",
-    "CLEMATIS": "克蕾玛琪丝",
-    "Clematis": "克蕾玛琪丝",
-    "藤都子": "藤都子",
-    "藤 都子": "藤都子",
-    "ふじみやこ": "藤都子",
-    "フジミヤコ": "藤都子",
-    "富士みやこ": "富士见夜子",
-    "富士 みやこ": "富士见夜子",
-    "富士み やこ": "富士见夜子",
-    "FUJI MIYAKO": "藤都子",
-    "Fuji Miyako": "藤都子",
-    "FUJIMI YAKO": "富士见夜子",
-    "FujiMi yako": "富士见夜子",
-    "千石ユノ": "千石由乃",
-    "千石 ユノ": "千石由乃",
-    "SENGOKU YUNO": "千石由乃",
-    "Sengoku Yuno": "千石由乃",
-    "あられ": "阿拉蕾",
-    "ののか": "野乃花",
-    "律": "律",
-    "都子": "都子",
-    "ユノ": "由乃",
-    "Vo. 仲町あられ": "主唱 仲町阿拉蕾",
-    "Vo. 仲町 あられ": "主唱 仲町阿拉蕾",
-    "Gt. 宮永ののか": "吉他手 宫永野乃花",
-    "Gt. 宮永 ののか": "吉他手 宫永野乃花",
-    "Gt. 峰月律": "吉他手 峰月律",
-    "Gt. 峰月 律": "吉他手 峰月律",
-    "Key. 藤都子": "键盘手 藤都子",
-    "Key. 藤 都子": "键盘手 藤都子",
-    "DJ&Mp. 千石ユノ": "DJ兼音序器手 千石由乃",
-    "DJ&Mp. 千石 ユノ": "DJ兼音序器手 千石由乃",
     "ビオラ": "Viola",
     "ベル": "Bell",
     "ポポ": "Popo",

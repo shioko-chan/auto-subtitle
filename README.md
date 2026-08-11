@@ -16,9 +16,8 @@ YouTube URL
   → yt-dlp 下载视频和元数据
   → Qwen3-ASR-1.7B 分块转写音轨
   → Qwen3-ForcedAligner-0.6B 生成词级时间戳
-  → 保留可靠句末标点，并由 LLM 判断超长无标点区域的词级语义边界
-  → OpenAI 兼容 /chat/completions API 分批翻译
-  → 轻微超宽 cue 缩小字号，其余按语义边界切成单行显示事件
+  → LLM 联合决定 cue 边界并翻译为单行中文字幕
+  → 本地按 ID 恢复时间轴并校验完整覆盖和整帧宽度
   → 用同一 LLM 翻译投稿标题和简介，并生成 B 站标签
   → 输出 SRT，并由 ffmpeg 烧录硬字幕
   → biliup 上传（可选，默认关闭）
@@ -81,27 +80,31 @@ max_retries = 5
 LLM HTTPS 请求会在系统 CA 基础上补充 `certifi` CA bundle，兼容 uv 独立 Python、
 NixOS、macOS 和 Windows，同时保留 `SSL_CERT_FILE` 等自定义 CA 配置。
 
-字幕翻译使用带全局 ID 的 NDJSON，每行是一条可独立校验、缓存和补传的译文；元数据
-翻译仍使用 JSON object。若兼容服务不接受 `response_format = json_object`，可设置
-`json_mode = false`，这只影响元数据请求。
+字幕使用联合 NDJSON 请求：LLM 直接把 forced aligner 单元组成 cue 并翻译，每行返回
+`start_id`、`end_id` 和中文 `text`。程序根据 ID 恢复日文原文和时间轴，并严格校验范围
+连续、有序、无遗漏、无重复。助词、专名和术语完整性由模型结合上下文判断，不由本地
+规则禁止特定边界。时长、字符数、停顿和窗口边缘都不会成为硬边界；停顿只作为语义
+判断证据。
 
-翻译按 cue 批处理，返回的每个 ID 都会校验，时间轴不会交给模型改写。每条有效 NDJSON
-记录都会原子写入 job 目录的 `translation-cache.json`；重跑或重试时只补缺失 ID，并向
-模型提供相邻源字幕和已缓存译文作为只读上下文。失败集合会指数退避重试，耗尽后自动
-对半拆分，任何字幕缺失都不会进入渲染或上传阶段。翻译前会删除 `[音楽]`、`[歌声]`、
-`[拍手]`、`[笑]`、`[鼻息]` 等非语音标记，并丢弃清理后为空的 cue。
+每个非最终窗口都会舍弃模型返回的最后一条 cue，并从它的 `start_id` 带入下一窗口重新
+规划。若窗口只有一条 cue，程序会扩大范围；请求连续失败后则缩小范围，无法在 API
+上下文限制内得到有效结果时停止，不使用硬裁断回退。已确认的连续前缀会逐窗原子写入
+job 目录的 `cue-translation-cache.json`，重跑时只恢复其中最长的合法连续前缀。旧的
+`source-segments-cache.json`、`translation-cache.json` 和 `display-segments-cache.json`
+不会再读取。
 
-源字幕断句不会按时长、字符数、停顿或模型窗口边缘硬裁断。无句末标点区域超过 `6s`
-或 `35` 个日文字符时，模型返回逐字不变的日语语义片段；程序校验拼接结果与原文完全
-一致，再把片段边界映射回词级时间轴，并将逐窗结果缓存到
-`source-segments-cache.json`。窗口响应缺失、文本变化、边界越界或格式不合法时，管线
-停止，不使用硬裁断回退。
+联合输入使用 `[id,duration_ms,gap_after_ms,text]`，绝对时间只在本地保存。固定规则、
+术语表和视频信息位于请求前缀，窗口数据随后，重试错误放在末尾，以提高 DeepSeek
+上下文缓存命中。日志会记录 `prompt_cache_hit_tokens`、`prompt_cache_miss_tokens`、
+命中率及输出 token；同起始时间单元只发送紧凑的 ID 范围，不枚举所有合法终点。
 
-渲染阶段只生成单行字幕。略微超宽的 cue 会单独缩小字号；缩小到标准字号的 85% 仍
-无法容纳时，LLM 会提供细粒度语义边界，本地程序在这些边界间组合并分配连续时间。
-分段必须保留原译文的全部文字和标点，并缓存到 `display-segments-cache.json`。
-最终写入 ASS 时会删除每个显示片段行末的逗号、句号、分号、冒号和顿号，但保留问号、
-感叹号与省略号；此显示清理不修改 SRT 或前述完整性校验结果。
+提示词中的建议字数按当前画幅扣除左右安全边距后计算；本地只在译文以标准字号超过
+整个视频宽度时拒绝响应。ASS 左右边距统一为 `1px`，不按 cue 单独调整。
+渲染阶段所有 cue 使用统一标准字号，不再逐 cue 缩字，也不调用 LLM 二次分段。最终
+写入 ASS 时会删除行末的逗号、句号、分号、冒号和顿号，但保留问号、感叹号与省略号；
+此显示清理不修改审计 SRT。翻译前会删除 `[音楽]`、`[歌声]`、`[拍手]`、`[笑]`、
+`[鼻息]` 等非语音标记，并丢弃清理后为空的 aligner 单元。任何字幕完整性错误都会
+阻止渲染和上传。
 
 ## 先在本地运行
 
@@ -178,14 +181,13 @@ B 站简介会按 2000 个 UTF-16 code units 安全截断，避免补充平面�
 - `asr.chunk_seconds` / `chunk_context_seconds`：控制可恢复分块和切点上下文；总输入
   长度不能超过 180 秒。
 - `asr.max_new_tokens`：单块 ASR 最多生成的 token 数，默认 `2048`。
-- `segmentation.review_duration_seconds` / `review_source_chars`：无句末标点区域触发模型
-  断句判断的阈值，默认 `6s` / `35` 字；它们不会直接产生字幕边界。
-- `segmentation.model_window_cues` / `model_context_cues`：每个模型判断窗口的词级单元数
-  及前后只读上下文；窗口边缘不会成为字幕边界。
-- `llm.batch_size`：字幕很长或模型上下文较小时调低。
+- `segmentation.model_window_cues`：联合请求初始新增的 forced aligner 单元数，默认
+  `600`；非最终窗口的末条 cue 会自动带入下一窗口。
+- `llm.batch_size`：旧字幕翻译接口及元数据辅助任务的批大小；联合字幕窗口由
+  `segmentation.model_window_cues` 控制。
 - `llm.max_tokens`：单次 LLM 响应的输出 token 上限，DeepSeek V4 建议设为 `16384`。
 - `llm.max_retries`：拆分批次前的请求重试次数，建议设为 `5`。
-- `llm.context_cues`：补翻缺失 ID 时附带的前后只读字幕数量，默认每侧 `3` 条。
+- `llm.context_cues`：联合请求附带的已确认相邻 cue 数量，默认 `3` 条。
 - `llm.thinking`：DeepSeek V4 的严格 JSON 翻译应设为 `"disabled"`；其他服务不支持该参数时省略。
 - `llm.translate_metadata`：是否翻译 YouTube 标题和简介。
 - `llm.metadata_description_max_chars`：发送给 LLM 的源简介字符上限。
@@ -197,8 +199,7 @@ B 站简介会按 2000 个 UTF-16 code units 安全截断，避免补充平面�
 - `render.font_size_ratio` / `portrait_font_size_ratio`：横屏与竖屏字号相对于视频短边的比例，并受最小/最大字号限制。
 - `render.margin_horizontal_ratio` / `portrait_margin_horizontal_ratio`：横屏与竖屏左右安全边距各自占视频宽度的比例。
 - `render.margin_vertical_ratio`：字幕底边距占视频高度的比例。
-- `render.min_cue_font_scale`：单条字幕允许缩小到标准字号的比例，默认 `0.85`；仍超宽
-  时改为语义切分。
+- `render.outline_ratio`：黑色描边相对于视频短边的比例，默认 `0.003`。
 - `upload.enabled`：生产环境才建议开启；命令行 `--no-upload` 始终优先关闭上传。
 - `upload.tags`：始终保留的固定标签；会与自动标签去重合并。
 - `upload.max_tags`：投稿使用的固定标签与自动标签总数上限。
@@ -235,8 +236,13 @@ B 站标签目录格式参考 `bilibili-tags.example.json`：
 萌娘百科简中条目及 BanG Dream Fandom 角色目录，来源 URL 保存在术语 JSON 中。
 
 可通过 `llm.glossary_files` 添加同格式 JSON；自定义文件在内置术语之后加载，所以
-可覆盖有争议或偏好的译名。设置 `"always": true` 可让某个自定义术语表对所有视频
-启用，否则应提供 `match` 字符串数组用于自动识别。
+可覆盖有争议或偏好的译名。普通作品名、歌曲名等放在 `terms` 字符串映射中；人物可放在
+`characters` 数组中，以 `id`、`canonical`、`source_name`、`aliases` 和
+`short_names` 描述同一实体。`short_names` 的 `source` 只翻译成对应 `target`，不会扩写
+为全名；设置 `context_only: true` 后，仅在视频、频道或当前语境支持该人物身份时采用。
+相同 `id` 的人物由后加载的自定义术语表整体覆盖。旧的纯 `terms` 格式继续兼容。
+设置 `"always": true` 可让某个自定义术语表对所有视频启用，否则应提供 `match` 字符串
+数组用于自动识别。
 
 ## 开发与测试
 

@@ -36,11 +36,7 @@ class ASRConfig:
 
 @dataclass(frozen=True)
 class SegmentationConfig:
-    enabled: bool = True
-    review_duration_seconds: float = 6.0
-    review_source_chars: int = 35
-    model_window_cues: int = 300
-    model_context_cues: int = 30
+    model_window_cues: int = 600
 
 
 @dataclass(frozen=True)
@@ -75,8 +71,7 @@ class RenderConfig:
     margin_horizontal_ratio: float = 0.075
     portrait_margin_horizontal_ratio: float = 0.025
     margin_vertical_ratio: float = 0.05
-    outline_ratio: float = 0.002
-    min_cue_font_scale: float = 0.85
+    outline_ratio: float = 0.003
     crf: int = 20
     preset: str = "medium"
 
@@ -175,14 +170,8 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("asr.max_inference_batch_size must be at least 1")
     if config.asr.max_new_tokens < 1:
         raise ConfigError("asr.max_new_tokens must be at least 1")
-    if config.segmentation.review_duration_seconds <= 0:
-        raise ConfigError("segmentation.review_duration_seconds must be positive")
-    if config.segmentation.review_source_chars < 1:
-        raise ConfigError("segmentation.review_source_chars must be at least 1")
     if config.segmentation.model_window_cues < 1:
         raise ConfigError("segmentation.model_window_cues must be at least 1")
-    if config.segmentation.model_context_cues < 0:
-        raise ConfigError("segmentation.model_context_cues cannot be negative")
     if config.render.font_size_ratio <= 0:
         raise ConfigError("render.font_size_ratio must be positive")
     if config.render.portrait_font_size_ratio <= 0:
@@ -205,8 +194,6 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("render.margin_vertical_ratio must be between 0 and 0.5")
     if config.render.outline_ratio < 0:
         raise ConfigError("render.outline_ratio cannot be negative")
-    if not 0 < config.render.min_cue_font_scale <= 1:
-        raise ConfigError("render.min_cue_font_scale must be between 0 and 1")
     if config.upload.copyright not in (1, 2):
         raise ConfigError("upload.copyright must be 1 (original) or 2 (repost)")
     if not 1 <= config.upload.max_tags <= 10:

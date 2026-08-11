@@ -68,7 +68,7 @@ def run_pipeline(
     translation_context = _translation_context(
         downloaded.metadata, config.llm.glossary_files
     )
-    if translation_context:
+    if translation_context.get("franchises"):
         names = [
             item["name"]
             for item in translation_context["franchises"]
@@ -76,41 +76,31 @@ def run_pipeline(
         ]
         logging.info("using translation glossary: %s", ", ".join(names))
     translator = OpenAICompatibleTranslator(config.llm, llm_api_key(config.llm))
-    cues = translator.segment_source_cues(
+    layout = subtitle_layout(downloaded.video, config.render)
+    joint = translator.plan_and_translate(
         cues,
         config.segmentation,
-        segmentation_context=translation_context,
-        cache_path=job_dir / "source-segments-cache.json",
+        translation_context=translation_context,
+        max_line_units=layout.max_line_units,
+        hard_max_line_units=layout.frame_line_units,
+        cache_path=job_dir / "cue-translation-cache.json",
     )
     logging.info(
-        "semantic segmentation: %d source cues -> %d translation units",
+        "joint cue planning and translation: %d aligned cues -> %d subtitle cues",
         original_cue_count,
-        len(cues),
+        len(joint.source_cues),
     )
     overlap_count = sum(
         current.end > following.start
-        for current, following in zip(cues, cues[1:])
+        for current, following in zip(joint.source_cues, joint.source_cues[1:])
     )
-    cues = trim_overlapping_cues(cues)
+    cues = trim_overlapping_cues(joint.source_cues)
+    translated = trim_overlapping_cues(joint.translated_cues)
     logging.info("timing overlap cleanup: adjusted %d cues", overlap_count)
     write_srt(cues, job_dir / "source.semantic.srt")
 
-    translated = translator.translate(
-        cues,
-        translation_context=translation_context,
-        cache_path=job_dir / "translation-cache.json",
-    )
     translated_path = job_dir / "translated.zh-CN.srt"
     write_srt(translated, translated_path)
-
-    layout = subtitle_layout(downloaded.video, config.render)
-    semantic_segments = translator.segment_for_single_line(
-        translated,
-        max_line_units=layout.max_line_units,
-        font_size=layout.font_size,
-        min_font_scale=config.render.min_cue_font_scale,
-        cache_path=job_dir / "display-segments-cache.json",
-    )
 
     subtitle_evidence = _subtitle_evidence(
         cues, config.llm.metadata_subtitle_max_chars
@@ -168,7 +158,6 @@ def run_pipeline(
         translated_path,
         rendered_path,
         config.render,
-        semantic_segments=semantic_segments,
     )
 
     should_upload = config.upload.enabled if upload_override is None else upload_override
@@ -317,6 +306,7 @@ def _translation_context(
     evidence = json.dumps(identity, ensure_ascii=False).casefold()
     franchises: list[dict[str, str]] = []
     terms: dict[str, str] = {}
+    characters_by_id: dict[str, dict[str, object]] = {}
     for glossary in glossaries:
         matches = glossary["match"]
         assert isinstance(matches, list)
@@ -331,7 +321,7 @@ def _translation_context(
                 "background": str(glossary["background"]),
             }
         )
-        glossary_terms = glossary["terms"]
+        glossary_terms = glossary.get("terms", {})
         assert isinstance(glossary_terms, dict)
         terms.update(
             {
@@ -343,9 +333,19 @@ def _translation_context(
                 and target.strip()
             }
         )
-    if not franchises:
-        return {}
-    return {"franchises": franchises, "terms": terms}
+        glossary_characters = glossary.get("characters", [])
+        assert isinstance(glossary_characters, list)
+        for character in glossary_characters:
+            assert isinstance(character, dict)
+            character_id = character["id"]
+            assert isinstance(character_id, str)
+            characters_by_id[character_id] = character
+    return {
+        "video": identity,
+        "franchises": franchises,
+        "characters": list(characters_by_id.values()),
+        "terms": terms,
+    }
 
 
 def _validate_translation_glossary(
@@ -362,12 +362,55 @@ def _validate_translation_glossary(
         isinstance(item, str) and item.strip() for item in matches
     ):
         raise ValueError(f"translation glossary {label} requires string match terms")
-    terms = value.get("terms")
+    terms = value.get("terms", {})
     if not isinstance(terms, dict) or not all(
         isinstance(source, str) and isinstance(target, str)
         for source, target in terms.items()
     ):
-        raise ValueError(f"translation glossary {label} requires string term mappings")
+        raise ValueError(f"translation glossary {label} terms must be string mappings")
+    characters = value.get("characters", [])
+    if not isinstance(characters, list):
+        raise ValueError(f"translation glossary {label} characters must be a list")
+    seen_character_ids: set[str] = set()
+    for position, character in enumerate(characters):
+        character_label = f"translation glossary {label} character {position}"
+        if not isinstance(character, dict):
+            raise ValueError(f"{character_label} must be an object")
+        character_id = character.get("id")
+        canonical = character.get("canonical")
+        source_name = character.get("source_name")
+        if not isinstance(character_id, str) or not character_id.strip():
+            raise ValueError(f"{character_label} requires a non-empty id")
+        if character_id in seen_character_ids:
+            raise ValueError(
+                f"translation glossary {label} duplicates character id {character_id}"
+            )
+        seen_character_ids.add(character_id)
+        if not isinstance(canonical, str) or not canonical.strip():
+            raise ValueError(f"{character_label} requires a non-empty canonical name")
+        if not isinstance(source_name, str) or not source_name.strip():
+            raise ValueError(f"{character_label} requires a non-empty source_name")
+        aliases = character.get("aliases", [])
+        if not isinstance(aliases, list) or not all(
+            isinstance(alias, str) and alias.strip() for alias in aliases
+        ):
+            raise ValueError(f"{character_label} aliases must be non-empty strings")
+        short_names = character.get("short_names", [])
+        if not isinstance(short_names, list):
+            raise ValueError(f"{character_label} short_names must be a list")
+        for short_position, short_name in enumerate(short_names):
+            short_label = f"{character_label} short name {short_position}"
+            if not isinstance(short_name, dict):
+                raise ValueError(f"{short_label} must be an object")
+            source = short_name.get("source")
+            target = short_name.get("target")
+            context_only = short_name.get("context_only", False)
+            if not isinstance(source, str) or not source.strip():
+                raise ValueError(f"{short_label} requires a non-empty source")
+            if not isinstance(target, str) or not target.strip():
+                raise ValueError(f"{short_label} requires a non-empty target")
+            if not isinstance(context_only, bool):
+                raise ValueError(f"{short_label} context_only must be boolean")
     return value
 
 

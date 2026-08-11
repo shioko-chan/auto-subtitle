@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from subtitle_pipeline.config import DownloadConfig, RenderConfig
 from subtitle_pipeline.media import (
+    RenderCue,
     _adaptive_font_size,
     _adaptive_horizontal_margin,
     _layout_subtitle_cues,
@@ -86,24 +87,21 @@ class SubtitleRenderTests(unittest.TestCase):
         self.assertEqual(_adaptive_horizontal_margin(1920, 1080, config), 144)
         self.assertEqual(_adaptive_horizontal_margin(1080, 1920, config), 27)
 
-    def test_shrinks_slightly_oversized_cue_to_one_line(self):
+    def test_allows_slightly_oversized_cue_into_safe_margin(self):
         text = "一二三四五六七八九十一"
         result = _layout_subtitle_cues(
-            [Cue(10, 18, text)], max_line_units=10, font_size=100
+            [Cue(10, 18, text)],
+            max_line_units=10,
+            hard_max_line_units=12,
         )
 
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0].text, text)
-        self.assertEqual(result[0].font_size, 90)
-        self.assertEqual(result[0].start, 10)
-        self.assertEqual(result[-1].end, 18)
+        self.assertEqual(result, [RenderCue(10, 18, text)])
 
     def test_splits_oversized_cue_into_single_line_semantic_events(self):
         text = "一二三四五六七八九十甲乙"
         result = _layout_subtitle_cues(
             [Cue(10, 18, text)],
             max_line_units=10,
-            font_size=100,
             semantic_segments={0: ["一二三四五六", "七八九十甲乙"]},
         )
 
@@ -124,7 +122,6 @@ class SubtitleRenderTests(unittest.TestCase):
         result = _layout_subtitle_cues(
             [Cue(0, 12, text)],
             max_line_units=20,
-            font_size=100,
             semantic_segments={0: segments},
         )
 
@@ -138,10 +135,9 @@ class SubtitleRenderTests(unittest.TestCase):
             _layout_subtitle_cues(
                 [Cue(0, 1, "一二三四五六七八九十甲乙")],
                 max_line_units=10,
-                font_size=100,
             )
 
-    def test_ass_uses_video_resolution_and_requested_margins(self):
+    def test_ass_uses_video_resolution_and_global_one_pixel_margins(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "subtitle.ass"
             _write_ass(
@@ -151,7 +147,6 @@ class SubtitleRenderTests(unittest.TestCase):
                 height=1920,
                 font_name="Noto Sans CJK SC",
                 font_size=48,
-                margin_horizontal=81,
                 margin_vertical=96,
                 outline=2,
             )
@@ -162,8 +157,10 @@ class SubtitleRenderTests(unittest.TestCase):
         self.assertIn(
             "Style: Default,Noto Sans CJK SC,48,", content
         )
-        self.assertIn(",2,81,81,96,1", content)
-        self.assertIn(r"{\fs48}单行字幕", content)
+        self.assertIn(",2,1,1,96,1", content)
+        self.assertNotIn(r"\fs", content)
+        self.assertIn("单行字幕", content)
+        self.assertIn("Default,,0,0,0,,单行字幕", content)
 
     def test_video_dimensions_respect_rotation_metadata(self):
         response = subprocess.CompletedProcess(

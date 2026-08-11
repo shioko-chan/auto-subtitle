@@ -21,14 +21,9 @@ max_inference_batch_size = 1
 max_new_tokens = 2048
 
 [segmentation]
-enabled = true
-# Punctuation-free regions beyond either threshold are sent to the LLM for review.
-# These values never directly create subtitle boundaries.
-review_duration_seconds = 6.0
-review_source_chars = 35
-# Decision windows overlap for context; window edges are never subtitle boundaries.
-model_window_cues = 300
-model_context_cues = 30
+# Each request initially adds this many forced-aligner units. The final cue is
+# always carried into the next request, so the window edge is never a cue boundary.
+model_window_cues = 600
 
 [llm]
 base_url = "https://api.deepseek.com"
@@ -68,9 +63,7 @@ max_font_size = 144
 margin_horizontal_ratio = 0.075
 portrait_margin_horizontal_ratio = 0.025
 margin_vertical_ratio = 0.05
-outline_ratio = 0.002
-# Slightly oversized cues may shrink this far before semantic splitting.
-min_cue_font_scale = 0.85
+outline_ratio = 0.003
 crf = 20
 preset = "medium"
 

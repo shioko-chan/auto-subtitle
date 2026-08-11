@@ -33,26 +33,14 @@ class ConfigTests(unittest.TestCase):
             )
             self.assertEqual(config.asr.dtype, "float16")
             self.assertEqual(config.asr.language, "Japanese")
-            self.assertEqual(config.segmentation.review_duration_seconds, 6.0)
-            self.assertEqual(config.segmentation.review_source_chars, 35)
-            self.assertEqual(config.segmentation.model_window_cues, 300)
-            self.assertEqual(config.segmentation.model_context_cues, 30)
+            self.assertEqual(config.segmentation.model_window_cues, 600)
             self.assertEqual(config.render.font_size_ratio, 0.066)
             self.assertEqual(config.render.portrait_font_size_ratio, 0.077)
             self.assertEqual(config.render.max_font_size, 144)
             self.assertEqual(config.render.margin_horizontal_ratio, 0.075)
             self.assertEqual(config.render.portrait_margin_horizontal_ratio, 0.025)
             self.assertEqual(config.render.margin_vertical_ratio, 0.05)
-            self.assertEqual(config.render.min_cue_font_scale, 0.85)
-
-    def test_rejects_invalid_minimum_cue_font_scale(self):
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "config.toml"
-            path.write_text(
-                "[render]\nmin_cue_font_scale = 1.1\n", encoding="utf-8"
-            )
-            with self.assertRaisesRegex(ConfigError, "min_cue_font_scale"):
-                load_config(path)
+            self.assertEqual(config.render.outline_ratio, 0.003)
 
     def test_rejects_invalid_batch_size(self):
         with tempfile.TemporaryDirectory() as temp:
