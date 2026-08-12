@@ -1,0 +1,24 @@
+[project]
+name = "subtitle-song-ocr-worker"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "modelscope>=1,<2",
+    "paddleocr>=3,<4",
+    "paddlepaddle-gpu==3.3.0",
+    "torch==2.8.0+cpu",
+]
+
+[[tool.uv.index]]
+name = "paddle-cu126"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu126/"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+paddlepaddle-gpu = { index = "paddle-cu126" }
+torch = { index = "pytorch-cpu" }

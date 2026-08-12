@@ -1,0 +1,8 @@
+[project]
+name = "subtitle-song-search-worker"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "ddgs>=9,<10",
+    "trafilatura>=2,<3",
+]

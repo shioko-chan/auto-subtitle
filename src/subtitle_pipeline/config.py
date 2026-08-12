@@ -46,6 +46,8 @@ class AudioAnalysisConfig:
     singing_stride_seconds: float = 2.5
     singing_threshold: float = 0.05
     singing_merge_gap_seconds: float = 1.5
+    singing_smoothing_windows: int = 3
+    singing_release_seconds: float = 35.0
     singing_phrase_silence_seconds: float = 0.45
     singing_min_phrase_seconds: float = 0.8
     singing_asr_window_seconds: float = 12.0
@@ -53,6 +55,25 @@ class AudioAnalysisConfig:
     speaker_profiles_dir: str = "work/speaker-profiles"
     speaker_match_threshold: float = 0.32
     character_styles_file: str | None = None
+
+
+@dataclass(frozen=True)
+class SongIdentificationConfig:
+    enabled: bool = False
+    device: str = "gpu:0"
+    detection_model: str = "PP-OCRv5_mobile_det"
+    recognition_model: str = "PP-OCRv5_server_rec"
+    ocr_worker_project: str = "tools/song_ocr"
+    search_worker_project: str = "tools/song_search"
+    seconds_before_start: float = 30.0
+    seconds_after_start: float = 15.0
+    sample_interval_seconds: float = 1.0
+    song_gap_seconds: float = 35.0
+    minimum_ocr_score: float = 0.45
+    minimum_persistent_frames: int = 2
+    max_tool_calls: int = 6
+    max_search_results: int = 5
+    max_page_chars: int = 12000
 
 
 @dataclass(frozen=True)
@@ -119,6 +140,9 @@ class AppConfig:
     download: DownloadConfig = field(default_factory=DownloadConfig)
     asr: ASRConfig = field(default_factory=ASRConfig)
     audio_analysis: AudioAnalysisConfig = field(default_factory=AudioAnalysisConfig)
+    song_identification: SongIdentificationConfig = field(
+        default_factory=SongIdentificationConfig
+    )
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
@@ -147,6 +171,9 @@ def load_config(path: Path) -> AppConfig:
             download=DownloadConfig(**_section(data, "download")),
             asr=ASRConfig(**_section(data, "asr")),
             audio_analysis=AudioAnalysisConfig(**_section(data, "audio_analysis")),
+            song_identification=SongIdentificationConfig(
+                **_section(data, "song_identification")
+            ),
             segmentation=SegmentationConfig(**_section(data, "segmentation")),
             llm=LLMConfig(**_section(data, "llm")),
             render=RenderConfig(**_section(data, "render")),
@@ -205,6 +232,15 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("audio_analysis.singing_threshold must be between 0 and 1")
     if analysis.singing_merge_gap_seconds < 0:
         raise ConfigError("audio_analysis.singing_merge_gap_seconds cannot be negative")
+    if (
+        analysis.singing_smoothing_windows < 1
+        or analysis.singing_smoothing_windows % 2 == 0
+    ):
+        raise ConfigError(
+            "audio_analysis.singing_smoothing_windows must be a positive odd integer"
+        )
+    if analysis.singing_release_seconds < 0:
+        raise ConfigError("audio_analysis.singing_release_seconds cannot be negative")
     if analysis.singing_phrase_silence_seconds <= 0:
         raise ConfigError(
             "audio_analysis.singing_phrase_silence_seconds must be positive"
@@ -222,6 +258,27 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError(
             "audio_analysis.speaker_match_threshold must be between 0 and 2"
         )
+    songs = config.song_identification
+    if songs.seconds_before_start < 0 or songs.seconds_after_start < 0:
+        raise ConfigError("song identification OCR windows cannot be negative")
+    if songs.sample_interval_seconds <= 0:
+        raise ConfigError(
+            "song_identification.sample_interval_seconds must be positive"
+        )
+    if songs.song_gap_seconds < 0:
+        raise ConfigError("song_identification.song_gap_seconds cannot be negative")
+    if not 0 <= songs.minimum_ocr_score <= 1:
+        raise ConfigError(
+            "song_identification.minimum_ocr_score must be between 0 and 1"
+        )
+    if songs.minimum_persistent_frames < 1:
+        raise ConfigError(
+            "song_identification.minimum_persistent_frames must be at least 1"
+        )
+    if songs.max_tool_calls < 1 or songs.max_search_results < 1:
+        raise ConfigError("song identification search limits must be at least 1")
+    if songs.max_page_chars < 1000:
+        raise ConfigError("song_identification.max_page_chars must be at least 1000")
     if config.segmentation.model_window_cues < 1:
         raise ConfigError("segmentation.model_window_cues must be at least 1")
     if config.render.font_size_ratio <= 0:

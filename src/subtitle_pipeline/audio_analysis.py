@@ -13,7 +13,7 @@ from .commands import require_command, run
 from .config import AudioAnalysisConfig
 
 
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
 _SINGING_LABELS = {
     "chant",
     "child singing",
@@ -216,7 +216,7 @@ def _run_singing_detection(
     if not singing_ids:
         raise RuntimeError("AST singing detector exposes no recognized singing labels")
 
-    windows: list[AudioRegion] = []
+    scored_windows: list[AudioRegion] = []
     try:
         for batch_start in range(0, len(starts), 16):
             batch_offsets = starts[batch_start : batch_start + 16]
@@ -232,19 +232,64 @@ def _run_singing_detection(
                 probabilities = torch.softmax(model(**inputs).logits, dim=-1).cpu()
             for offset, row in zip(batch_offsets, probabilities):
                 score = sum(float(row[index]) for index in singing_ids)
-                if score >= config.singing_threshold:
-                    windows.append(
-                        AudioRegion(
-                            round(offset / sample_rate, 3),
-                            round(min(len(mono), offset + window_samples) / sample_rate, 3),
-                            "singing",
-                            confidence=round(score, 4),
-                        )
+                scored_windows.append(
+                    AudioRegion(
+                        round(offset / sample_rate, 3),
+                        round(min(len(mono), offset + window_samples) / sample_rate, 3),
+                        "singing",
+                        confidence=round(score, 4),
                     )
+                )
     finally:
         del model
         _release_cuda()
-    return _merge_regions(windows, config.singing_merge_gap_seconds)
+    return _singing_regions_from_scores(
+        scored_windows,
+        threshold=config.singing_threshold,
+        smoothing_windows=config.singing_smoothing_windows,
+        release_seconds=config.singing_release_seconds,
+        merge_gap_seconds=config.singing_merge_gap_seconds,
+    )
+
+
+def _singing_regions_from_scores(
+    windows: list[AudioRegion],
+    *,
+    threshold: float,
+    smoothing_windows: int,
+    release_seconds: float,
+    merge_gap_seconds: float = 0.0,
+) -> list[AudioRegion]:
+    """Turn noisy AST scores into song episodes with release hysteresis."""
+    if not windows:
+        return []
+
+    radius = smoothing_windows // 2
+    smoothed: list[AudioRegion] = []
+    for index, window in enumerate(windows):
+        nearby = windows[max(0, index - radius) : index + radius + 1]
+        scores = sorted(float(item.confidence or 0.0) for item in nearby)
+        scores.extend([0.0] * (smoothing_windows - len(scores)))
+        scores.sort()
+        score = scores[len(scores) // 2]
+        smoothed.append(
+            AudioRegion(
+                window.start,
+                window.end,
+                "singing",
+                confidence=round(score, 4),
+            )
+        )
+
+    anchors = [
+        raw
+        for raw, smooth in zip(windows, smoothed)
+        if float(smooth.confidence or 0.0) >= threshold
+    ]
+    # Offline release hysteresis: a negative run closes the song only when no
+    # later singing anchor arrives within the configured release interval.
+    episodes = _merge_regions(anchors, release_seconds)
+    return _merge_regions(episodes, merge_gap_seconds)
 
 
 def _run_overlap_separation(

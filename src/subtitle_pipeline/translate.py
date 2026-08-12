@@ -77,6 +77,15 @@ class OpenAICompatibleTranslator:
         self.api_key = api_key
         self.ssl_context = _create_ssl_context()
 
+    def request(self, body: dict[str, object]) -> dict[str, object]:
+        """Send an auxiliary agent request using the configured model settings."""
+        payload = dict(body)
+        payload.setdefault("model", self.config.model)
+        payload.setdefault("max_tokens", self.config.max_tokens)
+        if self.config.thinking is not None:
+            payload.setdefault("thinking", {"type": self.config.thinking})
+        return self._request(payload)
+
     def plan_and_translate(
         self,
         cues: list[Cue],

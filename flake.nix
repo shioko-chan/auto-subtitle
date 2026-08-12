@@ -21,7 +21,10 @@
         cuda.cuda_cudart
         cuda.libcublas
         cuda.libcusparse
+        cuda.libnvjitlink
         pkgs.ffmpeg
+        pkgs.glib
+        pkgs.libglvnd
         pkgs.stdenv.cc.cc.lib
         pkgs.zlib
       ];

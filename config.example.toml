@@ -34,7 +34,10 @@ device = "cuda:0"
 singing_window_seconds = 5.0
 singing_stride_seconds = 2.5
 singing_threshold = 0.05
+# Smooth isolated AST misses/hits, then keep the song state through short gaps.
 singing_merge_gap_seconds = 1.5
+singing_smoothing_windows = 3
+singing_release_seconds = 35.0
 singing_phrase_silence_seconds = 0.45
 singing_min_phrase_seconds = 0.8
 singing_asr_window_seconds = 12.0
@@ -43,6 +46,24 @@ speaker_profiles_dir = "work/speaker-profiles"
 speaker_match_threshold = 0.32
 # Rendering/training metadata is separate from the LLM glossary.
 # character_styles_file = "character-styles.json"
+
+[song_identification]
+# Inspect only the short interval around each detected start of singing.
+enabled = true
+device = "gpu:0"
+detection_model = "PP-OCRv5_mobile_det"
+recognition_model = "PP-OCRv5_server_rec"
+ocr_worker_project = "tools/song_ocr"
+search_worker_project = "tools/song_search"
+seconds_before_start = 30.0
+seconds_after_start = 15.0
+sample_interval_seconds = 1.0
+song_gap_seconds = 35.0
+minimum_ocr_score = 0.45
+minimum_persistent_frames = 2
+max_tool_calls = 6
+max_search_results = 5
+max_page_chars = 12000
 
 [segmentation]
 # Each request initially adds this many forced-aligner units. The final cue is

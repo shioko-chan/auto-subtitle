@@ -49,6 +49,16 @@ cp config.example.toml config.toml
 `yt-dlp` 会随项目安装。当前新管线始终从音轨重新生成源字幕，不使用 YouTube 人工或
 自动字幕，因此运行完整管线必须安装 `asr` extra。
 
+启用 `[song_identification]` 后，管线只在每次检测到开唱的前后短窗口抽帧，使用
+PaddleOCR 聚合稳定的日英文字，再把 OCR、报幕 ASR、简介歌单和歌唱 ASR 交给
+DeepSeek。模型可通过受限的 `ddgs` 搜索与 `trafilatura` 页面提取工具核验歌名和歌词；
+网页正文只作为不可信证据。PaddleOCR 运行在 `tools/song_ocr` 的独立 uv 环境中，避免
+其 Paddle/CUDA 依赖与 Qwen 的 PyTorch 环境冲突；搜索工具同样运行在
+`tools/song_search` 的独立锁定环境中。首次启用会下载工具环境和 OCR 模型。
+原始 `source.qwen3-asr.srt` 始终保留；核验结果写入
+`song-identification-cache.json`，修正版写入 `source.lyrics-corrected.srt`。单首识别
+失败会保留原 ASR 并继续，不会阻塞非歌曲内容。
+
 完整的 YouTube 格式解析还需要 JavaScript runtime。管线会依次自动寻找 Deno、Node
 和 QuickJS；推荐安装 Deno 2.3+，Node 则需 22+。PyPI 依赖已启用 yt-dlp 的 EJS 和
 `curl-cffi` extras。
@@ -130,7 +140,8 @@ URL 放在单引号中时不要再写 `\?` 或 `\=`。为兼容常见的复制�
 forced aligner 的 180 秒输入限制约束。
 
 启用 `[audio_analysis]` 后，管线会先用 pyannote `community-1` 做 VAD 和说话人
-分离，用 AST 检测歌声。普通说话仍由 Qwen forced aligner 生成细粒度时间；歌声先由
+分离，用 AST 检测歌声。AST 概率会经过时间平滑，并以 release hysteresis 桥接短暂漏检，
+不会直接把一首歌切开。普通说话仍由 Qwen forced aligner 生成细粒度时间；歌声先由
 Demucs 分离主唱，再按主唱静音切成歌词短句，由 Qwen ASR 直接生成句级时间，避免把
 歌声送入语音 aligner。检测到重叠说话时，pyannote ToTaToNet 会输出独立声源并分别
 转写。所有音频分析结果和带说话人字段的 cue sidecar 都写入 job 目录并可断点复用。

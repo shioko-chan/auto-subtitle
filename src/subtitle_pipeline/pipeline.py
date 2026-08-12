@@ -13,6 +13,7 @@ from .asr import read_cue_sidecar, transcribe_with_qwen
 from .config import AppConfig, llm_api_key
 from .media import download_youtube, render_subtitles, subtitle_layout
 from .speakers import load_character_styles
+from .song_identification import SongIdentificationResult, identify_and_align_songs
 from .subtitles import (
     Cue,
     clean_non_speech_markers,
@@ -82,6 +83,28 @@ def run_pipeline(
         ]
         logging.info("using translation glossary: %s", ", ".join(names))
     translator = OpenAICompatibleTranslator(config.llm, llm_api_key(config.llm))
+    if config.song_identification.enabled:
+        song_result = identify_and_align_songs(
+            downloaded.video,
+            cues,
+            downloaded.metadata,
+            job_dir,
+            config.song_identification,
+            translator.request,
+        )
+    else:
+        song_result = SongIdentificationResult(cues, [])
+    cues = song_result.corrected_cues
+    if song_result.reports:
+        write_srt(cues, job_dir / "source.lyrics-corrected.srt")
+        translation_context = {
+            **translation_context,
+            "identified_songs": song_result.reports,
+        }
+        logging.info(
+            "song identification produced %d episode reports",
+            len(song_result.reports),
+        )
     layout = subtitle_layout(downloaded.video, config.render)
     joint = translator.plan_and_translate(
         cues,
@@ -145,6 +168,7 @@ def run_pipeline(
                 "translation_glossaries": [
                     item["name"] for item in translation_context.get("franchises", [])
                 ],
+                "identified_songs": song_result.reports,
                 "content_summary": content_summary,
                 "generated_tags": generated_tags,
                 "tag_catalog_matches": tag_catalog_matches,

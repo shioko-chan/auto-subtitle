@@ -5,6 +5,7 @@ from subtitle_pipeline.audio_analysis import (
     _mark_overlaps,
     _merge_regions,
     _overlap_spans,
+    _singing_regions_from_scores,
     _subtract_regions,
 )
 from subtitle_pipeline.speakers import (
@@ -40,6 +41,68 @@ class AudioAnalysisTests(unittest.TestCase):
                 AudioRegion(0, 9, "singing", confidence=0.8),
                 AudioRegion(12, 15, "singing", confidence=0.7),
             ],
+        )
+
+    def test_singing_hysteresis_bridges_short_ast_miss(self):
+        windows = [
+            AudioRegion(index * 5, index * 5 + 5, "singing", confidence=score)
+            for index, score in enumerate([0.8, 0.7, 0.0, 0.0, 0.0, 0.8, 0.7])
+        ]
+        result = _singing_regions_from_scores(
+            windows,
+            threshold=0.05,
+            smoothing_windows=3,
+            release_seconds=35,
+        )
+        self.assertEqual(result, [AudioRegion(0, 35, "singing", confidence=0.8)])
+
+    def test_singing_hysteresis_ends_after_sustained_ast_miss(self):
+        windows = [
+            AudioRegion(index * 10, index * 10 + 5, "singing", confidence=score)
+            for index, score in enumerate([0.8, 0.7, 0.0, 0.0, 0.0, 0.0, 0.8, 0.7])
+        ]
+        result = _singing_regions_from_scores(
+            windows,
+            threshold=0.05,
+            smoothing_windows=3,
+            release_seconds=20,
+        )
+        self.assertEqual(
+            result,
+            [
+                AudioRegion(0, 15, "singing", confidence=0.8),
+                AudioRegion(60, 75, "singing", confidence=0.8),
+            ],
+        )
+
+    def test_singing_score_smoothing_removes_isolated_ast_hit(self):
+        windows = [
+            AudioRegion(index * 2.5, index * 2.5 + 5, "singing", confidence=score)
+            for index, score in enumerate([0.0, 0.0, 0.9, 0.0, 0.0])
+        ]
+        self.assertEqual(
+            _singing_regions_from_scores(
+                windows,
+                threshold=0.05,
+                smoothing_windows=3,
+                release_seconds=35,
+            ),
+            [],
+        )
+
+    def test_singing_score_smoothing_removes_isolated_edge_hit(self):
+        windows = [
+            AudioRegion(index * 2.5, index * 2.5 + 5, "singing", confidence=score)
+            for index, score in enumerate([0.9, 0.0, 0.0])
+        ]
+        self.assertEqual(
+            _singing_regions_from_scores(
+                windows,
+                threshold=0.05,
+                smoothing_windows=3,
+                release_seconds=35,
+            ),
+            [],
         )
 
     def test_limits_separation_to_padded_overlap_region(self):

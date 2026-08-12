@@ -35,6 +35,10 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.asr.language, "Japanese")
             self.assertTrue(config.audio_analysis.enabled)
             self.assertEqual(config.audio_analysis.singing_threshold, 0.05)
+            self.assertEqual(config.audio_analysis.singing_smoothing_windows, 3)
+            self.assertEqual(config.audio_analysis.singing_release_seconds, 35.0)
+            self.assertFalse(config.song_identification.enabled)
+            self.assertEqual(config.song_identification.device, "gpu:0")
             self.assertEqual(config.segmentation.model_window_cues, 600)
             self.assertEqual(config.render.font_size_ratio, 0.066)
             self.assertEqual(config.render.portrait_font_size_ratio, 0.077)
@@ -63,6 +67,16 @@ class ConfigTests(unittest.TestCase):
             path = Path(temp) / "config.toml"
             path.write_text("[llm]\ncontext_cues = -1\n", encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, "context_cues"):
+                load_config(path)
+
+    def test_rejects_invalid_song_ocr_interval(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(
+                "[song_identification]\nsample_interval_seconds = 0\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ConfigError, "sample_interval_seconds"):
                 load_config(path)
 
     def test_rejects_asr_chunk_longer_than_aligner_limit(self):
