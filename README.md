@@ -123,9 +123,22 @@ uv run --extra asr subtitle-pipeline --config config.toml run --no-upload 'https
 
 URL 放在单引号中时不要再写 `\?` 或 `\=`。为兼容常见的复制方式，管线会自动移除
 这两个位置的多余反斜杠。音轨按 170 秒分块，每个切点两侧额外提供 2 秒上下文，减少
-边界处截词。每个成功块会立即原子写入 job 目录的 `asr-cache.json`；中断重跑时只转写
+边界处截词。若检测到 ASR 连续生成同一长文本，当前块会自动递归二分并重新识别，最短约
+20 秒；仍然循环时整条任务失败，异常文本不会进入翻译。每个成功块会立即原子写入 job
+目录的 `asr-cache.json`；中断重跑时只转写
 缺失块。上下文区的时间戳只归属相应核心区间，因此不会产生重复 cue。分块总长度受
 forced aligner 的 180 秒输入限制约束。
+
+启用 `[audio_analysis]` 后，管线会先用 pyannote `community-1` 做 VAD 和说话人
+分离，用 AST 检测歌声。普通说话仍由 Qwen forced aligner 生成细粒度时间；歌声先由
+Demucs 分离主唱，再按主唱静音切成歌词短句，由 Qwen ASR 直接生成句级时间，避免把
+歌声送入语音 aligner。检测到重叠说话时，pyannote ToTaToNet 会输出独立声源并分别
+转写。所有音频分析结果和带说话人字段的 cue sidecar 都写入 job 目录并可断点复用。
+
+梦限大 MewType 五位成员的应援色与声纹配置位于独立的
+`character_styles.json`，不会发给 LLM。独播频道会从无重叠语音自动建立声纹原型；
+团播仅在余弦距离达到阈值时映射身份，否则保留匿名说话人和默认白色字幕。重叠人物
+字幕会保留各自时间，并在 ASS 中分配不同垂直行。
 
 结果位于 `work/<URL哈希>/translated.mp4`，译文位于
 `work/<URL哈希>/translated.zh-CN.srt`，投稿标题、简介和最终标签位于

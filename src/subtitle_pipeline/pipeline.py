@@ -9,9 +9,10 @@ from importlib import resources
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .asr import transcribe_with_qwen
+from .asr import read_cue_sidecar, transcribe_with_qwen
 from .config import AppConfig, llm_api_key
 from .media import download_youtube, render_subtitles, subtitle_layout
+from .speakers import load_character_styles
 from .subtitles import (
     Cue,
     clean_non_speech_markers,
@@ -51,10 +52,15 @@ def run_pipeline(
 
     downloaded = download_youtube(url, job_dir, config.download)
     source_subtitle = transcribe_with_qwen(
-        downloaded.video, job_dir / "source.qwen3-asr.srt", config.asr
+        downloaded.video,
+        job_dir / "source.qwen3-asr.srt",
+        config.asr,
+        config.audio_analysis,
+        downloaded.metadata,
     )
 
-    cues = read_subtitles(source_subtitle)
+    sidecar = source_subtitle.with_suffix(".cues.json")
+    cues = read_cue_sidecar(sidecar) if sidecar.is_file() else read_subtitles(source_subtitle)
     original_cue_count = len(cues)
     cues = clean_non_speech_markers(cues)
     logging.info(
@@ -158,6 +164,10 @@ def run_pipeline(
         translated_path,
         rendered_path,
         config.render,
+        cues=translated,
+        character_styles=load_character_styles(
+            config.audio_analysis.character_styles_file
+        ),
     )
 
     should_upload = config.upload.enabled if upload_override is None else upload_override
@@ -339,13 +349,19 @@ def _translation_context(
             assert isinstance(character, dict)
             character_id = character["id"]
             assert isinstance(character_id, str)
-            characters_by_id[character_id] = character
+            characters_by_id[character_id] = _translation_character(character)
     return {
         "video": identity,
         "franchises": franchises,
         "characters": list(characters_by_id.values()),
         "terms": terms,
     }
+
+
+def _translation_character(character: dict[str, object]) -> dict[str, object]:
+    """Keep rendering/training metadata out of the LLM reference payload."""
+    allowed = ("id", "canonical", "source_name", "aliases", "short_names")
+    return {key: character[key] for key in allowed if key in character}
 
 
 def _validate_translation_glossary(

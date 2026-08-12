@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .commands import require_command, run
 from .config import DownloadConfig, RenderConfig
+from .speakers import CharacterStyle
 from .subtitles import Cue, read_subtitles, text_display_width
 
 
@@ -45,6 +46,8 @@ class RenderCue:
     start: float
     end: float
     text: str
+    speaker: str | None = None
+    kind: str = "speech"
 
 
 def download_youtube(url: str, directory: Path, config: DownloadConfig) -> DownloadResult:
@@ -117,6 +120,8 @@ def render_subtitles(
     config: RenderConfig,
     *,
     semantic_segments: dict[int, list[str]] | None = None,
+    cues: list[Cue] | None = None,
+    character_styles: dict[str, CharacterStyle] | None = None,
 ) -> Path:
     ffmpeg = require_command("ffmpeg")
     layout = subtitle_layout(video, config)
@@ -128,7 +133,7 @@ def render_subtitles(
     if local_subtitle.parent != local_destination.parent:
         raise ValueError("subtitle and rendered video must share a work directory")
 
-    source_cues = read_subtitles(local_subtitle)
+    source_cues = cues if cues is not None else read_subtitles(local_subtitle)
     render_cues = _layout_subtitle_cues(
         source_cues,
         max_line_units=layout.max_line_units,
@@ -145,6 +150,7 @@ def render_subtitles(
         font_size=layout.font_size,
         margin_vertical=layout.margin_vertical,
         outline=layout.outline,
+        character_styles=character_styles,
     )
     logging.info(
         "adaptive subtitle style: %dx%d font=%d prompt_margin=%d "
@@ -317,7 +323,7 @@ def _layout_subtitle_cues(
                 end = cue.end
             else:
                 end = elapsed + (cue.end - cue.start) * units / total_width
-            rendered.append(RenderCue(elapsed, end, segment))
+            rendered.append(RenderCue(elapsed, end, segment, cue.speaker, cue.kind))
             elapsed = end
     return rendered
 
@@ -374,6 +380,7 @@ def _write_ass(
     font_size: int,
     margin_vertical: int,
     outline: int,
+    character_styles: dict[str, CharacterStyle] | None = None,
 ) -> None:
     safe_font_name = font_name.replace(",", "")
     style_format = (
@@ -382,12 +389,21 @@ def _write_ass(
         "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
         "MarginL, MarginR, MarginV, Encoding"
     )
-    style = (
+    default_style = (
         f"Style: Default,{safe_font_name},{font_size},&H00FFFFFF,&H000000FF,"
         "&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,"
         f"{outline},0,2,1,1,"
         f"{margin_vertical},1"
     )
+    styles = [default_style]
+    for character_id, character in sorted((character_styles or {}).items()):
+        styles.append(
+            f"Style: {_ass_style_name(character_id)},{safe_font_name},{font_size},"
+            f"{_ass_color(character.primary_color)},&H000000FF,"
+            f"{_ass_color(character.outline_color)},&H00000000,0,0,0,0,"
+            f"100,100,0,0,1,{outline},0,2,1,1,{margin_vertical},1"
+        )
+    styles_text = "\n".join(styles)
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -398,20 +414,45 @@ def _write_ass(
         "YCbCr Matrix: TV.709\n\n"
         "[V4+ Styles]\n"
         f"{style_format}\n"
-        f"{style}\n\n"
+        f"{styles_text}\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
         "Effect, Text\n"
     )
-    events = [
-        "Dialogue: 0,"
-        f"{_ass_timestamp(cue.start)},{_ass_timestamp(cue.end)},"
-        "Default,,0,0,0,,"
-        f"{_escape_ass_text(cue.text)}"
-        for cue in cues
-        if cue.text.strip() and cue.end > cue.start
-    ]
+    events = []
+    active: list[tuple[float, int]] = []
+    for cue in sorted(cues, key=lambda item: (item.start, item.end)):
+        if not cue.text.strip() or cue.end <= cue.start:
+            continue
+        active = [(end, lane) for end, lane in active if end > cue.start]
+        occupied = {lane for _end, lane in active}
+        lane = next(index for index in range(len(occupied) + 1) if index not in occupied)
+        active.append((cue.end, lane))
+        speaker = getattr(cue, "speaker", None)
+        style_name = (
+            _ass_style_name(speaker)
+            if speaker is not None and speaker in (character_styles or {})
+            else "Default"
+        )
+        event_margin = 0 if lane == 0 else margin_vertical + lane * round(font_size * 1.25)
+        events.append(
+            "Dialogue: 0,"
+            f"{_ass_timestamp(cue.start)},{_ass_timestamp(cue.end)},"
+            f"{style_name},{speaker or ''},0,0,{event_margin},,"
+            f"{_escape_ass_text(cue.text)}"
+        )
     path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
+
+
+def _ass_color(value: str) -> str:
+    red = value[1:3]
+    green = value[3:5]
+    blue = value[5:7]
+    return f"&H00{blue}{green}{red}"
+
+
+def _ass_style_name(value: str) -> str:
+    return "Speaker_" + re.sub(r"[^A-Za-z0-9_]", "_", value)
 
 
 def _ass_timestamp(value: float) -> str:

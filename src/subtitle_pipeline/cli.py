@@ -4,6 +4,7 @@ import argparse
 import logging
 import shutil
 import sys
+import warnings
 from pathlib import Path
 
 from .config import AppConfig, ConfigError, load_config
@@ -81,6 +82,15 @@ def _check(config: AppConfig) -> int:
             else:
                 missing.append("CUDA")
                 logging.error("Qwen3-ASR is configured for CUDA, but CUDA is unavailable")
+        if config.audio_analysis.enabled:
+            import demucs  # noqa: F401
+            import transformers  # noqa: F401
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", module=r"pyannote\.audio\.core\.io"
+                )
+                import pyannote.audio  # noqa: F401
+            logging.info("found diarization, singing, and separation runtimes")
     except ImportError:
         missing.append("qwen-asr")
         logging.error("missing Qwen3-ASR runtime; run `uv sync --extra asr`")

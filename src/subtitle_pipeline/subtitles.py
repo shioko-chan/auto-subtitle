@@ -11,6 +11,8 @@ class Cue:
     start: float
     end: float
     text: str
+    speaker: str | None = None
+    kind: str = "speech"
 
 
 _TIMING_RE = re.compile(
@@ -152,6 +154,8 @@ def merge_cues_at_boundaries(
                 current.start,
                 following.end,
                 _join_fragments(current.text, following.text),
+                current.speaker if current.speaker == following.speaker else None,
+                current.kind if current.kind == following.kind else "mixed",
             )
     merged.append(current)
     return merged
@@ -167,11 +171,26 @@ def trim_overlapping_cues(cues: list[Cue]) -> list[Cue]:
         return cues.copy()
 
     trimmed: list[Cue] = []
-    for current, following in zip(cues, cues[1:]):
-        if following.start < current.start:
+    for index, current in enumerate(cues):
+        if index and current.start < cues[index - 1].start:
             raise ValueError("subtitle cues must be ordered by start time")
-        trimmed.append(replace(current, end=min(current.end, following.start)))
-    trimmed.append(cues[-1])
+        following = next(
+            (
+                candidate
+                for candidate in cues[index + 1 :]
+                if not (
+                    current.speaker is not None
+                    and candidate.speaker is not None
+                    and current.speaker != candidate.speaker
+                )
+            ),
+            None,
+        )
+        trimmed.append(
+            current
+            if following is None
+            else replace(current, end=min(current.end, following.start))
+        )
     return trimmed
 
 

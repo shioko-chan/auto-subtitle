@@ -102,6 +102,36 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(context["characters"][-1]["id"], "example")
         self.assertEqual(context["terms"], {})
 
+    def test_translation_context_strips_character_rendering_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "characters.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "name": "Characters",
+                        "background": "Character glossary",
+                        "match": ["styled-video"],
+                        "characters": [
+                            {
+                                "id": "example",
+                                "canonical": "例子",
+                                "source_name": "れいこ",
+                                "aliases": [],
+                                "subtitle_style": {"primary_color": "#FFFFFF"},
+                                "voice_profile": "private.bin",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            context = _translation_context({"title": "styled-video"}, [str(path)])
+
+        character = context["characters"][-1]
+        self.assertNotIn("subtitle_style", character)
+        self.assertNotIn("voice_profile", character)
+
     def test_custom_character_overrides_builtin_character_by_id(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "override.json"

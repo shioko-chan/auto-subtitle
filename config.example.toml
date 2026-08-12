@@ -17,8 +17,32 @@ language = "Japanese"
 # 每块连同两侧上下文必须不超过 forced aligner 的 180 秒限制。
 chunk_seconds = 170.0
 chunk_context_seconds = 2.0
+# Repeated ASR generation is detected automatically. Affected chunks are
+# recursively halved down to about 20 seconds instead of being cached.
 max_inference_batch_size = 1
 max_new_tokens = 2048
+
+[audio_analysis]
+# Run VAD/diarization and singing detection before Qwen ASR. Gated pyannote
+# models require an authenticated Hugging Face account with accepted terms.
+enabled = true
+diarization_model = "pyannote/speaker-diarization-community-1"
+speaker_embedding_model = "pyannote/wespeaker-voxceleb-resnet34-LM"
+overlap_separation_model = "pyannote/separation-ami-1.0"
+singing_model = "MIT/ast-finetuned-audioset-10-10-0.4593"
+device = "cuda:0"
+singing_window_seconds = 5.0
+singing_stride_seconds = 2.5
+singing_threshold = 0.05
+singing_merge_gap_seconds = 1.5
+singing_phrase_silence_seconds = 0.45
+singing_min_phrase_seconds = 0.8
+singing_asr_window_seconds = 12.0
+singing_asr_overlap_seconds = 2.0
+speaker_profiles_dir = "work/speaker-profiles"
+speaker_match_threshold = 0.32
+# Rendering/training metadata is separate from the LLM glossary.
+# character_styles_file = "character-styles.json"
 
 [segmentation]
 # Each request initially adds this many forced-aligner units. The final cue is

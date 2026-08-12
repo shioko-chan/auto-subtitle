@@ -64,8 +64,11 @@ class TranslationTests(unittest.TestCase):
             [Cue(0, 1.0, "梦想就是力量"), Cue(1.0, 1.8, "Power")],
         )
         prompt = request.call_args.args[0]["messages"][1]["content"]
-        self.assertIn("Unit columns: [id,duration_ms,gap_after_ms,text]", prompt)
-        self.assertIn('[[0,400,300,"夢"]', prompt)
+        self.assertIn(
+            "Unit columns: [id,duration_ms,gap_after_ms,speaker,kind,text]",
+            prompt,
+        )
+        self.assertIn('[[0,400,300,null,"speech","夢"]', prompt)
         self.assertNotIn("Required individual IDs", prompt)
         self.assertNotIn("valid end_id values", prompt)
         self.assertLess(prompt.index("REFERENCE:"), prompt.index("Required ID range:"))

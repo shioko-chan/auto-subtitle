@@ -21,7 +21,7 @@
         cuda.cuda_cudart
         cuda.libcublas
         cuda.libcusparse
-        cuda.cudnn
+        pkgs.ffmpeg
         pkgs.stdenv.cc.cc.lib
         pkgs.zlib
       ];

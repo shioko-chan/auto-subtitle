@@ -12,7 +12,7 @@ import urllib.request
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import certifi
 
@@ -1631,6 +1631,8 @@ def _joint_translation_prompt(
                 index,
                 max(0, round((cues[index].end - cues[index].start) * 1000)),
                 gap_after_ms,
+                cues[index].speaker,
+                cues[index].kind,
                 " ".join(cues[index].text.split()),
             ]
         )
@@ -1640,6 +1642,12 @@ def _joint_translation_prompt(
             "end_id": record.end_id,
             "source": _source_text_for_range(cues, record.start_id, record.end_id),
             "translation": record.text,
+            "speaker": _uniform_attribute(
+                cues, record.start_id, record.end_id, "speaker", None
+            ),
+            "kind": _uniform_attribute(
+                cues, record.start_id, record.end_id, "kind", "mixed"
+            ),
         }
         for record in (confirmed[-context_cues:] if context_cues else [])
     ]
@@ -1692,7 +1700,10 @@ def _joint_translation_prompt(
         "Collapsed start-time runs: "
         f"{collapsed_runs}. If a cue starts inside one of these inclusive ID runs, it must "
         "include through the run's final ID so it has positive display duration.\n"
-        "Unit columns: [id,duration_ms,gap_after_ms,text]\n"
+        "Speaker labels and speech/singing kind are reliable context. Prefer a cue boundary "
+        "when the speaker changes, and never combine simultaneous speakers into one cue. "
+        "Translate lyrics naturally when kind is singing.\n"
+        "Unit columns: [id,duration_ms,gap_after_ms,speaker,kind,text]\n"
         f"ADJACENT_CUES: {json.dumps(adjacent, ensure_ascii=False, separators=(',', ':'))}\n"
         f"TARGET:\n{json.dumps(units, ensure_ascii=False, separators=(',', ':'))}"
         f"{retry}"
@@ -1770,11 +1781,21 @@ def _joint_records_to_cues(
             cues[record.start_id].start,
             cues[record.end_id].end,
             _source_text_for_range(cues, record.start_id, record.end_id),
+            _uniform_attribute(
+                cues, record.start_id, record.end_id, "speaker", None
+            ),
+            _uniform_attribute(cues, record.start_id, record.end_id, "kind", "mixed"),
         )
         for record in records
     ]
     translated = [
-        Cue(source_cue.start, source_cue.end, record.text)
+        Cue(
+            source_cue.start,
+            source_cue.end,
+            record.text,
+            source_cue.speaker,
+            source_cue.kind,
+        )
         for source_cue, record in zip(source, records)
     ]
     return CueTranslationResult(source, translated)
@@ -1841,6 +1862,8 @@ def _joint_translation_signature(
                 "start_ms": round(cue.start * 1000),
                 "end_ms": round(cue.end * 1000),
                 "text": cue.text,
+                "speaker": cue.speaker,
+                "kind": cue.kind,
             }
             for cue in cues
         ],
@@ -1850,6 +1873,13 @@ def _joint_translation_signature(
             "utf-8"
         )
     ).hexdigest()
+
+
+def _uniform_attribute(
+    cues: list[Cue], start_id: int, end_id: int, name: str, mixed: Any
+) -> Any:
+    values = {getattr(cue, name) for cue in cues[start_id : end_id + 1]}
+    return next(iter(values)) if len(values) == 1 else mixed
 
 
 def _load_joint_translation_cache(

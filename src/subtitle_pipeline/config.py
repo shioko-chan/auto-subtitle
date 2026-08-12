@@ -35,6 +35,27 @@ class ASRConfig:
 
 
 @dataclass(frozen=True)
+class AudioAnalysisConfig:
+    enabled: bool = True
+    diarization_model: str = "pyannote/speaker-diarization-community-1"
+    speaker_embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
+    overlap_separation_model: str = "pyannote/separation-ami-1.0"
+    singing_model: str = "MIT/ast-finetuned-audioset-10-10-0.4593"
+    device: str = "cuda:0"
+    singing_window_seconds: float = 5.0
+    singing_stride_seconds: float = 2.5
+    singing_threshold: float = 0.05
+    singing_merge_gap_seconds: float = 1.5
+    singing_phrase_silence_seconds: float = 0.45
+    singing_min_phrase_seconds: float = 0.8
+    singing_asr_window_seconds: float = 12.0
+    singing_asr_overlap_seconds: float = 2.0
+    speaker_profiles_dir: str = "work/speaker-profiles"
+    speaker_match_threshold: float = 0.32
+    character_styles_file: str | None = None
+
+
+@dataclass(frozen=True)
 class SegmentationConfig:
     model_window_cues: int = 600
 
@@ -97,6 +118,7 @@ class AppConfig:
     work_dir: Path = Path("work")
     download: DownloadConfig = field(default_factory=DownloadConfig)
     asr: ASRConfig = field(default_factory=ASRConfig)
+    audio_analysis: AudioAnalysisConfig = field(default_factory=AudioAnalysisConfig)
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
@@ -124,6 +146,7 @@ def load_config(path: Path) -> AppConfig:
             work_dir=Path(data.get("work_dir", "work")),
             download=DownloadConfig(**_section(data, "download")),
             asr=ASRConfig(**_section(data, "asr")),
+            audio_analysis=AudioAnalysisConfig(**_section(data, "audio_analysis")),
             segmentation=SegmentationConfig(**_section(data, "segmentation")),
             llm=LLMConfig(**_section(data, "llm")),
             render=RenderConfig(**_section(data, "render")),
@@ -170,6 +193,35 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("asr.max_inference_batch_size must be at least 1")
     if config.asr.max_new_tokens < 1:
         raise ConfigError("asr.max_new_tokens must be at least 1")
+    analysis = config.audio_analysis
+    if analysis.singing_window_seconds <= 0:
+        raise ConfigError("audio_analysis.singing_window_seconds must be positive")
+    if not 0 < analysis.singing_stride_seconds <= analysis.singing_window_seconds:
+        raise ConfigError(
+            "audio_analysis.singing_stride_seconds must be positive and no larger "
+            "than singing_window_seconds"
+        )
+    if not 0 <= analysis.singing_threshold <= 1:
+        raise ConfigError("audio_analysis.singing_threshold must be between 0 and 1")
+    if analysis.singing_merge_gap_seconds < 0:
+        raise ConfigError("audio_analysis.singing_merge_gap_seconds cannot be negative")
+    if analysis.singing_phrase_silence_seconds <= 0:
+        raise ConfigError(
+            "audio_analysis.singing_phrase_silence_seconds must be positive"
+        )
+    if analysis.singing_min_phrase_seconds <= 0:
+        raise ConfigError("audio_analysis.singing_min_phrase_seconds must be positive")
+    if analysis.singing_asr_window_seconds <= 0:
+        raise ConfigError("audio_analysis.singing_asr_window_seconds must be positive")
+    if not 0 <= analysis.singing_asr_overlap_seconds < analysis.singing_asr_window_seconds:
+        raise ConfigError(
+            "audio_analysis.singing_asr_overlap_seconds must be non-negative and "
+            "smaller than singing_asr_window_seconds"
+        )
+    if not 0 <= analysis.speaker_match_threshold <= 2:
+        raise ConfigError(
+            "audio_analysis.speaker_match_threshold must be between 0 and 2"
+        )
     if config.segmentation.model_window_cues < 1:
         raise ConfigError("segmentation.model_window_cues must be at least 1")
     if config.render.font_size_ratio <= 0:

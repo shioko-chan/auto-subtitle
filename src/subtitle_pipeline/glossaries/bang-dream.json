@@ -68,6 +68,16 @@
           "source": "ののか",
           "target": "野乃花",
           "context_only": true
+        },
+        {
+          "source": "のの",
+          "target": "野乃",
+          "context_only": true
+        },
+        {
+          "source": "ののちゃん",
+          "target": "野乃酱",
+          "context_only": true
         }
       ]
     },

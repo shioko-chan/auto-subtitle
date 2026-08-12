@@ -14,7 +14,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-asr = ["qwen-asr>=0.0.6,<0.1"]
+asr = [
+    "demucs>=4,<5",
+    "librosa>=0.11,<1",
+    "pyannote-audio[separation]>=4,<5",
+    "qwen-asr>=0.0.6,<0.1",
+    "speechbrain>=1,<2",
+]
 
 [project.scripts]
 subtitle-pipeline = "subtitle_pipeline.cli:main"

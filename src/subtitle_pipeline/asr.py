@@ -3,22 +3,37 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import subprocess
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from .audio_analysis import AudioAnalysis, AudioRegion, analyze_audio
 from .commands import require_command, run
-from .config import ASRConfig
-from .subtitles import Cue, write_srt
-
+from .config import ASRConfig, AudioAnalysisConfig
+from .subtitles import Cue, merge_cues_at_boundaries, write_srt
 
 _CACHE_VERSION = 1
+_MIN_RETRY_CHUNK_SECONDS = 20.0
+_MIN_REPETITION_SPAN_CHARACTERS = 160
+_REPETITION_RE = re.compile(r"(.{12,200}?)\1{3,}", re.DOTALL)
 
 
 def transcribe_with_qwen(
-    video: Path, destination: Path, config: ASRConfig
+    video: Path,
+    destination: Path,
+    config: ASRConfig,
+    analysis_config: AudioAnalysisConfig | None = None,
+    metadata: dict[str, object] | None = None,
 ) -> Path:
+    if analysis_config is not None and analysis_config.enabled:
+        analysis = analyze_audio(
+            video, destination.parent, analysis_config, metadata=metadata
+        )
+        return _transcribe_analyzed(
+            video, destination, config, analysis_config, analysis
+        )
     duration = _media_duration(video)
     chunk_count = max(1, math.ceil(duration / config.chunk_seconds))
     cache_path = destination.parent / "asr-cache.json"
@@ -33,6 +48,15 @@ def transcribe_with_qwen(
         if not _valid_cached_record(cached_chunks.get(str(index)))
     ]
     for index in missing:
+        record = cached_chunks.get(str(index))
+        if isinstance(record, dict) and _repetition_hallucination(
+            str(record.get("text") or "")
+        ):
+            logging.warning(
+                "discarding Qwen3-ASR chunk %d/%d with repeated-loop text",
+                index + 1,
+                chunk_count,
+            )
         cached_chunks.pop(str(index), None)
     model = None
     if missing:
@@ -50,9 +74,6 @@ def transcribe_with_qwen(
     for index in missing:
         core_start = index * config.chunk_seconds
         core_end = min(duration, core_start + config.chunk_seconds)
-        extract_start = max(0.0, core_start - config.chunk_context_seconds)
-        extract_end = min(duration, core_end + config.chunk_context_seconds)
-        chunk_path = chunk_dir / f"chunk-{index:05d}.wav"
         logging.info(
             "Qwen3-ASR chunk %d/%d: %.1f-%.1fs",
             index + 1,
@@ -60,48 +81,26 @@ def transcribe_with_qwen(
             core_start,
             core_end,
         )
-        try:
-            _extract_audio_chunk(
-                video,
-                chunk_path,
-                start=extract_start,
-                duration=extract_end - extract_start,
-            )
-            assert model is not None
-            results = model.transcribe(
-                audio=str(chunk_path),
-                context=config.context,
-                language=config.language,
-                return_time_stamps=True,
-            )
-            if len(results) != 1:
-                raise RuntimeError(
-                    f"Qwen3-ASR returned {len(results)} results for one audio chunk"
-                )
-            result = results[0]
-            cues = _result_to_cues(
-                result,
-                offset=extract_start,
-                keep_start=core_start,
-                keep_end=core_end,
-                final_chunk=index == chunk_count - 1,
-            )
-            cached_chunks[str(index)] = {
-                "core_start": core_start,
-                "core_end": core_end,
-                "language": str(getattr(result, "language", "")),
-                "text": str(getattr(result, "text", "")),
-                "cues": [asdict(cue) for cue in cues],
-            }
-            _write_cache(cache_path, cache)
-            logging.info(
-                "cached Qwen3-ASR chunk %d/%d: %d aligned units",
-                index + 1,
-                chunk_count,
-                len(cues),
-            )
-        finally:
-            chunk_path.unlink(missing_ok=True)
+        assert model is not None
+        record = _transcribe_range(
+            model,
+            video,
+            chunk_dir,
+            config,
+            core_start=core_start,
+            core_end=core_end,
+            media_duration=duration,
+            final_chunk=index == chunk_count - 1,
+            label=f"{index:05d}",
+        )
+        cached_chunks[str(index)] = record
+        _write_cache(cache_path, cache)
+        logging.info(
+            "cached Qwen3-ASR chunk %d/%d: %d aligned units",
+            index + 1,
+            chunk_count,
+            len(record["cues"]),
+        )
 
     all_cues: list[Cue] = []
     for index in range(chunk_count):
@@ -114,6 +113,402 @@ def transcribe_with_qwen(
     write_srt(all_cues, destination)
     logging.info("Qwen3-ASR wrote %d aligned units: %s", len(all_cues), destination)
     return destination
+
+
+def _transcribe_analyzed(
+    video: Path,
+    destination: Path,
+    config: ASRConfig,
+    analysis_config: AudioAnalysisConfig,
+    analysis: AudioAnalysis,
+) -> Path:
+    regions = _analysis_regions(analysis)
+    if not regions:
+        raise RuntimeError("audio analysis found no speech or singing regions")
+    duration = _media_duration(video)
+    cache_path = destination.parent / "asr-analysis-cache.json"
+    signature = {
+        **_cache_signature(video, duration, config),
+        "analysis_version": 3,
+        "analysis_config": asdict(analysis_config),
+        "regions": [asdict(region) for region in regions],
+    }
+    cache = _load_cache(cache_path, signature)
+    cached = cache["chunks"]
+    assert isinstance(cached, dict)
+    missing = [
+        index
+        for index in range(len(regions))
+        if not _valid_cached_record(cached.get(str(index)))
+    ]
+    model = _load_qwen_model(config) if missing else None
+    chunk_dir = destination.parent / "asr-analysis-chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    for index in missing:
+        region = regions[index]
+        assert model is not None
+        if region.kind == "singing":
+            record = _transcribe_song_range(
+                model,
+                Path(region.source_path) if region.source_path else video,
+                chunk_dir,
+                config,
+                region,
+                label=f"{index:05d}",
+                window_seconds=analysis_config.singing_asr_window_seconds,
+                overlap_seconds=analysis_config.singing_asr_overlap_seconds,
+            )
+        else:
+            source_offset = region.source_offset if region.source_path else 0.0
+            record = _transcribe_range(
+                model,
+                Path(region.source_path) if region.source_path else video,
+                chunk_dir,
+                config,
+                core_start=region.start - source_offset,
+                core_end=region.end - source_offset,
+                media_duration=(
+                    _media_duration(Path(region.source_path))
+                    if region.source_path
+                    else duration
+                ),
+                final_chunk=True,
+                label=f"{index:05d}",
+            )
+            if source_offset:
+                for cue in record["cues"]:
+                    cue["start"] = round(float(cue["start"]) + source_offset, 3)
+                    cue["end"] = round(float(cue["end"]) + source_offset, 3)
+                record["core_start"] = region.start
+                record["core_end"] = region.end
+            for cue in record["cues"]:
+                cue["speaker"] = region.speaker
+                cue["kind"] = "speech"
+            if region.overlap and record["cues"]:
+                decoded = _decode_cached_cues(record["cues"], index)
+                utterance = merge_cues_at_boundaries(decoded, set())[0]
+                record["cues"] = [
+                    asdict(
+                        Cue(
+                            utterance.start,
+                            utterance.end,
+                            utterance.text,
+                            region.speaker,
+                            "speech",
+                        )
+                    )
+                ]
+                record["overlap_utterance"] = True
+        cached[str(index)] = record
+        _write_cache(cache_path, cache)
+        logging.info(
+            "cached analyzed ASR region %d/%d kind=%s speaker=%s cues=%d",
+            index + 1,
+            len(regions),
+            region.kind,
+            region.speaker or "unknown",
+            len(record["cues"]),
+        )
+
+    cues: list[Cue] = []
+    for index in range(len(regions)):
+        record = cached.get(str(index))
+        if not isinstance(record, dict) or not isinstance(record.get("cues"), list):
+            raise RuntimeError(f"analyzed ASR cache is missing region {index}")
+        cues.extend(_decode_cached_cues(record["cues"], index))
+    cues.sort(key=lambda cue: (cue.start, cue.end, cue.speaker or ""))
+    if not cues:
+        raise RuntimeError("analyzed Qwen3-ASR did not produce any speech")
+    write_srt(cues, destination)
+    _write_cue_sidecar(cues, destination.with_suffix(".cues.json"))
+    return destination
+
+
+def _analysis_regions(analysis: AudioAnalysis) -> list[AudioRegion]:
+    singing = sorted(analysis.singing, key=lambda region: region.start)
+    speech = [
+        fragment
+        for region in analysis.speech
+        for fragment in _subtract_singing_regions(region, singing)
+    ]
+    separated_tracks: dict[tuple[str | None, str, float], AudioRegion] = {}
+    ordinary_speech: list[AudioRegion] = []
+    for region in speech:
+        if region.overlap and region.source_path:
+            key = (region.speaker, region.source_path, region.source_offset)
+            previous = separated_tracks.get(key)
+            separated_tracks[key] = AudioRegion(
+                min(previous.start, region.start) if previous else region.start,
+                max(previous.end, region.end) if previous else region.end,
+                "speech",
+                region.speaker,
+                confidence=region.confidence,
+                overlap=True,
+                source_path=region.source_path,
+                source_offset=region.source_offset,
+            )
+        else:
+            ordinary_speech.append(region)
+
+    merged: list[AudioRegion] = []
+    for region in sorted(
+        [*ordinary_speech, *separated_tracks.values()],
+        key=lambda item: (item.start, item.end, item.speaker or ""),
+    ):
+        if (
+            merged
+            and merged[-1].kind == "speech"
+            and merged[-1].speaker == region.speaker
+            and merged[-1].overlap == region.overlap
+            and merged[-1].source_path == region.source_path
+            and region.start - merged[-1].end <= 0.5
+            and region.end - merged[-1].start <= 30.0
+        ):
+            previous = merged[-1]
+            merged[-1] = AudioRegion(
+                previous.start,
+                max(previous.end, region.end),
+                "speech",
+                previous.speaker,
+                confidence=previous.confidence,
+                overlap=previous.overlap,
+                source_path=previous.source_path,
+                source_offset=previous.source_offset,
+            )
+        else:
+            merged.append(region)
+    return sorted([*merged, *singing], key=lambda item: (item.start, item.end))
+
+
+def _subtract_singing_regions(
+    region: AudioRegion, singing: list[AudioRegion]
+) -> list[AudioRegion]:
+    fragments = [(region.start, region.end)]
+    for song in singing:
+        updated: list[tuple[float, float]] = []
+        for start, end in fragments:
+            if song.end <= start or song.start >= end:
+                updated.append((start, end))
+                continue
+            if start < song.start:
+                updated.append((start, song.start))
+            if song.end < end:
+                updated.append((song.end, end))
+        fragments = updated
+    return [
+        AudioRegion(
+            start,
+            end,
+            region.kind,
+            region.speaker,
+            region.confidence,
+            region.overlap,
+            region.source_path,
+            region.source_offset,
+        )
+        for start, end in fragments
+        if end - start >= 0.08
+    ]
+
+
+def _transcribe_song_range(
+    model: Any,
+    video: Path,
+    chunk_dir: Path,
+    config: ASRConfig,
+    region: AudioRegion,
+    *,
+    label: str,
+    window_seconds: float,
+    overlap_seconds: float,
+) -> dict[str, object]:
+    windows = _song_windows(region.start, region.end, window_seconds, overlap_seconds)
+    texts: list[str] = []
+    for window_index, (start, end) in enumerate(windows):
+        chunk_path = chunk_dir / f"song-{label}-{window_index}.wav"
+        try:
+            _extract_audio_chunk(video, chunk_path, start=start, duration=end - start)
+            results = model.transcribe(
+                audio=str(chunk_path),
+                context=config.context,
+                language=config.language,
+                return_time_stamps=False,
+            )
+        finally:
+            chunk_path.unlink(missing_ok=True)
+        if len(results) != 1:
+            raise RuntimeError(f"Qwen3-ASR returned {len(results)} song results")
+        text = str(getattr(results[0], "text", "")).strip()
+        if _repetition_hallucination(text):
+            raise RuntimeError(
+                f"Qwen3-ASR repetition loop in singing phrase {start:.3f}-{end:.3f}s"
+            )
+        texts.append(_remove_text_overlap(texts[-1] if texts else "", text))
+
+    cues: list[Cue] = []
+    for index, ((start, end), text) in enumerate(zip(windows, texts)):
+        if not text:
+            continue
+        owned_start = region.start if index == 0 else (windows[index - 1][1] + start) / 2
+        owned_end = region.end if index == len(windows) - 1 else (end + windows[index + 1][0]) / 2
+        cues.append(Cue(owned_start, owned_end, text, region.speaker, "singing"))
+    language = "Japanese"
+    return {
+        "core_start": region.start,
+        "core_end": region.end,
+        "language": language,
+        "text": "\n".join(texts).strip(),
+        "cues": [asdict(cue) for cue in cues],
+    }
+
+
+def _song_windows(
+    start: float, end: float, window_seconds: float, overlap_seconds: float
+) -> list[tuple[float, float]]:
+    if end - start <= window_seconds:
+        return [(start, end)]
+    step = window_seconds - overlap_seconds
+    windows: list[tuple[float, float]] = []
+    cursor = start
+    while cursor < end:
+        window_end = min(end, cursor + window_seconds)
+        windows.append((cursor, window_end))
+        if window_end >= end:
+            break
+        cursor += step
+    return windows
+
+
+def _remove_text_overlap(previous: str, current: str) -> str:
+    left = "".join(previous.split())
+    right = "".join(current.split())
+    maximum = min(len(left), len(right), 80)
+    for size in range(maximum, 2, -1):
+        if left[-size:] == right[:size]:
+            compact_count = 0
+            for position, character in enumerate(current):
+                if not character.isspace():
+                    compact_count += 1
+                if compact_count == size:
+                    return current[position + 1 :].lstrip()
+    return current
+
+
+def _transcribe_range(
+    model: Any,
+    video: Path,
+    chunk_dir: Path,
+    config: ASRConfig,
+    *,
+    core_start: float,
+    core_end: float,
+    media_duration: float,
+    final_chunk: bool,
+    label: str,
+) -> dict[str, object]:
+    extract_start = max(0.0, core_start - config.chunk_context_seconds)
+    extract_end = min(media_duration, core_end + config.chunk_context_seconds)
+    chunk_path = chunk_dir / f"chunk-{label}.wav"
+    try:
+        _extract_audio_chunk(
+            video,
+            chunk_path,
+            start=extract_start,
+            duration=extract_end - extract_start,
+        )
+        results = model.transcribe(
+            audio=str(chunk_path),
+            context=config.context,
+            language=config.language,
+            return_time_stamps=True,
+        )
+        if len(results) != 1:
+            raise RuntimeError(
+                f"Qwen3-ASR returned {len(results)} results for one audio chunk"
+            )
+        result = results[0]
+        text = str(getattr(result, "text", "")).strip()
+        repetition = _repetition_hallucination(text)
+        if repetition is not None:
+            pattern, repeats = repetition
+            duration = core_end - core_start
+            child_duration = duration / 2
+            logging.warning(
+                "Qwen3-ASR repetition loop in %.3f-%.3fs: pattern=%r repeats=%d; "
+                "retrying with shorter chunks",
+                core_start,
+                core_end,
+                pattern[:80],
+                repeats,
+            )
+            if child_duration < _MIN_RETRY_CHUNK_SECONDS:
+                raise RuntimeError(
+                    "Qwen3-ASR repetition loop remains at minimum retry chunk "
+                    f"{core_start:.3f}-{core_end:.3f}s"
+                )
+            midpoint = core_start + child_duration
+            left = _transcribe_range(
+                model,
+                video,
+                chunk_dir,
+                config,
+                core_start=core_start,
+                core_end=midpoint,
+                media_duration=media_duration,
+                final_chunk=False,
+                label=f"{label}-0",
+            )
+            right = _transcribe_range(
+                model,
+                video,
+                chunk_dir,
+                config,
+                core_start=midpoint,
+                core_end=core_end,
+                media_duration=media_duration,
+                final_chunk=final_chunk,
+                label=f"{label}-1",
+            )
+            return {
+                "core_start": core_start,
+                "core_end": core_end,
+                "language": right["language"] or left["language"],
+                "text": f'{left["text"]}\n{right["text"]}'.strip(),
+                "cues": [*left["cues"], *right["cues"]],
+                "recovered_from_repetition": True,
+            }
+
+        cues = _result_to_cues(
+            result,
+            offset=extract_start,
+            keep_start=core_start,
+            keep_end=core_end,
+            final_chunk=final_chunk,
+        )
+        return {
+            "core_start": core_start,
+            "core_end": core_end,
+            "language": str(getattr(result, "language", "")),
+            "text": text,
+            "cues": [asdict(cue) for cue in cues],
+        }
+    finally:
+        chunk_path.unlink(missing_ok=True)
+
+
+def _repetition_hallucination(text: str) -> tuple[str, int] | None:
+    normalized = "".join(text.split())
+    candidates = [
+        match
+        for match in _REPETITION_RE.finditer(normalized)
+        if match.end() - match.start() >= _MIN_REPETITION_SPAN_CHARACTERS
+    ]
+    if candidates:
+        match = max(candidates, key=lambda item: item.end() - item.start())
+        pattern = match.group(1)
+        repeats = (match.end() - match.start()) // len(pattern)
+        return pattern, repeats
+    return None
 
 
 def _load_qwen_model(config: ASRConfig) -> Any:
@@ -180,7 +575,16 @@ def _result_to_cues(
             midpoint < keep_end or (final_chunk and midpoint <= keep_end)
         )
         if in_owned_range and fragment.strip():
-            cues.append(Cue(start, max(start + 0.08, end), fragment.strip()))
+            owned_start = max(start, keep_start)
+            owned_end = min(end, keep_end)
+            if owned_end > owned_start:
+                cues.append(
+                    Cue(
+                        owned_start,
+                        min(keep_end, max(owned_start + 0.08, owned_end)),
+                        fragment.strip(),
+                    )
+                )
     return cues
 
 
@@ -311,6 +715,8 @@ def _decode_cached_cues(values: list[object], chunk_index: int) -> list[Cue]:
                     float(value["start"]),
                     float(value["end"]),
                     str(value["text"]),
+                    str(value["speaker"]) if value.get("speaker") else None,
+                    str(value.get("kind") or "speech"),
                 )
             )
     except (KeyError, TypeError, ValueError) as exc:
@@ -320,8 +726,31 @@ def _decode_cached_cues(values: list[object], chunk_index: int) -> list[Cue]:
     return cues
 
 
+def _write_cue_sidecar(cues: list[Cue], path: Path) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(
+            {"version": 1, "cues": [asdict(cue) for cue in cues]},
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def read_cue_sidecar(path: Path) -> list[Cue]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or not isinstance(value.get("cues"), list):
+        raise RuntimeError(f"invalid cue sidecar: {path}")
+    return _decode_cached_cues(value["cues"], 0)
+
+
 def _valid_cached_record(value: object) -> bool:
     if not isinstance(value, dict) or not isinstance(value.get("cues"), list):
+        return False
+    if _repetition_hallucination(str(value.get("text") or "")) is not None:
         return False
     try:
         for cue in value["cues"]:

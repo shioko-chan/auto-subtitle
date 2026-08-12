@@ -1,0 +1,37 @@
+{
+  "characters": [
+    {
+      "id": "nakamachi_arale",
+      "source_name": "仲町あられ",
+      "identity_aliases": ["仲町あられ", "Nakamachi Arale", "arale_yumemita"],
+      "subtitle_style": {"primary_color": "#FFE052", "outline_color": "#000000"}
+    },
+    {
+      "id": "miyanaga_nonoka",
+      "source_name": "宮永ののか",
+      "identity_aliases": ["宮永ののか", "Miyanaga Nonoka", "nonoka_yumemita"],
+      "subtitle_style": {"primary_color": "#FF9CC7", "outline_color": "#000000"}
+    },
+    {
+      "id": "minetsuki_ritsu",
+      "source_name": "峰月律",
+      "identity_aliases": ["峰月律", "Minetsuki Ritsu", "ritsu_yumemita"],
+      "subtitle_style": {"primary_color": "#65A9FF", "outline_color": "#000000"}
+    },
+    {
+      "id": "fuji_miyako",
+      "source_name": "藤都子",
+      "identity_aliases": ["藤都子", "Fuji Miyako", "miyako_yumemita"],
+      "subtitle_style": {"primary_color": "#BC91FF", "outline_color": "#000000"}
+    },
+    {
+      "id": "sengoku_yuno",
+      "source_name": "千石ユノ",
+      "identity_aliases": ["千石ユノ", "Sengoku Yuno", "yuno_yumemita"],
+      "subtitle_style": {"primary_color": "#FF6685", "outline_color": "#000000"}
+    }
+  ],
+  "sources": [
+    "https://bushiroad-creative.com/items/79369/"
+  ]
+}

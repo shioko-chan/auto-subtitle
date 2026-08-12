@@ -15,6 +15,7 @@ from subtitle_pipeline.media import (
     _write_ass,
     download_youtube,
 )
+from subtitle_pipeline.speakers import CharacterStyle
 from subtitle_pipeline.subtitles import Cue
 
 
@@ -169,6 +170,35 @@ class SubtitleRenderTests(unittest.TestCase):
         self.assertNotIn(r"\fs", content)
         self.assertIn("单行字幕", content)
         self.assertIn("Default,,0,0,0,,单行字幕", content)
+
+    def test_ass_uses_character_color_and_separate_overlap_lanes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "subtitle.ass"
+            styles = {
+                "fuji_miyako": CharacterStyle(
+                    "fuji_miyako", "藤都子", "#BC91FF", "#000000"
+                )
+            }
+            _write_ass(
+                [
+                    Cue(1, 4, "都子", "fuji_miyako"),
+                    Cue(2, 3, "默认", "unknown"),
+                ],
+                path,
+                width=1080,
+                height=1920,
+                font_name="Noto Sans CJK SC",
+                font_size=48,
+                margin_vertical=96,
+                outline=2,
+                character_styles=styles,
+            )
+            content = path.read_text(encoding="utf-8")
+
+        self.assertIn("Style: Speaker_fuji_miyako", content)
+        self.assertIn("&H00FF91BC", content)
+        self.assertIn("Speaker_fuji_miyako,fuji_miyako,0,0,0,,都子", content)
+        self.assertIn("Default,unknown,0,0,156,,默认", content)
 
     def test_video_dimensions_respect_rotation_metadata(self):
         response = subprocess.CompletedProcess(

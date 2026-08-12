@@ -33,6 +33,8 @@ class ConfigTests(unittest.TestCase):
             )
             self.assertEqual(config.asr.dtype, "float16")
             self.assertEqual(config.asr.language, "Japanese")
+            self.assertTrue(config.audio_analysis.enabled)
+            self.assertEqual(config.audio_analysis.singing_threshold, 0.05)
             self.assertEqual(config.segmentation.model_window_cues, 600)
             self.assertEqual(config.render.font_size_ratio, 0.066)
             self.assertEqual(config.render.portrait_font_size_ratio, 0.077)

@@ -130,6 +130,13 @@ class SubtitleTests(unittest.TestCase):
         cues = [Cue(0, 2, "first"), Cue(2, 4, "second")]
         self.assertEqual(trim_overlapping_cues(cues), cues)
 
+    def test_overlap_cleanup_preserves_different_simultaneous_speakers(self):
+        cues = [
+            Cue(0, 5, "甲", "nakamachi_arale"),
+            Cue(2, 4, "乙", "fuji_miyako"),
+        ]
+        self.assertEqual(trim_overlapping_cues(cues), cues)
+
 
 if __name__ == "__main__":
     unittest.main()
