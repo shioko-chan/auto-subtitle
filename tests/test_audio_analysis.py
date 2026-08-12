@@ -14,6 +14,7 @@ from subtitle_pipeline.audio_analysis import (
     _mark_overlaps,
     _merge_regions,
     _overlap_spans,
+    _separated_source_is_usable,
     _singing_evidence_score,
     _singing_regions_from_scores,
     _subtract_regions,
@@ -33,6 +34,19 @@ from subtitle_pipeline.speakers import (
 
 
 class AudioAnalysisTests(unittest.TestCase):
+    def test_rejects_silent_and_tiny_separated_speaker_sources(self):
+        segment = type("Segment", (), {"start": 0.1, "end": 0.4})()
+        self.assertFalse(
+            _separated_source_is_usable(np.zeros(8000), [segment], 16000)
+        )
+        tiny = type("Segment", (), {"start": 0.1, "end": 0.108})()
+        self.assertFalse(
+            _separated_source_is_usable(np.full(8000, 0.01), [tiny], 16000)
+        )
+        self.assertTrue(
+            _separated_source_is_usable(np.full(8000, 0.01), [segment], 16000)
+        )
+
     def test_audio_is_reextracted_when_analysis_cache_is_invalid(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

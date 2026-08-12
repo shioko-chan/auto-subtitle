@@ -9,7 +9,6 @@ from subtitle_pipeline.asr import (
     _record_timeline_is_healthy,
     _remove_text_overlap,
     _repetition_hallucination,
-    _restore_punctuation,
     _result_to_cues,
     _song_windows,
     _transcribe_ambiguous_range,
@@ -197,13 +196,32 @@ class QwenASRTests(unittest.TestCase):
     def test_does_not_flag_short_natural_repetition(self):
         self.assertIsNone(_repetition_hallucination("はいはいはいはい、大丈夫です"))
 
-    def test_restores_punctuation_between_japanese_aligner_tokens(self):
-        self.assertEqual(
-            _restore_punctuation(
-                "こんにちは、今日はライブです。",
-                ["こんにちは", "今日", "は", "ライブ", "です"],
+    def test_aligner_cues_do_not_restore_asr_punctuation(self):
+        result = SimpleNamespace(
+            text="こんにちは、今日はライブです。",
+            time_stamps=SimpleNamespace(
+                items=[
+                    SimpleNamespace(text="こんにちは", start_time=0, end_time=1),
+                    SimpleNamespace(text="今日", start_time=1, end_time=2),
+                    SimpleNamespace(text="は", start_time=2, end_time=3),
+                    SimpleNamespace(text="ライブ", start_time=3, end_time=4),
+                    SimpleNamespace(text="です", start_time=4, end_time=5),
+                ]
             ),
-            ["こんにちは、", "今日", "は", "ライブ", "です。"],
+        )
+
+        self.assertEqual(
+            [
+                cue.text
+                for cue in _result_to_cues(
+                    result,
+                    offset=0,
+                    keep_start=0,
+                    keep_end=5,
+                    final_chunk=True,
+                )
+            ],
+            ["こんにちは", "今日", "は", "ライブ", "です"],
         )
 
     def test_caches_each_completed_audio_chunk_and_reuses_it(self):
@@ -233,7 +251,8 @@ class QwenASRTests(unittest.TestCase):
 
             load_model.assert_called_once()
             self.assertTrue((root / "asr-cache.json").is_file())
-            self.assertEqual(destination.read_text(encoding="utf-8").count("一。"), 2)
+            self.assertEqual(destination.read_text(encoding="utf-8").count("一"), 2)
+            self.assertNotIn("一。", destination.read_text(encoding="utf-8"))
 
     def test_rejects_zero_duration_cached_cue(self):
         self.assertFalse(
@@ -299,8 +318,9 @@ class QwenASRTests(unittest.TestCase):
                 transcribe_with_qwen(video, destination, config)
 
             self.assertEqual(model.calls, 3)
-            self.assertIn("左。", destination.read_text(encoding="utf-8"))
-            self.assertIn("右。", destination.read_text(encoding="utf-8"))
+            self.assertIn("左", destination.read_text(encoding="utf-8"))
+            self.assertIn("右", destination.read_text(encoding="utf-8"))
+            self.assertNotIn("。", destination.read_text(encoding="utf-8"))
             cache = __import__("json").loads(
                 (root / "asr-cache.json").read_text(encoding="utf-8")
             )

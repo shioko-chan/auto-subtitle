@@ -14,7 +14,7 @@ from .commands import require_command, run
 from .config import ASRConfig, AudioAnalysisConfig
 from .subtitles import Cue, merge_cues_at_boundaries, write_srt
 
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 _MIN_RETRY_CHUNK_SECONDS = 20.0
 _MIN_REPETITION_SPAN_CHARACTERS = 160
 _REPETITION_RE = re.compile(r"(.{12,200}?)\1{3,}", re.DOTALL)
@@ -684,10 +684,10 @@ def _result_to_cues(
     items = list(getattr(alignment, "items", []) or [])
     if text and not items:
         raise RuntimeError("Qwen3 forced aligner returned no timestamps for non-empty text")
-    fragments = _restore_punctuation(text, [str(item.text) for item in items])
     cues: list[Cue] = []
     previous_start = -1.0
-    for item, fragment in zip(items, fragments):
+    for item in items:
+        fragment = str(item.text)
         start = round(float(item.start_time) + offset, 3)
         end = round(float(item.end_time) + offset, 3)
         if start < previous_start:
@@ -709,29 +709,6 @@ def _result_to_cues(
                     )
                 )
     return cues
-
-
-def _restore_punctuation(text: str, tokens: list[str]) -> list[str]:
-    if not tokens:
-        return []
-    spans: list[tuple[int, int]] = []
-    cursor = 0
-    for token in tokens:
-        start = text.find(token, cursor)
-        if start < 0:
-            logging.warning(
-                "could not map aligner tokens back to ASR punctuation; using bare tokens"
-            )
-            return tokens
-        spans.append((start, start + len(token)))
-        cursor = start + len(token)
-
-    fragments: list[str] = []
-    for index, (start, _end) in enumerate(spans):
-        fragment_start = 0 if index == 0 else start
-        fragment_end = spans[index + 1][0] if index + 1 < len(spans) else len(text)
-        fragments.append(text[fragment_start:fragment_end])
-    return fragments
 
 
 def _media_duration(video: Path) -> float:

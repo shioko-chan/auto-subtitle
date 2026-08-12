@@ -7,6 +7,7 @@ import math
 import re
 import ssl
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -36,7 +37,7 @@ class TranslationError(RuntimeError):
 _CACHE_VERSION = 1
 _PROMPT_VERSION = 3
 _JOINT_CACHE_VERSION = 1
-_JOINT_PROMPT_VERSION = 17
+_JOINT_PROMPT_VERSION = 18
 _JAPANESE_KANA_RE = re.compile(r"[\u3040-\u30ff]")
 
 
@@ -1642,14 +1643,16 @@ def _joint_translation_prompt(
                 gap_after_ms,
                 cues[index].speaker,
                 cues[index].kind,
-                " ".join(cues[index].text.split()),
+                _without_source_punctuation(cues[index].text),
             ]
         )
     adjacent = [
         {
             "start_id": record.start_id,
             "end_id": record.end_id,
-            "source": _source_text_for_range(cues, record.start_id, record.end_id),
+            "source": _without_source_punctuation(
+                _source_text_for_range(cues, record.start_id, record.end_id)
+            ),
             "translation": record.text,
             "speaker": _uniform_attribute(
                 cues, record.start_id, record.end_id, "speaker", None
@@ -1670,8 +1673,10 @@ def _joint_translation_prompt(
     return (
         f"Group every TARGET forced-aligner unit into natural subtitle cues and translate "
         f"each cue into {target_language} in the same operation. IDs and timing are evidence; "
-        "do not output or alter timestamps. Semantic completeness, reliable punctuation, word "
-        "gaps, and Chinese readability all inform boundaries. Prefer a clear pause as a boundary, "
+        "do not output or alter timestamps. ASR punctuation has been removed from TARGET because "
+        "it is not reliable; unit edges are alignment edges, not sentence boundaries. Semantic "
+        "completeness, word gaps, and Chinese readability all inform boundaries. Prefer a clear "
+        "pause as a boundary, "
         "but duration, character count, pauses, and window edges are never hard boundaries. "
         "Each cue must cover one or more adjacent units. Partition the entire required range "
         "exactly once, in order, with no gaps, overlaps, duplicates, or units outside the range. "
@@ -1716,6 +1721,16 @@ def _joint_translation_prompt(
         f"ADJACENT_CUES: {json.dumps(adjacent, ensure_ascii=False, separators=(',', ':'))}\n"
         f"TARGET:\n{json.dumps(units, ensure_ascii=False, separators=(',', ':'))}"
         f"{retry}"
+    )
+
+
+def _without_source_punctuation(text: str) -> str:
+    return " ".join(
+        "".join(
+            character
+            for character in text
+            if not unicodedata.category(character).startswith("P")
+        ).split()
     )
 
 

@@ -19,6 +19,7 @@ from subtitle_pipeline.translate import (
     _parse_json_object,
     _protected_source_boundaries,
     _remove_terminal_period,
+    _without_source_punctuation,
     _validate_joint_target_language,
     _validate_joint_timing,
     _validate_joint_records,
@@ -31,7 +32,7 @@ class TranslationTests(unittest.TestCase):
         translator = OpenAICompatibleTranslator(LLMConfig(thinking="disabled"), "secret")
         cues = [
             Cue(0, 0.4, "夢"),
-            Cue(0.7, 1.0, "パワー"),
+            Cue(0.7, 1.0, "パワー。"),
             Cue(1.0, 1.8, "次"),
         ]
         response = {
@@ -57,7 +58,7 @@ class TranslationTests(unittest.TestCase):
             )
         self.assertEqual(
             result.source_cues,
-            [Cue(0, 1.0, "夢パワー"), Cue(1.0, 1.8, "次")],
+            [Cue(0, 1.0, "夢パワー。"), Cue(1.0, 1.8, "次")],
         )
         self.assertEqual(
             result.translated_cues,
@@ -69,6 +70,9 @@ class TranslationTests(unittest.TestCase):
             prompt,
         )
         self.assertIn('[[0,400,300,null,"speech","夢"]', prompt)
+        self.assertIn('[1,300,0,null,"speech","パワー"]', prompt)
+        self.assertNotIn("パワー。", prompt)
+        self.assertIn("ASR punctuation has been removed", prompt)
         self.assertNotIn("Required individual IDs", prompt)
         self.assertNotIn("valid end_id values", prompt)
         self.assertLess(prompt.index("REFERENCE:"), prompt.index("Required ID range:"))
@@ -82,6 +86,12 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(request.call_args.args[0]["thinking"], {"type": "disabled"})
         self.assertEqual(
             request.call_args.args[0]["response_format"], {"type": "json_object"}
+        )
+
+    def test_joint_prompt_source_view_removes_unicode_punctuation(self):
+        self.assertEqual(
+            _without_source_punctuation('「使ってる。ね？」 BanG Dream!'),
+            "使ってるね BanG Dream",
         )
 
     def test_joint_parser_accepts_legacy_and_equivalent_record_containers(self):

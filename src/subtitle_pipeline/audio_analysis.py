@@ -13,7 +13,10 @@ from .config import AudioAnalysisConfig
 
 logger = logging.getLogger(__name__)
 
-_CACHE_VERSION = 5
+_CACHE_VERSION = 6
+_MIN_SEPARATED_SEGMENT_SECONDS = 0.08
+_MIN_SEPARATED_PEAK = 1e-4
+_MIN_SEPARATED_RMS = 1e-5
 _SINGING_LABELS = {
     "chant",
     "child singing",
@@ -522,10 +525,26 @@ def _run_overlap_separation(
             data = sources.data
             if data.ndim != 2 or data.shape[1] < len(labels):
                 raise RuntimeError("pyannote overlap separator returned malformed sources")
+            tracks = [
+                (segment, str(speaker))
+                for segment, _track, speaker in annotation.itertracks(
+                    yield_label=True
+                )
+                if float(segment.end) - float(segment.start)
+                >= _MIN_SEPARATED_SEGMENT_SECONDS
+            ]
             source_paths: dict[str, str] = {}
             for source_index, label in enumerate(labels):
+                label_segments = [
+                    segment for segment, speaker in tracks if speaker == str(label)
+                ]
+                source = data[:, source_index]
+                if not _separated_source_is_usable(
+                    source, label_segments, sample_rate
+                ):
+                    continue
                 path = output_dir / f"overlap-{span_index:05d}-{label}.wav"
-                sf.write(path, data[:, source_index], sample_rate)
+                sf.write(path, source, sample_rate)
                 source_paths[str(label)] = str(path.resolve())
             separated.extend(
                 AudioRegion(
@@ -537,8 +556,8 @@ def _run_overlap_separation(
                     source_path=source_paths.get(str(speaker)),
                     source_offset=span_start,
                 )
-                for segment, _track, speaker in annotation.itertracks(yield_label=True)
-                if float(segment.end) > float(segment.start)
+                for segment, speaker in tracks
+                if str(speaker) in source_paths
             )
         untouched = [
             fragment
@@ -549,6 +568,36 @@ def _run_overlap_separation(
     finally:
         del pipeline
         _release_cuda()
+
+
+def _separated_source_is_usable(
+    source: Any, segments: list[Any], sample_rate: int
+) -> bool:
+    segments = [
+        segment
+        for segment in segments
+        if float(segment.end) - float(segment.start)
+        >= _MIN_SEPARATED_SEGMENT_SECONDS
+    ]
+    if not segments:
+        return False
+    squared_sum = 0.0
+    sample_count = 0
+    peak = 0.0
+    for segment in segments:
+        start = max(0, round(float(segment.start) * sample_rate))
+        end = min(len(source), round(float(segment.end) * sample_rate))
+        if end <= start:
+            continue
+        chunk = source[start:end]
+        absolute = abs(chunk)
+        peak = max(peak, float(absolute.max()))
+        squared_sum += float((chunk * chunk).sum())
+        sample_count += len(chunk)
+    if sample_count == 0:
+        return False
+    rms = (squared_sum / sample_count) ** 0.5
+    return peak >= _MIN_SEPARATED_PEAK and rms >= _MIN_SEPARATED_RMS
 
 
 def _separate_vocals(source: Path, destination: Path, device: str) -> None:
