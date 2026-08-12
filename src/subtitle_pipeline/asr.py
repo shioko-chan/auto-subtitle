@@ -129,7 +129,7 @@ def _transcribe_analyzed(
     cache_path = destination.parent / "asr-analysis-cache.json"
     signature = {
         **_cache_signature(video, duration, config),
-        "analysis_version": 3,
+        "analysis_version": 4,
         "analysis_config": asdict(analysis_config),
         "regions": [asdict(region) for region in regions],
     }
@@ -155,6 +155,17 @@ def _transcribe_analyzed(
                 config,
                 region,
                 label=f"{index:05d}",
+                window_seconds=analysis_config.singing_asr_window_seconds,
+                overlap_seconds=analysis_config.singing_asr_overlap_seconds,
+            )
+        elif region.kind == "ambiguous":
+            record = _transcribe_ambiguous_range(
+                model,
+                video,
+                chunk_dir,
+                config,
+                region,
+                index=index,
                 window_seconds=analysis_config.singing_asr_window_seconds,
                 overlap_seconds=analysis_config.singing_asr_overlap_seconds,
             )
@@ -226,10 +237,12 @@ def _transcribe_analyzed(
 
 def _analysis_regions(analysis: AudioAnalysis) -> list[AudioRegion]:
     singing = sorted(analysis.singing, key=lambda region: region.start)
+    ambiguous = sorted(analysis.ambiguous, key=lambda region: region.start)
+    excluded = sorted([*singing, *ambiguous], key=lambda region: region.start)
     speech = [
         fragment
         for region in analysis.speech
-        for fragment in _subtract_singing_regions(region, singing)
+        for fragment in _subtract_singing_regions(region, excluded)
     ]
     separated_tracks: dict[tuple[str | None, str, float], AudioRegion] = {}
     ordinary_speech: list[AudioRegion] = []
@@ -277,7 +290,10 @@ def _analysis_regions(analysis: AudioAnalysis) -> list[AudioRegion]:
             )
         else:
             merged.append(region)
-    return sorted([*merged, *singing], key=lambda item: (item.start, item.end))
+    return sorted(
+        [*merged, *singing, *ambiguous],
+        key=lambda item: (item.start, item.end),
+    )
 
 
 def _subtract_singing_regions(
@@ -309,6 +325,113 @@ def _subtract_singing_regions(
         for start, end in fragments
         if end - start >= 0.08
     ]
+
+
+def _transcribe_ambiguous_range(
+    model: Any,
+    video: Path,
+    chunk_dir: Path,
+    config: ASRConfig,
+    region: AudioRegion,
+    *,
+    index: int,
+    window_seconds: float,
+    overlap_seconds: float,
+) -> dict[str, object]:
+    speech_record: dict[str, object] | None = None
+    song_record: dict[str, object] | None = None
+    speech_error: RuntimeError | None = None
+    song_error: RuntimeError | None = None
+    try:
+        speech_record = _transcribe_range(
+            model,
+            video,
+            chunk_dir,
+            config,
+            core_start=region.start,
+            core_end=region.end,
+            media_duration=_media_duration(video),
+            final_chunk=True,
+            label=f"ambiguous-speech-{index:05d}",
+        )
+        for cue in speech_record["cues"]:
+            cue["speaker"] = region.speaker
+            cue["kind"] = "speech"
+    except RuntimeError as exc:
+        speech_error = exc
+
+    try:
+        song_record = _transcribe_song_range(
+            model,
+            Path(region.source_path) if region.source_path else video,
+            chunk_dir,
+            config,
+            region,
+            label=f"ambiguous-song-{index:05d}",
+            window_seconds=window_seconds,
+            overlap_seconds=overlap_seconds,
+        )
+    except RuntimeError as exc:
+        song_error = exc
+
+    if speech_record is not None and _record_timeline_is_healthy(
+        speech_record, region
+    ):
+        speech_record["ambiguous_route"] = "speech"
+        logging.info(
+            "ambiguous %.3f-%.3fs selected forced-aligned speech",
+            region.start,
+            region.end,
+        )
+        return speech_record
+    if song_record is not None and _valid_cached_record(song_record):
+        song_record["ambiguous_route"] = "singing"
+        logging.warning(
+            "ambiguous %.3f-%.3fs selected sentence-level singing ASR",
+            region.start,
+            region.end,
+        )
+        return song_record
+    details = "; ".join(
+        str(error) for error in (speech_error, song_error) if error is not None
+    )
+    raise RuntimeError(
+        f"both ASR routes failed for ambiguous region {region.start:.3f}-"
+        f"{region.end:.3f}s{': ' + details if details else ''}"
+    )
+
+
+def _record_timeline_is_healthy(
+    record: dict[str, object], region: AudioRegion
+) -> bool:
+    if not _valid_cached_record(record):
+        return False
+    text = str(record.get("text") or "")
+    if _repetition_hallucination(text):
+        return False
+    values = record.get("cues")
+    if not isinstance(values, list) or not values:
+        return False
+    try:
+        starts = [float(cue["start"]) for cue in values]
+        ends = [float(cue["end"]) for cue in values]
+    except (KeyError, TypeError, ValueError):
+        return False
+    if any(end <= start for start, end in zip(starts, ends)):
+        return False
+    aligned_span = max(ends) - min(starts)
+    duration = max(region.end - region.start, 1e-6)
+    compact_length = len("".join(text.split()))
+    if compact_length >= 20 and aligned_span < min(1.0, duration * 0.25):
+        return False
+    rounded_starts = [round(start, 3) for start in starts]
+    if len(rounded_starts) >= 20:
+        most_common = max(
+            rounded_starts.count(start) for start in set(rounded_starts)
+        )
+        if most_common / len(rounded_starts) >= 0.8:
+            return False
+    return True
 
 
 def _transcribe_song_range(

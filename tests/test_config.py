@@ -20,7 +20,8 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.toml"
             path.write_text(
-                'work_dir = "jobs"\n[llm]\nmodel = "test-model"\n[upload]\nenabled = true\n',
+                'work_dir = "jobs"\n[llm]\nmodel = "test-model"\n'
+                "[upload]\nenabled = true\n",
                 encoding="utf-8",
             )
             config = load_config(path)
@@ -34,9 +35,37 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.asr.dtype, "float16")
             self.assertEqual(config.asr.language, "Japanese")
             self.assertTrue(config.audio_analysis.enabled)
+            self.assertEqual(
+                config.audio_analysis.speaker_embedding_backend, "eres2netv2"
+            )
+            self.assertEqual(
+                config.audio_analysis.speaker_embedding_model,
+                "iic/speech_eres2netv2_sv_zh-cn_16k-common",
+            )
+            self.assertEqual(
+                config.audio_analysis.speaker_enrollment_samples_per_video, 40
+            )
+            self.assertEqual(
+                config.audio_analysis.speaker_overlap_match_threshold, 0.24
+            )
+            self.assertEqual(config.audio_analysis.speaker_match_margin, 0.03)
+            self.assertEqual(config.audio_analysis.speaker_profile_max_centers, 5)
+            self.assertEqual(
+                config.audio_analysis.speaker_profile_min_samples_per_center, 20
+            )
             self.assertEqual(config.audio_analysis.singing_threshold, 0.05)
+            self.assertEqual(config.audio_analysis.singing_vocal_threshold, 0.5)
+            self.assertEqual(
+                config.audio_analysis.singing_speech_bgm_coverage, 0.35
+            )
+            self.assertEqual(
+                config.audio_analysis.singing_ambiguous_min_seconds, 15.0
+            )
             self.assertEqual(config.audio_analysis.singing_smoothing_windows, 3)
             self.assertEqual(config.audio_analysis.singing_release_seconds, 35.0)
+            self.assertEqual(
+                config.audio_analysis.singing_min_phrase_seconds, 30.0
+            )
             self.assertFalse(config.song_identification.enabled)
             self.assertEqual(config.song_identification.device, "gpu:0")
             self.assertEqual(config.segmentation.model_window_cues, 600)
@@ -77,6 +106,16 @@ class ConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ConfigError, "sample_interval_seconds"):
+                load_config(path)
+
+    def test_rejects_unknown_speaker_embedding_backend(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(
+                "[audio_analysis]\nspeaker_embedding_backend = \"mystery\"\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ConfigError, "speaker_embedding_backend"):
                 load_config(path)
 
     def test_rejects_asr_chunk_longer_than_aligner_limit(self):

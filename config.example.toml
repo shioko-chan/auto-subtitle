@@ -27,23 +27,39 @@ max_new_tokens = 2048
 # models require an authenticated Hugging Face account with accepted terms.
 enabled = true
 diarization_model = "pyannote/speaker-diarization-community-1"
-speaker_embedding_model = "pyannote/wespeaker-voxceleb-resnet34-LM"
+overlap_embedding_model = "pyannote/wespeaker-voxceleb-resnet34-LM"
+speaker_embedding_backend = "eres2netv2"
+speaker_embedding_model = "iic/speech_eres2netv2_sv_zh-cn_16k-common"
+speaker_embedding_worker_project = "tools/speaker_embedding"
 overlap_separation_model = "pyannote/separation-ami-1.0"
 singing_model = "MIT/ast-finetuned-audioset-10-10-0.4593"
 device = "cuda:0"
 singing_window_seconds = 5.0
 singing_stride_seconds = 2.5
 singing_threshold = 0.05
+# Raw AST only proposes candidates. Vocal-stem AST confirms actual singing;
+# speech-heavy candidates without vocal singing remain ordinary speech+BGM.
+singing_vocal_threshold = 0.5
+singing_speech_bgm_coverage = 0.35
+singing_ambiguous_min_seconds = 15.0
 # Smooth isolated AST misses/hits, then keep the song state through short gaps.
 singing_merge_gap_seconds = 1.5
 singing_smoothing_windows = 3
 singing_release_seconds = 35.0
 singing_phrase_silence_seconds = 0.45
-singing_min_phrase_seconds = 0.8
+# Confirmed songs and sentence-level singing ASR blocks must span at least this
+# long. Short vocal fragments are merged; short candidate episodes use dual ASR.
+singing_min_phrase_seconds = 30.0
 singing_asr_window_seconds = 12.0
 singing_asr_overlap_seconds = 2.0
-speaker_profiles_dir = "work/speaker-profiles"
+speaker_profiles_dir = "work/speaker-profiles-eres2netv2"
 speaker_match_threshold = 0.32
+speaker_overlap_match_threshold = 0.24
+speaker_match_margin = 0.03
+speaker_enrollment_samples_per_video = 40
+# Preserve distinct speaking conditions instead of averaging the whole profile.
+speaker_profile_max_centers = 5
+speaker_profile_min_samples_per_center = 20
 # Rendering/training metadata is separate from the LLM glossary.
 # character_styles_file = "character-styles.json"
 

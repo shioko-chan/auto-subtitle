@@ -3,17 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import math
 import warnings
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .commands import require_command, run
 from .config import AudioAnalysisConfig
 
+logger = logging.getLogger(__name__)
 
-_CACHE_VERSION = 3
+_CACHE_VERSION = 5
 _SINGING_LABELS = {
     "chant",
     "child singing",
@@ -24,6 +24,16 @@ _SINGING_LABELS = {
     "singing",
     "synthetic singing",
     "yodeling",
+}
+_SPEECH_LABELS = {
+    "child speech, kid speaking",
+    "conversation",
+    "female speech, woman speaking",
+    "hubbub, speech noise, speech babble",
+    "male speech, man speaking",
+    "narration, monologue",
+    "speech",
+    "speech synthesizer",
 }
 
 
@@ -43,6 +53,7 @@ class AudioRegion:
 class AudioAnalysis:
     speech: list[AudioRegion]
     singing: list[AudioRegion]
+    ambiguous: list[AudioRegion] = field(default_factory=list)
 
 
 def analyze_audio(
@@ -57,10 +68,11 @@ def analyze_audio(
     signature = _signature(video, config, metadata or {})
     cached = _load_cache(cache_path, signature)
     if cached is not None:
-        logging.info(
-            "audio analysis cache: %d speech turns, %d singing regions",
+        logger.info(
+            "audio analysis cache: %d speech turns, %d singing, %d ambiguous",
             len(cached.speech),
             len(cached.singing),
+            len(cached.ambiguous),
         )
         return cached
 
@@ -76,7 +88,39 @@ def analyze_audio(
             config,
             job_dir / "separated-speakers",
         )
-    singing_windows = _run_singing_detection(waveform, sample_rate, config)
+    raw_scores = _score_singing_windows(waveform, sample_rate, config)
+    raw_candidates = _singing_regions_from_scores(
+        raw_scores,
+        threshold=config.singing_threshold,
+        smoothing_windows=config.singing_smoothing_windows,
+        release_seconds=0.0,
+        merge_gap_seconds=config.singing_merge_gap_seconds,
+    )
+    vocals_path = job_dir / "source.vocals.wav"
+    singing_windows: list[AudioRegion] = []
+    ambiguous_windows: list[AudioRegion] = []
+    vocal_waveform = None
+    vocal_rate = 0
+    if raw_candidates:
+        _separate_vocals(wav_path, vocals_path, config.device)
+        vocal_waveform, vocal_rate = _load_waveform(vocals_path)
+        vocal_scores = _score_singing_windows(vocal_waveform, vocal_rate, config)
+        vocal_anchors = _singing_regions_from_scores(
+            vocal_scores,
+            threshold=config.singing_vocal_threshold,
+            smoothing_windows=config.singing_smoothing_windows,
+            release_seconds=0.0,
+            merge_gap_seconds=config.singing_merge_gap_seconds,
+        )
+        singing_windows, ambiguous_windows = _arbitrate_singing_regions(
+            raw_candidates,
+            vocal_anchors,
+            speech,
+            speech_bgm_coverage=config.singing_speech_bgm_coverage,
+            ambiguous_min_seconds=config.singing_ambiguous_min_seconds,
+            minimum_singing_seconds=config.singing_min_phrase_seconds,
+            release_seconds=config.singing_release_seconds,
+        )
     from .speakers import identify_speakers, metadata_character
 
     known_character = metadata_character(
@@ -91,22 +135,16 @@ def analyze_audio(
         excluded_regions=singing_windows,
     )
 
-    vocals_path = job_dir / "source.vocals.wav"
     singing = singing_windows
     if singing_windows:
-        _separate_vocals(wav_path, vocals_path, config.device)
-        vocal_waveform, vocal_rate = _load_waveform(vocals_path)
+        assert vocal_waveform is not None
         singing = _singing_phrases(
             vocal_waveform,
             vocal_rate,
             singing_windows,
             silence_seconds=config.singing_phrase_silence_seconds,
+            minimum_seconds=config.singing_min_phrase_seconds,
         )
-        singing = [
-            region
-            for region in singing
-            if region.end - region.start >= config.singing_min_phrase_seconds
-        ]
         singing = [
             AudioRegion(
                 **{
@@ -118,12 +156,24 @@ def analyze_audio(
             for region in singing
         ]
 
-    result = AudioAnalysis(speech=speech, singing=singing)
+    ambiguous = [
+        AudioRegion(
+            **{
+                **asdict(region),
+                "kind": "ambiguous",
+                "speaker": _dominant_speaker(region, speech),
+                "source_path": str(vocals_path.resolve()),
+            }
+        )
+        for region in ambiguous_windows
+    ]
+    result = AudioAnalysis(speech=speech, singing=singing, ambiguous=ambiguous)
     payload = {
         "version": _CACHE_VERSION,
         "signature": _signature(video, config, metadata or {}),
         "speech": [asdict(region) for region in speech],
         "singing": [asdict(region) for region in singing],
+        "ambiguous": [asdict(region) for region in ambiguous],
     }
     temporary = cache_path.with_suffix(".tmp")
     temporary.write_text(
@@ -131,10 +181,12 @@ def analyze_audio(
         encoding="utf-8",
     )
     temporary.replace(cache_path)
-    logging.info(
-        "audio analysis wrote %d speech turns and %d singing phrases",
+    logger.info(
+        "audio analysis wrote %d speech turns, %d singing phrases, "
+        "%d ambiguous regions",
         len(speech),
         len(singing),
+        len(ambiguous),
     )
     return result
 
@@ -156,7 +208,7 @@ def _run_diarization(
             "speaker diarization is unavailable; run `uv sync --extra asr`"
         ) from exc
 
-    logging.info("loading speaker diarization model %s", config.diarization_model)
+    logger.info("loading speaker diarization model %s", config.diarization_model)
     pipeline = Pipeline.from_pretrained(config.diarization_model)
     if pipeline is None:
         raise RuntimeError(
@@ -187,22 +239,45 @@ def _run_singing_detection(
     sample_rate: int,
     config: AudioAnalysisConfig,
 ) -> list[AudioRegion]:
+    return _singing_regions_from_scores(
+        _score_singing_windows(waveform, sample_rate, config),
+        threshold=config.singing_threshold,
+        smoothing_windows=config.singing_smoothing_windows,
+        release_seconds=config.singing_release_seconds,
+        merge_gap_seconds=config.singing_merge_gap_seconds,
+    )
+
+
+def _score_singing_windows(
+    waveform: Any,
+    sample_rate: int,
+    config: AudioAnalysisConfig,
+) -> list[AudioRegion]:
     try:
         import torch
-        from transformers import AutoFeatureExtractor, ASTForAudioClassification
+        from transformers import ASTForAudioClassification, AutoFeatureExtractor
     except ImportError as exc:
         raise RuntimeError(
             "singing detection is unavailable; run `uv sync --extra asr`"
         ) from exc
 
-    mono = waveform.mean(dim=0).detach().cpu().numpy()
+    mono_tensor = waveform.mean(dim=0).detach().cpu()
+    target_rate = 16000
+    if sample_rate != target_rate:
+        import torchaudio.functional as audio_functional
+
+        mono_tensor = audio_functional.resample(
+            mono_tensor, sample_rate, target_rate
+        )
+        sample_rate = target_rate
+    mono = mono_tensor.numpy()
     window_samples = max(1, round(config.singing_window_seconds * sample_rate))
     stride_samples = max(1, round(config.singing_stride_seconds * sample_rate))
     starts = list(range(0, max(1, len(mono) - window_samples + 1), stride_samples))
     if not starts or starts[-1] + window_samples < len(mono):
         starts.append(max(0, len(mono) - window_samples))
 
-    logging.info("loading singing detector %s", config.singing_model)
+    logger.info("loading singing detector %s", config.singing_model)
     extractor = AutoFeatureExtractor.from_pretrained(config.singing_model)
     model = ASTForAudioClassification.from_pretrained(config.singing_model).to(
         config.device
@@ -212,7 +287,10 @@ def _run_singing_detection(
         int(index): str(label).casefold()
         for index, label in model.config.id2label.items()
     }
-    singing_ids = [index for index, label in labels.items() if label in _SINGING_LABELS]
+    singing_ids = [
+        index for index, label in labels.items() if label in _SINGING_LABELS
+    ]
+    speech_ids = [index for index, label in labels.items() if label in _SPEECH_LABELS]
     if not singing_ids:
         raise RuntimeError("AST singing detector exposes no recognized singing labels")
 
@@ -231,7 +309,9 @@ def _run_singing_detection(
             with torch.inference_mode():
                 probabilities = torch.softmax(model(**inputs).logits, dim=-1).cpu()
             for offset, row in zip(batch_offsets, probabilities):
-                score = sum(float(row[index]) for index in singing_ids)
+                singing_score = sum(float(row[index]) for index in singing_ids)
+                speech_score = sum(float(row[index]) for index in speech_ids)
+                score = _singing_evidence_score(singing_score, speech_score)
                 scored_windows.append(
                     AudioRegion(
                         round(offset / sample_rate, 3),
@@ -243,13 +323,94 @@ def _run_singing_detection(
     finally:
         del model
         _release_cuda()
-    return _singing_regions_from_scores(
-        scored_windows,
-        threshold=config.singing_threshold,
-        smoothing_windows=config.singing_smoothing_windows,
-        release_seconds=config.singing_release_seconds,
-        merge_gap_seconds=config.singing_merge_gap_seconds,
-    )
+    return scored_windows
+
+
+def _singing_evidence_score(singing_score: float, speech_score: float) -> float:
+    return max(0.0, singing_score - speech_score)
+
+
+def _arbitrate_singing_regions(
+    raw_candidates: list[AudioRegion],
+    vocal_anchors: list[AudioRegion],
+    speech: list[AudioRegion],
+    *,
+    speech_bgm_coverage: float,
+    release_seconds: float,
+    ambiguous_min_seconds: float = 15.0,
+    minimum_singing_seconds: float = 30.0,
+) -> tuple[list[AudioRegion], list[AudioRegion]]:
+    """Confirm vocal singing and retain uncertain candidates for dual ASR."""
+    confirmed: list[AudioRegion] = []
+    ambiguous: list[AudioRegion] = []
+    episodes = _merge_regions(raw_candidates, release_seconds)
+    for candidate in episodes:
+        matching_vocals = [
+            vocal
+            for vocal in vocal_anchors
+            if _overlap_duration(candidate, vocal) > 0
+        ]
+        if matching_vocals:
+            if candidate.end - candidate.start < minimum_singing_seconds:
+                ambiguous.append(candidate)
+                continue
+            confirmed.append(
+                AudioRegion(
+                    candidate.start,
+                    candidate.end,
+                    "singing",
+                    confidence=max(
+                        float(region.confidence or 0.0)
+                        for region in matching_vocals
+                    ),
+                )
+            )
+            continue
+        coverage = _region_coverage(candidate, speech)
+        if (
+            coverage < speech_bgm_coverage
+            or candidate.end - candidate.start >= ambiguous_min_seconds
+        ):
+            ambiguous.append(candidate)
+
+    ambiguous = [
+        fragment
+        for candidate in ambiguous
+        for fragment in _subtract_regions(
+            candidate, [(region.start, region.end) for region in confirmed]
+        )
+    ]
+    return confirmed, ambiguous
+
+
+def _overlap_duration(left: AudioRegion, right: AudioRegion) -> float:
+    return max(0.0, min(left.end, right.end) - max(left.start, right.start))
+
+
+def _region_coverage(region: AudioRegion, others: list[AudioRegion]) -> float:
+    intersections = [
+        AudioRegion(
+            max(region.start, other.start),
+            min(region.end, other.end),
+            "speech",
+        )
+        for other in others
+        if _overlap_duration(region, other) > 0
+    ]
+    covered = sum(item.end - item.start for item in _merge_regions(intersections, 0))
+    return covered / max(region.end - region.start, 1e-6)
+
+
+def _dominant_speaker(
+    region: AudioRegion, speech: list[AudioRegion]
+) -> str | None:
+    durations: dict[str, float] = {}
+    for turn in speech:
+        if turn.speaker:
+            durations[turn.speaker] = durations.get(turn.speaker, 0.0) + (
+                _overlap_duration(region, turn)
+            )
+    return max(durations, key=durations.get) if durations else None
 
 
 def _singing_regions_from_scores(
@@ -312,7 +473,7 @@ def _run_overlap_separation(
     overlap_spans = _overlap_spans(diarized_regions, float(waveform.shape[-1]) / sample_rate)
     if not overlap_spans:
         return diarized_regions
-    logging.info(
+    logger.info(
         "loading overlap separator %s for %d local regions",
         config.overlap_separation_model,
         len(overlap_spans),
@@ -320,7 +481,7 @@ def _run_overlap_separation(
     pipeline = SpeechSeparation(
         segmentation=config.overlap_separation_model,
         segmentation_step=0.1,
-        embedding=config.speaker_embedding_model,
+        embedding=config.overlap_embedding_model,
         embedding_exclude_overlap=False,
         clustering="AgglomerativeClustering",
         embedding_batch_size=8,
@@ -399,7 +560,7 @@ def _separate_vocals(source: Path, destination: Path, device: str) -> None:
     except ImportError as exc:
         raise RuntimeError("vocal separation requires the ASR optional dependencies") from exc
 
-    logging.info("separating vocals with Demucs htdemucs")
+    logger.info("separating vocals with Demucs htdemucs")
     separator = Separator(model="htdemucs", device=device, progress=True)
     try:
         _origin, stems = separator.separate_audio_file(source)
@@ -419,6 +580,7 @@ def _singing_phrases(
     regions: list[AudioRegion],
     *,
     silence_seconds: float,
+    minimum_seconds: float = 30.0,
 ) -> list[AudioRegion]:
     """Use silence in the separated vocal stem as approximate lyric-line edges."""
     import librosa
@@ -426,6 +588,7 @@ def _singing_phrases(
     mono = waveform.mean(dim=0).detach().cpu().numpy()
     phrases: list[AudioRegion] = []
     for region in regions:
+        region_phrases: list[AudioRegion] = []
         offset = max(0, round(region.start * sample_rate))
         end = min(len(mono), round(region.end * sample_rate))
         intervals = librosa.effects.split(
@@ -440,11 +603,67 @@ def _singing_phrases(
             if gap <= silence_seconds:
                 current[1] = int(local_end)
             else:
-                phrases.append(_vocal_interval(offset, current, sample_rate, region))
+                region_phrases.append(
+                    _vocal_interval(offset, current, sample_rate, region)
+                )
                 current = [int(local_start), int(local_end)]
         if current is not None:
-            phrases.append(_vocal_interval(offset, current, sample_rate, region))
+            region_phrases.append(
+                _vocal_interval(offset, current, sample_rate, region)
+            )
+        blocks = _coalesce_singing_phrases(
+            region_phrases,
+            minimum_seconds=minimum_seconds,
+        )
+        if blocks and len(blocks) == 1 and blocks[0].end - blocks[0].start < minimum_seconds:
+            blocks = [
+                AudioRegion(
+                    region.start,
+                    region.end,
+                    "singing",
+                    confidence=blocks[0].confidence,
+                )
+            ]
+        phrases.extend(blocks)
     return phrases
+
+
+def _coalesce_singing_phrases(
+    phrases: list[AudioRegion], *, minimum_seconds: float
+) -> list[AudioRegion]:
+    if not phrases:
+        return []
+    blocks: list[AudioRegion] = []
+    start = phrases[0].start
+    confidence = phrases[0].confidence
+    for phrase in phrases:
+        confidence = max(
+            float(confidence or 0.0), float(phrase.confidence or 0.0)
+        )
+        if phrase.end - start >= minimum_seconds:
+            blocks.append(
+                AudioRegion(start, phrase.end, "singing", confidence=confidence)
+            )
+            start = phrase.end
+            confidence = phrase.confidence
+    tail_end = phrases[-1].end
+    if tail_end > start:
+        if blocks:
+            previous = blocks[-1]
+            blocks[-1] = AudioRegion(
+                previous.start,
+                tail_end,
+                "singing",
+                confidence=max(
+                    float(previous.confidence or 0.0),
+                    float(confidence or 0.0),
+                ),
+            )
+        else:
+            blocks.append(
+                AudioRegion(start, tail_end, "singing", confidence=confidence)
+            )
+    return blocks
 
 
 def _vocal_interval(
@@ -570,8 +789,6 @@ def _load_waveform(path: Path) -> tuple[Any, int]:
 
 
 def _extract_audio(video: Path, destination: Path) -> None:
-    if destination.is_file():
-        return
     ffmpeg = require_command("ffmpeg")
     run(
         [
@@ -636,7 +853,8 @@ def _load_cache(path: Path, signature: str) -> AudioAnalysis | None:
         return AudioAnalysis(
             speech=[AudioRegion(**item) for item in value["speech"]],
             singing=[AudioRegion(**item) for item in value["singing"]],
+            ambiguous=[AudioRegion(**item) for item in value.get("ambiguous", [])],
         )
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-        logging.warning("ignoring unreadable audio analysis cache %s: %s", path, exc)
+        logger.warning("ignoring unreadable audio analysis cache %s: %s", path, exc)
         return None

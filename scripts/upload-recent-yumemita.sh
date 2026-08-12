@@ -7,6 +7,7 @@ CONFIG_PATH="${1:-$ROOT_DIR/config.toml}"
 WORK_DIR="$ROOT_DIR/work"
 STATUS_PATH="$WORK_DIR/yumemita-2026-08-10-status.log"
 STOP_PATH="$WORK_DIR/yumemita-2026-08-10.stop"
+UPLOADED_PATH="$WORK_DIR/yumemita-2026-08-10-uploaded.txt"
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/auto-subtitle-uv-cache}"
 
@@ -41,6 +42,7 @@ fi
 
 mkdir -p "$WORK_DIR"
 touch "$STATUS_PATH"
+touch "$UPLOADED_PATH"
 
 printf 'Unlocking the DeepSeek API key...\n'
 if ! pass show api/deepseek >/dev/null; then
@@ -124,7 +126,8 @@ for index in "${!RECORDS[@]}"; do
         exit 0
     fi
 
-    if [[ -f "$manifest" ]] && jq -e '.uploaded == true' "$manifest" >/dev/null; then
+    if grep -Fxq "$video_id" "$UPLOADED_PATH" || \
+        { [[ -f "$manifest" ]] && jq -e '.uploaded == true' "$manifest" >/dev/null; }; then
         printf '[%d/%d] SKIP %s %s %s (already uploaded)\n' \
             "$position" "$total" "$published" "$channel" "$video_id"
         log_status "SKIP position=$position/$total published=$published channel=$channel video=$video_id reason=already-uploaded"
@@ -137,6 +140,9 @@ for index in "${!RECORDS[@]}"; do
     log_status "RUN position=$position/$total published=$published channel=$channel video=$video_id"
 
     if uv run --extra asr subtitle-pipeline --config "$CONFIG_PATH" run --upload "$url"; then
+        if ! grep -Fxq "$video_id" "$UPLOADED_PATH"; then
+            printf '%s\n' "$video_id" >>"$UPLOADED_PATH"
+        fi
         log_status "OK position=$position/$total video=$video_id"
         succeeded=$((succeeded + 1))
     else

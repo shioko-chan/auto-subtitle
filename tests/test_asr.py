@@ -6,11 +6,13 @@ from unittest.mock import patch
 
 from subtitle_pipeline.asr import (
     _analysis_regions,
+    _record_timeline_is_healthy,
     _remove_text_overlap,
     _repetition_hallucination,
     _restore_punctuation,
     _result_to_cues,
     _song_windows,
+    _transcribe_ambiguous_range,
     _valid_cached_record,
     transcribe_with_qwen,
 )
@@ -56,6 +58,98 @@ class QwenASRTests(unittest.TestCase):
             [(item.start, item.end, item.kind) for item in result],
             [(10, 15, "speech"), (15, 25, "singing"), (25, 30, "speech")],
         )
+
+    def test_ambiguous_regions_are_subtracted_and_routed_once(self):
+        result = _analysis_regions(
+            AudioAnalysis(
+                speech=[AudioRegion(0, 20, "speech", "A")],
+                singing=[],
+                ambiguous=[AudioRegion(5, 15, "ambiguous", "A")],
+            )
+        )
+        self.assertEqual(
+            [(item.start, item.end, item.kind) for item in result],
+            [(0, 5, "speech"), (5, 15, "ambiguous"), (15, 20, "speech")],
+        )
+
+    def test_rejects_collapsed_ambiguous_forced_alignment(self):
+        record = {
+            "text": "这是足够长的识别结果但是整个时间轴已经完全坍缩了",
+            "cues": [
+                {"start": 10.0, "end": 10.1, "text": str(index)}
+                for index in range(25)
+            ],
+        }
+        self.assertFalse(
+            _record_timeline_is_healthy(
+                record, AudioRegion(10, 20, "ambiguous")
+            )
+        )
+
+    def test_ambiguous_region_runs_both_routes_and_keeps_healthy_alignment(self):
+        speech = {
+            "text": "これは十分に長く正常に整列された発話です",
+            "cues": [{"start": 10.0, "end": 18.0, "text": "正常な発話"}],
+        }
+        singing = {
+            "text": "歌声候補",
+            "cues": [{"start": 10.0, "end": 20.0, "text": "歌声候補"}],
+        }
+        with (
+            patch("subtitle_pipeline.asr._media_duration", return_value=30.0),
+            patch(
+                "subtitle_pipeline.asr._transcribe_range", return_value=speech
+            ) as speech_route,
+            patch(
+                "subtitle_pipeline.asr._transcribe_song_range",
+                return_value=singing,
+            ) as singing_route,
+        ):
+            result = _transcribe_ambiguous_range(
+                object(),
+                Path("source.mp4"),
+                Path("chunks"),
+                ASRConfig(),
+                AudioRegion(10, 20, "ambiguous", "A"),
+                index=0,
+                window_seconds=12,
+                overlap_seconds=2,
+            )
+        self.assertEqual(result["ambiguous_route"], "speech")
+        speech_route.assert_called_once()
+        singing_route.assert_called_once()
+
+    def test_ambiguous_region_falls_back_when_alignment_collapses(self):
+        speech = {
+            "text": "これは十分に長いのに時間軸が完全に壊れた発話です",
+            "cues": [
+                {"start": 10.0, "end": 10.1, "text": str(index)}
+                for index in range(25)
+            ],
+        }
+        singing = {
+            "text": "歌声候補",
+            "cues": [{"start": 10.0, "end": 20.0, "text": "歌声候補"}],
+        }
+        with (
+            patch("subtitle_pipeline.asr._media_duration", return_value=30.0),
+            patch("subtitle_pipeline.asr._transcribe_range", return_value=speech),
+            patch(
+                "subtitle_pipeline.asr._transcribe_song_range",
+                return_value=singing,
+            ),
+        ):
+            result = _transcribe_ambiguous_range(
+                object(),
+                Path("source.mp4"),
+                Path("chunks"),
+                ASRConfig(),
+                AudioRegion(10, 20, "ambiguous", "A"),
+                index=0,
+                window_seconds=12,
+                overlap_seconds=2,
+            )
+        self.assertEqual(result["ambiguous_route"], "singing")
 
     def test_aligner_cues_are_clamped_to_owned_analysis_region(self):
         result = SimpleNamespace(

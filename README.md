@@ -140,11 +140,21 @@ URL 放在单引号中时不要再写 `\?` 或 `\=`。为兼容常见的复制�
 forced aligner 的 180 秒输入限制约束。
 
 启用 `[audio_analysis]` 后，管线会先用 pyannote `community-1` 做 VAD 和说话人
-分离，用 AST 检测歌声。AST 概率会经过时间平滑，并以 release hysteresis 桥接短暂漏检，
-不会直接把一首歌切开。普通说话仍由 Qwen forced aligner 生成细粒度时间；歌声先由
-Demucs 分离主唱，再按主唱静音切成歌词短句，由 Qwen ASR 直接生成句级时间，避免把
-歌声送入语音 aligner。检测到重叠说话时，pyannote ToTaToNet 会输出独立声源并分别
-转写。所有音频分析结果和带说话人字段的 cue sidecar 都写入 job 目录并可断点复用。
+分离。原音 AST 只提出歌声候选，Demucs 人声轨上的 AST 再确认实际歌唱；候选中存在
+连续讲话但人声轨没有歌唱证据时按“讲话+BGM”处理。证据模糊时同时运行普通 forced
+aligner 与句级歌声 ASR，时间轴坍缩或循环输出时采用歌声结果。release hysteresis 只在
+确认进入歌唱状态后桥接短暂漏检，不会让一次 AST 误报扩成整段歌曲。检测到重叠说话
+时，pyannote ToTaToNet 会输出独立声源并分别转写。所有音频分析结果和带说话人字段的
+cue sidecar 都写入 job 目录并可断点复用。
+
+人物身份使用独立 uv worker 中的 ERes2NetV2 embedding 和余弦距离匹配。成员个人频道
+的独播会自动将 2–15 秒、非歌唱且非重叠的主说话人片段注册到
+`work/speaker-profiles-eres2netv2/`；每人最多保留 400 条。profile 带模型签名，不能与
+旧 WeSpeaker embedding 混用。识别时保留原始样本，并用确定性的 cosine k-means 为
+每人建立最多 5 个中心；每个中心默认至少需要 20 条样本，小簇会通过减少中心数重新
+聚类。这样可以分别覆盖普通聊天、激动语气和带背景音等声音状态。匹配还要求第一候选
+相对第二候选保持足够距离；重叠分轨使用更严格的绝对阈值，证据不足时保留匿名标签。
+重叠声源分离内部仍使用 pyannote 兼容的 WeSpeaker。
 
 梦限大 MewType 五位成员的应援色与声纹配置位于独立的
 `character_styles.json`，不会发给 LLM。独播频道会从无重叠语音自动建立声纹原型；
