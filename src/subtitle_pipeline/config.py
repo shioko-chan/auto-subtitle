@@ -18,6 +18,10 @@ class DownloadConfig:
     cookies_from_browser: str | None = None
     cookies_file: str | None = None
     js_runtime: str | None = "auto"
+    video_format: str = (
+        "bv*[vcodec^=vp9]+ba/bv*[vcodec^=vp09]+ba/"
+        "bv*[vcodec^=avc1]+ba/b"
+    )
 
 
 @dataclass(frozen=True)
@@ -118,6 +122,7 @@ class LLMConfig:
 
 @dataclass(frozen=True)
 class RenderConfig:
+    backend: str = "auto"
     font_name: str = "Noto Sans CJK SC"
     font_size_ratio: float = 0.066
     portrait_font_size_ratio: float = 0.077
@@ -129,6 +134,8 @@ class RenderConfig:
     outline_ratio: float = 0.003
     crf: int = 20
     preset: str = "medium"
+    nvenc_preset: str = "p4"
+    nvenc_cq: int = 23
 
 
 @dataclass(frozen=True)
@@ -348,6 +355,10 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("render.margin_vertical_ratio must be between 0 and 0.5")
     if config.render.outline_ratio < 0:
         raise ConfigError("render.outline_ratio cannot be negative")
+    if config.render.backend not in {"auto", "cpu", "cuda"}:
+        raise ConfigError("render.backend must be 'auto', 'cpu', or 'cuda'")
+    if not 0 <= config.render.nvenc_cq <= 51:
+        raise ConfigError("render.nvenc_cq must be between 0 and 51")
     if config.upload.copyright not in (1, 2):
         raise ConfigError("upload.copyright must be 1 (original) or 2 (repost)")
     if not 1 <= config.upload.max_tags <= 10:

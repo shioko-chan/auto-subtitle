@@ -19,7 +19,7 @@ YouTube URL
   → LLM 联合决定 cue 边界并翻译为单行中文字幕
   → 本地按 ID 恢复时间轴并校验完整覆盖和整帧宽度
   → 用同一 LLM 翻译投稿标题和简介，并生成 B 站标签
-  → 输出 SRT，并由 ffmpeg 烧录硬字幕
+  → 输出 SRT/ASS，由稀疏 libass/CUDA/NVENC 或 ffmpeg CPU 后端烧录硬字幕
   → biliup 上传（可选，默认关闭）
 ```
 
@@ -48,6 +48,13 @@ cp config.example.toml config.toml
 `uv` 会根据 `.python-version` 准备 Python 3.11，并严格按照 `uv.lock` 创建 `.venv`；
 `yt-dlp` 会随项目安装。当前新管线始终从音轨重新生成源字幕，不使用 YouTube 人工或
 自动字幕，因此运行完整管线必须安装 `asr` extra。
+
+默认 `render.backend = "auto"`：优先调用 Nix 构建的 `ass-cuda-render`。该后端使用
+NVDEC 将视频帧保留在显存，CPU libass 只生成文字、描边和阴影的小型 alpha mask；
+mask 仅在字幕画面变化时上传，并由 CUDA 直接混合到 NV12 帧后交给 NVENC。GPU 不支持
+输入编码、旋转或像素格式时自动回退到原有 ffmpeg CPU/libass 路径；设为 `cuda` 可要求
+失败即停止，设为 `cpu` 可禁用该后端。Turing 显卡不支持 AV1 NVDEC，因此下载默认优先
+VP9/H.264，已缓存的 AV1 视频仍可经 CPU 回退处理。
 
 启用 `[song_identification]` 后，管线只在每次检测到开唱的前后短窗口抽帧，使用
 PaddleOCR 聚合稳定的日英文字，再把 OCR、报幕 ASR、简介歌单和歌唱 ASR 交给
@@ -100,6 +107,16 @@ JSON 对象，再统一执行相同校验。程序根据 ID 恢复日文原文�
 规划。若窗口只有一条 cue，程序会扩大范围；请求连续失败后则缩小范围，无法在 API
 上下文限制内得到有效结果时停止，不使用硬裁断回退。已确认的连续前缀会逐窗原子写入
 job 目录的 `cue-translation-cache.json`，重跑时只恢复其中最长的合法连续前缀。
+
+窗口的 ID 覆盖、顺序、时间轴或硬宽度不合法时仍会重跑该窗口；空译文、目标语言中
+残留日文假名等可定位文本错误不会触发整窗重译，而是先以 `pending` 状态缓存。所有窗口
+完成后，管线把 pending cue 连同各自原文、说话人和已确认相邻字幕合并成定点修复请求，
+模型只能按 `repair_id` 修改译文，不能改变 cue 边界。一次响应中通过校验的修复会立即
+写回缓存，后续请求只包含尚未修好的 ID；只要仍有 pending cue，就禁止渲染和上传。
+网络错误和超时使用指数退避；HTTP 5xx 也使用指数退避，但耗尽重试后直接终止而不缩小
+窗口。HTTP 429 优先遵守服务端的 `Retry-After` 响应头，缺失时才使用指数退避，同样在
+耗尽后直接终止而不缩窗。其他 HTTP 状态视为非暂时性错误，首次遇到便直接终止。本地
+输出校验失败会立即重试。
 
 联合输入使用 `[id,duration_ms,gap_after_ms,text]`，绝对时间只在本地保存。固定规则、
 术语表和视频信息位于请求前缀，窗口数据随后，重试错误放在末尾，以提高 DeepSeek

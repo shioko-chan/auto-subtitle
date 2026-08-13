@@ -17,6 +17,24 @@
         };
       };
       cuda = pkgs.cudaPackages;
+      assCudaRender = pkgs.stdenv.mkDerivation {
+        pname = "ass-cuda-render";
+        version = "0.1.0";
+        src = ./native;
+        nativeBuildInputs = [ pkgs.pkg-config cuda.cuda_nvcc ];
+        buildInputs = [ pkgs.ffmpeg.dev pkgs.libass.dev cuda.cuda_cudart ];
+        buildPhase = ''
+          nvcc -std=c++17 -O3 -lineinfo \
+            $(pkg-config --cflags libavformat libavcodec libavutil libass) \
+            ass_cuda_render.cu -o ass-cuda-render \
+            $(pkg-config --libs libavformat libavcodec libavutil libass) \
+            -lcudart
+        '';
+        installPhase = ''
+          mkdir -p $out/bin
+          install -m755 ass-cuda-render $out/bin/
+        '';
+      };
       runtimeLibraries = [
         cuda.cuda_cudart
         cuda.libcublas
@@ -37,6 +55,10 @@
           pkgs.ffmpeg
           cuda.cuda_nvcc
           cuda.cuda_cccl
+          assCudaRender
+          pkgs.pkg-config
+          pkgs.ffmpeg.dev
+          pkgs.libass.dev
         ];
 
         CUDA_HOME = "${cuda.cuda_nvcc}";
@@ -51,5 +73,6 @@
           echo "subtitle-pipeline CUDA shell: $(python --version 2>&1), CUDA $(nvcc --version | sed -n 's/.*release \([^,]*\).*/\1/p')"
         '';
       };
+      packages.${system}.ass-cuda-render = assCudaRender;
     };
 }

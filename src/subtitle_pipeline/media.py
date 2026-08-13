@@ -8,11 +8,10 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .commands import require_command, run
+from .commands import CommandError, require_command, run
 from .config import DownloadConfig, RenderConfig
 from .speakers import CharacterStyle
 from .subtitles import Cue, read_subtitles, text_display_width
-
 
 _RENDER_TERMINAL_PLAIN_PUNCTUATION_RE = re.compile(
     r'''[，、；：。．,;:]+(?=["'”’」』）)\]]*$)'''
@@ -60,7 +59,7 @@ def download_youtube(url: str, directory: Path, config: DownloadConfig) -> Downl
         *common,
         "--write-info-json",
         "--format",
-        "bv*+ba/b",
+        config.video_format,
         "--merge-output-format",
         "mp4",
         "--output",
@@ -165,6 +164,19 @@ def render_subtitles(
         len(render_cues),
         sum("\n" in cue.text for cue in render_cues),
     )
+    if config.backend in {"auto", "cuda"}:
+        try:
+            return _render_subtitles_cuda(
+                local_video,
+                ass_path,
+                local_destination,
+                config,
+            )
+        except (CommandError, RuntimeError) as exc:
+            if config.backend == "cuda":
+                raise
+            logging.warning("CUDA subtitle renderer unavailable; using CPU: %s", exc)
+
     subtitle_name = ass_path.name.replace("'", r"\'").replace(":", r"\:")
     filter_value = f"subtitles=filename='{subtitle_name}'"
     run(
@@ -189,6 +201,57 @@ def render_subtitles(
         ],
         cwd=local_destination.parent,
     )
+    return destination
+
+
+def _render_subtitles_cuda(
+    video: Path,
+    subtitle: Path,
+    destination: Path,
+    config: RenderConfig,
+) -> Path:
+    renderer = require_command("ass-cuda-render")
+    ffmpeg = require_command("ffmpeg")
+    video_only = destination.with_suffix(".cuda-video.mp4")
+    try:
+        run(
+            [
+                renderer,
+                "--input",
+                str(video),
+                "--ass",
+                str(subtitle),
+                "--output",
+                str(video_only),
+                "--preset",
+                config.nvenc_preset,
+                "--cq",
+                str(config.nvenc_cq),
+            ]
+        )
+        run(
+            [
+                ffmpeg,
+                "-y",
+                "-i",
+                str(video_only),
+                "-i",
+                str(video),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a?",
+                "-map_metadata",
+                "1",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(destination),
+            ]
+        )
+    finally:
+        video_only.unlink(missing_ok=True)
     return destination
 
 

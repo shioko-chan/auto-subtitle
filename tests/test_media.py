@@ -5,15 +5,19 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from subtitle_pipeline.commands import CommandError
 from subtitle_pipeline.config import DownloadConfig, RenderConfig
 from subtitle_pipeline.media import (
     RenderCue,
+    SubtitleLayout,
     _adaptive_font_size,
     _adaptive_horizontal_margin,
     _layout_subtitle_cues,
+    _render_subtitles_cuda,
     _video_dimensions,
     _write_ass,
     download_youtube,
+    render_subtitles,
 )
 from subtitle_pipeline.speakers import CharacterStyle
 from subtitle_pipeline.subtitles import Cue
@@ -52,6 +56,7 @@ class MediaDownloadTests(unittest.TestCase):
             self.assertNotIn("--write-subs", video_command)
             self.assertNotIn("--write-auto-subs", video_command)
             self.assertIn("node:/usr/bin/node", video_command)
+            self.assertIn(DownloadConfig().video_format, video_command)
 
     def test_existing_subtitle_is_ignored_by_qwen_pipeline(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -78,6 +83,65 @@ class MediaDownloadTests(unittest.TestCase):
 
 
 class SubtitleRenderTests(unittest.TestCase):
+    def test_auto_backend_falls_back_to_cpu_when_cuda_render_fails(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            video = directory / "source.mp4"
+            subtitle = directory / "translated.srt"
+            destination = directory / "rendered.mp4"
+            video.write_bytes(b"video")
+            subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\n字幕\n", encoding="utf-8")
+            with patch(
+                "subtitle_pipeline.media.subtitle_layout",
+                return_value=SubtitleLayout(1920, 1080, 71, 144, 54, 3, 22, 27),
+            ), patch(
+                "subtitle_pipeline.media._render_subtitles_cuda",
+                side_effect=CommandError("unsupported codec"),
+            ), patch(
+                "subtitle_pipeline.media.require_command", return_value="ffmpeg"
+            ), patch("subtitle_pipeline.media.run") as run:
+                result = render_subtitles(
+                    video,
+                    subtitle,
+                    destination,
+                    RenderConfig(backend="auto"),
+                )
+
+        self.assertEqual(result, destination)
+        run.assert_called_once()
+        self.assertIn("libx264", run.call_args.args[0])
+
+    def test_cuda_renderer_muxes_original_audio_without_reencoding(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            video = directory / "source.mp4"
+            subtitle = directory / "translated.ass"
+            destination = directory / "rendered.mp4"
+            video.write_bytes(b"video")
+            subtitle.write_text("ass", encoding="utf-8")
+
+            with patch(
+                "subtitle_pipeline.media.require_command",
+                side_effect=["ass-cuda-render", "ffmpeg"],
+            ), patch("subtitle_pipeline.media.run") as run:
+                result = _render_subtitles_cuda(
+                    video,
+                    subtitle,
+                    destination,
+                    RenderConfig(backend="cuda", nvenc_preset="p4", nvenc_cq=23),
+                )
+
+        self.assertEqual(result, destination)
+        self.assertEqual(run.call_count, 2)
+        render_command = run.call_args_list[0].args[0]
+        self.assertEqual(render_command[0], "ass-cuda-render")
+        self.assertIn("p4", render_command)
+        self.assertIn("23", render_command)
+        mux_command = run.call_args_list[1].args[0]
+        self.assertEqual(mux_command[0], "ffmpeg")
+        self.assertIn("1:a?", mux_command)
+        self.assertIn("copy", mux_command)
+
     def test_font_size_uses_orientation_specific_short_edge_ratio(self):
         config = RenderConfig(max_font_size=100)
         self.assertEqual(_adaptive_font_size(1920, 1080, config), 71)

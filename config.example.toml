@@ -1,6 +1,8 @@
 work_dir = "work"
 
 [download]
+# Prefer formats supported by NVDEC on Turing GPUs; fall back to any combined stream.
+video_format = "bv*[vcodec^=vp9]+ba/bv*[vcodec^=vp09]+ba/bv*[vcodec^=avc1]+ba/b"
 # Automatically use Deno, Node or QuickJS when available; set "" to disable.
 js_runtime = "auto"
 # cookies_from_browser = "chrome"
@@ -116,6 +118,8 @@ metadata_subtitle_max_chars = 4000
 glossary_files = []
 
 [render]
+# auto tries the sparse libass/CUDA/NVENC renderer and falls back to CPU libass.
+backend = "auto"
 font_name = "Noto Sans CJK SC"
 # Font size is this fraction of the video's short edge, clamped below.
 font_size_ratio = 0.066
@@ -128,6 +132,8 @@ margin_vertical_ratio = 0.05
 outline_ratio = 0.003
 crf = 20
 preset = "medium"
+nvenc_preset = "p4"
+nvenc_cq = 23
 
 [upload]
 # Keep false until `biliup login` has produced the cookie file and a dry run succeeds.
