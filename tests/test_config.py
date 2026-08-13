@@ -28,10 +28,9 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.work_dir, Path("jobs"))
             self.assertEqual(config.llm.model, "test-model")
             self.assertTrue(config.upload.enabled)
+            self.assertEqual(config.upload.description_max_chars, 1800)
             self.assertEqual(config.asr.model, "Qwen/Qwen3-ASR-1.7B")
-            self.assertEqual(
-                config.asr.aligner_model, "Qwen/Qwen3-ForcedAligner-0.6B"
-            )
+            self.assertEqual(config.asr.aligner_model, "Qwen/Qwen3-ForcedAligner-0.6B")
             self.assertEqual(config.asr.dtype, "float16")
             self.assertEqual(config.asr.language, "Japanese")
             self.assertTrue(config.audio_analysis.enabled)
@@ -41,6 +40,18 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(
                 config.audio_analysis.speaker_embedding_model,
                 "iic/speech_eres2netv2_sv_zh-cn_16k-common",
+            )
+            self.assertEqual(
+                config.audio_analysis.diarization_model,
+                "pyannote/speaker-diarization-community-1",
+            )
+            self.assertEqual(
+                config.audio_analysis.overlap_separation_model,
+                "MossFormer2_SS_16K",
+            )
+            self.assertEqual(
+                config.audio_analysis.overlap_separation_worker_project,
+                "tools/mossformer2",
             )
             self.assertEqual(
                 config.audio_analysis.speaker_enrollment_samples_per_video, 40
@@ -55,17 +66,11 @@ class ConfigTests(unittest.TestCase):
             )
             self.assertEqual(config.audio_analysis.singing_threshold, 0.05)
             self.assertEqual(config.audio_analysis.singing_vocal_threshold, 0.5)
-            self.assertEqual(
-                config.audio_analysis.singing_speech_bgm_coverage, 0.35
-            )
-            self.assertEqual(
-                config.audio_analysis.singing_ambiguous_min_seconds, 15.0
-            )
+            self.assertEqual(config.audio_analysis.singing_speech_bgm_coverage, 0.35)
+            self.assertEqual(config.audio_analysis.singing_ambiguous_min_seconds, 15.0)
             self.assertEqual(config.audio_analysis.singing_smoothing_windows, 3)
             self.assertEqual(config.audio_analysis.singing_release_seconds, 35.0)
-            self.assertEqual(
-                config.audio_analysis.singing_min_phrase_seconds, 30.0
-            )
+            self.assertEqual(config.audio_analysis.singing_min_phrase_seconds, 30.0)
             self.assertFalse(config.song_identification.enabled)
             self.assertEqual(config.song_identification.device, "gpu:0")
             self.assertEqual(config.segmentation.model_window_cues, 600)
@@ -76,13 +81,6 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.render.portrait_margin_horizontal_ratio, 0.025)
             self.assertEqual(config.render.margin_vertical_ratio, 0.05)
             self.assertEqual(config.render.outline_ratio, 0.003)
-
-    def test_rejects_invalid_batch_size(self):
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "config.toml"
-            path.write_text("[llm]\nbatch_size = 0\n", encoding="utf-8")
-            with self.assertRaisesRegex(ConfigError, "batch_size"):
-                load_config(path)
 
     def test_rejects_invalid_max_tokens(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -112,7 +110,7 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.toml"
             path.write_text(
-                "[audio_analysis]\nspeaker_embedding_backend = \"mystery\"\n",
+                '[audio_analysis]\nspeaker_embedding_backend = "mystery"\n',
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ConfigError, "speaker_embedding_backend"):
@@ -152,11 +150,15 @@ class ConfigTests(unittest.TestCase):
                 "secret-key\nmetadata: ignored\n",
                 "",
             )
-            with patch(
-                "subtitle_pipeline.config.shutil.which", return_value="/usr/bin/pass"
-            ), patch(
-                "subtitle_pipeline.config.subprocess.run", return_value=completed
-            ) as run:
+            with (
+                patch(
+                    "subtitle_pipeline.config.shutil.which",
+                    return_value="/usr/bin/pass",
+                ),
+                patch(
+                    "subtitle_pipeline.config.subprocess.run", return_value=completed
+                ) as run,
+            ):
                 self.assertEqual(llm_api_key(config.llm), "secret-key")
             run.assert_called_once_with(
                 ["/usr/bin/pass", "show", "api/deepseek"],

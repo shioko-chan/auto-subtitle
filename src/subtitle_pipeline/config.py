@@ -38,11 +38,14 @@ class ASRConfig:
 class AudioAnalysisConfig:
     enabled: bool = True
     diarization_model: str = "pyannote/speaker-diarization-community-1"
+    # Retained for compatibility with older configuration files. MossFormer2
+    # does not use a pyannote embedding model internally.
     overlap_embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
     speaker_embedding_backend: str = "eres2netv2"
     speaker_embedding_model: str = "iic/speech_eres2netv2_sv_zh-cn_16k-common"
     speaker_embedding_worker_project: str = "tools/speaker_embedding"
-    overlap_separation_model: str = "pyannote/separation-ami-1.0"
+    overlap_separation_model: str = "MossFormer2_SS_16K"
+    overlap_separation_worker_project: str = "tools/mossformer2"
     singing_model: str = "MIT/ast-finetuned-audioset-10-10-0.4593"
     device: str = "cuda:0"
     singing_window_seconds: float = 5.0
@@ -99,7 +102,6 @@ class LLMConfig:
     api_key_env: str = "DEEPSEEK_API_KEY"
     model: str = "deepseek-chat"
     target_language: str = "简体中文"
-    batch_size: int = 30
     timeout_seconds: int = 120
     max_retries: int = 5
     max_tokens: int = 16384
@@ -141,6 +143,7 @@ class UploadConfig:
     source: str = ""
     title_prefix: str = ""
     description_suffix: str = ""
+    description_max_chars: int = 1800
     line: str | None = None
     limit: int = 3
 
@@ -193,8 +196,6 @@ def load_config(path: Path) -> AppConfig:
     except TypeError as exc:
         raise ConfigError(f"unknown or missing configuration field: {exc}") from exc
 
-    if config.llm.batch_size < 1:
-        raise ConfigError("llm.batch_size must be at least 1")
     if config.llm.max_retries < 1:
         raise ConfigError("llm.max_retries must be at least 1")
     if config.llm.max_tokens < 1:
@@ -278,9 +279,7 @@ def load_config(path: Path) -> AppConfig:
     if analysis.singing_asr_window_seconds <= 0:
         raise ConfigError("audio_analysis.singing_asr_window_seconds must be positive")
     if not (
-        0
-        <= analysis.singing_asr_overlap_seconds
-        < analysis.singing_asr_window_seconds
+        0 <= analysis.singing_asr_overlap_seconds < analysis.singing_asr_window_seconds
     ):
         raise ConfigError(
             "audio_analysis.singing_asr_overlap_seconds must be non-negative and "
@@ -295,9 +294,7 @@ def load_config(path: Path) -> AppConfig:
             "audio_analysis.speaker_overlap_match_threshold must be between 0 and 2"
         )
     if not 0 <= analysis.speaker_match_margin <= 2:
-        raise ConfigError(
-            "audio_analysis.speaker_match_margin must be between 0 and 2"
-        )
+        raise ConfigError("audio_analysis.speaker_match_margin must be between 0 and 2")
     if analysis.speaker_enrollment_samples_per_video < 1:
         raise ConfigError(
             "audio_analysis.speaker_enrollment_samples_per_video must be at least 1"
@@ -340,13 +337,9 @@ def load_config(path: Path) -> AppConfig:
     if config.render.min_font_size < 1:
         raise ConfigError("render.min_font_size must be at least 1")
     if config.render.max_font_size < config.render.min_font_size:
-        raise ConfigError(
-            "render.max_font_size must be at least render.min_font_size"
-        )
+        raise ConfigError("render.max_font_size must be at least render.min_font_size")
     if not 0 <= config.render.margin_horizontal_ratio < 0.5:
-        raise ConfigError(
-            "render.margin_horizontal_ratio must be between 0 and 0.5"
-        )
+        raise ConfigError("render.margin_horizontal_ratio must be between 0 and 0.5")
     if not 0 <= config.render.portrait_margin_horizontal_ratio < 0.5:
         raise ConfigError(
             "render.portrait_margin_horizontal_ratio must be between 0 and 0.5"
@@ -359,6 +352,8 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("upload.copyright must be 1 (original) or 2 (repost)")
     if not 1 <= config.upload.max_tags <= 10:
         raise ConfigError("upload.max_tags must be between 1 and 10")
+    if config.upload.description_max_chars < 1:
+        raise ConfigError("upload.description_max_chars must be at least 1")
     return config
 
 

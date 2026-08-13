@@ -14,7 +14,9 @@ from .pipeline import run_pipeline
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="subtitle-pipeline",
-        description="Download YouTube, translate/generate subtitles, upload to Bilibili.",
+        description=(
+            "Download YouTube, translate/generate subtitles, upload to Bilibili."
+        ),
     )
     parser.add_argument("--config", type=Path, default=Path("config.toml"))
     parser.add_argument("--verbose", action="store_true")
@@ -72,8 +74,8 @@ def _check(config: AppConfig) -> int:
             missing.append("biliup")
             logging.error("missing executable: biliup")
     try:
-        import torch
         import qwen_asr  # noqa: F401
+        import torch
 
         logging.info("found Qwen3-ASR runtime")
         if config.asr.device.startswith("cuda"):
@@ -81,16 +83,27 @@ def _check(config: AppConfig) -> int:
                 logging.info("found CUDA device: %s", torch.cuda.get_device_name(0))
             else:
                 missing.append("CUDA")
-                logging.error("Qwen3-ASR is configured for CUDA, but CUDA is unavailable")
+                logging.error(
+                    "Qwen3-ASR is configured for CUDA, but CUDA is unavailable"
+                )
         if config.audio_analysis.enabled:
             import demucs  # noqa: F401
             import transformers  # noqa: F401
+
             with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore", module=r"pyannote\.audio\.core\.io"
-                )
+                warnings.filterwarnings("ignore", module=r"pyannote\.audio\.core\.io")
                 import pyannote.audio  # noqa: F401
-            logging.info("found diarization, singing, and separation runtimes")
+            worker = (
+                Path(config.audio_analysis.overlap_separation_worker_project)
+                .resolve()
+                .joinpath("worker.py")
+            )
+            if shutil.which("uv") is None or not worker.is_file():
+                missing.append("MossFormer2 worker")
+                logging.error("missing MossFormer2 worker: %s", worker)
+            else:
+                logging.info("found MossFormer2 separation worker: %s", worker)
+            logging.info("found diarization and singing runtimes")
     except ImportError:
         missing.append("qwen-asr")
         logging.error("missing Qwen3-ASR runtime; run `uv sync --extra asr`")

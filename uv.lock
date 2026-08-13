@@ -239,32 +239,6 @@ wheels = [
 ]
 
 [[package]]
-name = "asteroid"
-version = "0.5.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "asteroid-filterbanks" },
-    { name = "huggingface-hub" },
-    { name = "julius" },
-    { name = "numpy" },
-    { name = "pandas" },
-    { name = "pb-bss-eval" },
-    { name = "pytorch-lightning" },
-    { name = "pyyaml" },
-    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "soundfile" },
-    { name = "torch" },
-    { name = "torch-optimizer" },
-    { name = "torch-stoi" },
-    { name = "torchaudio" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/fa/19/066a94a303029c6cff3badf85c780ae103db8eb3c7959509c209419f1412/asteroid-0.5.2.tar.gz", hash = "sha256:f35df2ac52ec1699191f89f22c9f537e3b928f4260a78bd5fa520b95872cabbb", size = 125930, upload-time = "2021-12-06T09:32:58.621Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/0f/dd/94a9be234358448a4d2d47c6697ba53cc5ecd6b4d72ea176fb4869e2b62b/asteroid-0.5.2-py3-none-any.whl", hash = "sha256:0a2f668850634087fbccabd6d45533d2cab70e1d2b751d8aa9598ec837833599", size = 246004, upload-time = "2021-12-06T09:32:56.969Z" },
-]
-
-[[package]]
 name = "asteroid-filterbanks"
 version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -462,15 +436,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/1f/d9/d5340b43cf5fbe7fe5a083d237e5338cc1caa73bea523be1c5e452c26290/brotlicffi-1.2.0.1-pp311-pypy311_pp73-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:37cb587d32bf7168e2218c455e22e409ad1f3157c6c71945879a311f3e6b6abf", size = 406710, upload-time = "2026-03-05T19:54:07.272Z" },
     { url = "https://files.pythonhosted.org/packages/a3/82/dbced4c1e0792efdf23fd90ff6d2a320c64ff4dfef7aacc85c04fde9ddd2/brotlicffi-1.2.0.1-pp311-pypy311_pp73-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:9d6ba65dd528892b4d9960beba2ae011a753620bcfc66cf6fa3cee18d7b0baa4", size = 402787, upload-time = "2026-03-05T19:54:08.73Z" },
     { url = "https://files.pythonhosted.org/packages/ef/6f/534205ba7590c9a8716a614f270c5c2ec419b5b7079b3f9cd31b7b5580de/brotlicffi-1.2.0.1-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:f2a5575653b0672638ba039b82fda56854934d7a6a24d4b8b5033f73ab43cbc1", size = 375108, upload-time = "2026-03-05T19:54:10.079Z" },
-]
-
-[[package]]
-name = "cached-property"
-version = "2.0.1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/76/4b/3d870836119dbe9a5e3c9a61af8cc1a8b69d75aea564572e385882d5aefb/cached_property-2.0.1.tar.gz", hash = "sha256:484d617105e3ee0e4f1f58725e72a8ef9e93deee462222dbd51cd91230897641", size = 10574, upload-time = "2024-10-25T15:43:55.667Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/11/0e/7d8225aab3bc1a0f5811f8e1b557aa034ac04bdf641925b30d3caf586b28/cached_property-2.0.1-py3-none-any.whl", hash = "sha256:f617d70ab1100b7bcf6e42228f9ddcb78c676ffa167278d9f730d1c2fba69ccb", size = 7428, upload-time = "2024-10-25T15:43:54.711Z" },
 ]
 
 [[package]]
@@ -2090,21 +2055,6 @@ wheels = [
 ]
 
 [[package]]
-name = "mir-eval"
-version = "0.8.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "decorator" },
-    { name = "numpy" },
-    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/28/db/3bf39fc9ab0fb757f297f9a0da7207e823688291f9e61bb67b44fa17bc2f/mir_eval-0.8.2.tar.gz", hash = "sha256:141a3e1193276889fc32e911547e73dcb3e829ee8cfea60f7bbcd633c0792569", size = 117649, upload-time = "2025-02-25T18:09:57.505Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/1b/5a/69ce896a32ebc8c75deae00b1fba9837567405fa6ef37b377f2e85b856ae/mir_eval-0.8.2-py3-none-any.whl", hash = "sha256:114cda33d8e17408c170598e0b36ed0d71ff4a2fee8eaf9e165b58ecf1c87170", size = 102794, upload-time = "2025-02-25T18:09:56.012Z" },
-]
-
-[[package]]
 name = "mpmath"
 version = "1.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2922,28 +2872,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pb-bss-eval"
-version = "0.0.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "cached-property" },
-    { name = "einops" },
-    { name = "mir-eval" },
-    { name = "pesq" },
-    { name = "pystoi" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/37/2a/377b05ba6c4293b8e86a3f85184181e3d681b146b812fc98781862490ff9/pb_bss_eval-0.0.2.tar.gz", hash = "sha256:395fbcabc9d3be66490131a67a122d08d4c2cdb88b2ddcd7a4120664c33c6d38", size = 12665, upload-time = "2020-04-25T07:23:56.055Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b2/d5/2825e46367d810dda650655a818fb8185147628f16ee85dd54aaa4dac8b0/pb_bss_eval-0.0.2-py3-none-any.whl", hash = "sha256:a72c2fd04c9f4a4e734cf615029c3877e6e4536225eeaaae05bb0cf014b3af1b", size = 14566, upload-time = "2020-04-25T07:23:54.619Z" },
-]
-
-[[package]]
-name = "pesq"
-version = "0.0.4"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/22/e6/f8bdcef3238ac10fb3ce37d150e9b03a152d971febd681f088c6e5e17d8e/pesq-0.0.4.tar.gz", hash = "sha256:b724b28f73fb638522982bd68e8c3c0957e2f45210639a460233b17aa7fc890b", size = 38702, upload-time = "2022-05-17T14:15:26.301Z" }
-
-[[package]]
 name = "pillow"
 version = "12.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3246,12 +3174,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/66/a3/1d03ed6c7669f7b94ce4a7ebe3b21f5c3b6331999a5680837e371e0a0537/pyannote_audio-4.0.7-py3-none-any.whl", hash = "sha256:852ea15c4d85bc34773e618267603ffca6a521669a74d33742692cc67fc700d6", size = 894598, upload-time = "2026-06-30T14:28:51.779Z" },
 ]
 
-[package.optional-dependencies]
-separation = [
-    { name = "asteroid" },
-    { name = "transformers" },
-]
-
 [[package]]
 name = "pyannote-core"
 version = "6.0.1"
@@ -3520,20 +3442,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pystoi"
-version = "0.4.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy" },
-    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/bf/3d/1ae8bdb686c6aaaeef474aa6b790abbe38f42b61188b57a974dd9320e521/pystoi-0.4.1.tar.gz", hash = "sha256:1c6f50d6fbfee46b00c922458cdbd27228d9830ca81cea788fd600fc2f7de6e4", size = 10401, upload-time = "2023-12-29T16:48:05.726Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/1a/22/60cd92bd3ec00948800984410f4cf5ded5bd8e9b715729f3642efe0edb3d/pystoi-0.4.1-py2.py3-none-any.whl", hash = "sha256:e277b671663d26d35a2416c9c8010a74084e6c3970354506398051a554896939", size = 8218, upload-time = "2023-12-29T16:48:03.748Z" },
-]
-
-[[package]]
 name = "python-dateutil"
 version = "2.9.0.post0"
 source = { registry = "https://pypi.org/simple" }
@@ -3589,18 +3497,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/9b/80/6e61b1a91debf4c1b47d441f9a9d7fe2aabcdd9575ed70b2811474eb95c3/pytorch-metric-learning-2.9.0.tar.gz", hash = "sha256:27a626caf5e2876a0fd666605a78cb67ef7597e25d7a68c18053dd503830701f", size = 84530, upload-time = "2025-08-17T17:11:19.501Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/46/7d/73ef5052f57b7720cad00e16598db3592a5ef4826745ffca67a2f085d4dc/pytorch_metric_learning-2.9.0-py3-none-any.whl", hash = "sha256:d51646006dc87168f00cf954785db133a4c5aac81253877248737aa42ef6432a", size = 127801, upload-time = "2025-08-17T17:11:18.185Z" },
-]
-
-[[package]]
-name = "pytorch-ranger"
-version = "0.1.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "torch" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/bb/32/9269ee5981995e760c3bf51d6cf7f84a2ce051eca2315753910585bce50d/pytorch_ranger-0.1.1.tar.gz", hash = "sha256:aa7115431cef11b57d7dd7bc86e7302a911dae467f62ec5d0b10e1ff744875db", size = 7865, upload-time = "2020-03-30T07:37:22.194Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/0d/70/12256257d861bbc3e176130d25be1de085ce7a9e60594064888a950f2154/pytorch_ranger-0.1.1-py3-none-any.whl", hash = "sha256:1e69156c9cc8439185cb8ba4725b18c91947fbe72743e25aca937da8aeb0c8ec", size = 14436, upload-time = "2020-03-30T07:37:21.198Z" },
 ]
 
 [[package]]
@@ -4589,19 +4485,6 @@ wheels = [
 ]
 
 [[package]]
-name = "torch-optimizer"
-version = "0.1.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "pytorch-ranger" },
-    { name = "torch" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/76/87/12f8646a46018d8c84cc74456f82aa263f55eb93b6f96c195f85cd0d2f72/torch-optimizer-0.1.0.tar.gz", hash = "sha256:3f67b71838a23a149afa7b3e1d9d7d3fd7c83b5758c8f3744900de1584969cf5", size = 14318377, upload-time = "2021-01-01T16:51:32.121Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/af/0f/bc49a0f714a1896b80f31db9ba82eebcb2bad9e0f5757184574f8ecfe2f1/torch_optimizer-0.1.0-py3-none-any.whl", hash = "sha256:b7adaed38b66a5c5105a59b30a71c4ab7c9954baf0acabd969fee3dac954657d", size = 72545, upload-time = "2021-01-01T16:51:15.199Z" },
-]
-
-[[package]]
 name = "torch-pitch-shift"
 version = "1.2.5"
 source = { registry = "https://pypi.org/simple" }
@@ -4614,21 +4497,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/79/a6/722a832bca75d5079f6731e005b3d0c2eec7c6c6863d030620952d143d57/torch_pitch_shift-1.2.5.tar.gz", hash = "sha256:6e1c7531f08d0f407a4c55e5ff8385a41355c5c5d27ab7fa08632e51defbd0ed", size = 4725, upload-time = "2024-09-25T19:10:12.922Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/27/4c/96ac2a09efb56cc3c41fb3ce9b6f4d8c0604499f7481d4a13a7b03e21382/torch_pitch_shift-1.2.5-py3-none-any.whl", hash = "sha256:6f8500cbc13f1c98b11cde1805ce5084f82cdd195c285f34287541f168a7c6a7", size = 5005, upload-time = "2024-09-25T19:10:11.521Z" },
-]
-
-[[package]]
-name = "torch-stoi"
-version = "0.2.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy" },
-    { name = "pystoi" },
-    { name = "torch" },
-    { name = "torchaudio" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/47/a4/23be9a35b6c5b5c4547d24c52b07f4a5d55406a5ae43d9cce09f2352d75a/torch_stoi-0.2.3.tar.gz", hash = "sha256:228207b8d63548336c5520b156f1e6b30d3ae3db1fb3c41999f01aee087c5f85", size = 9224, upload-time = "2024-09-30T15:22:12.841Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a3/92/ead346e904390a53e71b5da2df7e7839abb16e967ba07fa15addf1f9f37c/torch_stoi-0.2.3-py3-none-any.whl", hash = "sha256:6eee85e33b42fe843a2150de46000f72e7b87cbeb19ae6ab9bbd94b6ec6b3cd2", size = 8146, upload-time = "2024-09-30T15:22:10.92Z" },
 ]
 
 [[package]]
@@ -5069,7 +4937,7 @@ asr = [
     { name = "demucs", version = "4.0.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'" },
     { name = "demucs", version = "4.1.0", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'" },
     { name = "librosa" },
-    { name = "pyannote-audio", extra = ["separation"] },
+    { name = "pyannote-audio" },
     { name = "qwen-asr" },
     { name = "speechbrain" },
 ]
@@ -5079,7 +4947,7 @@ requires-dist = [
     { name = "certifi", specifier = ">=2025.1.31" },
     { name = "demucs", marker = "extra == 'asr'", specifier = ">=4,<5" },
     { name = "librosa", marker = "extra == 'asr'", specifier = ">=0.11,<1" },
-    { name = "pyannote-audio", extras = ["separation"], marker = "extra == 'asr'", specifier = ">=4,<5" },
+    { name = "pyannote-audio", marker = "extra == 'asr'", specifier = ">=4,<5" },
     { name = "qwen-asr", marker = "extra == 'asr'", specifier = ">=0.0.6,<0.1" },
     { name = "speechbrain", marker = "extra == 'asr'", specifier = ">=1,<2" },
     { name = "yt-dlp", extras = ["default", "curl-cffi"], specifier = ">=2025.1.15" },

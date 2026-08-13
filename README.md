@@ -91,17 +91,15 @@ LLM HTTPS 请求会在系统 CA 基础上补充 `certifi` CA bundle，兼容 uv 
 NixOS、macOS 和 Windows，同时保留 `SSL_CERT_FILE` 等自定义 CA 配置。
 
 字幕使用联合 JSON 请求：LLM 直接把 forced aligner 单元组成 cue 并翻译，首选返回
-`{"cues":[{"start_id":...省略...}]}`。解析器同时兼容旧 NDJSON、裸数组和连续 JSON
-对象，再统一执行相同校验。程序根据 ID 恢复日文原文和时间轴，并严格校验范围连续、
+`{"cues":[{"start_id":...省略...}]}`。解析器也容忍模型偶尔返回 NDJSON、裸数组或连续
+JSON 对象，再统一执行相同校验。程序根据 ID 恢复日文原文和时间轴，并严格校验范围连续、
 有序、无遗漏、无重复。助词、专名和术语完整性由模型结合上下文判断，不由本地规则禁止
 特定边界。时长、字符数、停顿和窗口边缘都不会成为硬边界；停顿只作为语义判断证据。
 
 每个非最终窗口都会舍弃模型返回的最后一条 cue，并从它的 `start_id` 带入下一窗口重新
 规划。若窗口只有一条 cue，程序会扩大范围；请求连续失败后则缩小范围，无法在 API
 上下文限制内得到有效结果时停止，不使用硬裁断回退。已确认的连续前缀会逐窗原子写入
-job 目录的 `cue-translation-cache.json`，重跑时只恢复其中最长的合法连续前缀。旧的
-`source-segments-cache.json`、`translation-cache.json` 和 `display-segments-cache.json`
-不会再读取。
+job 目录的 `cue-translation-cache.json`，重跑时只恢复其中最长的合法连续前缀。
 
 联合输入使用 `[id,duration_ms,gap_after_ms,text]`，绝对时间只在本地保存。固定规则、
 术语表和视频信息位于请求前缀，窗口数据随后，重试错误放在末尾，以提高 DeepSeek
@@ -139,12 +137,13 @@ URL 放在单引号中时不要再写 `\?` 或 `\=`。为兼容常见的复制�
 缺失块。上下文区的时间戳只归属相应核心区间，因此不会产生重复 cue。分块总长度受
 forced aligner 的 180 秒输入限制约束。
 
-启用 `[audio_analysis]` 后，管线会先用 pyannote `community-1` 做 VAD 和说话人
-分离。原音 AST 只提出歌声候选，Demucs 人声轨上的 AST 再确认实际歌唱；候选中存在
+启用 `[audio_analysis]` 后，管线会先用 pyannote `community-1` 做 VAD、全局说话人
+聚类和重叠检测。原音 AST 只提出歌声候选，Demucs 人声轨上的 AST 再确认实际歌唱；候选中存在
 连续讲话但人声轨没有歌唱证据时按“讲话+BGM”处理。证据模糊时同时运行普通 forced
 aligner 与句级歌声 ASR，时间轴坍缩或循环输出时采用歌声结果。release hysteresis 只在
-确认进入歌唱状态后桥接短暂漏检，不会让一次 AST 误报扩成整段歌曲。检测到重叠说话
-时，pyannote ToTaToNet 会输出独立声源并分别转写。所有音频分析结果和带说话人字段的
+确认进入歌唱状态后桥接短暂漏检，不会让一次 AST 误报扩成整段歌曲。检测到两人重叠
+说话时，独立 worker 中的 `MossFormer2_SS_16K` 会输出两条声源并分别转写；三人重叠、
+分离失败或存在空轨时保留原音，不会采用不完整的分离结果。所有音频分析结果和带说话人字段的
 cue sidecar 都写入 job 目录并可断点复用。
 
 人物身份使用独立 uv worker 中的 ERes2NetV2 embedding 和余弦距离匹配。成员个人频道
@@ -154,7 +153,7 @@ cue sidecar 都写入 job 目录并可断点复用。
 每人建立最多 5 个中心；每个中心默认至少需要 20 条样本，小簇会通过减少中心数重新
 聚类。这样可以分别覆盖普通聊天、激动语气和带背景音等声音状态。匹配还要求第一候选
 相对第二候选保持足够距离；重叠分轨使用更严格的绝对阈值，证据不足时保留匿名标签。
-重叠声源分离内部仍使用 pyannote 兼容的 WeSpeaker。
+MossFormer2 使用独立 uv 环境，避免其 NumPy 1.x 依赖影响 pyannote 和 Qwen ASR。
 
 梦限大 MewType 五位成员的应援色与声纹配置位于独立的
 `character_styles.json`，不会发给 LLM。独播频道会从无重叠语音自动建立声纹原型；
@@ -190,7 +189,9 @@ uv run --extra asr subtitle-pipeline --config config.toml run 'https://www.youtu
 
 默认 `copyright = 2` 表示转载，来源自动使用 YouTube URL；若 `source` 非空则使用配置值。
 上传使用 `biliup --user-cookie ... upload`，不会把 Cookie 内容放到命令行。
-B 站简介会按 2000 个 UTF-16 code units 安全截断，避免补充平面字符导致服务端误判超长。
+B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服务端计数差异留出余量。
+超长正文优先在段落或整行边界缩短，并为 `description_suffix` 预留空间；可通过
+`upload.description_max_chars` 调整上限。
 
 批量处理 2026-07-27 至 2026-08-10 的梦限大MewType公开直播录播：
 
@@ -218,8 +219,6 @@ B 站简介会按 2000 个 UTF-16 code units 安全截断，避免补充平面�
 - `asr.max_new_tokens`：单块 ASR 最多生成的 token 数，默认 `2048`。
 - `segmentation.model_window_cues`：联合请求初始新增的 forced aligner 单元数，默认
   `600`；非最终窗口的末条 cue 会自动带入下一窗口。
-- `llm.batch_size`：旧字幕翻译接口及元数据辅助任务的批大小；联合字幕窗口由
-  `segmentation.model_window_cues` 控制。
 - `llm.max_tokens`：单次 LLM 响应的输出 token 上限，DeepSeek V4 建议设为 `16384`。
 - `llm.max_retries`：拆分批次前的请求重试次数，建议设为 `5`。
 - `llm.context_cues`：联合请求附带的已确认相邻 cue 数量，默认 `3` 条。
@@ -239,6 +238,7 @@ B 站简介会按 2000 个 UTF-16 code units 安全截断，避免补充平面�
 - `upload.tags`：始终保留的固定标签；会与自动标签去重合并。
 - `upload.max_tags`：投稿使用的固定标签与自动标签总数上限。
 - `upload.tag_catalog_file`：经授权获取或人工维护的 B 站规范标签与热度目录。
+- `upload.description_max_chars`：简介的保守字符上限，同时作为 UTF-16 单位上限。
 
 IP 别名文件格式参考 `ip_aliases.example.json`：
 

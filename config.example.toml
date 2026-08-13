@@ -27,11 +27,13 @@ max_new_tokens = 2048
 # models require an authenticated Hugging Face account with accepted terms.
 enabled = true
 diarization_model = "pyannote/speaker-diarization-community-1"
+# Kept only for compatibility with older configs; MossFormer2 does not use it.
 overlap_embedding_model = "pyannote/wespeaker-voxceleb-resnet34-LM"
 speaker_embedding_backend = "eres2netv2"
 speaker_embedding_model = "iic/speech_eres2netv2_sv_zh-cn_16k-common"
 speaker_embedding_worker_project = "tools/speaker_embedding"
-overlap_separation_model = "pyannote/separation-ami-1.0"
+overlap_separation_model = "MossFormer2_SS_16K"
+overlap_separation_worker_project = "tools/mossformer2"
 singing_model = "MIT/ast-finetuned-audioset-10-10-0.4593"
 device = "cuda:0"
 singing_window_seconds = 5.0
@@ -92,12 +94,11 @@ api_key_pass_entry = "api/deepseek"
 api_key_env = "DEEPSEEK_API_KEY"
 model = "deepseek-v4-flash"
 target_language = "简体中文"
-batch_size = 30
 timeout_seconds = 120
 max_retries = 5
 max_tokens = 16384
 context_cues = 3
-# Joint subtitles and metadata use json_object; legacy per-ID translation keeps NDJSON.
+# Joint subtitles and metadata use json_object.
 # Set false if an OpenAI-compatible provider rejects response_format=json_object.
 json_mode = true
 # DeepSeek V4 defaults to thinking mode, which is slow and unreliable for strict JSON.
@@ -141,5 +142,7 @@ max_tags = 10
 source = ""
 title_prefix = "【中字】"
 description_suffix = "\n\n字幕由自动化工具生成，请以原视频为准。"
+# Keep a margin below Bilibili's nominal limit; truncation preserves the suffix.
+description_max_chars = 1800
 # line = "kodo"
 limit = 3

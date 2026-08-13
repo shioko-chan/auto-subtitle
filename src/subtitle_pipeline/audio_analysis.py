@@ -3,6 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import shutil
+import subprocess
+import tempfile
 import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -13,7 +17,7 @@ from .config import AudioAnalysisConfig
 
 logger = logging.getLogger(__name__)
 
-_CACHE_VERSION = 6
+_CACHE_VERSION = 7
 _MIN_SEPARATED_SEGMENT_SECONDS = 0.08
 _MIN_SEPARATED_PEAK = 1e-4
 _MIN_SEPARATED_RMS = 1e-5
@@ -126,9 +130,7 @@ def analyze_audio(
         )
     from .speakers import identify_speakers, metadata_character
 
-    known_character = metadata_character(
-        metadata or {}, config.character_styles_file
-    )
+    known_character = metadata_character(metadata or {}, config.character_styles_file)
     speech = identify_speakers(
         waveform,
         sample_rate,
@@ -201,10 +203,9 @@ def _run_diarization(
 ) -> list[AudioRegion]:
     try:
         import torch
+
         with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore", module=r"pyannote\.audio\.core\.io"
-            )
+            warnings.filterwarnings("ignore", module=r"pyannote\.audio\.core\.io")
             from pyannote.audio import Pipeline
     except ImportError as exc:
         raise RuntimeError(
@@ -269,9 +270,7 @@ def _score_singing_windows(
     if sample_rate != target_rate:
         import torchaudio.functional as audio_functional
 
-        mono_tensor = audio_functional.resample(
-            mono_tensor, sample_rate, target_rate
-        )
+        mono_tensor = audio_functional.resample(mono_tensor, sample_rate, target_rate)
         sample_rate = target_rate
     mono = mono_tensor.numpy()
     window_samples = max(1, round(config.singing_window_seconds * sample_rate))
@@ -290,9 +289,7 @@ def _score_singing_windows(
         int(index): str(label).casefold()
         for index, label in model.config.id2label.items()
     }
-    singing_ids = [
-        index for index, label in labels.items() if label in _SINGING_LABELS
-    ]
+    singing_ids = [index for index, label in labels.items() if label in _SINGING_LABELS]
     speech_ids = [index for index, label in labels.items() if label in _SPEECH_LABELS]
     if not singing_ids:
         raise RuntimeError("AST singing detector exposes no recognized singing labels")
@@ -349,9 +346,7 @@ def _arbitrate_singing_regions(
     episodes = _merge_regions(raw_candidates, release_seconds)
     for candidate in episodes:
         matching_vocals = [
-            vocal
-            for vocal in vocal_anchors
-            if _overlap_duration(candidate, vocal) > 0
+            vocal for vocal in vocal_anchors if _overlap_duration(candidate, vocal) > 0
         ]
         if matching_vocals:
             if candidate.end - candidate.start < minimum_singing_seconds:
@@ -363,8 +358,7 @@ def _arbitrate_singing_regions(
                     candidate.end,
                     "singing",
                     confidence=max(
-                        float(region.confidence or 0.0)
-                        for region in matching_vocals
+                        float(region.confidence or 0.0) for region in matching_vocals
                     ),
                 )
             )
@@ -404,9 +398,7 @@ def _region_coverage(region: AudioRegion, others: list[AudioRegion]) -> float:
     return covered / max(region.end - region.start, 1e-6)
 
 
-def _dominant_speaker(
-    region: AudioRegion, speech: list[AudioRegion]
-) -> str | None:
+def _dominant_speaker(region: AudioRegion, speech: list[AudioRegion]) -> str | None:
     durations: dict[str, float] = {}
     for turn in speech:
         if turn.speaker:
@@ -463,111 +455,216 @@ def _run_overlap_separation(
     config: AudioAnalysisConfig,
     output_dir: Path,
 ) -> list[AudioRegion]:
-    """Separate overlapping speakers while retaining full-recording timestamps."""
+    """Separate two-speaker overlaps while retaining recording timestamps."""
     try:
         import soundfile as sf
-        import torch
-        from pyannote.audio.pipelines import SpeechSeparation
     except ImportError as exc:
         raise RuntimeError(
             "overlap separation is unavailable; install the ASR optional dependencies"
         ) from exc
 
-    overlap_spans = _overlap_spans(diarized_regions, float(waveform.shape[-1]) / sample_rate)
+    overlap_spans = _overlap_spans(
+        diarized_regions, float(waveform.shape[-1]) / sample_rate
+    )
     if not overlap_spans:
         return diarized_regions
+    eligible_spans: list[tuple[int, float, float]] = []
+    for span_index, (span_start, span_end) in enumerate(overlap_spans):
+        concurrent = _maximum_concurrent_speakers(
+            diarized_regions, span_start, span_end
+        )
+        if concurrent > 2:
+            logger.warning(
+                "overlap %.3f-%.3f has %d concurrent speakers; "
+                "MossFormer2 supports two, retaining original audio",
+                span_start,
+                span_end,
+                concurrent,
+            )
+            continue
+        eligible_spans.append((span_index, span_start, span_end))
+    if not eligible_spans:
+        return diarized_regions
+
     logger.info(
-        "loading overlap separator %s for %d local regions",
+        "running overlap separator %s for %d two-speaker regions",
         config.overlap_separation_model,
-        len(overlap_spans),
+        len(eligible_spans),
     )
-    pipeline = SpeechSeparation(
-        segmentation=config.overlap_separation_model,
-        segmentation_step=0.1,
-        embedding=config.overlap_embedding_model,
-        embedding_exclude_overlap=False,
-        clustering="AgglomerativeClustering",
-        embedding_batch_size=8,
-        segmentation_batch_size=8,
-    )
-    pipeline.instantiate(
-        {
-            "segmentation": {"min_duration_off": 0.0, "threshold": 0.82},
-            "clustering": {
-                "method": "centroid",
-                "min_cluster_size": 15,
-                "threshold": 0.68,
-            },
-            "separation": {"leakage_removal": True, "asr_collar": 0.32},
-        }
-    )
-    pipeline.to(torch.device(config.device))
+    output_dir.mkdir(parents=True, exist_ok=True)
     try:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        separated: list[AudioRegion] = []
-        for span_index, (span_start, span_end) in enumerate(overlap_spans):
+        outputs = _run_mossformer2_worker(
+            waveform,
+            sample_rate,
+            eligible_spans,
+            config,
+            output_dir,
+        )
+    except RuntimeError as exc:
+        logger.warning(
+            "MossFormer2 separation failed; retaining original audio: %s", exc
+        )
+        return diarized_regions
+
+    separated: list[AudioRegion] = []
+    successful_spans: list[tuple[float, float]] = []
+    for span_index, span_start, span_end in eligible_spans:
+        paths = outputs.get(span_index, [])
+        usable: list[Path] = []
+        for path in paths:
+            try:
+                data, rate = sf.read(path, always_2d=True, dtype="float32")
+            except (OSError, RuntimeError) as exc:
+                logger.warning("could not read MossFormer2 output %s: %s", path, exc)
+                continue
+            source = data.mean(axis=1)
+            duration = len(source) / max(int(rate), 1)
+            if _separated_source_is_usable(
+                source,
+                [AudioRegion(0.0, duration, "speech")],
+                int(rate),
+            ):
+                usable.append(path)
+        if len(usable) != 2:
+            logger.warning(
+                "MossFormer2 overlap %d returned %d usable tracks; "
+                "retaining original audio",
+                span_index,
+                len(usable),
+            )
+            continue
+        successful_spans.append((span_start, span_end))
+        separated.extend(
+            AudioRegion(
+                round(span_start, 3),
+                round(span_end, 3),
+                "speech",
+                f"OVERLAP_{span_index:05d}_SOURCE_{source_index}",
+                overlap=True,
+                source_path=str(path.resolve()),
+                source_offset=span_start,
+            )
+            for source_index, path in enumerate(usable)
+        )
+
+    if not successful_spans:
+        return diarized_regions
+    failed_spans = [
+        span
+        for span in overlap_spans
+        if not any(span == successful for successful in successful_spans)
+    ]
+    untouched = [
+        AudioRegion(
+            **{
+                **asdict(fragment),
+                "overlap": any(
+                    min(fragment.end, failed_end)
+                    > max(fragment.start, failed_start)
+                    for failed_start, failed_end in failed_spans
+                ),
+            }
+        )
+        for region in diarized_regions
+        for fragment in _subtract_regions(region, successful_spans)
+    ]
+    return sorted([*untouched, *separated], key=lambda item: (item.start, item.end))
+
+
+def _run_mossformer2_worker(
+    waveform: Any,
+    sample_rate: int,
+    spans: list[tuple[int, float, float]],
+    config: AudioAnalysisConfig,
+    output_dir: Path,
+) -> dict[int, list[Path]]:
+    import soundfile as sf
+
+    uv = shutil.which("uv")
+    project = Path(config.overlap_separation_worker_project).resolve()
+    worker = project / "worker.py"
+    if uv is None or not worker.is_file():
+        raise RuntimeError(f"MossFormer2 worker is unavailable at {worker}")
+
+    with tempfile.TemporaryDirectory(prefix="mossformer2-input-") as temp:
+        input_dir = Path(temp)
+        items: list[dict[str, object]] = []
+        for span_index, span_start, span_end in spans:
             start_sample = round(span_start * sample_rate)
             end_sample = round(span_end * sample_rate)
-            output = pipeline(
+            mono = (
+                waveform[:, start_sample:end_sample].mean(dim=0).detach().cpu().numpy()
+            )
+            input_path = input_dir / f"overlap-{span_index:05d}.wav"
+            output_paths = [
+                output_dir / f"mossformer2-overlap-{span_index:05d}-source-{index}.wav"
+                for index in range(2)
+            ]
+            sf.write(input_path, mono, sample_rate)
+            items.append(
                 {
-                    "waveform": waveform[:, start_sample:end_sample],
-                    "sample_rate": sample_rate,
+                    "id": span_index,
+                    "input_path": str(input_path),
+                    "output_paths": [str(path.resolve()) for path in output_paths],
                 }
             )
-            if isinstance(output, tuple) and len(output) == 2:
-                annotation, sources = output
-            else:
-                annotation = getattr(output, "speaker_diarization", None)
-                sources = getattr(output, "separation", None)
-            if annotation is None or sources is None:
-                raise RuntimeError("pyannote overlap separator returned no sources")
-            labels = list(annotation.labels())
-            data = sources.data
-            if data.ndim != 2 or data.shape[1] < len(labels):
-                raise RuntimeError("pyannote overlap separator returned malformed sources")
-            tracks = [
-                (segment, str(speaker))
-                for segment, _track, speaker in annotation.itertracks(
-                    yield_label=True
+        payload = {
+            "model": config.overlap_separation_model,
+            "items": items,
+        }
+        environment = os.environ.copy()
+        if config.device.startswith("cuda:"):
+            environment["CUDA_VISIBLE_DEVICES"] = config.device.split(":", 1)[1]
+        else:
+            environment["CUDA_VISIBLE_DEVICES"] = ""
+        result = subprocess.run(
+            [
+                uv,
+                "run",
+                "--frozen",
+                "--project",
+                str(project),
+                "python",
+                str(worker),
+            ],
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            check=False,
+            cwd=project,
+            env=environment,
+        )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "MossFormer2 worker failed: " + (result.stderr or result.stdout)[-3000:]
+        )
+    try:
+        response = json.loads(result.stdout)
+        records = response["items"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError("MossFormer2 worker returned malformed JSON") from exc
+    if not isinstance(records, list):
+        raise RuntimeError("MossFormer2 worker returned malformed items")
+    outputs: dict[int, list[Path]] = {}
+    for record in records:
+        if not isinstance(record, dict) or record.get("error"):
+            if isinstance(record, dict):
+                logger.warning(
+                    "MossFormer2 overlap %s failed: %s",
+                    record.get("id"),
+                    record.get("error"),
                 )
-                if float(segment.end) - float(segment.start)
-                >= _MIN_SEPARATED_SEGMENT_SECONDS
-            ]
-            source_paths: dict[str, str] = {}
-            for source_index, label in enumerate(labels):
-                label_segments = [
-                    segment for segment, speaker in tracks if speaker == str(label)
-                ]
-                source = data[:, source_index]
-                if not _separated_source_is_usable(
-                    source, label_segments, sample_rate
-                ):
-                    continue
-                path = output_dir / f"overlap-{span_index:05d}-{label}.wav"
-                sf.write(path, source, sample_rate)
-                source_paths[str(label)] = str(path.resolve())
-            separated.extend(
-                AudioRegion(
-                    round(span_start + float(segment.start), 3),
-                    round(span_start + float(segment.end), 3),
-                    "speech",
-                    f"OVERLAP_{span_index:05d}_{speaker}",
-                    overlap=True,
-                    source_path=source_paths.get(str(speaker)),
-                    source_offset=span_start,
-                )
-                for segment, speaker in tracks
-                if str(speaker) in source_paths
-            )
-        untouched = [
-            fragment
-            for region in diarized_regions
-            for fragment in _subtract_regions(region, overlap_spans)
-        ]
-        return sorted([*untouched, *separated], key=lambda item: (item.start, item.end))
-    finally:
-        del pipeline
-        _release_cuda()
+            continue
+        try:
+            span_index = int(record["id"])
+            paths = [Path(str(path)) for path in record["output_paths"]]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "MossFormer2 worker returned malformed output paths"
+            ) from exc
+        if len(paths) == 2 and all(path.is_file() for path in paths):
+            outputs[span_index] = paths
+    return outputs
 
 
 def _separated_source_is_usable(
@@ -576,8 +673,7 @@ def _separated_source_is_usable(
     segments = [
         segment
         for segment in segments
-        if float(segment.end) - float(segment.start)
-        >= _MIN_SEPARATED_SEGMENT_SECONDS
+        if float(segment.end) - float(segment.start) >= _MIN_SEPARATED_SEGMENT_SECONDS
     ]
     if not segments:
         return False
@@ -607,7 +703,9 @@ def _separate_vocals(source: Path, destination: Path, device: str) -> None:
         import soundfile as sf
         from demucs.api import Separator
     except ImportError as exc:
-        raise RuntimeError("vocal separation requires the ASR optional dependencies") from exc
+        raise RuntimeError(
+            "vocal separation requires the ASR optional dependencies"
+        ) from exc
 
     logger.info("separating vocals with Demucs htdemucs")
     separator = Separator(model="htdemucs", device=device, progress=True)
@@ -657,14 +755,16 @@ def _singing_phrases(
                 )
                 current = [int(local_start), int(local_end)]
         if current is not None:
-            region_phrases.append(
-                _vocal_interval(offset, current, sample_rate, region)
-            )
+            region_phrases.append(_vocal_interval(offset, current, sample_rate, region))
         blocks = _coalesce_singing_phrases(
             region_phrases,
             minimum_seconds=minimum_seconds,
         )
-        if blocks and len(blocks) == 1 and blocks[0].end - blocks[0].start < minimum_seconds:
+        if (
+            blocks
+            and len(blocks) == 1
+            and blocks[0].end - blocks[0].start < minimum_seconds
+        ):
             blocks = [
                 AudioRegion(
                     region.start,
@@ -686,9 +786,7 @@ def _coalesce_singing_phrases(
     start = phrases[0].start
     confidence = phrases[0].confidence
     for phrase in phrases:
-        confidence = max(
-            float(confidence or 0.0), float(phrase.confidence or 0.0)
-        )
+        confidence = max(float(confidence or 0.0), float(phrase.confidence or 0.0))
         if phrase.end - start >= minimum_seconds:
             blocks.append(
                 AudioRegion(start, phrase.end, "singing", confidence=confidence)
@@ -759,7 +857,9 @@ def _overlap_spans(
             end = min(left.end, right.end)
             if end > start:
                 intersections.append(
-                    AudioRegion(max(0.0, start - 0.75), min(duration, end + 0.75), "speech")
+                    AudioRegion(
+                        max(0.0, start - 0.75), min(duration, end + 0.75), "speech"
+                    )
                 )
     merged = _merge_regions(intersections, 0.25)
     spans: list[tuple[float, float]] = []
@@ -772,6 +872,35 @@ def _overlap_spans(
                 break
             cursor = end
     return spans
+
+
+def _maximum_concurrent_speakers(
+    regions: list[AudioRegion], start: float, end: float
+) -> int:
+    events: list[tuple[float, int, str]] = []
+    for region in regions:
+        if not region.speaker:
+            continue
+        clipped_start = max(start, region.start)
+        clipped_end = min(end, region.end)
+        if clipped_end <= clipped_start:
+            continue
+        events.append((clipped_start, 1, region.speaker))
+        events.append((clipped_end, -1, region.speaker))
+    counts: dict[str, int] = {}
+    maximum = 0
+    # End events precede start events at the same timestamp.
+    for _time, delta, speaker in sorted(events, key=lambda item: (item[0], item[1])):
+        if delta < 0:
+            count = counts.get(speaker, 0) - 1
+            if count > 0:
+                counts[speaker] = count
+            else:
+                counts.pop(speaker, None)
+        else:
+            counts[speaker] = counts.get(speaker, 0) + 1
+            maximum = max(maximum, len(counts))
+    return maximum
 
 
 def _subtract_regions(
@@ -872,10 +1001,14 @@ def _signature(
 ) -> str:
     stat = video.stat()
     profile_dir = Path(config.speaker_profiles_dir).expanduser()
-    profile_state = [
-        (path.name, path.stat().st_size, path.stat().st_mtime_ns)
-        for path in sorted(profile_dir.glob("*.json"))
-    ] if profile_dir.is_dir() else []
+    profile_state = (
+        [
+            (path.name, path.stat().st_size, path.stat().st_mtime_ns)
+            for path in sorted(profile_dir.glob("*.json"))
+        ]
+        if profile_dir.is_dir()
+        else []
+    )
     payload = {
         "version": _CACHE_VERSION,
         "video_size": stat.st_size,
@@ -897,7 +1030,10 @@ def _load_cache(path: Path, signature: str) -> AudioAnalysis | None:
         return None
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-        if value.get("version") != _CACHE_VERSION or value.get("signature") != signature:
+        if (
+            value.get("version") != _CACHE_VERSION
+            or value.get("signature") != signature
+        ):
             return None
         return AudioAnalysis(
             speech=[AudioRegion(**item) for item in value["speech"]],
