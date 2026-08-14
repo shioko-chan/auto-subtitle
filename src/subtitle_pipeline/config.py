@@ -41,6 +41,8 @@ class ASRConfig:
 @dataclass(frozen=True)
 class AudioAnalysisConfig:
     enabled: bool = True
+    debug_audio_artifacts: bool = False
+    initial_analysis_concurrency: int = 1
     diarization_model: str = "pyannote/speaker-diarization-community-1"
     # Retained for compatibility with older configuration files. MossFormer2
     # does not use a pyannote embedding model internally.
@@ -108,7 +110,7 @@ class LLMConfig:
     target_language: str = "简体中文"
     timeout_seconds: int = 120
     max_retries: int = 5
-    max_concurrency: int = 4
+    max_concurrency: int = 16
     max_tokens: int = 16384
     context_cues: int = 3
     json_mode: bool = True
@@ -154,6 +156,13 @@ class UploadConfig:
     description_max_chars: int = 1800
     line: str | None = None
     limit: int = 3
+    cooldown_min_seconds: float = 60.0
+    cooldown_max_seconds: float = 120.0
+    rate_limit_retry_delays_seconds: list[float] = field(
+        default_factory=lambda: [120.0, 300.0, 600.0, 1200.0]
+    )
+    throttle_state_file: str = "work/bilibili-upload-throttle.json"
+    pause_marker_file: str = "work/bilibili-upload-paused.json"
 
 
 @dataclass(frozen=True)
@@ -243,6 +252,10 @@ def load_config(path: Path) -> AppConfig:
     if config.asr.max_new_tokens < 1:
         raise ConfigError("asr.max_new_tokens must be at least 1")
     analysis = config.audio_analysis
+    if analysis.initial_analysis_concurrency not in {1, 2}:
+        raise ConfigError(
+            "audio_analysis.initial_analysis_concurrency must be 1 or 2"
+        )
     if analysis.speaker_embedding_backend not in {"eres2netv2", "wespeaker"}:
         raise ConfigError(
             "audio_analysis.speaker_embedding_backend must be 'eres2netv2' or "
@@ -368,6 +381,18 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("upload.max_tags must be between 1 and 10")
     if config.upload.description_max_chars < 1:
         raise ConfigError("upload.description_max_chars must be at least 1")
+    if config.upload.cooldown_min_seconds < 0:
+        raise ConfigError("upload.cooldown_min_seconds cannot be negative")
+    if config.upload.cooldown_max_seconds < config.upload.cooldown_min_seconds:
+        raise ConfigError(
+            "upload.cooldown_max_seconds must be at least cooldown_min_seconds"
+        )
+    if not config.upload.rate_limit_retry_delays_seconds or any(
+        delay <= 0 for delay in config.upload.rate_limit_retry_delays_seconds
+    ):
+        raise ConfigError(
+            "upload.rate_limit_retry_delays_seconds must contain positive delays"
+        )
     return config
 
 

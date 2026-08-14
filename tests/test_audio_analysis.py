@@ -1,7 +1,9 @@
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -15,16 +17,20 @@ from subtitle_pipeline.audio_analysis import (
     _maximum_concurrent_speakers,
     _merge_regions,
     _overlap_spans,
+    _run_initial_audio_analysis,
+    _run_mossformer2_worker,
     _run_overlap_separation,
     _separated_source_is_usable,
     _singing_evidence_score,
     _singing_regions_from_scores,
     _subtract_regions,
 )
+from subtitle_pipeline.audio_buffer import AudioBufferPool
 from subtitle_pipeline.config import AudioAnalysisConfig
 from subtitle_pipeline.speakers import (
     _can_embed_region,
     _evenly_spaced,
+    _extract_eres2netv2_embeddings,
     _identity_candidates,
     _load_profiles,
     _profile_centers,
@@ -37,6 +43,85 @@ from subtitle_pipeline.speakers import (
 
 
 class AudioAnalysisTests(unittest.TestCase):
+    def test_initial_diarization_and_ast_can_run_concurrently(self):
+        barrier = threading.Barrier(2)
+
+        def diarize(*_args):
+            barrier.wait(timeout=1)
+            return [AudioRegion(0, 1, "speech")]
+
+        def singing(*_args):
+            barrier.wait(timeout=1)
+            return [AudioRegion(0, 1, "singing")]
+
+        with patch(
+            "subtitle_pipeline.audio_analysis._run_diarization",
+            side_effect=diarize,
+        ), patch(
+            "subtitle_pipeline.audio_analysis._score_singing_windows",
+            side_effect=singing,
+        ):
+            speech, scores = _run_initial_audio_analysis(
+                np.zeros((1, 16000), dtype=np.float32),
+                16000,
+                AudioAnalysisConfig(device="cpu", initial_analysis_concurrency=2),
+            )
+
+        self.assertEqual(speech[0].kind, "speech")
+        self.assertEqual(scores[0].kind, "singing")
+
+    def test_mossformer_worker_uses_shared_memory_descriptors(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            video = root / "source.mp4"
+            video.write_bytes(b"video")
+            pool = AudioBufferPool(video, root, 1.0)
+            source = pool.add(np.ones(16000, dtype=np.float32), 16000)
+            response = SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"items": [{"id": 0}]}),
+                stderr="",
+            )
+            with patch.object(pool, "main", return_value=source), patch(
+                "subtitle_pipeline.audio_analysis.subprocess.run",
+                return_value=response,
+            ) as invoke:
+                outputs = _run_mossformer2_worker(
+                    np.zeros((1, 16000), dtype=np.float32),
+                    16000,
+                    [(0, 0.0, 1.0)],
+                    AudioAnalysisConfig(),
+                    root / "debug",
+                    audio_pool=pool,
+                )
+            payload = json.loads(invoke.call_args.kwargs["input"])
+            self.assertIn("audio", payload)
+            self.assertNotIn("input_path", payload["items"][0])
+            self.assertEqual(len(payload["items"][0]["outputs"]), 2)
+            self.assertEqual(len(outputs[0]), 2)
+            self.assertFalse((root / "debug").exists())
+            pool.close()
+
+    def test_eres2net_worker_uses_one_shared_audio_batch(self):
+        import torch
+
+        response = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"embeddings": [[0.1, 0.2]]}),
+            stderr="",
+        )
+        with patch(
+            "subtitle_pipeline.speakers.subprocess.run", return_value=response
+        ) as invoke:
+            embeddings = _extract_eres2netv2_embeddings(
+                [(torch.ones((1, 32000)), 16000)], AudioAnalysisConfig()
+            )
+        payload = json.loads(invoke.call_args.kwargs["input"])
+        self.assertIn("audio", payload)
+        self.assertNotIn("paths", payload)
+        self.assertEqual(payload["items"], [{"id": 0, "start_sample": 0, "end_sample": 32000}])
+        self.assertEqual(embeddings, [[0.1, 0.2]])
+
     def test_counts_distinct_simultaneous_speakers(self):
         regions = [
             AudioRegion(0, 5, "speech", "A"),

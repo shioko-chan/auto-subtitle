@@ -4,7 +4,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
+
 from subtitle_pipeline.asr import (
+    _analysis_region_signature,
     _analysis_regions,
     _record_timeline_is_healthy,
     _remove_text_overlap,
@@ -12,14 +15,25 @@ from subtitle_pipeline.asr import (
     _result_to_cues,
     _song_windows,
     _transcribe_ambiguous_range,
+    _transcribe_analyzed,
     _valid_cached_record,
     transcribe_with_qwen,
 )
 from subtitle_pipeline.audio_analysis import AudioAnalysis, AudioRegion
-from subtitle_pipeline.config import ASRConfig
+from subtitle_pipeline.config import ASRConfig, AudioAnalysisConfig
 
 
 class QwenASRTests(unittest.TestCase):
+    def test_shared_audio_names_do_not_invalidate_asr_cache_signature(self):
+        left = _analysis_region_signature(
+            AudioRegion(1, 2, "speech", "A", source_path="shm://first")
+        )
+        right = _analysis_region_signature(
+            AudioRegion(1, 2, "speech", "A", source_path="shm://second")
+        )
+        self.assertEqual(left, right)
+        self.assertEqual(left["source_path"], "shared-memory")
+
     def test_groups_fragments_from_one_separated_speaker_track(self):
         result = _analysis_regions(
             AudioAnalysis(
@@ -44,6 +58,49 @@ class QwenASRTests(unittest.TestCase):
         self.assertEqual(len(result), 2)
         self.assertEqual((result[0].start, result[0].end), (10.0, 14.0))
         self.assertEqual(result[0].source_offset, 9.0)
+
+    def test_analyzed_shared_audio_uses_buffer_duration_without_ffprobe(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            video = root / "source.mp4"
+            destination = root / "source.qwen3-asr.srt"
+            video.write_bytes(b"video")
+            region = AudioRegion(
+                10.0,
+                11.0,
+                "speech",
+                "A",
+                source_path="shm://track",
+                source_offset=9.0,
+            )
+            buffer = SimpleNamespace(duration=2.0)
+            pool = SimpleNamespace(
+                contains=lambda _uri: True,
+                resolve=lambda _uri: buffer,
+            )
+            record = {
+                "text": "字幕",
+                "cues": [{"start": 1.0, "end": 1.5, "text": "字幕"}],
+            }
+            with patch(
+                "subtitle_pipeline.asr._media_duration", return_value=30.0
+            ) as media_duration, patch(
+                "subtitle_pipeline.asr._load_qwen_model", return_value=object()
+            ), patch(
+                "subtitle_pipeline.asr._transcribe_range", return_value=record
+            ) as transcribe:
+                _transcribe_analyzed(
+                    video,
+                    destination,
+                    ASRConfig(),
+                    AudioAnalysisConfig(),
+                    AudioAnalysis([region], []),
+                    pool,
+                )
+
+            media_duration.assert_called_once_with(video)
+            self.assertEqual(transcribe.call_args.kwargs["media_duration"], 2.0)
+            self.assertIs(transcribe.call_args.kwargs["audio_buffer"], buffer)
 
     def test_singing_regions_are_subtracted_from_speech_timing(self):
         result = _analysis_regions(
@@ -237,20 +294,37 @@ class QwenASRTests(unittest.TestCase):
                 text="一。",
                 time_stamps=SimpleNamespace(items=[item]),
             )
-            model = SimpleNamespace(transcribe=lambda **_kwargs: [result])
+            calls = []
+            model = SimpleNamespace(
+                transcribe=lambda **kwargs: calls.append(kwargs) or [result]
+            )
+            audio = SimpleNamespace(
+                sample_rate=16000,
+                slice=lambda *_args, **_kwargs: np.zeros(16000, dtype=np.float32),
+            )
 
             with patch(
                 "subtitle_pipeline.asr._media_duration", return_value=15
             ), patch(
                 "subtitle_pipeline.asr._load_qwen_model", return_value=model
             ) as load_model, patch(
-                "subtitle_pipeline.asr._extract_audio_chunk"
+                "subtitle_pipeline.asr.AudioBufferPool.main", return_value=audio
             ):
                 transcribe_with_qwen(video, destination, config)
                 transcribe_with_qwen(video, destination, config)
 
             load_model.assert_called_once()
+            self.assertTrue(calls)
+            self.assertTrue(
+                all(
+                    isinstance(call["audio"], tuple)
+                    and call["audio"][1] == 16000
+                    and isinstance(call["audio"][0], np.ndarray)
+                    for call in calls
+                )
+            )
             self.assertTrue((root / "asr-cache.json").is_file())
+            self.assertFalse((root / "asr-chunks").exists())
             self.assertEqual(destination.read_text(encoding="utf-8").count("一"), 2)
             self.assertNotIn("一。", destination.read_text(encoding="utf-8"))
 
@@ -310,11 +384,17 @@ class QwenASRTests(unittest.TestCase):
                     return [next(self.results)]
 
             model = Model()
+            audio = SimpleNamespace(
+                sample_rate=16000,
+                slice=lambda *_args, **_kwargs: np.zeros(16000, dtype=np.float32),
+            )
             with patch(
                 "subtitle_pipeline.asr._media_duration", return_value=40
             ), patch(
                 "subtitle_pipeline.asr._load_qwen_model", return_value=model
-            ), patch("subtitle_pipeline.asr._extract_audio_chunk"):
+            ), patch(
+                "subtitle_pipeline.asr.AudioBufferPool.main", return_value=audio
+            ):
                 transcribe_with_qwen(video, destination, config)
 
             self.assertEqual(model.calls, 3)

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,9 +6,14 @@ from unittest.mock import patch
 
 from subtitle_pipeline.config import UploadConfig
 from subtitle_pipeline.upload import (
+    BiliupCommandError,
+    _bilibili_failure_code,
     _prepare_description,
+    _record_upload_cooldown,
+    _retry_after_from_output,
     _truncate_utf16,
     _utf16_units,
+    _wait_for_upload_cooldown,
     upload_to_bilibili,
 )
 
@@ -46,9 +52,11 @@ class UploadTests(unittest.TestCase):
             cookie.write_text("{}", encoding="utf-8")
             video = root / "video.mp4"
             config = UploadConfig(cookie_file=str(cookie), tags=["中字", "科技"])
-            with patch("subtitle_pipeline.upload.require_command", return_value="/bin/biliup"), patch(
-                "subtitle_pipeline.upload.run"
-            ) as run:
+            with patch(
+                "subtitle_pipeline.upload.require_command", return_value="/bin/biliup"
+            ), patch("subtitle_pipeline.upload._wait_for_upload_cooldown"), patch(
+                "subtitle_pipeline.upload._record_upload_cooldown"
+            ), patch("subtitle_pipeline.upload._run_biliup") as run:
                 upload_to_bilibili(
                     video,
                     title="A title",
@@ -64,6 +72,91 @@ class UploadTests(unittest.TestCase):
             description = command[command.index("--desc") + 1]
             self.assertEqual(description, "Description")
             self.assertEqual(command[-1], str(video))
+
+    def test_retries_rate_limited_complete_upload_with_configured_delays(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cookie = root / "cookies.json"
+            cookie.write_text("{}", encoding="utf-8")
+            config = UploadConfig(
+                cookie_file=str(cookie),
+                rate_limit_retry_delays_seconds=[2, 5],
+                throttle_state_file=str(root / "throttle.json"),
+                pause_marker_file=str(root / "paused.json"),
+            )
+            failures = [
+                BiliupCommandError(1, '{"code":406,"message":"too fast"}'),
+                BiliupCommandError(1, "HTTP 429 Retry-After: 7"),
+                "success",
+            ]
+            with patch(
+                "subtitle_pipeline.upload.require_command", return_value="/bin/biliup"
+            ), patch("subtitle_pipeline.upload._run_biliup", side_effect=failures) as run, patch(
+                "subtitle_pipeline.upload.time.sleep"
+            ) as sleep, patch("subtitle_pipeline.upload._record_upload_cooldown"):
+                upload_to_bilibili(
+                    root / "video.mp4",
+                    title="title",
+                    description="description",
+                    source_url="https://youtube.test/video",
+                    tags=["中字"],
+                    config=config,
+                )
+            self.assertEqual(run.call_count, 3)
+            self.assertEqual([item.args[0] for item in sleep.call_args_list], [2, 7])
+
+    def test_412_writes_pause_marker_and_aborts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cookie = root / "cookies.json"
+            marker = root / "paused.json"
+            cookie.write_text("{}", encoding="utf-8")
+            config = UploadConfig(
+                cookie_file=str(cookie),
+                throttle_state_file=str(root / "throttle.json"),
+                pause_marker_file=str(marker),
+            )
+            error = BiliupCommandError(1, '{"code":412,"message":"risk"}')
+            with patch(
+                "subtitle_pipeline.upload.require_command", return_value="/bin/biliup"
+            ), patch("subtitle_pipeline.upload._run_biliup", side_effect=error):
+                with self.assertRaisesRegex(RuntimeError, "queue paused"):
+                    upload_to_bilibili(
+                        root / "video.mp4",
+                        title="title",
+                        description="description",
+                        source_url="https://youtube.test/video",
+                        tags=["中字"],
+                        config=config,
+                    )
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual(payload["code"], 412)
+
+    def test_cooldown_state_delays_the_next_process(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "throttle.json"
+            config = UploadConfig(
+                cooldown_min_seconds=60,
+                cooldown_max_seconds=120,
+                throttle_state_file=str(path),
+            )
+            with patch("subtitle_pipeline.upload.random.uniform", return_value=75), patch(
+                "subtitle_pipeline.upload.time.time", return_value=1000
+            ):
+                _record_upload_cooldown(config)
+            with patch("subtitle_pipeline.upload.time.time", return_value=1020), patch(
+                "subtitle_pipeline.upload.time.sleep"
+            ) as sleep:
+                _wait_for_upload_cooldown(path)
+            sleep.assert_called_once_with(55)
+
+    def test_classifies_rate_limit_and_retry_after_output(self):
+        self.assertEqual(_bilibili_failure_code("{'code': 406}"), 406)
+        self.assertEqual(_bilibili_failure_code("HTTP status 429"), 429)
+        self.assertEqual(_bilibili_failure_code('{"code":412}'), 412)
+        self.assertIsNone(_bilibili_failure_code('{"code":500}'))
+        self.assertEqual(_retry_after_from_output("Retry-After: 12.5"), 12.5)
+        self.assertEqual(_retry_after_from_output('"retry_after": "7"'), 7)
 
 
 if __name__ == "__main__":

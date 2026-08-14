@@ -2,9 +2,10 @@
 
 ## Status
 
-This document records an accepted follow-up optimization. It is not implemented yet.
-The objective is to remove avoidable temporary audio files, retain reusable audio in
-memory, and overlap independent work without running competing GPU models blindly.
+Implemented on 2026-08-14. The pipeline now removes avoidable temporary audio files,
+retains reusable 16 kHz audio in shared CPU memory, and overlaps only explicitly
+configured independent work. Same-model batching and wider GPU concurrency remain
+benchmark-driven follow-ups rather than assumptions.
 
 ## Current Process Boundaries
 
@@ -19,8 +20,8 @@ The main Python process currently owns:
 
 The following components use separate address spaces:
 
-- MossFormer2: a new uv worker process is started for each request;
-- ERes2NetV2: a new uv worker process is started for each request;
+- MossFormer2: one batched uv worker invocation handles all eligible overlaps;
+- ERes2NetV2: one batched uv worker invocation handles all enrollment snippets;
 - PaddleOCR: one persistent uv worker process per song-identification run;
 - song search: a short-lived uv worker process per tool call;
 - ffmpeg, yt-dlp, the CUDA subtitle renderer, and biliup: native subprocesses.
@@ -40,13 +41,12 @@ original 44.1/48 kHz stereo audio
    `- Qwen ASR and forced alignment
 ```
 
-The complete 16 kHz mono waveform should remain in ordinary CPU memory for the job.
+The complete 16 kHz mono waveform remains in shared ordinary CPU memory for the job.
 One hour of float32 mono audio is about 230 MB. Use pinned memory only as a bounded,
 reusable staging area for batches that are about to move to a GPU.
 
-Do not keep the complete high-quality stereo track resident by default. Decode only
-the detected song candidate ranges at source quality for Demucs. A bounded cache may
-retain nearby or repeatedly used ranges during the current job.
+The complete high-quality stereo track is not retained. Only detected song candidate
+ranges are decoded at the Demucs sample rate as stereo float32 audio.
 
 ## Shared-Memory Transport
 
@@ -75,8 +75,8 @@ segments can be cleaned after a crash.
 
 ## Worker Changes
 
-1. Keep MossFormer2 and ERes2NetV2 workers alive across requests so model weights are
-   loaded once per job.
+1. MossFormer2 and ERes2NetV2 accept persistent JSON-lines requests; the current
+   pipeline batches all same-model job items into one request, so each model loads once.
 2. Pass MossFormer2 and ERes2NetV2 input ranges through shared-memory descriptors.
 3. Return ERes2NetV2 embeddings as JSON because they are small.
 4. Write MossFormer2 outputs into preallocated shared memory and return descriptors.
@@ -111,26 +111,29 @@ Use one GPU scheduler with an explicit memory budget rather than independent thr
 launching models directly. Record per-stage load time, inference time, transfer time,
 peak VRAM, and fallback count before changing concurrency defaults.
 
-## Implementation Order
+## Implemented
 
-1. Introduce an `AudioBuffer` abstraction and decode 16 kHz PCM once from ffmpeg
-   stdout into ordinary CPU memory.
+1. `AudioBufferPool` decodes 16 kHz float32 PCM once from ffmpeg stdout into shared
+   CPU memory and records owned segment names for crash cleanup.
 2. Change Qwen to accept NumPy slices and remove `asr-analysis-chunks` WAV traffic.
 3. Add shared-memory ownership and crash cleanup.
 4. Convert ERes2NetV2 to a persistent shared-memory worker.
 5. Convert MossFormer2 input and output to shared memory, with disk output enabled only
    in debug mode.
 6. Decode source-quality stereo only for song candidate ranges before Demucs.
-7. Add stage timing and VRAM telemetry, then benchmark safe concurrency and true
-   same-model batching.
+7. Stage timing and peak allocated VRAM are logged. `initial_analysis_concurrency=2`
+   can overlap pyannote and raw AST after a machine-specific memory check; the example
+   remains at `1`. Demucs, MossFormer2, ERes2NetV2 and Qwen remain stage-serialized.
 
 ## Acceptance Checks
 
 - A normal job creates no per-cue or per-region ASR WAV files.
-- Qwen output and timestamps remain equivalent on a fixed benchmark.
+- Unit coverage verifies Qwen receives in-memory `(numpy_array, 16000)` inputs while
+  preserving the existing timestamp restoration path. A real-video equivalence and
+  wall-time benchmark remains required before changing production defaults broadly.
 - Worker restart and a killed main process do not leave unbounded shared memory.
 - MossFormer2 and ERes2NetV2 load once per job rather than once per request.
-- Parallel execution is enabled only where measured wall time improves without OOM or
-  quality regression.
+- Parallel initial analysis is opt-in and should remain enabled only where measured
+  wall time improves without OOM or quality regression.
 - Demucs receives source-quality stereo song ranges rather than the 16 kHz mono
   analysis waveform.

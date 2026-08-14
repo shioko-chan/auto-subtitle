@@ -8,12 +8,15 @@ import shutil
 import subprocess
 import tempfile
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .audio_buffer import AudioBuffer, AudioBufferPool, is_shared_audio_uri
 from .commands import require_command, run
 from .config import AudioAnalysisConfig
+from .telemetry import stage_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +71,14 @@ def analyze_audio(
     job_dir: Path,
     config: AudioAnalysisConfig,
     metadata: dict[str, object] | None = None,
+    audio_pool: AudioBufferPool | None = None,
+    force_runtime_sources: bool = False,
 ) -> AudioAnalysis:
     """Run reusable VAD/diarization and singing analysis before ASR."""
     job_dir.mkdir(parents=True, exist_ok=True)
     cache_path = job_dir / "audio-analysis.json"
     signature = _signature(video, config, metadata or {})
-    cached = _load_cache(cache_path, signature)
+    cached = None if force_runtime_sources else _load_cache(cache_path, signature)
     if cached is not None:
         logger.info(
             "audio analysis cache: %d speech turns, %d singing, %d ambiguous",
@@ -83,19 +88,29 @@ def analyze_audio(
         )
         return cached
 
-    wav_path = job_dir / "source.analysis.wav"
-    _extract_audio(video, wav_path)
-    waveform, sample_rate = _load_waveform(wav_path)
-    speech = _run_diarization(waveform, sample_rate, config)
+    if audio_pool is not None:
+        import torch
+
+        buffer = audio_pool.main()
+        waveform = torch.from_numpy(buffer.samples).unsqueeze(0)
+        sample_rate = buffer.sample_rate
+    else:
+        wav_path = job_dir / "source.analysis.wav"
+        _extract_audio(video, wav_path)
+        waveform, sample_rate = _load_waveform(wav_path)
+    speech, raw_scores = _run_initial_audio_analysis(
+        waveform, sample_rate, config
+    )
     if any(region.overlap for region in speech):
-        speech = _run_overlap_separation(
-            waveform,
-            sample_rate,
-            speech,
-            config,
-            job_dir / "separated-speakers",
-        )
-    raw_scores = _score_singing_windows(waveform, sample_rate, config)
+        with stage_metrics("audio.overlap_separation", config.device):
+            speech = _run_overlap_separation(
+                waveform,
+                sample_rate,
+                speech,
+                config,
+                job_dir / "separated-speakers",
+                audio_pool=audio_pool,
+            )
     raw_candidates = _singing_regions_from_scores(
         raw_scores,
         threshold=config.singing_threshold,
@@ -103,15 +118,44 @@ def analyze_audio(
         release_seconds=0.0,
         merge_gap_seconds=config.singing_merge_gap_seconds,
     )
-    vocals_path = job_dir / "source.vocals.wav"
     singing_windows: list[AudioRegion] = []
     ambiguous_windows: list[AudioRegion] = []
     vocal_waveform = None
     vocal_rate = 0
+    vocal_candidates: list[tuple[AudioRegion, AudioBuffer]] = []
+    vocals_path = job_dir / "source.vocals.wav"
     if raw_candidates:
-        _separate_vocals(wav_path, vocals_path, config.device)
-        vocal_waveform, vocal_rate = _load_waveform(vocals_path)
-        vocal_scores = _score_singing_windows(vocal_waveform, vocal_rate, config)
+        with stage_metrics("audio.vocal_separation_and_detection", config.device):
+            if audio_pool is not None:
+                separation_candidates = _merge_regions(
+                    raw_candidates, config.singing_release_seconds
+                )
+                vocal_candidates = _separate_vocal_candidates(
+                    video,
+                    separation_candidates,
+                    config.device,
+                    audio_pool,
+                    debug_dir=(job_dir / "vocal-candidates")
+                    if config.debug_audio_artifacts
+                    else None,
+                )
+                vocal_scores = _score_singing_sources(
+                    [
+                        (
+                            candidate.start,
+                            _buffer_waveform(buffer),
+                            buffer.sample_rate,
+                        )
+                        for candidate, buffer in vocal_candidates
+                    ],
+                    config,
+                )
+            else:
+                _separate_vocals(video, vocals_path, config.device)
+                vocal_waveform, vocal_rate = _load_waveform(vocals_path)
+                vocal_scores = _score_singing_windows(
+                    vocal_waveform, vocal_rate, config
+                )
         vocal_anchors = _singing_regions_from_scores(
             vocal_scores,
             threshold=config.singing_vocal_threshold,
@@ -131,47 +175,65 @@ def analyze_audio(
     from .speakers import identify_speakers, metadata_character
 
     known_character = metadata_character(metadata or {}, config.character_styles_file)
-    speech = identify_speakers(
-        waveform,
-        sample_rate,
-        speech,
-        config,
-        known_character=known_character,
-        excluded_regions=singing_windows,
-    )
+    with stage_metrics("audio.speaker_identity", config.device):
+        speech = identify_speakers(
+            waveform,
+            sample_rate,
+            speech,
+            config,
+            known_character=known_character,
+            excluded_regions=singing_windows,
+            audio_pool=audio_pool,
+        )
 
     singing = singing_windows
     if singing_windows:
-        assert vocal_waveform is not None
-        singing = _singing_phrases(
-            vocal_waveform,
-            vocal_rate,
-            singing_windows,
-            silence_seconds=config.singing_phrase_silence_seconds,
-            minimum_seconds=config.singing_min_phrase_seconds,
-        )
-        singing = [
+        if vocal_candidates:
+            singing = _phrases_from_vocal_candidates(
+                singing_windows,
+                vocal_candidates,
+                known_character,
+                silence_seconds=config.singing_phrase_silence_seconds,
+                minimum_seconds=config.singing_min_phrase_seconds,
+            )
+        else:
+            assert vocal_waveform is not None
+            singing = _singing_phrases(
+                vocal_waveform,
+                vocal_rate,
+                singing_windows,
+                silence_seconds=config.singing_phrase_silence_seconds,
+                minimum_seconds=config.singing_min_phrase_seconds,
+            )
+            singing = [
+                AudioRegion(
+                    **{
+                        **asdict(region),
+                        "speaker": known_character,
+                        "source_path": str(vocals_path.resolve()),
+                    }
+                )
+                for region in singing
+            ]
+
+    ambiguous = []
+    for region in ambiguous_windows:
+        source = _vocal_source_for_region(region, vocal_candidates)
+        ambiguous.append(
             AudioRegion(
                 **{
                     **asdict(region),
-                    "speaker": known_character,
-                    "source_path": str(vocals_path.resolve()),
+                    "kind": "ambiguous",
+                    "speaker": _dominant_speaker(region, speech),
+                    "source_path": (
+                        source[1].uri
+                        if source is not None
+                        else str(vocals_path.resolve())
+                    ),
+                    "source_offset": source[0].start if source is not None else 0.0,
                 }
             )
-            for region in singing
-        ]
-
-    ambiguous = [
-        AudioRegion(
-            **{
-                **asdict(region),
-                "kind": "ambiguous",
-                "speaker": _dominant_speaker(region, speech),
-                "source_path": str(vocals_path.resolve()),
-            }
         )
-        for region in ambiguous_windows
-    ]
     result = AudioAnalysis(speech=speech, singing=singing, ambiguous=ambiguous)
     payload = {
         "version": _CACHE_VERSION,
@@ -194,6 +256,28 @@ def analyze_audio(
         len(ambiguous),
     )
     return result
+
+
+def _run_initial_audio_analysis(
+    waveform: Any,
+    sample_rate: int,
+    config: AudioAnalysisConfig,
+) -> tuple[list[AudioRegion], list[AudioRegion]]:
+    def diarize() -> list[AudioRegion]:
+        with stage_metrics("audio.diarization", config.device):
+            return _run_diarization(waveform, sample_rate, config)
+
+    def detect_singing() -> list[AudioRegion]:
+        with stage_metrics("audio.raw_singing_detection", config.device):
+            return _score_singing_windows(waveform, sample_rate, config)
+
+    if config.initial_analysis_concurrency == 1:
+        return diarize(), detect_singing()
+    logger.info("running pyannote and raw-audio AST concurrently")
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="audio-analysis") as pool:
+        diarization = pool.submit(diarize)
+        singing = pool.submit(detect_singing)
+        return diarization.result(), singing.result()
 
 
 def _run_diarization(
@@ -257,6 +341,13 @@ def _score_singing_windows(
     sample_rate: int,
     config: AudioAnalysisConfig,
 ) -> list[AudioRegion]:
+    return _score_singing_sources([(0.0, waveform, sample_rate)], config)
+
+
+def _score_singing_sources(
+    sources: list[tuple[float, Any, int]],
+    config: AudioAnalysisConfig,
+) -> list[AudioRegion]:
     try:
         import torch
         from transformers import ASTForAudioClassification, AutoFeatureExtractor
@@ -265,19 +356,35 @@ def _score_singing_windows(
             "singing detection is unavailable; run `uv sync --extra asr`"
         ) from exc
 
-    mono_tensor = waveform.mean(dim=0).detach().cpu()
     target_rate = 16000
-    if sample_rate != target_rate:
-        import torchaudio.functional as audio_functional
+    prepared: list[tuple[float, Any]] = []
+    for timeline_offset, waveform, sample_rate in sources:
+        mono_tensor = waveform.mean(dim=0).detach().cpu()
+        if sample_rate != target_rate:
+            import torchaudio.functional as audio_functional
 
-        mono_tensor = audio_functional.resample(mono_tensor, sample_rate, target_rate)
-        sample_rate = target_rate
-    mono = mono_tensor.numpy()
-    window_samples = max(1, round(config.singing_window_seconds * sample_rate))
-    stride_samples = max(1, round(config.singing_stride_seconds * sample_rate))
-    starts = list(range(0, max(1, len(mono) - window_samples + 1), stride_samples))
-    if not starts or starts[-1] + window_samples < len(mono):
-        starts.append(max(0, len(mono) - window_samples))
+            mono_tensor = audio_functional.resample(
+                mono_tensor, sample_rate, target_rate
+            )
+        prepared.append((timeline_offset, mono_tensor.numpy()))
+    window_samples = max(1, round(config.singing_window_seconds * target_rate))
+    stride_samples = max(1, round(config.singing_stride_seconds * target_rate))
+    windows: list[tuple[Any, float, float]] = []
+    for timeline_offset, mono in prepared:
+        starts = list(
+            range(0, max(1, len(mono) - window_samples + 1), stride_samples)
+        )
+        if not starts or starts[-1] + window_samples < len(mono):
+            starts.append(max(0, len(mono) - window_samples))
+        windows.extend(
+            (
+                mono[offset : offset + window_samples],
+                timeline_offset + offset / target_rate,
+                timeline_offset
+                + min(len(mono), offset + window_samples) / target_rate,
+            )
+            for offset in starts
+        )
 
     logger.info("loading singing detector %s", config.singing_model)
     extractor = AutoFeatureExtractor.from_pretrained(config.singing_model)
@@ -296,26 +403,25 @@ def _score_singing_windows(
 
     scored_windows: list[AudioRegion] = []
     try:
-        for batch_start in range(0, len(starts), 16):
-            batch_offsets = starts[batch_start : batch_start + 16]
-            audio = [mono[offset : offset + window_samples] for offset in batch_offsets]
+        for batch_start in range(0, len(windows), 16):
+            batch = windows[batch_start : batch_start + 16]
             inputs = extractor(
-                audio,
-                sampling_rate=sample_rate,
+                [item[0] for item in batch],
+                sampling_rate=target_rate,
                 return_tensors="pt",
                 padding=True,
             )
             inputs = {key: value.to(config.device) for key, value in inputs.items()}
             with torch.inference_mode():
                 probabilities = torch.softmax(model(**inputs).logits, dim=-1).cpu()
-            for offset, row in zip(batch_offsets, probabilities):
+            for (_audio, start, end), row in zip(batch, probabilities):
                 singing_score = sum(float(row[index]) for index in singing_ids)
                 speech_score = sum(float(row[index]) for index in speech_ids)
                 score = _singing_evidence_score(singing_score, speech_score)
                 scored_windows.append(
                     AudioRegion(
-                        round(offset / sample_rate, 3),
-                        round(min(len(mono), offset + window_samples) / sample_rate, 3),
+                        round(start, 3),
+                        round(end, 3),
                         "singing",
                         confidence=round(score, 4),
                     )
@@ -454,6 +560,8 @@ def _run_overlap_separation(
     diarized_regions: list[AudioRegion],
     config: AudioAnalysisConfig,
     output_dir: Path,
+    *,
+    audio_pool: AudioBufferPool | None = None,
 ) -> list[AudioRegion]:
     """Separate two-speaker overlaps while retaining recording timestamps."""
     try:
@@ -491,7 +599,8 @@ def _run_overlap_separation(
         config.overlap_separation_model,
         len(eligible_spans),
     )
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if config.debug_audio_artifacts:
+        output_dir.mkdir(parents=True, exist_ok=True)
     try:
         outputs = _run_mossformer2_worker(
             waveform,
@@ -499,6 +608,7 @@ def _run_overlap_separation(
             eligible_spans,
             config,
             output_dir,
+            audio_pool=audio_pool,
         )
     except RuntimeError as exc:
         logger.warning(
@@ -509,22 +619,33 @@ def _run_overlap_separation(
     separated: list[AudioRegion] = []
     successful_spans: list[tuple[float, float]] = []
     for span_index, span_start, span_end in eligible_spans:
-        paths = outputs.get(span_index, [])
-        usable: list[Path] = []
-        for path in paths:
+        sources = outputs.get(span_index, [])
+        usable: list[str | Path] = []
+        for source_value in sources:
             try:
-                data, rate = sf.read(path, always_2d=True, dtype="float32")
-            except (OSError, RuntimeError) as exc:
-                logger.warning("could not read MossFormer2 output %s: %s", path, exc)
+                if is_shared_audio_uri(str(source_value)):
+                    if audio_pool is None:
+                        raise RuntimeError("shared separation output has no audio pool")
+                    buffer = audio_pool.resolve(str(source_value))
+                    source = buffer.samples
+                    rate = buffer.sample_rate
+                else:
+                    data, rate = sf.read(
+                        source_value, always_2d=True, dtype="float32"
+                    )
+                    source = data.mean(axis=1)
+            except (OSError, RuntimeError, ValueError) as exc:
+                logger.warning(
+                    "could not read MossFormer2 output %s: %s", source_value, exc
+                )
                 continue
-            source = data.mean(axis=1)
             duration = len(source) / max(int(rate), 1)
             if _separated_source_is_usable(
                 source,
                 [AudioRegion(0.0, duration, "speech")],
                 int(rate),
             ):
-                usable.append(path)
+                usable.append(source_value)
         if len(usable) != 2:
             logger.warning(
                 "MossFormer2 overlap %d returned %d usable tracks; "
@@ -541,7 +662,9 @@ def _run_overlap_separation(
                 "speech",
                 f"OVERLAP_{span_index:05d}_SOURCE_{source_index}",
                 overlap=True,
-                source_path=str(path.resolve()),
+                source_path=(
+                    str(path.resolve()) if isinstance(path, Path) else str(path)
+                ),
                 source_offset=span_start,
             )
             for source_index, path in enumerate(usable)
@@ -577,7 +700,9 @@ def _run_mossformer2_worker(
     spans: list[tuple[int, float, float]],
     config: AudioAnalysisConfig,
     output_dir: Path,
-) -> dict[int, list[Path]]:
+    *,
+    audio_pool: AudioBufferPool | None = None,
+) -> dict[int, list[str | Path]]:
     import soundfile as sf
 
     uv = shutil.which("uv")
@@ -586,9 +711,41 @@ def _run_mossformer2_worker(
     if uv is None or not worker.is_file():
         raise RuntimeError(f"MossFormer2 worker is unavailable at {worker}")
 
-    with tempfile.TemporaryDirectory(prefix="mossformer2-input-") as temp:
-        input_dir = Path(temp)
-        items: list[dict[str, object]] = []
+    temporary: tempfile.TemporaryDirectory[str] | None = None
+    shared_outputs: dict[int, list[str]] = {}
+    if audio_pool is not None:
+        import numpy as np
+
+        items = []
+        source = audio_pool.main()
+        for span_index, span_start, span_end in spans:
+            start_sample = round(span_start * sample_rate)
+            end_sample = round(span_end * sample_rate)
+            outputs = [
+                audio_pool.add(
+                    np.zeros(max(1, end_sample - start_sample), dtype=np.float32),
+                    sample_rate,
+                )
+                for _ in range(2)
+            ]
+            shared_outputs[span_index] = [output.uri for output in outputs]
+            items.append(
+                {
+                    "id": span_index,
+                    "start_sample": start_sample,
+                    "end_sample": end_sample,
+                    "outputs": [output.descriptor.as_dict() for output in outputs],
+                }
+            )
+        payload = {
+            "model": config.overlap_separation_model,
+            "audio": source.descriptor.as_dict(),
+            "items": items,
+        }
+    else:
+        temporary = tempfile.TemporaryDirectory(prefix="mossformer2-input-")
+        input_dir = Path(temporary.name)
+        items = []
         for span_index, span_start, span_end in spans:
             start_sample = round(span_start * sample_rate)
             end_sample = round(span_end * sample_rate)
@@ -600,6 +757,7 @@ def _run_mossformer2_worker(
                 output_dir / f"mossformer2-overlap-{span_index:05d}-source-{index}.wav"
                 for index in range(2)
             ]
+            output_dir.mkdir(parents=True, exist_ok=True)
             sf.write(input_path, mono, sample_rate)
             items.append(
                 {
@@ -608,10 +766,9 @@ def _run_mossformer2_worker(
                     "output_paths": [str(path.resolve()) for path in output_paths],
                 }
             )
-        payload = {
-            "model": config.overlap_separation_model,
-            "items": items,
-        }
+        payload = {"model": config.overlap_separation_model, "items": items}
+
+    try:
         environment = os.environ.copy()
         if config.device.startswith("cuda:"):
             environment["CUDA_VISIBLE_DEVICES"] = config.device.split(":", 1)[1]
@@ -634,6 +791,9 @@ def _run_mossformer2_worker(
             cwd=project,
             env=environment,
         )
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
     if result.returncode != 0:
         raise RuntimeError(
             "MossFormer2 worker failed: " + (result.stderr or result.stdout)[-3000:]
@@ -645,7 +805,7 @@ def _run_mossformer2_worker(
         raise RuntimeError("MossFormer2 worker returned malformed JSON") from exc
     if not isinstance(records, list):
         raise RuntimeError("MossFormer2 worker returned malformed items")
-    outputs: dict[int, list[Path]] = {}
+    outputs: dict[int, list[str | Path]] = {}
     for record in records:
         if not isinstance(record, dict) or record.get("error"):
             if isinstance(record, dict):
@@ -657,13 +817,33 @@ def _run_mossformer2_worker(
             continue
         try:
             span_index = int(record["id"])
-            paths = [Path(str(path)) for path in record["output_paths"]]
+            span_index = int(record["id"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "MossFormer2 worker returned malformed output paths"
-            ) from exc
-        if len(paths) == 2 and all(path.is_file() for path in paths):
-            outputs[span_index] = paths
+            raise RuntimeError("MossFormer2 worker returned malformed output") from exc
+        if audio_pool is not None:
+            uris = shared_outputs.get(span_index, [])
+            if len(uris) == 2:
+                outputs[span_index] = uris
+                if config.debug_audio_artifacts:
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    for source_index, uri in enumerate(uris):
+                        buffer = audio_pool.resolve(uri)
+                        sf.write(
+                            output_dir
+                            / f"mossformer2-overlap-{span_index:05d}-source-"
+                            f"{source_index}.wav",
+                            buffer.samples,
+                            buffer.sample_rate,
+                        )
+        else:
+            try:
+                paths = [Path(str(path)) for path in record["output_paths"]]
+            except (KeyError, TypeError) as exc:
+                raise RuntimeError(
+                    "MossFormer2 worker returned malformed output paths"
+                ) from exc
+            if len(paths) == 2 and all(path.is_file() for path in paths):
+                outputs[span_index] = paths
     return outputs
 
 
@@ -719,6 +899,166 @@ def _separate_vocals(source: Path, destination: Path, device: str) -> None:
     finally:
         del separator
         _release_cuda()
+
+
+def _separate_vocal_candidates(
+    video: Path,
+    candidates: list[AudioRegion],
+    device: str,
+    audio_pool: AudioBufferPool,
+    *,
+    debug_dir: Path | None = None,
+) -> list[tuple[AudioRegion, AudioBuffer]]:
+    try:
+        import soundfile as sf
+        import torchaudio.functional as audio_functional
+        from demucs.api import Separator
+    except ImportError as exc:
+        raise RuntimeError(
+            "vocal separation requires the ASR optional dependencies"
+        ) from exc
+
+    logger.info(
+        "separating vocals for %d source-quality song candidate ranges",
+        len(candidates),
+    )
+    separator = Separator(model="htdemucs", device=device, progress=True)
+    outputs: list[tuple[AudioRegion, AudioBuffer]] = []
+    try:
+        for index, candidate in enumerate(candidates):
+            waveform, sample_rate = _decode_stereo_range(
+                video,
+                candidate.start,
+                candidate.end,
+                separator.samplerate,
+            )
+            _origin, stems = separator.separate_tensor(waveform, sr=sample_rate)
+            vocals = stems.get("vocals")
+            if vocals is None:
+                raise RuntimeError("Demucs did not return a vocals stem")
+            mono = vocals.mean(dim=0).detach().cpu()
+            if separator.samplerate != 16000:
+                mono = audio_functional.resample(mono, separator.samplerate, 16000)
+            buffer = audio_pool.add(mono.numpy(), 16000)
+            outputs.append((candidate, buffer))
+            if debug_dir is not None:
+                debug_dir.mkdir(parents=True, exist_ok=True)
+                sf.write(
+                    debug_dir / f"candidate-{index:04d}.vocals.wav",
+                    buffer.samples,
+                    buffer.sample_rate,
+                )
+    finally:
+        del separator
+        _release_cuda()
+    return outputs
+
+
+def _decode_stereo_range(
+    video: Path,
+    start: float,
+    end: float,
+    sample_rate: int,
+) -> tuple[Any, int]:
+    import numpy as np
+    import torch
+
+    ffmpeg = require_command("ffmpeg")
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{end - start:.3f}",
+            "-i",
+            str(video.resolve()),
+            "-vn",
+            "-ac",
+            "2",
+            "-ar",
+            str(sample_rate),
+            "-f",
+            "f32le",
+            "pipe:1",
+        ],
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "could not decode source-quality song candidate: "
+            + result.stderr.decode("utf-8", errors="replace")[-2000:]
+        )
+    values = np.frombuffer(result.stdout, dtype=np.float32)
+    if len(values) < 2:
+        raise RuntimeError("song candidate contains no decoded audio")
+    values = values[: len(values) - len(values) % 2].reshape(-1, 2)
+    return torch.from_numpy(values.T.copy()), sample_rate
+
+
+def _buffer_waveform(buffer: AudioBuffer) -> Any:
+    import torch
+
+    return torch.from_numpy(buffer.samples).unsqueeze(0)
+
+
+def _vocal_source_for_region(
+    region: AudioRegion,
+    candidates: list[tuple[AudioRegion, AudioBuffer]],
+) -> tuple[AudioRegion, AudioBuffer] | None:
+    matches = [
+        item
+        for item in candidates
+        if item[0].start <= region.start and item[0].end >= region.end
+    ]
+    return min(matches, key=lambda item: item[0].end - item[0].start) if matches else None
+
+
+def _phrases_from_vocal_candidates(
+    regions: list[AudioRegion],
+    candidates: list[tuple[AudioRegion, AudioBuffer]],
+    speaker: str | None,
+    *,
+    silence_seconds: float,
+    minimum_seconds: float,
+) -> list[AudioRegion]:
+    phrases: list[AudioRegion] = []
+    for region in regions:
+        source = _vocal_source_for_region(region, candidates)
+        if source is None:
+            raise RuntimeError(
+                f"no separated vocal source covers {region.start:.3f}-{region.end:.3f}s"
+            )
+        candidate, buffer = source
+        local = AudioRegion(
+            region.start - candidate.start,
+            region.end - candidate.start,
+            "singing",
+            confidence=region.confidence,
+        )
+        local_phrases = _singing_phrases(
+            _buffer_waveform(buffer),
+            buffer.sample_rate,
+            [local],
+            silence_seconds=silence_seconds,
+            minimum_seconds=minimum_seconds,
+        )
+        phrases.extend(
+            AudioRegion(
+                round(phrase.start + candidate.start, 3),
+                round(phrase.end + candidate.start, 3),
+                "singing",
+                speaker,
+                phrase.confidence,
+                source_path=buffer.uri,
+                source_offset=candidate.start,
+            )
+            for phrase in local_phrases
+        )
+    return phrases
 
 
 def _singing_phrases(
@@ -1035,11 +1375,12 @@ def _load_cache(path: Path, signature: str) -> AudioAnalysis | None:
             or value.get("signature") != signature
         ):
             return None
-        return AudioAnalysis(
+        result = AudioAnalysis(
             speech=[AudioRegion(**item) for item in value["speech"]],
             singing=[AudioRegion(**item) for item in value["singing"]],
             ambiguous=[AudioRegion(**item) for item in value.get("ambiguous", [])],
         )
+        return result
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         logger.warning("ignoring unreadable audio analysis cache %s: %s", path, exc)
         return None

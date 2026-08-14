@@ -4,13 +4,14 @@ import json
 import logging
 import shutil
 import subprocess
-import tempfile
 from dataclasses import dataclass, replace
 from importlib import resources
+from multiprocessing import shared_memory
 from pathlib import Path
 from typing import Any
 
 from .audio_analysis import AudioRegion
+from .audio_buffer import AudioBufferPool, is_shared_audio_uri
 from .config import AudioAnalysisConfig
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ def identify_speakers(
     *,
     known_character: str | None = None,
     excluded_regions: list[AudioRegion] | None = None,
+    audio_pool: AudioBufferPool | None = None,
 ) -> list[AudioRegion]:
     """Enroll clean solo audio and map anonymous clusters to member prototypes."""
     import numpy as np
@@ -95,7 +97,9 @@ def identify_speakers(
     ]
     if not candidates:
         return regions
-    snippets = _candidate_snippets(waveform, sample_rate, candidates)
+    snippets = _candidate_snippets(
+        waveform, sample_rate, candidates, audio_pool=audio_pool
+    )
     embeddings = _extract_embeddings(snippets, config)
     by_label: dict[str, list[Any]] = {}
     for region, embedding in zip(candidates, embeddings):
@@ -205,6 +209,8 @@ def _candidate_snippets(
     waveform: Any,
     sample_rate: int,
     candidates: list[AudioRegion],
+    *,
+    audio_pool: AudioBufferPool | None = None,
 ) -> list[tuple[Any, int]]:
     import soundfile as sf
     import torch
@@ -215,13 +221,22 @@ def _candidate_snippets(
         source_waveform, source_rate = waveform, sample_rate
         if region.source_path:
             if region.source_path not in separated_waveforms:
-                data, loaded_rate = sf.read(
-                    region.source_path, always_2d=True, dtype="float32"
-                )
-                separated_waveforms[region.source_path] = (
-                    torch.from_numpy(data.T.copy()),
-                    int(loaded_rate),
-                )
+                if is_shared_audio_uri(region.source_path):
+                    if audio_pool is None:
+                        raise RuntimeError("shared speaker track has no audio pool")
+                    buffer = audio_pool.resolve(region.source_path)
+                    separated_waveforms[region.source_path] = (
+                        torch.from_numpy(buffer.samples).unsqueeze(0),
+                        buffer.sample_rate,
+                    )
+                else:
+                    data, loaded_rate = sf.read(
+                        region.source_path, always_2d=True, dtype="float32"
+                    )
+                    separated_waveforms[region.source_path] = (
+                        torch.from_numpy(data.T.copy()),
+                        int(loaded_rate),
+                    )
             source_waveform, source_rate = separated_waveforms[region.source_path]
         start = round((region.start - region.source_offset) * source_rate)
         end = round((region.end - region.source_offset) * source_rate)
@@ -265,25 +280,42 @@ def _extract_wespeaker_embeddings(
 def _extract_eres2netv2_embeddings(
     snippets: list[tuple[Any, int]], config: AudioAnalysisConfig
 ) -> list[Any]:
-    import soundfile as sf
+    import numpy as np
+    import torchaudio.functional as audio_functional
 
     uv = shutil.which("uv")
     project = Path(config.speaker_embedding_worker_project).resolve()
     worker = project / "worker.py"
     if uv is None or not worker.is_file():
         raise RuntimeError(f"speaker embedding worker is unavailable at {worker}")
-    with tempfile.TemporaryDirectory(prefix="speaker-embedding-") as temp:
-        root = Path(temp)
-        paths: list[str] = []
-        for index, (audio, rate) in enumerate(snippets):
-            path = root / f"{index:05d}.wav"
-            mono = audio.mean(dim=0).detach().cpu().numpy()
-            sf.write(path, mono, rate)
-            paths.append(str(path))
+    values: list[np.ndarray] = []
+    items: list[dict[str, int]] = []
+    cursor = 0
+    for index, (audio, rate) in enumerate(snippets):
+        mono = audio.mean(dim=0).detach().cpu()
+        if rate != 16000:
+            mono = audio_functional.resample(mono, rate, 16000)
+        value = np.asarray(mono.numpy(), dtype=np.float32)
+        values.append(value)
+        items.append(
+            {"id": index, "start_sample": cursor, "end_sample": cursor + len(value)}
+        )
+        cursor += len(value)
+    combined = np.concatenate(values) if values else np.empty(0, dtype=np.float32)
+    memory = shared_memory.SharedMemory(create=True, size=max(1, combined.nbytes))
+    shared = np.ndarray(combined.shape, dtype=np.float32, buffer=memory.buf)
+    shared[:] = combined
+    try:
         payload = {
             "model": config.speaker_embedding_model,
             "device": config.device,
-            "paths": paths,
+            "audio": {
+                "shared_memory": memory.name,
+                "dtype": "float32",
+                "shape": list(shared.shape),
+                "sample_rate": 16000,
+            },
+            "items": items,
         }
         result = subprocess.run(
             [uv, "run", "--project", str(project), "python", str(worker)],
@@ -292,6 +324,10 @@ def _extract_eres2netv2_embeddings(
             capture_output=True,
             check=False,
         )
+    finally:
+        del shared
+        memory.close()
+        memory.unlink()
     if result.returncode != 0:
         raise RuntimeError(
             "ERes2NetV2 speaker worker failed: "

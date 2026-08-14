@@ -90,7 +90,7 @@ model = "deepseek-v4-flash"
 thinking = "disabled"
 max_tokens = 16384
 max_retries = 5
-max_concurrency = 4
+max_concurrency = 16
 ```
 
 如需改用环境变量，将 `api_key_pass_entry = ""`，再通过 `api_key_env` 指定变量名。
@@ -119,10 +119,11 @@ forced aligner 单元会划分为互不重叠的固定窗口，并以 `llm.max_c
 完成后，管线把 pending cue 连同各自原文、说话人和已确认相邻字幕合并成定点修复请求，
 模型只能按 `repair_id` 修改译文，不能改变 cue 边界。一次响应中通过校验的修复会立即
 写回缓存，后续请求只包含尚未修好的 ID；只要仍有 pending cue，就禁止渲染和上传。
-网络错误和超时使用指数退避；HTTP 5xx 也使用指数退避，但耗尽重试后直接终止而不缩小
-窗口。HTTP 429 优先遵守服务端的 `Retry-After` 响应头，缺失时才使用指数退避，同样在
-耗尽后直接终止而不缩窗。其他 HTTP 状态视为非暂时性错误，首次遇到便直接终止。本地
-输出校验失败会立即重试。
+网络错误和超时使用带随机抖动的指数退避；HTTP 5xx 也采用相同策略，但耗尽重试后直接
+终止而不缩小窗口。HTTP 429 优先遵守服务端的 `Retry-After` 响应头，并在规定等待时间
+之后增加少量随机抖动；缺失该响应头时才使用带抖动的指数退避，同样在耗尽后直接终止而
+不缩窗。其他 HTTP 状态视为非暂时性错误，首次遇到便直接终止。本地输出校验失败会立即
+重试。
 
 联合输入使用 `[id,duration_ms,gap_after_ms,speaker,kind,text]`，绝对时间只在本地保存。固定规则、
 术语表和视频信息位于请求前缀，窗口数据随后，重试错误放在末尾，以提高 DeepSeek
@@ -169,6 +170,13 @@ aligner 与句级歌声 ASR，时间轴坍缩或循环输出时采用歌声结�
 分离失败或存在空轨时保留原音，不会采用不完整的分离结果。所有音频分析结果和带说话人字段的
 cue sidecar 都写入 job 目录并可断点复用。
 
+作业只用 ffmpeg 解码一次完整的 16 kHz 单声道音频，并由 `AudioBufferPool` 在共享 CPU
+内存中提供给 Qwen、MossFormer2 和 ERes2NetV2。Qwen 直接接收 NumPy 切片，正常运行不再
+创建 `asr-chunks`、`asr-analysis-chunks` 或分离声源 WAV。MossFormer2 音轨仅在
+`audio_analysis.debug_audio_artifacts = true` 时落盘。Demucs 只按需解码候选歌曲区间的
+高质量立体声音频。各阶段日志包含耗时和可用时的峰值显存；pyannote 与原音 AST 可通过
+`initial_analysis_concurrency = 2` 并行，其余重型 GPU 模型仍按阶段串行。
+
 人物身份使用独立 uv worker 中的 ERes2NetV2 embedding 和余弦距离匹配。成员个人频道
 的独播会自动将 2–15 秒、非歌唱且非重叠的主说话人片段注册到
 `work/speaker-profiles-eres2netv2/`；每人最多保留 400 条。profile 带模型签名，不能与
@@ -177,7 +185,7 @@ cue sidecar 都写入 job 目录并可断点复用。
 聚类。这样可以分别覆盖普通聊天、激动语气和带背景音等声音状态。匹配还要求第一候选
 相对第二候选保持足够距离；重叠分轨使用更严格的绝对阈值，证据不足时保留匿名标签。
 MossFormer2 使用独立 uv 环境，避免其 NumPy 1.x 依赖影响 pyannote 和 Qwen ASR。
-取消临时音频文件、按需保留高质量立体声、使用共享内存和受控并行的后续设计见
+共享内存、按需高质量立体声和受控并行的实现说明见
 [音频管线内存与并行优化](docs/audio-pipeline-optimization.md)。
 
 梦限大 MewType 五位成员的应援色与声纹配置位于独立的
@@ -242,11 +250,14 @@ B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服�
 - `asr.chunk_seconds` / `chunk_context_seconds`：控制可恢复分块和切点上下文；总输入
   长度不能超过 180 秒。
 - `asr.max_new_tokens`：单块 ASR 最多生成的 token 数，默认 `2048`。
+- `audio_analysis.initial_analysis_concurrency`：`1` 为顺序执行 pyannote 与原音 AST；
+  在显存和实测耗时允许时可设为 `2`。
+- `audio_analysis.debug_audio_artifacts`：仅调试时持久化分离音轨，默认 `false`。
 - `segmentation.model_window_cues`：每个并行联合请求的目标 forced aligner 单元数，默认
   `600`；为避免末窗只有一个单元，实际边界可能向相邻窗口调整。
 - `llm.max_tokens`：单次 LLM 响应的输出 token 上限，DeepSeek V4 建议设为 `16384`。
 - `llm.max_retries`：同一窗口、边界或定点修复请求的重试次数，建议设为 `5`。
-- `llm.max_concurrency`：窗口和边界 LLM 请求的最大并发数，默认 `4`。
+- `llm.max_concurrency`：窗口和边界 LLM 请求的最大并发数，默认 `16`。
 - `llm.context_cues`：窗口附带的相邻源单元及边界修复附带的只读 cue 数量，默认 `3`。
 - `llm.thinking`：DeepSeek V4 的严格 JSON 翻译应设为 `"disabled"`；其他服务不支持该参数时省略。
 - `llm.translate_metadata`：是否翻译 YouTube 标题和简介。
@@ -265,6 +276,12 @@ B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服�
 - `upload.max_tags`：投稿使用的固定标签与自动标签总数上限。
 - `upload.tag_catalog_file`：经授权获取或人工维护的 B 站规范标签与热度目录。
 - `upload.description_max_chars`：简介的保守字符上限，同时作为 UTF-16 单位上限。
+- `upload.cooldown_min_seconds` / `cooldown_max_seconds`：成功投稿后写入下一次投稿的
+  随机冷却期限，默认 `60–120` 秒，跨进程生效。
+- `upload.rate_limit_retry_delays_seconds`：biliup 输出 `406/429` 且未提供
+  `Retry-After` 时的重试间隔；每次会重新执行完整上传。
+- `upload.pause_marker_file`：遇到 B 站 `412` 风控时写入的暂停标记；删除标记前拒绝
+  后续投稿。
 
 IP 别名文件格式参考 `ip_aliases.example.json`：
 

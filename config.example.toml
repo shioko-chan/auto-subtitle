@@ -28,6 +28,10 @@ max_new_tokens = 2048
 # Run VAD/diarization and singing detection before Qwen ASR. Gated pyannote
 # models require an authenticated Hugging Face account with accepted terms.
 enabled = true
+# Persist separated WAV files for inspection; normal runs keep them in shared memory.
+debug_audio_artifacts = false
+# Set to 2 only after confirming concurrent pyannote + AST fits GPU memory.
+initial_analysis_concurrency = 1
 diarization_model = "pyannote/speaker-diarization-community-1"
 # Kept only for compatibility with older configs; MossFormer2 does not use it.
 overlap_embedding_model = "pyannote/wespeaker-voxceleb-resnet34-LM"
@@ -98,7 +102,7 @@ model = "deepseek-v4-flash"
 target_language = "简体中文"
 timeout_seconds = 120
 max_retries = 5
-max_concurrency = 4
+max_concurrency = 16
 max_tokens = 16384
 context_cues = 3
 # Joint subtitles and metadata use json_object.
@@ -153,3 +157,8 @@ description_suffix = "\n\n字幕由自动化工具生成，请以原视频为准
 description_max_chars = 1800
 # line = "kodo"
 limit = 3
+cooldown_min_seconds = 60
+cooldown_max_seconds = 120
+rate_limit_retry_delays_seconds = [120, 300, 600, 1200]
+throttle_state_file = "work/bilibili-upload-throttle.json"
+pause_marker_file = "work/bilibili-upload-paused.json"

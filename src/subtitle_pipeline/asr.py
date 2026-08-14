@@ -10,14 +10,20 @@ from pathlib import Path
 from typing import Any
 
 from .audio_analysis import AudioAnalysis, AudioRegion, analyze_audio
+from .audio_buffer import AudioBuffer, AudioBufferPool, is_shared_audio_uri
 from .commands import require_command, run
 from .config import ASRConfig, AudioAnalysisConfig
 from .subtitles import Cue, merge_cues_at_boundaries, write_srt
+from .telemetry import stage_metrics
 
 _CACHE_VERSION = 2
 _MIN_RETRY_CHUNK_SECONDS = 20.0
 _MIN_REPETITION_SPAN_CHARACTERS = 160
 _REPETITION_RE = re.compile(r"(.{12,200}?)\1{3,}", re.DOTALL)
+
+
+class _StaleRuntimeAudio(RuntimeError):
+    pass
 
 
 def transcribe_with_qwen(
@@ -27,14 +33,58 @@ def transcribe_with_qwen(
     analysis_config: AudioAnalysisConfig | None = None,
     metadata: dict[str, object] | None = None,
 ) -> Path:
-    if analysis_config is not None and analysis_config.enabled:
-        analysis = analyze_audio(
-            video, destination.parent, analysis_config, metadata=metadata
-        )
-        return _transcribe_analyzed(
-            video, destination, config, analysis_config, analysis
-        )
     duration = _media_duration(video)
+    with AudioBufferPool(video, destination.parent, duration) as audio_pool:
+        if analysis_config is not None and analysis_config.enabled:
+            analysis = analyze_audio(
+                video,
+                destination.parent,
+                analysis_config,
+                metadata=metadata,
+                audio_pool=audio_pool,
+            )
+            try:
+                return _transcribe_analyzed(
+                    video,
+                    destination,
+                    config,
+                    analysis_config,
+                    analysis,
+                    audio_pool,
+                )
+            except _StaleRuntimeAudio:
+                logging.info(
+                    "cached analysis needs ephemeral source tracks for missing ASR; "
+                    "recomputing audio analysis"
+                )
+                analysis = analyze_audio(
+                    video,
+                    destination.parent,
+                    analysis_config,
+                    metadata=metadata,
+                    audio_pool=audio_pool,
+                    force_runtime_sources=True,
+                )
+                return _transcribe_analyzed(
+                    video,
+                    destination,
+                    config,
+                    analysis_config,
+                    analysis,
+                    audio_pool,
+                )
+        return _transcribe_unanalyzed(
+            video, destination, config, duration, audio_pool
+        )
+
+
+def _transcribe_unanalyzed(
+    video: Path,
+    destination: Path,
+    config: ASRConfig,
+    duration: float,
+    audio_pool: AudioBufferPool,
+) -> Path:
     chunk_count = max(1, math.ceil(duration / config.chunk_seconds))
     cache_path = destination.parent / "asr-cache.json"
     signature = _cache_signature(video, duration, config)
@@ -69,8 +119,6 @@ def transcribe_with_qwen(
     else:
         logging.info("Qwen3-ASR cache complete: %d chunks", chunk_count)
 
-    chunk_dir = destination.parent / "asr-chunks"
-    chunk_dir.mkdir(parents=True, exist_ok=True)
     for index in missing:
         core_start = index * config.chunk_seconds
         core_end = min(duration, core_start + config.chunk_seconds)
@@ -85,13 +133,14 @@ def transcribe_with_qwen(
         record = _transcribe_range(
             model,
             video,
-            chunk_dir,
+            None,
             config,
             core_start=core_start,
             core_end=core_end,
             media_duration=duration,
             final_chunk=index == chunk_count - 1,
             label=f"{index:05d}",
+            audio_buffer=audio_pool.main(),
         )
         cached_chunks[str(index)] = record
         _write_cache(cache_path, cache)
@@ -121,6 +170,7 @@ def _transcribe_analyzed(
     config: ASRConfig,
     analysis_config: AudioAnalysisConfig,
     analysis: AudioAnalysis,
+    audio_pool: AudioBufferPool,
 ) -> Path:
     regions = _analysis_regions(analysis)
     if not regions:
@@ -129,9 +179,9 @@ def _transcribe_analyzed(
     cache_path = destination.parent / "asr-analysis-cache.json"
     signature = {
         **_cache_signature(video, duration, config),
-        "analysis_version": 4,
+        "analysis_version": 5,
         "analysis_config": asdict(analysis_config),
-        "regions": [asdict(region) for region in regions],
+        "regions": [_analysis_region_signature(region) for region in regions],
     }
     cache = _load_cache(cache_path, signature)
     cached = cache["chunks"]
@@ -141,9 +191,13 @@ def _transcribe_analyzed(
         for index in range(len(regions))
         if not _valid_cached_record(cached.get(str(index)))
     ]
+    if missing and any(
+        is_shared_audio_uri(regions[index].source_path)
+        and not audio_pool.contains(str(regions[index].source_path))
+        for index in missing
+    ):
+        raise _StaleRuntimeAudio("missing ephemeral source audio")
     model = _load_qwen_model(config) if missing else None
-    chunk_dir = destination.parent / "asr-analysis-chunks"
-    chunk_dir.mkdir(parents=True, exist_ok=True)
     for index in missing:
         region = regions[index]
         assert model is not None
@@ -151,40 +205,42 @@ def _transcribe_analyzed(
             record = _transcribe_song_range(
                 model,
                 Path(region.source_path) if region.source_path else video,
-                chunk_dir,
+                None,
                 config,
                 region,
                 label=f"{index:05d}",
                 window_seconds=analysis_config.singing_asr_window_seconds,
                 overlap_seconds=analysis_config.singing_asr_overlap_seconds,
+                audio_buffer=_region_audio_buffer(
+                    region, video, audio_pool
+                ),
             )
         elif region.kind == "ambiguous":
             record = _transcribe_ambiguous_range(
                 model,
                 video,
-                chunk_dir,
+                None,
                 config,
                 region,
                 index=index,
                 window_seconds=analysis_config.singing_asr_window_seconds,
                 overlap_seconds=analysis_config.singing_asr_overlap_seconds,
+                audio_pool=audio_pool,
             )
         else:
             source_offset = region.source_offset if region.source_path else 0.0
+            region_audio = _region_audio_buffer(region, video, audio_pool)
             record = _transcribe_range(
                 model,
                 Path(region.source_path) if region.source_path else video,
-                chunk_dir,
+                None,
                 config,
                 core_start=region.start - source_offset,
                 core_end=region.end - source_offset,
-                media_duration=(
-                    _media_duration(Path(region.source_path))
-                    if region.source_path
-                    else duration
-                ),
+                media_duration=region_audio.duration,
                 final_chunk=True,
                 label=f"{index:05d}",
+                audio_buffer=region_audio,
             )
             if source_offset:
                 for cue in record["cues"]:
@@ -296,6 +352,13 @@ def _analysis_regions(analysis: AudioAnalysis) -> list[AudioRegion]:
     )
 
 
+def _analysis_region_signature(region: AudioRegion) -> dict[str, object]:
+    value = asdict(region)
+    if is_shared_audio_uri(region.source_path):
+        value["source_path"] = "shared-memory"
+    return value
+
+
 def _subtract_singing_regions(
     region: AudioRegion, singing: list[AudioRegion]
 ) -> list[AudioRegion]:
@@ -330,13 +393,14 @@ def _subtract_singing_regions(
 def _transcribe_ambiguous_range(
     model: Any,
     video: Path,
-    chunk_dir: Path,
+    chunk_dir: Path | None,
     config: ASRConfig,
     region: AudioRegion,
     *,
     index: int,
     window_seconds: float,
     overlap_seconds: float,
+    audio_pool: AudioBufferPool | None = None,
 ) -> dict[str, object]:
     speech_record: dict[str, object] | None = None
     song_record: dict[str, object] | None = None
@@ -353,6 +417,7 @@ def _transcribe_ambiguous_range(
             media_duration=_media_duration(video),
             final_chunk=True,
             label=f"ambiguous-speech-{index:05d}",
+            audio_buffer=audio_pool.main() if audio_pool is not None else None,
         )
         for cue in speech_record["cues"]:
             cue["speaker"] = region.speaker
@@ -370,6 +435,11 @@ def _transcribe_ambiguous_range(
             label=f"ambiguous-song-{index:05d}",
             window_seconds=window_seconds,
             overlap_seconds=overlap_seconds,
+            audio_buffer=(
+                _region_audio_buffer(region, video, audio_pool)
+                if audio_pool is not None
+                else None
+            ),
         )
     except RuntimeError as exc:
         song_error = exc
@@ -437,28 +507,46 @@ def _record_timeline_is_healthy(
 def _transcribe_song_range(
     model: Any,
     video: Path,
-    chunk_dir: Path,
+    chunk_dir: Path | None,
     config: ASRConfig,
     region: AudioRegion,
     *,
     label: str,
     window_seconds: float,
     overlap_seconds: float,
+    audio_buffer: AudioBuffer | None = None,
 ) -> dict[str, object]:
     windows = _song_windows(region.start, region.end, window_seconds, overlap_seconds)
     texts: list[str] = []
     for window_index, (start, end) in enumerate(windows):
-        chunk_path = chunk_dir / f"song-{label}-{window_index}.wav"
-        try:
-            _extract_audio_chunk(video, chunk_path, start=start, duration=end - start)
-            results = model.transcribe(
-                audio=str(chunk_path),
-                context=config.context,
-                language=config.language,
-                return_time_stamps=False,
+        chunk_path = (
+            chunk_dir / f"song-{label}-{window_index}.wav"
+            if chunk_dir is not None
+            else None
+        )
+        if audio_buffer is not None:
+            local_start = start - region.source_offset
+            local_end = end - region.source_offset
+            audio: object = (
+                audio_buffer.slice(local_start, local_end, copy=True),
+                audio_buffer.sample_rate,
             )
+        else:
+            if chunk_path is None:
+                raise RuntimeError("song ASR requires an audio buffer or chunk directory")
+            _extract_audio_chunk(video, chunk_path, start=start, duration=end - start)
+            audio = str(chunk_path)
+        try:
+            with stage_metrics("asr.singing_chunk", config.device):
+                results = model.transcribe(
+                    audio=audio,
+                    context=config.context,
+                    language=config.language,
+                    return_time_stamps=False,
+                )
         finally:
-            chunk_path.unlink(missing_ok=True)
+            if chunk_path is not None:
+                chunk_path.unlink(missing_ok=True)
         if len(results) != 1:
             raise RuntimeError(f"Qwen3-ASR returned {len(results)} song results")
         text = str(getattr(results[0], "text", "")).strip()
@@ -520,7 +608,7 @@ def _remove_text_overlap(previous: str, current: str) -> str:
 def _transcribe_range(
     model: Any,
     video: Path,
-    chunk_dir: Path,
+    chunk_dir: Path | None,
     config: ASRConfig,
     *,
     core_start: float,
@@ -528,23 +616,34 @@ def _transcribe_range(
     media_duration: float,
     final_chunk: bool,
     label: str,
+    audio_buffer: AudioBuffer | None = None,
 ) -> dict[str, object]:
     extract_start = max(0.0, core_start - config.chunk_context_seconds)
     extract_end = min(media_duration, core_end + config.chunk_context_seconds)
-    chunk_path = chunk_dir / f"chunk-{label}.wav"
-    try:
+    chunk_path = chunk_dir / f"chunk-{label}.wav" if chunk_dir is not None else None
+    if audio_buffer is not None:
+        audio: object = (
+            audio_buffer.slice(extract_start, extract_end, copy=True),
+            audio_buffer.sample_rate,
+        )
+    else:
+        if chunk_path is None:
+            raise RuntimeError("ASR requires an audio buffer or chunk directory")
         _extract_audio_chunk(
             video,
             chunk_path,
             start=extract_start,
             duration=extract_end - extract_start,
         )
-        results = model.transcribe(
-            audio=str(chunk_path),
-            context=config.context,
-            language=config.language,
-            return_time_stamps=True,
-        )
+        audio = str(chunk_path)
+    try:
+        with stage_metrics("asr.forced_aligned_chunk", config.device):
+            results = model.transcribe(
+                audio=audio,
+                context=config.context,
+                language=config.language,
+                return_time_stamps=True,
+            )
         if len(results) != 1:
             raise RuntimeError(
                 f"Qwen3-ASR returned {len(results)} results for one audio chunk"
@@ -580,6 +679,7 @@ def _transcribe_range(
                 media_duration=media_duration,
                 final_chunk=False,
                 label=f"{label}-0",
+                audio_buffer=audio_buffer,
             )
             right = _transcribe_range(
                 model,
@@ -591,6 +691,7 @@ def _transcribe_range(
                 media_duration=media_duration,
                 final_chunk=final_chunk,
                 label=f"{label}-1",
+                audio_buffer=audio_buffer,
             )
             return {
                 "core_start": core_start,
@@ -616,7 +717,20 @@ def _transcribe_range(
             "cues": [asdict(cue) for cue in cues],
         }
     finally:
-        chunk_path.unlink(missing_ok=True)
+        if chunk_path is not None:
+            chunk_path.unlink(missing_ok=True)
+
+
+def _region_audio_buffer(
+    region: AudioRegion,
+    video: Path,
+    audio_pool: AudioBufferPool,
+) -> AudioBuffer:
+    if region.source_path:
+        if is_shared_audio_uri(region.source_path):
+            return audio_pool.resolve(region.source_path)
+        return audio_pool.source(Path(region.source_path))
+    return audio_pool.source(video)
 
 
 def _repetition_hallucination(text: str) -> tuple[str, int] | None:

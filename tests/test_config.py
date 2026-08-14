@@ -34,6 +34,8 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.asr.dtype, "float16")
             self.assertEqual(config.asr.language, "Japanese")
             self.assertTrue(config.audio_analysis.enabled)
+            self.assertFalse(config.audio_analysis.debug_audio_artifacts)
+            self.assertEqual(config.audio_analysis.initial_analysis_concurrency, 1)
             self.assertEqual(
                 config.audio_analysis.speaker_embedding_backend, "eres2netv2"
             )
@@ -74,7 +76,7 @@ class ConfigTests(unittest.TestCase):
             self.assertFalse(config.song_identification.enabled)
             self.assertEqual(config.song_identification.device, "gpu:0")
             self.assertEqual(config.segmentation.model_window_cues, 600)
-            self.assertEqual(config.llm.max_concurrency, 4)
+            self.assertEqual(config.llm.max_concurrency, 16)
             self.assertEqual(config.render.font_size_ratio, 0.066)
             self.assertEqual(config.render.portrait_font_size_ratio, 0.077)
             self.assertEqual(config.render.max_font_size, 144)
@@ -85,6 +87,12 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.render.backend, "auto")
             self.assertEqual(config.render.nvenc_preset, "p4")
             self.assertEqual(config.render.nvenc_cq, 23)
+            self.assertEqual(config.upload.cooldown_min_seconds, 60)
+            self.assertEqual(config.upload.cooldown_max_seconds, 120)
+            self.assertEqual(
+                config.upload.rate_limit_retry_delays_seconds,
+                [120, 300, 600, 1200],
+            )
             self.assertIn("vcodec^=vp9]", config.download.video_format)
             self.assertIn("vcodec^=vp09", config.download.video_format)
 
@@ -134,6 +142,16 @@ class ConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ConfigError, "speaker_embedding_backend"):
+                load_config(path)
+
+    def test_rejects_excessive_initial_audio_analysis_concurrency(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(
+                "[audio_analysis]\ninitial_analysis_concurrency = 3\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ConfigError, "initial_analysis_concurrency"):
                 load_config(path)
 
     def test_rejects_asr_chunk_longer_than_aligner_limit(self):

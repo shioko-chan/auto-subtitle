@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import math
+import random
 import re
 import ssl
 import time
@@ -331,6 +332,7 @@ class OpenAICompatibleTranslator:
                 if finish_reason not in (None, "stop"):
                     raise TranslationError(f"finish_reason={finish_reason}")
                 parsed = _parse_joint_records(content)
+                parsed = _normalize_boundary_translation_fields(parsed)
                 try:
                     records = _validate_joint_records(
                         parsed,
@@ -789,14 +791,24 @@ def _transient_retry_delay(exc: Exception, attempt: int) -> float | None:
     if isinstance(exc, LLMHTTPError):
         if exc.status == 429:
             if exc.retry_after_seconds is not None:
-                return exc.retry_after_seconds
-            return 2 ** (attempt - 1)
+                return _retry_after_delay(exc.retry_after_seconds)
+            return _jittered_exponential_backoff(attempt)
         if 500 <= exc.status < 600:
-            return 2 ** (attempt - 1)
+            return _jittered_exponential_backoff(attempt)
         return None
     if isinstance(exc, (urllib.error.URLError, TimeoutError)):
-        return 2 ** (attempt - 1)
+        return _jittered_exponential_backoff(attempt)
     return None
+
+
+def _jittered_exponential_backoff(attempt: int) -> float:
+    base_delay = float(2 ** (attempt - 1))
+    return random.uniform(base_delay * 0.75, base_delay * 1.25)
+
+
+def _retry_after_delay(server_delay: float) -> float:
+    jitter_ceiling = max(0.25, min(2.0, server_delay * 0.25))
+    return server_delay + random.uniform(0.0, jitter_ceiling)
 
 
 def _parse_retry_after(
@@ -1151,6 +1163,8 @@ def _translation_boundary_prompt(
         f"must partition exactly IDs {left.start_id}-{right.end_id} once with no gaps, overlap, "
         "duplicates, or outside IDs. READ_ONLY_CUES are immutable context: never output or "
         "modify their IDs or translations. Return only one JSON object with a cues array. "
+        "Each output cue must use exactly the fields start_id, end_id, and text, for example "
+        '{"cues":[{"start_id":120,"end_id":128,"text":"中文字幕"}]}. '
         f"Every text must be natural {target_language}, non-empty, semantically complete, and "
         f"no wider than {maximum_units:.3f} units (about {maximum_characters} full-width "
         "characters). Preserve speaker changes, names, fixed terms, and honorific tone. "
@@ -1358,6 +1372,18 @@ def _validate_joint_records(
     if expected != end:
         raise TranslationError(f"joint cue response missing IDs {expected}-{end - 1}")
     return records
+
+
+def _normalize_boundary_translation_fields(values: list[object]) -> list[object]:
+    normalized: list[object] = []
+    for value in values:
+        if not isinstance(value, dict) or "text" in value or "translation" not in value:
+            normalized.append(value)
+            continue
+        record = dict(value)
+        record["text"] = record.pop("translation")
+        normalized.append(record)
+    return normalized
 
 
 def _source_text_for_range(cues: list[Cue], start_id: int, end_id: int) -> str:

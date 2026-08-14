@@ -5,7 +5,7 @@ import unittest
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from subtitle_pipeline.config import LLMConfig, SegmentationConfig
 from subtitle_pipeline.subtitles import Cue
@@ -215,6 +215,48 @@ class TranslationTests(unittest.TestCase):
             in call.args[0]["messages"][0]["content"]
         ]
         self.assertEqual(len(boundary_calls), 1)
+
+    def test_boundary_repair_accepts_translation_field_alias(self):
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(max_retries=1, max_concurrency=1), "secret"
+        )
+        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁")]
+
+        def response(body):
+            prompt = body["messages"][1]["content"]
+            if "WRITABLE:" in prompt:
+                self.assertIn('"text":"中文字幕"', prompt)
+                content = (
+                    '{"cues":['
+                    '{"start_id":1,"end_id":1,"translation":"一"},'
+                    '{"start_id":2,"end_id":2,"translation":"二"}'
+                    "]}"
+                )
+            elif "Required ID range: 0-1" in prompt:
+                content = (
+                    '{"cues":['
+                    '{"start_id":0,"end_id":0,"text":"零"},'
+                    '{"start_id":1,"end_id":1,"text":"一"}'
+                    "]}"
+                )
+            else:
+                content = (
+                    '{"cues":['
+                    '{"start_id":2,"end_id":2,"text":"二"},'
+                    '{"start_id":3,"end_id":3,"text":"三"}'
+                    "]}"
+                )
+            return {"choices": [{"message": {"content": content}}]}
+
+        with patch.object(translator, "_request", side_effect=response):
+            result = translator.plan_and_translate(
+                cues,
+                SegmentationConfig(model_window_cues=2),
+                max_line_units=20,
+            )
+        self.assertEqual(
+            [cue.text for cue in result.translated_cues], ["零", "一", "二", "三"]
+        )
 
     def test_independent_windows_execute_concurrently(self):
         translator = OpenAICompatibleTranslator(
@@ -466,7 +508,9 @@ class TranslationTests(unittest.TestCase):
             translator,
             "_request",
             side_effect=[urllib.error.URLError("temporary network failure"), response],
-        ) as request, patch("subtitle_pipeline.translate.time.sleep") as sleep:
+        ) as request, patch(
+            "subtitle_pipeline.translate.random.uniform", return_value=1
+        ), patch("subtitle_pipeline.translate.time.sleep") as sleep:
             translator.plan_and_translate(
                 cues,
                 SegmentationConfig(),
@@ -479,12 +523,22 @@ class TranslationTests(unittest.TestCase):
         self.assertNotIn("RETRY:", second_prompt)
 
     def test_only_transient_transport_failures_receive_backoff(self):
+        with patch(
+            "subtitle_pipeline.translate.random.uniform",
+            side_effect=[4.5, 2.25, 1.75, 3.5],
+        ) as uniform:
+            self.assertEqual(
+                _transient_retry_delay(urllib.error.URLError("network"), 3), 4.5
+            )
+            self.assertEqual(_transient_retry_delay(TimeoutError("timeout"), 2), 2.25)
+            self.assertEqual(
+                _transient_retry_delay(LLMHTTPError(429, "limited"), 2), 1.75
+            )
+            self.assertEqual(_transient_retry_delay(LLMHTTPError(503, "busy"), 3), 3.5)
         self.assertEqual(
-            _transient_retry_delay(urllib.error.URLError("network"), 3), 4
+            uniform.call_args_list,
+            [call(3.0, 5.0), call(1.5, 2.5), call(1.5, 2.5), call(3.0, 5.0)],
         )
-        self.assertEqual(_transient_retry_delay(TimeoutError("timeout"), 2), 2)
-        self.assertEqual(_transient_retry_delay(LLMHTTPError(429, "limited"), 2), 2)
-        self.assertEqual(_transient_retry_delay(LLMHTTPError(503, "busy"), 3), 4)
         self.assertIsNone(_transient_retry_delay(LLMHTTPError(400, "bad"), 3))
         self.assertIsNone(_transient_retry_delay(TranslationError("invalid"), 3))
         self.assertIsNone(_transient_retry_delay(ValueError("invalid JSON"), 3))
@@ -496,7 +550,11 @@ class TranslationTests(unittest.TestCase):
 
     def test_retry_after_overrides_429_backoff(self):
         error = LLMHTTPError(429, "limited", retry_after_seconds=12.5)
-        self.assertEqual(_transient_retry_delay(error, 4), 12.5)
+        with patch(
+            "subtitle_pipeline.translate.random.uniform", return_value=1.25
+        ) as uniform:
+            self.assertEqual(_transient_retry_delay(error, 4), 13.75)
+        uniform.assert_called_once_with(0.0, 2.0)
         self.assertEqual(_parse_retry_after("7"), 7)
         self.assertEqual(_parse_retry_after("0"), 0)
         self.assertEqual(
@@ -518,7 +576,9 @@ class TranslationTests(unittest.TestCase):
             translator,
             "_request",
             side_effect=error,
-        ) as request, patch("subtitle_pipeline.translate.time.sleep") as sleep:
+        ) as request, patch(
+            "subtitle_pipeline.translate.random.uniform", return_value=0
+        ), patch("subtitle_pipeline.translate.time.sleep") as sleep:
             with self.assertRaisesRegex(LLMHTTPError, "HTTP 429"):
                 translator.plan_and_translate(
                     cues,
@@ -538,7 +598,9 @@ class TranslationTests(unittest.TestCase):
             translator,
             "_request",
             side_effect=error,
-        ) as request, patch("subtitle_pipeline.translate.time.sleep") as sleep:
+        ) as request, patch(
+            "subtitle_pipeline.translate.random.uniform", side_effect=[1, 2]
+        ), patch("subtitle_pipeline.translate.time.sleep") as sleep:
             with self.assertRaisesRegex(LLMHTTPError, "HTTP 503"):
                 translator.plan_and_translate(
                     cues,

@@ -7,6 +7,7 @@ CONFIG_PATH="${1:-$ROOT_DIR/config.toml}"
 WORK_DIR="$ROOT_DIR/work"
 STATUS_PATH="$WORK_DIR/yumemita-2026-08-10-status.log"
 STOP_PATH="$WORK_DIR/yumemita-2026-08-10.stop"
+BILIBILI_PAUSE_PATH="$WORK_DIR/bilibili-upload-paused.json"
 UPLOADED_PATH="$WORK_DIR/yumemita-2026-08-10-uploaded.txt"
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/auto-subtitle-uv-cache}"
@@ -125,6 +126,11 @@ for index in "${!RECORDS[@]}"; do
         printf 'Remove %s before resuming.\n' "$STOP_PATH"
         exit 0
     fi
+    if [[ -f "$BILIBILI_PAUSE_PATH" ]]; then
+        log_status "STOP position=$position/$total reason=bilibili-risk-control"
+        printf 'Bilibili upload pause marker found: %s\n' "$BILIBILI_PAUSE_PATH" >&2
+        exit 1
+    fi
 
     if grep -Fxq "$video_id" "$UPLOADED_PATH" || \
         { [[ -f "$manifest" ]] && jq -e '.uploaded == true' "$manifest" >/dev/null; }; then
@@ -151,6 +157,12 @@ for index in "${!RECORDS[@]}"; do
         printf '[%d/%d] FAILED %s (exit %d); continuing.\n' \
             "$position" "$total" "$video_id" "$status" >&2
         failed=$((failed + 1))
+        if [[ -f "$BILIBILI_PAUSE_PATH" ]]; then
+            log_status "STOP after=$position/$total reason=bilibili-risk-control"
+            printf 'Bilibili risk control paused the batch; inspect %s\n' \
+                "$BILIBILI_PAUSE_PATH" >&2
+            exit 1
+        fi
     fi
 done
 
