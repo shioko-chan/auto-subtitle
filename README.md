@@ -90,6 +90,7 @@ model = "deepseek-v4-flash"
 thinking = "disabled"
 max_tokens = 16384
 max_retries = 5
+max_concurrency = 4
 ```
 
 如需改用环境变量，将 `api_key_pass_entry = ""`，再通过 `api_key_env` 指定变量名。
@@ -103,10 +104,15 @@ JSON 对象，再统一执行相同校验。程序根据 ID 恢复日文原文�
 有序、无遗漏、无重复。助词、专名和术语完整性由模型结合上下文判断，不由本地规则禁止
 特定边界。时长、字符数、停顿和窗口边缘都不会成为硬边界；停顿只作为语义判断证据。
 
-每个非最终窗口都会舍弃模型返回的最后一条 cue，并从它的 `start_id` 带入下一窗口重新
-规划。若窗口只有一条 cue，程序会扩大范围；请求连续失败后则缩小范围，无法在 API
-上下文限制内得到有效结果时停止，不使用硬裁断回退。已确认的连续前缀会逐窗原子写入
-job 目录的 `cue-translation-cache.json`，重跑时只恢复其中最长的合法连续前缀。
+forced aligner 单元会划分为互不重叠的固定窗口，并以 `llm.max_concurrency` 为上限并行
+规划和翻译。每个多单元窗口至少必须生成两条 cue；只生成一条时视为内容校验失败，立即
+重试同一范围而不缩窗。所有窗口完成后，程序把每个相邻窗口的末条与首条 cue 作为唯一
+可写范围并行交给 LLM 重规划；外侧 cue 只作为只读上下文。边界修复完成前所有窗口结果
+均为暂定状态，不允许渲染或上传。
+
+`cue-translation-cache.json` 分别保存已完成的暂定窗口、边界修复和最终连续记录。每个
+并发请求成功后由主线程立即原子写入缓存；中断重跑时只补缺失窗口、缺失边界或未完成的
+定点文本修复。
 
 窗口的 ID 覆盖、顺序、时间轴或硬宽度不合法时仍会重跑该窗口；空译文、目标语言中
 残留日文假名等可定位文本错误不会触发整窗重译，而是先以 `pending` 状态缓存。所有窗口
@@ -118,7 +124,7 @@ job 目录的 `cue-translation-cache.json`，重跑时只恢复其中最长的�
 耗尽后直接终止而不缩窗。其他 HTTP 状态视为非暂时性错误，首次遇到便直接终止。本地
 输出校验失败会立即重试。
 
-联合输入使用 `[id,duration_ms,gap_after_ms,text]`，绝对时间只在本地保存。固定规则、
+联合输入使用 `[id,duration_ms,gap_after_ms,speaker,kind,text]`，绝对时间只在本地保存。固定规则、
 术语表和视频信息位于请求前缀，窗口数据随后，重试错误放在末尾，以提高 DeepSeek
 上下文缓存命中。日志会记录 `prompt_cache_hit_tokens`、`prompt_cache_miss_tokens`、
 命中率及输出 token；同起始时间单元只发送紧凑的 ID 范围，不枚举所有合法终点。
@@ -171,6 +177,8 @@ cue sidecar 都写入 job 目录并可断点复用。
 聚类。这样可以分别覆盖普通聊天、激动语气和带背景音等声音状态。匹配还要求第一候选
 相对第二候选保持足够距离；重叠分轨使用更严格的绝对阈值，证据不足时保留匿名标签。
 MossFormer2 使用独立 uv 环境，避免其 NumPy 1.x 依赖影响 pyannote 和 Qwen ASR。
+取消临时音频文件、按需保留高质量立体声、使用共享内存和受控并行的后续设计见
+[音频管线内存与并行优化](docs/audio-pipeline-optimization.md)。
 
 梦限大 MewType 五位成员的应援色与声纹配置位于独立的
 `character_styles.json`，不会发给 LLM。独播频道会从无重叠语音自动建立声纹原型；
@@ -234,11 +242,12 @@ B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服�
 - `asr.chunk_seconds` / `chunk_context_seconds`：控制可恢复分块和切点上下文；总输入
   长度不能超过 180 秒。
 - `asr.max_new_tokens`：单块 ASR 最多生成的 token 数，默认 `2048`。
-- `segmentation.model_window_cues`：联合请求初始新增的 forced aligner 单元数，默认
-  `600`；非最终窗口的末条 cue 会自动带入下一窗口。
+- `segmentation.model_window_cues`：每个并行联合请求的目标 forced aligner 单元数，默认
+  `600`；为避免末窗只有一个单元，实际边界可能向相邻窗口调整。
 - `llm.max_tokens`：单次 LLM 响应的输出 token 上限，DeepSeek V4 建议设为 `16384`。
-- `llm.max_retries`：拆分批次前的请求重试次数，建议设为 `5`。
-- `llm.context_cues`：联合请求附带的已确认相邻 cue 数量，默认 `3` 条。
+- `llm.max_retries`：同一窗口、边界或定点修复请求的重试次数，建议设为 `5`。
+- `llm.max_concurrency`：窗口和边界 LLM 请求的最大并发数，默认 `4`。
+- `llm.context_cues`：窗口附带的相邻源单元及边界修复附带的只读 cue 数量，默认 `3`。
 - `llm.thinking`：DeepSeek V4 的严格 JSON 翻译应设为 `"disabled"`；其他服务不支持该参数时省略。
 - `llm.translate_metadata`：是否翻译 YouTube 标题和简介。
 - `llm.metadata_description_max_chars`：发送给 LLM 的源简介字符上限。

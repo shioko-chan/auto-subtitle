@@ -74,6 +74,7 @@ class ConfigTests(unittest.TestCase):
             self.assertFalse(config.song_identification.enabled)
             self.assertEqual(config.song_identification.device, "gpu:0")
             self.assertEqual(config.segmentation.model_window_cues, 600)
+            self.assertEqual(config.llm.max_concurrency, 4)
             self.assertEqual(config.render.font_size_ratio, 0.066)
             self.assertEqual(config.render.portrait_font_size_ratio, 0.077)
             self.assertEqual(config.render.max_font_size, 144)
@@ -99,6 +100,13 @@ class ConfigTests(unittest.TestCase):
             path = Path(temp) / "config.toml"
             path.write_text("[llm]\nmax_tokens = 0\n", encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, "max_tokens"):
+                load_config(path)
+
+    def test_rejects_invalid_llm_concurrency(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text("[llm]\nmax_concurrency = 0\n", encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "max_concurrency"):
                 load_config(path)
 
     def test_rejects_negative_context_cues(self):

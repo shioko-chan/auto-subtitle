@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 import urllib.error
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ from subtitle_pipeline.translate import (
     _parse_retry_after,
     _prompt_translation_context,
     _transient_retry_delay,
+    _translation_window_ranges,
     _validate_joint_records,
     _validate_joint_target_language,
     _validate_joint_timing,
@@ -160,25 +162,43 @@ class TranslationTests(unittest.TestCase):
         self.assertIn("cache_miss=250", message)
         self.assertIn("cache_hit_rate=75.0%", message)
 
-    def test_nonfinal_window_always_carries_and_replans_last_cue(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+    def test_parallel_windows_then_repair_only_two_edge_cues(self):
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(max_concurrency=2), "secret"
+        )
         cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁戊")]
-        responses = [
-            {
-                "choices": [{"message": {"content": (
-                    '{"start_id":0,"end_id":0,"text":"一"}\n'
-                    '{"start_id":1,"end_id":2,"text":"旧尾句"}'
-                )}}]
-            },
-            {
-                "choices": [{"message": {"content": (
-                    '{"start_id":1,"end_id":3,"text":"重新分组"}\n'
+
+        def response(body):
+            prompt = body["messages"][1]["content"]
+            system = body["messages"][0]["content"]
+            if "repair one provisional" in system:
+                self.assertIn("IDs 1-3", prompt)
+                self.assertIn('"start_id":1', prompt)
+                self.assertIn('"start_id":3', prompt)
+                return {"choices": [{"message": {"content": (
+                    '{"cues":['
+                    '{"start_id":1,"end_id":3,"text":"重新分组"}'
+                    "]}"
+                )}}]}
+            if "Required ID range: 0-2" in prompt:
+                content = (
+                    '{"cues":['
+                    '{"start_id":0,"end_id":0,"text":"一"},'
+                    '{"start_id":1,"end_id":2,"text":"暂定左边"}'
+                    "]}"
+                )
+            else:
+                self.assertIn("Required ID range: 3-4", prompt)
+                content = (
+                    '{"cues":['
+                    '{"start_id":3,"end_id":3,"text":"暂定右边"},'
                     '{"start_id":4,"end_id":4,"text":"五"}'
-                )}}]
-            },
-        ]
+                    "]}"
+                )
+            return {"choices": [{"message": {"content": content}}]}
+
         config = SegmentationConfig(model_window_cues=3)
-        with patch.object(translator, "_request", side_effect=responses) as request:
+        with patch.object(translator, "_request", side_effect=response) as request:
             result = translator.plan_and_translate(
                 cues,
                 config,
@@ -187,10 +207,74 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(
             [cue.text for cue in result.translated_cues], ["一", "重新分组", "五"]
         )
-        self.assertEqual(request.call_count, 2)
-        second_prompt = request.call_args_list[1].args[0]["messages"][1]["content"]
-        self.assertIn("Required ID range: 1-4", second_prompt)
-        self.assertNotIn("旧尾句", second_prompt)
+        self.assertEqual(request.call_count, 3)
+        boundary_calls = [
+            call
+            for call in request.call_args_list
+            if "repair one provisional"
+            in call.args[0]["messages"][0]["content"]
+        ]
+        self.assertEqual(len(boundary_calls), 1)
+
+    def test_independent_windows_execute_concurrently(self):
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(max_retries=1, max_concurrency=2), "secret"
+        )
+        cues = [Cue(index, index + 1, str(index)) for index in range(4)]
+        barrier = threading.Barrier(2)
+        lock = threading.Lock()
+        active = 0
+        maximum_active = 0
+
+        def response(body):
+            nonlocal active, maximum_active
+            prompt = body["messages"][1]["content"]
+            if "WRITABLE:" in prompt:
+                content = (
+                    '{"cues":['
+                    '{"start_id":1,"end_id":1,"text":"一"},'
+                    '{"start_id":2,"end_id":2,"text":"二"}'
+                    "]}"
+                )
+                return {"choices": [{"message": {"content": content}}]}
+            with lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            barrier.wait(timeout=2)
+            if "Required ID range: 0-1" in prompt:
+                content = (
+                    '{"cues":['
+                    '{"start_id":0,"end_id":0,"text":"零"},'
+                    '{"start_id":1,"end_id":1,"text":"一"}'
+                    "]}"
+                )
+            else:
+                content = (
+                    '{"cues":['
+                    '{"start_id":2,"end_id":2,"text":"二"},'
+                    '{"start_id":3,"end_id":3,"text":"三"}'
+                    "]}"
+                )
+            with lock:
+                active -= 1
+            return {"choices": [{"message": {"content": content}}]}
+
+        with patch.object(translator, "_request", side_effect=response):
+            result = translator.plan_and_translate(
+                cues,
+                SegmentationConfig(model_window_cues=2),
+                max_line_units=20,
+            )
+        self.assertEqual(maximum_active, 2)
+        self.assertEqual(
+            [cue.text for cue in result.translated_cues], ["零", "一", "二", "三"]
+        )
+
+    def test_window_ranges_never_leave_one_unit_chunk(self):
+        self.assertEqual(_translation_window_ranges(5, 2), [(0, 2), (2, 5)])
+        self.assertEqual(
+            _translation_window_ranges(601, 600), [(0, 599), (599, 601)]
+        )
 
     def test_joint_translation_tolerates_text_beyond_prompt_limit_within_frame(self):
         translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
@@ -216,19 +300,26 @@ class TranslationTests(unittest.TestCase):
         self.assertIn("10 full-width characters", prompt)
         self.assertNotIn("12 full-width characters", prompt)
 
-    def test_single_cue_nonfinal_window_expands_without_hard_cut(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(max_retries=1), "secret")
-        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁戊")]
+    def test_single_cue_window_retries_same_range_immediately(self):
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(max_retries=2, max_concurrency=1), "secret"
+        )
+        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁")]
         responses = [
             {"choices": [{"message": {"content": (
                 '{"start_id":0,"end_id":1,"text":"未完成"}'
             )}}]},
             {"choices": [{"message": {"content": (
-                '{"start_id":0,"end_id":1,"text":"前句"}\n'
-                '{"start_id":2,"end_id":3,"text":"未完成尾句"}'
+                '{"start_id":0,"end_id":0,"text":"一"}\n'
+                '{"start_id":1,"end_id":1,"text":"二"}'
             )}}]},
             {"choices": [{"message": {"content": (
-                '{"start_id":2,"end_id":4,"text":"最终句"}'
+                '{"start_id":2,"end_id":2,"text":"三"}\n'
+                '{"start_id":3,"end_id":3,"text":"四"}'
+            )}}]},
+            {"choices": [{"message": {"content": (
+                '{"start_id":1,"end_id":1,"text":"二"}\n'
+                '{"start_id":2,"end_id":2,"text":"三"}'
             )}}]},
         ]
         with patch.object(translator, "_request", side_effect=responses) as request:
@@ -237,38 +328,18 @@ class TranslationTests(unittest.TestCase):
                 SegmentationConfig(model_window_cues=2),
                 max_line_units=20,
             )
-        self.assertEqual([cue.text for cue in result.translated_cues], ["前句", "最终句"])
-        ranges = [
+        self.assertEqual(
+            [cue.text for cue in result.translated_cues], ["一", "二", "三", "四"]
+        )
+        prompts = [
             call.args[0]["messages"][1]["content"]
             for call in request.call_args_list
         ]
-        self.assertIn("Required ID range: 0-1", ranges[0])
-        self.assertIn("Required ID range: 0-3", ranges[1])
-        self.assertIn("Required ID range: 2-4", ranges[2])
-
-    def test_discarded_nonfinal_tail_may_have_collapsed_timing(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(max_retries=1), "secret")
-        cues = [
-            Cue(0, 1, "甲"),
-            Cue(1, 2, "乙"),
-            Cue(1, 3, "丙"),
-        ]
-        responses = [
-            {"choices": [{"message": {"content": (
-                '{"start_id":0,"end_id":0,"text":"一"}\n'
-                '{"start_id":1,"end_id":1,"text":"未完成"}'
-            )}}]},
-            {"choices": [{"message": {"content": (
-                '{"start_id":1,"end_id":2,"text":"完成"}'
-            )}}]},
-        ]
-        with patch.object(translator, "_request", side_effect=responses):
-            result = translator.plan_and_translate(
-                cues,
-                SegmentationConfig(model_window_cues=2),
-                max_line_units=20,
-            )
-        self.assertEqual([cue.text for cue in result.translated_cues], ["一", "完成"])
+        self.assertIn("Required ID range: 0-1", prompts[0])
+        self.assertIn("Required ID range: 0-1", prompts[1])
+        self.assertIn("RETRY:", prompts[1])
+        self.assertIn("only one cue", prompts[1])
+        self.assertNotIn("Required ID range: 0-3", "\n".join(prompts))
 
     def test_collapsed_timing_runs_are_compact(self):
         cues = [
@@ -280,19 +351,16 @@ class TranslationTests(unittest.TestCase):
         runs = _collapsed_start_runs(cues, 0, 4)
         self.assertEqual(runs, [[1, 3]])
 
-    def test_failed_joint_range_shrinks_after_retries(self):
+    def test_failed_joint_range_retries_without_shrinking(self):
         translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=1), "secret"
+            LLMConfig(max_retries=2), "secret"
         )
         cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁")]
         responses = [
             {"choices": [{"message": {"content": "not json"}}]},
             {"choices": [{"message": {"content": (
-                '{"start_id":0,"end_id":0,"text":"一"}\n'
-                '{"start_id":1,"end_id":1,"text":"尾"}'
-            )}}]},
-            {"choices": [{"message": {"content": (
-                '{"start_id":1,"end_id":3,"text":"后句"}'
+                '{"start_id":0,"end_id":1,"text":"前句"}\n'
+                '{"start_id":2,"end_id":3,"text":"后句"}'
             )}}]},
         ]
         with patch.object(translator, "_request", side_effect=responses) as request:
@@ -301,10 +369,11 @@ class TranslationTests(unittest.TestCase):
                 SegmentationConfig(model_window_cues=4),
                 max_line_units=20,
             )
-        self.assertEqual([cue.text for cue in result.translated_cues], ["一", "后句"])
+        self.assertEqual([cue.text for cue in result.translated_cues], ["前句", "后句"])
         prompts = [call.args[0]["messages"][1]["content"] for call in request.call_args_list]
         self.assertIn("Required ID range: 0-3", prompts[0])
-        self.assertIn("Required ID range: 0-1", prompts[1])
+        self.assertIn("Required ID range: 0-3", prompts[1])
+        self.assertNotIn("Required ID range: 0-1", prompts[1])
 
     def test_joint_finish_reason_is_retried_with_expected_range(self):
         translator = OpenAICompatibleTranslator(
@@ -691,9 +760,9 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(records, [CueTranslationRecord(0, 0, "零")])
         self.assertEqual(next_end, 4)
 
-    def test_joint_cache_resumes_from_confirmed_prefix_only(self):
+    def test_parallel_cache_resumes_only_missing_windows_then_boundaries(self):
         config = SegmentationConfig(model_window_cues=2)
-        llm = LLMConfig(max_retries=1)
+        llm = LLMConfig(max_retries=1, max_concurrency=1)
         cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁")]
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "cue-translation-cache.json"
@@ -701,9 +770,8 @@ class TranslationTests(unittest.TestCase):
             first_responses = [
                 {"choices": [{"message": {"content": (
                     '{"start_id":0,"end_id":0,"text":"一"}\n'
-                    '{"start_id":1,"end_id":1,"text":"待重做"}'
+                    '{"start_id":1,"end_id":1,"text":"二"}'
                 )}}]},
-                {"choices": [{"message": {"content": "invalid"}}]},
                 {"choices": [{"message": {"content": "invalid"}}]},
             ]
             with patch.object(first, "_request", side_effect=first_responses):
@@ -715,32 +783,37 @@ class TranslationTests(unittest.TestCase):
                         cache_path=path,
                     )
             payload = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["records"], [
-                {
-                    "start_id": 0,
-                    "end_id": 0,
-                    "text": "一",
-                    "status": "confirmed",
-                    "errors": [],
-                }
-            ])
+            self.assertNotIn("records", payload)
+            self.assertEqual(set(payload["windows"]), {"0:2"})
 
             second = OpenAICompatibleTranslator(llm, "secret")
-            response = {"choices": [{"message": {"content": (
-                '{"start_id":1,"end_id":3,"text":"完成后句"}'
-            )}}]}
-            with patch.object(second, "_request", return_value=response) as request:
+            responses = [
+                {"choices": [{"message": {"content": (
+                    '{"start_id":2,"end_id":2,"text":"三"}\n'
+                    '{"start_id":3,"end_id":3,"text":"四"}'
+                )}}]},
+                {"choices": [{"message": {"content": (
+                    '{"start_id":1,"end_id":1,"text":"二"}\n'
+                    '{"start_id":2,"end_id":2,"text":"三"}'
+                )}}]},
+            ]
+            with patch.object(second, "_request", side_effect=responses) as request:
                 result = second.plan_and_translate(
                     cues,
                     config,
                     max_line_units=20,
                     cache_path=path,
                 )
-        self.assertEqual([cue.text for cue in result.translated_cues], ["一", "完成后句"])
-        prompt = request.call_args.args[0]["messages"][1]["content"]
-        self.assertIn("Required ID range: 1-3", prompt)
-        self.assertIn('"translation":"一"', prompt)
-        self.assertNotIn("待重做", prompt)
+            final_payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [cue.text for cue in result.translated_cues], ["一", "二", "三", "四"]
+        )
+        self.assertEqual(request.call_count, 2)
+        prompts = [call.args[0]["messages"][1]["content"] for call in request.call_args_list]
+        self.assertIn("Required ID range: 2-3", prompts[0])
+        self.assertNotIn("Required ID range: 0-1", "\n".join(prompts))
+        self.assertEqual(set(final_payload["windows"]), {"0:2", "2:4"})
+        self.assertEqual(set(final_payload["boundaries"]), {"1|2"})
 
     def test_complete_cached_plan_resumes_at_pending_repairs_only(self):
         config = SegmentationConfig()

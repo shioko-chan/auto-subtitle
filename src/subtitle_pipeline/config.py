@@ -108,6 +108,7 @@ class LLMConfig:
     target_language: str = "简体中文"
     timeout_seconds: int = 120
     max_retries: int = 5
+    max_concurrency: int = 4
     max_tokens: int = 16384
     context_cues: int = 3
     json_mode: bool = True
@@ -205,6 +206,8 @@ def load_config(path: Path) -> AppConfig:
 
     if config.llm.max_retries < 1:
         raise ConfigError("llm.max_retries must be at least 1")
+    if config.llm.max_concurrency < 1:
+        raise ConfigError("llm.max_concurrency must be at least 1")
     if config.llm.max_tokens < 1:
         raise ConfigError("llm.max_tokens must be at least 1")
     if config.llm.context_cues < 0:

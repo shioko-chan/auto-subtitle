@@ -86,8 +86,8 @@ max_search_results = 5
 max_page_chars = 12000
 
 [segmentation]
-# Each request initially adds this many forced-aligner units. The final cue is
-# always carried into the next request, so the window edge is never a cue boundary.
+# Target number of forced-aligner units in each independent parallel request.
+# Ranges may be rebalanced so no multi-window job ends with a one-unit window.
 model_window_cues = 600
 
 [llm]
@@ -98,6 +98,7 @@ model = "deepseek-v4-flash"
 target_language = "简体中文"
 timeout_seconds = 120
 max_retries = 5
+max_concurrency = 4
 max_tokens = 16384
 context_cues = 3
 # Joint subtitles and metadata use json_object.
