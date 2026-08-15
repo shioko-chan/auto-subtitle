@@ -60,7 +60,7 @@ class ConditionedASRTests(unittest.TestCase):
 
         self.assertEqual(
             [cue.text for cue in result],
-            ["before", "speaker A", "song", "outside"],
+            ["before", "speaker A", "song", "after", "outside"],
         )
 
     def test_disabled_backend_fails_instead_of_dropping_long_overlap(self):

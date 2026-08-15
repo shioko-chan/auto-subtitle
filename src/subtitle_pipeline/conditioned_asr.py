@@ -235,9 +235,12 @@ def _decode_cues(value: object, windows: list[ConditionedWindow]) -> list[Cue]:
         }
         missing = sorted(expected - returned)
         if missing:
-            raise RuntimeError(
-                "DiCoW omitted active speakers from a repair window: "
-                + ", ".join(missing)
+            logger.warning(
+                "DiCoW omitted active speakers from %.3f-%.3fs; preserving their "
+                "Qwen baseline cues: %s",
+                window.start,
+                window.end,
+                ", ".join(missing),
             )
     return sorted(cues, key=lambda cue: (cue.start, cue.end, cue.speaker or ""))
 
@@ -245,15 +248,28 @@ def _decode_cues(value: object, windows: list[ConditionedWindow]) -> list[Cue]:
 def _replace_windows(
     baseline: list[Cue], repaired: list[Cue], windows: list[ConditionedWindow]
 ) -> list[Cue]:
-    retained = [
-        cue
-        for cue in baseline
-        if cue.kind == "singing"
-        or not any(
-            window.start <= (cue.start + cue.end) / 2 <= window.end
-            for window in windows
-        )
-    ]
+    repaired_speakers = {
+        (window.start, window.end): {
+            cue.speaker
+            for cue in repaired
+            if cue.end > window.start and cue.start < window.end
+        }
+        for window in windows
+    }
+    retained = []
+    for cue in baseline:
+        if cue.kind == "singing":
+            retained.append(cue)
+            continue
+        midpoint = (cue.start + cue.end) / 2
+        matching = [
+            window for window in windows if window.start <= midpoint <= window.end
+        ]
+        if not matching or all(
+            cue.speaker not in repaired_speakers[(window.start, window.end)]
+            for window in matching
+        ):
+            retained.append(cue)
     return sorted(
         [*retained, *repaired], key=lambda cue: (cue.start, cue.end, cue.speaker or "")
     )
