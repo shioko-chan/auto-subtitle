@@ -258,6 +258,40 @@ class TranslationTests(unittest.TestCase):
             [cue.text for cue in result.translated_cues], ["零", "一", "二", "三"]
         )
 
+    def test_failed_map_window_shrinks_and_repairs_new_boundary(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(max_retries=1), "secret")
+        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁")]
+
+        def plan(_cues, start, end, *_args):
+            if (start, end) == (0, 4):
+                raise TranslationError("finish_reason=length")
+            return [
+                CueTranslationRecord(index, index, str(index))
+                for index in range(start, end)
+            ]
+
+        with patch.object(
+            translator, "_plan_and_translate_window", side_effect=plan
+        ) as planned, patch.object(
+            translator,
+            "_repair_translation_boundary",
+            return_value=[CueTranslationRecord(1, 2, "一二")],
+        ) as repaired:
+            result = translator._plan_and_translate_window_resilient(
+                cues, 0, 4, {}, [], 20, 40
+            )
+
+        self.assertEqual(
+            result,
+            [
+                CueTranslationRecord(0, 0, "0"),
+                CueTranslationRecord(1, 2, "一二"),
+                CueTranslationRecord(3, 3, "3"),
+            ],
+        )
+        self.assertEqual(planned.call_count, 3)
+        repaired.assert_called_once()
+
     def test_independent_windows_execute_concurrently(self):
         translator = OpenAICompatibleTranslator(
             LLMConfig(max_retries=1, max_concurrency=2), "secret"
@@ -834,6 +868,7 @@ class TranslationTests(unittest.TestCase):
                     '{"start_id":0,"end_id":0,"text":"一"}\n'
                     '{"start_id":1,"end_id":1,"text":"二"}'
                 )}}]},
+                {"choices": [{"message": {"content": "invalid"}}]},
                 {"choices": [{"message": {"content": "invalid"}}]},
             ]
             with patch.object(first, "_request", side_effect=first_responses):

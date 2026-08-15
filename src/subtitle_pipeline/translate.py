@@ -142,7 +142,7 @@ class OpenAICompatibleTranslator:
                 ) as executor:
                     futures: dict[Future[list[CueTranslationRecord]], tuple[int, int]] = {
                         executor.submit(
-                            self._plan_and_translate_window,
+                            self._plan_and_translate_window_resilient,
                             cues,
                             start,
                             end,
@@ -494,6 +494,71 @@ class OpenAICompatibleTranslator:
             f"joint cue range {start}-{end - 1} failed after "
             f"{self.config.max_retries} attempts: {last_error}"
         )
+
+    def _plan_and_translate_window_resilient(
+        self,
+        cues: list[Cue],
+        start: int,
+        end: int,
+        translation_context: dict[str, object],
+        confirmed: list[CueTranslationRecord],
+        prompt_maximum_units: float,
+        validation_maximum_units: float,
+    ) -> list[CueTranslationRecord]:
+        try:
+            return self._plan_and_translate_window(
+                cues,
+                start,
+                end,
+                translation_context,
+                confirmed,
+                prompt_maximum_units,
+                validation_maximum_units,
+            )
+        except LLMHTTPError:
+            raise
+        except TranslationError:
+            if end - start <= 1:
+                raise
+            middle = start + (end - start) // 2
+            logging.warning(
+                "shrinking failed subtitle window %d-%d into %d-%d and %d-%d",
+                start,
+                end - 1,
+                start,
+                middle - 1,
+                middle,
+                end - 1,
+            )
+            left = self._plan_and_translate_window_resilient(
+                cues,
+                start,
+                middle,
+                translation_context,
+                confirmed,
+                prompt_maximum_units,
+                validation_maximum_units,
+            )
+            right = self._plan_and_translate_window_resilient(
+                cues,
+                middle,
+                end,
+                translation_context,
+                confirmed,
+                prompt_maximum_units,
+                validation_maximum_units,
+            )
+            provisional = [*left, *right]
+            repaired = self._repair_translation_boundary(
+                cues,
+                left[-1],
+                right[0],
+                provisional,
+                translation_context,
+                prompt_maximum_units,
+                validation_maximum_units,
+            )
+            return [*left[:-1], *repaired, *right[1:]]
 
     def _repair_translations(
         self,
