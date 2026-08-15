@@ -32,10 +32,21 @@ enabled = true
 debug_audio_artifacts = false
 # Set to 2 only after confirming concurrent diarization + AST fits GPU memory.
 initial_analysis_concurrency = 1
-diarization_backend = "moss"
+diarization_backend = "pyannote"
+# Community-1 supplies both ordinary overlap-preserving diarization and an
+# exclusive timeline for baseline ASR. Overlap duration always refers to the
+# real ordinary-timeline intersection, before context padding.
+diarization_model = "pyannote/speaker-diarization-community-1"
+overlap_boundary_seconds = 0.4
+overlap_conditioned_asr_seconds = 1.0
+overlap_context_seconds = 2.0
+conditioned_asr_backend = "dicow"
+conditioned_asr_model = "BUT-FIT/DiCoW_v3_3"
+# Pin trusted remote model code instead of executing a moving main branch.
+conditioned_asr_revision = "c34b64d9a9c5148c65fd355bb188d60343a6b44f"
+conditioned_asr_worker_project = "tools/dicow"
 # MOSS jointly produces the spoken transcript and anonymous speaker timeline.
-# The transcript is retained for audit; Qwen + forced aligner still produces the
-# fine-grained source units consumed by translation.
+# It remains available as a slower comparison backend.
 moss_transcribe_model = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
 moss_transcribe_worker_project = "tools/moss_transcribe"
 # Bound attention memory on consumer GPUs. Split near the quietest point around
@@ -46,8 +57,6 @@ moss_window_search_seconds = 60.0
 # An eight-minute transcript should fit comfortably; this cap prevents a
 # malformed generation from decoding tens of thousands of tokens.
 moss_max_new_tokens = 8192
-# Used only when diarization_backend = "pyannote".
-diarization_model = "pyannote/speaker-diarization-community-1"
 # Kept only for compatibility with older configs; MossFormer2 does not use it.
 overlap_embedding_model = "pyannote/wespeaker-voxceleb-resnet34-LM"
 speaker_embedding_backend = "eres2netv2"

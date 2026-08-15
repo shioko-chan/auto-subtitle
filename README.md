@@ -161,30 +161,34 @@ URL 放在单引号中时不要再写 `\?` 或 `\=`。为兼容常见的复制�
 缺失块。上下文区的时间戳只归属相应核心区间，因此不会产生重复 cue。分块总长度受
 forced aligner 的 180 秒输入限制约束。
 
-启用 `[audio_analysis]` 后，默认由 `MOSS-Transcribe-Diarize` 生成带匿名说话人标签的
-长上下文时间轴。每个窗口目标长度 80 分钟，在附近低能量位置切开且不超过模型支持的
-90 分钟；跨窗口的 `S01` 不会被当成同一匿名人物。MOSS 原始转写和时间戳保存在 job
-目录的 `moss-transcribe-diarize.json` 供审计，最终日文字幕仍由 Qwen ASR 和 forced
-aligner 生成。原音 AST 只提出歌声候选，Demucs 人声轨上的 AST 再确认实际歌唱；候选中存在
+启用 `[audio_analysis]` 后，默认由 pyannote Community-1 同时生成 ordinary 和 exclusive
+两条说话人时间轴。ordinary 时间轴保留真实重叠及参与者，用于身份聚合、审计和重叠 ASR
+掩码；exclusive 时间轴保证每一时刻只有一个主说话人，供普通 Qwen ASR 使用。真实重叠
+小于 0.4 秒时视作边界误差；0.4–1.0 秒仍走带完整上下文的 Qwen；严格超过 1.0 秒时，
+使用固定 revision 的 DiCoW 对包含重叠前后完整讲话轮次的局部窗口逐 speaker 转写，并替换
+整个局部基线结果。重叠时长不含 padding，DiCoW 不可用或遗漏活跃 speaker 时任务失败，
+不会静默丢字幕。MOSS 仍可作为较慢的回归后端显式启用。
+
+原音 AST 只提出歌声候选，Demucs 人声轨上的 AST 再确认实际歌唱；候选中存在
 连续讲话但人声轨没有歌唱证据时按“讲话+BGM”处理。证据模糊时同时运行普通 forced
 aligner 与句级歌声 ASR，时间轴坍缩或循环输出时采用歌声结果。release hysteresis 只在
 确认进入歌唱状态后桥接短暂漏检，不会让一次 AST 误报扩成整段歌曲。所有音频分析结果和
-带说话人字段的 cue sidecar 都写入 job 目录并可断点复用。旧的 pyannote + MossFormer2
-路径仍可通过 `diarization_backend = "pyannote"` 显式启用，主要用于回归比较。
+带说话人字段的 cue sidecar 都写入 job 目录并可断点复用。
 
 作业只用 ffmpeg 解码一次完整的 16 kHz 单声道音频，并由 `AudioBufferPool` 在共享 CPU
-内存中提供给 MOSS、Qwen 和 ERes2NetV2。Qwen 直接接收 NumPy 切片，正常运行不再
+内存中提供给 pyannote、Qwen、DiCoW 和 ERes2NetV2。Qwen 与 DiCoW 直接接收 NumPy
+切片或共享内存描述符，正常运行不再
 创建 `asr-chunks`、`asr-analysis-chunks` 或分离声源 WAV。MossFormer2 音轨仅在
 `audio_analysis.debug_audio_artifacts = true` 时落盘。Demucs 只按需解码候选歌曲区间的
-高质量立体声音频。各阶段日志包含耗时和可用时的峰值显存；MOSS 或 pyannote 与原音 AST 可通过
-`initial_analysis_concurrency = 2` 并行，其余重型 GPU 模型仍按阶段串行。
+高质量立体声音频。各阶段日志包含耗时和可用时的峰值显存；pyannote 与原音 AST 可通过
+`initial_analysis_concurrency = 2` 并行。Qwen 完成后会先释放显存再启动 DiCoW。
 
 人物身份使用独立 uv worker 中的 ERes2NetV2 embedding 和余弦距离匹配。成员个人频道
 的独播会自动将 2–15 秒、非歌唱且非重叠的主说话人片段注册到
 `work/speaker-profiles-eres2netv2/`；每人最多保留 400 条。profile 带模型签名，不能与
 旧 WeSpeaker embedding 混用。识别时保留原始样本，并用确定性的 cosine k-means 为
 每人建立最多 5 个中心；每个中心默认至少需要 20 条样本，小簇会通过减少中心数重新
-聚类。MOSS 同一窗口内同一匿名标签的非歌唱、非重叠干净片段会共同参与一次身份判断：
+聚类。同一全局匿名 speaker 的非歌唱、非重叠干净片段会共同参与一次身份判断：
 先按该标签 embedding 的 medoid 删除最远 15%，再按片段时长加权，单段权重最多计 10 秒。
 重叠片段不参与投票，但会继承该匿名标签的身份。不同匿名标签独立匹配，允许都映射为同一
 成员；匹配仍要求第一候选相对第二候选保持足够距离，证据不足时保留匿名标签。
@@ -254,8 +258,12 @@ B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服�
 - `asr.chunk_seconds` / `chunk_context_seconds`：控制可恢复分块和切点上下文；总输入
   长度不能超过 180 秒。
 - `asr.max_new_tokens`：单块 ASR 最多生成的 token 数，默认 `2048`。
-- `audio_analysis.diarization_backend`：默认 `moss`；设为 `pyannote` 可启用旧的
-  community-1 + MossFormer2 回退路径。
+- `audio_analysis.diarization_backend`：默认 `pyannote`，使用 Community-1 的 ordinary 与
+  exclusive 双时间轴；`moss` 仅保留作回归比较。
+- `audio_analysis.overlap_boundary_seconds` / `overlap_conditioned_asr_seconds`：默认
+  `0.4/1.0` 秒，控制 exclusive、带上下文 Qwen 和 DiCoW 三档路由。
+- `audio_analysis.conditioned_asr_model` / `conditioned_asr_revision`：长重叠局部修复所用
+  DiCoW 模型及固定代码 revision。
 - `audio_analysis.moss_window_seconds` / `moss_max_window_seconds`：MOSS 长窗目标和硬上限，
   默认 480/540 秒，避免长直播的注意力张量耗尽显存。
 - `audio_analysis.initial_analysis_concurrency`：`1` 为顺序执行 diarization 与原音 AST；

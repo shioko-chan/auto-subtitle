@@ -20,7 +20,7 @@ from .telemetry import stage_metrics
 
 logger = logging.getLogger(__name__)
 
-_CACHE_VERSION = 8
+_CACHE_VERSION = 9
 _MIN_SEPARATED_SEGMENT_SECONDS = 0.08
 _MIN_SEPARATED_PEAK = 1e-4
 _MIN_SEPARATED_RMS = 1e-5
@@ -58,6 +58,9 @@ class AudioRegion:
     source_path: str | None = None
     source_offset: float = 0.0
     anonymous_speaker: str | None = None
+    overlap_seconds: float = 0.0
+    overlap_speakers: tuple[str, ...] = ()
+    asr_route: str = "qwen"
 
 
 @dataclass(frozen=True)
@@ -65,6 +68,13 @@ class AudioAnalysis:
     speech: list[AudioRegion]
     singing: list[AudioRegion]
     ambiguous: list[AudioRegion] = field(default_factory=list)
+    diarization: list[AudioRegion] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DiarizationTimelines:
+    ordinary: list[AudioRegion]
+    exclusive: list[AudioRegion]
 
 
 def analyze_audio(
@@ -99,7 +109,7 @@ def analyze_audio(
         wav_path = job_dir / "source.analysis.wav"
         _extract_audio(video, wav_path)
         waveform, sample_rate = _load_waveform(wav_path)
-    speech, raw_scores = _run_initial_audio_analysis(
+    timelines, raw_scores = _run_initial_audio_analysis(
         video,
         job_dir,
         waveform,
@@ -108,18 +118,8 @@ def analyze_audio(
         metadata or {},
         audio_buffer=audio_pool.main() if audio_pool is not None else None,
     )
-    if config.diarization_backend == "pyannote" and any(
-        region.overlap for region in speech
-    ):
-        with stage_metrics("audio.overlap_separation", config.device):
-            speech = _run_overlap_separation(
-                waveform,
-                sample_rate,
-                speech,
-                config,
-                job_dir / "separated-speakers",
-                audio_pool=audio_pool,
-            )
+    speech = timelines.exclusive
+    ordinary_diarization = timelines.ordinary
     raw_candidates = _singing_regions_from_scores(
         raw_scores,
         threshold=config.singing_threshold,
@@ -194,6 +194,10 @@ def analyze_audio(
             excluded_regions=[*raw_candidates, *singing_windows, *ambiguous_windows],
             audio_pool=audio_pool,
         )
+        speech = _resolve_overlap_speakers(speech, speech)
+        ordinary_diarization = _resolve_diarization_speakers(
+            ordinary_diarization, speech
+        )
 
     singing = singing_windows
     if singing_windows:
@@ -243,13 +247,22 @@ def analyze_audio(
                 }
             )
         )
-    result = AudioAnalysis(speech=speech, singing=singing, ambiguous=ambiguous)
+    ordinary_diarization = _exclude_timeline_regions(
+        ordinary_diarization, [*singing, *ambiguous]
+    )
+    result = AudioAnalysis(
+        speech=speech,
+        singing=singing,
+        ambiguous=ambiguous,
+        diarization=ordinary_diarization,
+    )
     payload = {
         "version": _CACHE_VERSION,
         "signature": _signature(video, config, metadata or {}),
         "speech": [asdict(region) for region in speech],
         "singing": [asdict(region) for region in singing],
         "ambiguous": [asdict(region) for region in ambiguous],
+        "diarization": [asdict(region) for region in ordinary_diarization],
     }
     temporary = cache_path.with_suffix(".tmp")
     temporary.write_text(
@@ -276,8 +289,8 @@ def _run_initial_audio_analysis(
     metadata: dict[str, object],
     *,
     audio_buffer: AudioBuffer | None = None,
-) -> tuple[list[AudioRegion], list[AudioRegion]]:
-    def diarize() -> list[AudioRegion]:
+) -> tuple[DiarizationTimelines, list[AudioRegion]]:
+    def diarize() -> DiarizationTimelines:
         with stage_metrics("audio.diarization", config.device):
             if config.diarization_backend == "moss":
                 from .moss_diarization import transcribe_and_diarize
@@ -291,7 +304,7 @@ def _run_initial_audio_analysis(
                     waveform=waveform,
                     sample_rate=sample_rate,
                 )
-                return _mark_overlaps(
+                ordinary = _mark_overlaps(
                     [
                         AudioRegion(
                             segment.start,
@@ -303,6 +316,7 @@ def _run_initial_audio_analysis(
                         for segment in result.segments
                     ]
                 )
+                return DiarizationTimelines(ordinary, ordinary)
             return _run_diarization(waveform, sample_rate, config)
 
     def detect_singing() -> list[AudioRegion]:
@@ -325,7 +339,7 @@ def _run_diarization(
     waveform: Any,
     sample_rate: int,
     config: AudioAnalysisConfig,
-) -> list[AudioRegion]:
+) -> DiarizationTimelines:
     try:
         import torch
 
@@ -346,18 +360,47 @@ def _run_diarization(
     pipeline.to(torch.device(config.device))
     try:
         output = pipeline({"waveform": waveform, "sample_rate": sample_rate})
-        annotation = getattr(output, "speaker_diarization", output)
-        raw = [
+        ordinary_annotation = getattr(output, "speaker_diarization", output)
+        exclusive_annotation = getattr(output, "exclusive_speaker_diarization", None)
+        ordinary = [
             AudioRegion(
                 round(float(segment.start), 3),
                 round(float(segment.end), 3),
                 "speech",
                 str(speaker),
             )
-            for segment, _track, speaker in annotation.itertracks(yield_label=True)
+            for segment, _track, speaker in ordinary_annotation.itertracks(
+                yield_label=True
+            )
             if float(segment.end) > float(segment.start)
         ]
-        return _mark_overlaps(raw)
+        if exclusive_annotation is None:
+            raise RuntimeError(
+                "the configured diarization model did not return an exclusive timeline"
+            )
+        exclusive = [
+            AudioRegion(
+                round(float(segment.start), 3),
+                round(float(segment.end), 3),
+                "speech",
+                str(speaker),
+                anonymous_speaker=str(speaker),
+            )
+            for segment, _track, speaker in exclusive_annotation.itertracks(
+                yield_label=True
+            )
+            if float(segment.end) > float(segment.start)
+        ]
+        marked_ordinary = _mark_overlaps(ordinary)
+        return DiarizationTimelines(
+            marked_ordinary,
+            _annotate_exclusive_overlaps(
+                exclusive,
+                ordinary,
+                boundary_seconds=config.overlap_boundary_seconds,
+                conditioned_seconds=config.overlap_conditioned_asr_seconds,
+            ),
+        )
     finally:
         del pipeline
         _release_cuda()
@@ -412,17 +455,14 @@ def _score_singing_sources(
     stride_samples = max(1, round(config.singing_stride_seconds * target_rate))
     windows: list[tuple[Any, float, float]] = []
     for timeline_offset, mono in prepared:
-        starts = list(
-            range(0, max(1, len(mono) - window_samples + 1), stride_samples)
-        )
+        starts = list(range(0, max(1, len(mono) - window_samples + 1), stride_samples))
         if not starts or starts[-1] + window_samples < len(mono):
             starts.append(max(0, len(mono) - window_samples))
         windows.extend(
             (
                 mono[offset : offset + window_samples],
                 timeline_offset + offset / target_rate,
-                timeline_offset
-                + min(len(mono), offset + window_samples) / target_rate,
+                timeline_offset + min(len(mono), offset + window_samples) / target_rate,
             )
             for offset in starts
         )
@@ -671,9 +711,7 @@ def _run_overlap_separation(
                     source = buffer.samples
                     rate = buffer.sample_rate
                 else:
-                    data, rate = sf.read(
-                        source_value, always_2d=True, dtype="float32"
-                    )
+                    data, rate = sf.read(source_value, always_2d=True, dtype="float32")
                     source = data.mean(axis=1)
             except (OSError, RuntimeError, ValueError) as exc:
                 logger.warning(
@@ -723,8 +761,7 @@ def _run_overlap_separation(
             **{
                 **asdict(fragment),
                 "overlap": any(
-                    min(fragment.end, failed_end)
-                    > max(fragment.start, failed_start)
+                    min(fragment.end, failed_end) > max(fragment.start, failed_start)
                     for failed_start, failed_end in failed_spans
                 ),
             }
@@ -870,8 +907,7 @@ def _run_mossformer2_worker(
                     for source_index, uri in enumerate(uris):
                         buffer = audio_pool.resolve(uri)
                         sf.write(
-                            output_dir
-                            / f"mossformer2-overlap-{span_index:05d}-source-"
+                            output_dir / f"mossformer2-overlap-{span_index:05d}-source-"
                             f"{source_index}.wav",
                             buffer.samples,
                             buffer.sample_rate,
@@ -1055,7 +1091,9 @@ def _vocal_source_for_region(
         for item in candidates
         if item[0].start <= region.start and item[0].end >= region.end
     ]
-    return min(matches, key=lambda item: item[0].end - item[0].start) if matches else None
+    return (
+        min(matches, key=lambda item: item[0].end - item[0].start) if matches else None
+    )
 
 
 def _phrases_from_vocal_candidates(
@@ -1223,6 +1261,180 @@ def _mark_overlaps(regions: list[AudioRegion]) -> list[AudioRegion]:
     return marked
 
 
+def _overlap_intersections(regions: list[AudioRegion]) -> list[AudioRegion]:
+    ordered = sorted(regions, key=lambda item: (item.start, item.end))
+    intersections: list[AudioRegion] = []
+    for index, left in enumerate(ordered):
+        for right in ordered[index + 1 :]:
+            if right.start >= left.end:
+                break
+            left_label = left.anonymous_speaker or left.speaker
+            right_label = right.anonymous_speaker or right.speaker
+            if not left_label or not right_label or left_label == right_label:
+                continue
+            start = max(left.start, right.start)
+            end = min(left.end, right.end)
+            if end <= start:
+                continue
+            speakers = tuple(sorted({left_label, right_label}))
+            intersections.append(
+                AudioRegion(
+                    start,
+                    end,
+                    "overlap",
+                    overlap=True,
+                    overlap_seconds=end - start,
+                    overlap_speakers=speakers,
+                )
+            )
+    return intersections
+
+
+def _overlap_route(
+    duration: float, *, boundary_seconds: float, conditioned_seconds: float
+) -> str:
+    if duration < boundary_seconds:
+        return "exclusive"
+    if duration <= conditioned_seconds:
+        return "qwen_context"
+    return "conditioned"
+
+
+def _annotate_exclusive_overlaps(
+    exclusive: list[AudioRegion],
+    ordinary: list[AudioRegion],
+    *,
+    boundary_seconds: float,
+    conditioned_seconds: float,
+) -> list[AudioRegion]:
+    intersections = _overlap_intersections(ordinary)
+    annotated: list[AudioRegion] = []
+    for region in exclusive:
+        relevant = [
+            overlap
+            for overlap in intersections
+            if min(region.end, overlap.end) > max(region.start, overlap.start)
+        ]
+        if not relevant:
+            annotated.append(
+                AudioRegion(
+                    **{
+                        **asdict(region),
+                        "anonymous_speaker": (
+                            region.anonymous_speaker or region.speaker
+                        ),
+                    }
+                )
+            )
+            continue
+        boundaries = sorted(
+            {
+                region.start,
+                region.end,
+                *(
+                    max(region.start, item.start)
+                    for item in relevant
+                    if region.start < item.start < region.end
+                ),
+                *(
+                    min(region.end, item.end)
+                    for item in relevant
+                    if region.start < item.end < region.end
+                ),
+            }
+        )
+        for start, end in zip(boundaries, boundaries[1:]):
+            active = [
+                item for item in relevant if min(end, item.end) > max(start, item.start)
+            ]
+            values = {
+                **asdict(region),
+                "start": start,
+                "end": end,
+                "anonymous_speaker": region.anonymous_speaker or region.speaker,
+            }
+            if active:
+                maximum = max(item.end - item.start for item in active)
+                values.update(
+                    {
+                        "overlap": True,
+                        "overlap_seconds": round(maximum, 3),
+                        "overlap_speakers": tuple(
+                            sorted(
+                                {
+                                    speaker
+                                    for item in active
+                                    for speaker in item.overlap_speakers
+                                }
+                            )
+                        ),
+                        "asr_route": _overlap_route(
+                            maximum,
+                            boundary_seconds=boundary_seconds,
+                            conditioned_seconds=conditioned_seconds,
+                        ),
+                    }
+                )
+            else:
+                values.update(
+                    {
+                        "overlap": False,
+                        "overlap_seconds": 0.0,
+                        "overlap_speakers": (),
+                        "asr_route": "qwen",
+                    }
+                )
+            annotated.append(AudioRegion(**values))
+    return annotated
+
+
+def _resolve_diarization_speakers(
+    ordinary: list[AudioRegion], resolved_exclusive: list[AudioRegion]
+) -> list[AudioRegion]:
+    mapping = _speaker_resolution_mapping(resolved_exclusive)
+    return [
+        AudioRegion(
+            **{
+                **asdict(region),
+                "speaker": mapping.get(region.speaker or "", region.speaker),
+                "anonymous_speaker": region.anonymous_speaker or region.speaker,
+                "overlap_speakers": tuple(
+                    mapping.get(speaker, speaker) for speaker in region.overlap_speakers
+                ),
+            }
+        )
+        for region in ordinary
+    ]
+
+
+def _resolve_overlap_speakers(
+    regions: list[AudioRegion], resolved_exclusive: list[AudioRegion]
+) -> list[AudioRegion]:
+    mapping = _speaker_resolution_mapping(resolved_exclusive)
+    return [
+        AudioRegion(
+            **{
+                **asdict(region),
+                "overlap_speakers": tuple(
+                    mapping.get(speaker, speaker) for speaker in region.overlap_speakers
+                ),
+            }
+        )
+        for region in regions
+    ]
+
+
+def _speaker_resolution_mapping(
+    resolved_exclusive: list[AudioRegion],
+) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for region in resolved_exclusive:
+        anonymous = region.anonymous_speaker
+        if anonymous and region.speaker and anonymous != region.speaker:
+            mapping[anonymous] = region.speaker
+    return mapping
+
+
 def _overlap_spans(
     regions: list[AudioRegion], duration: float
 ) -> list[tuple[float, float]]:
@@ -1313,6 +1525,31 @@ def _subtract_regions(
         for start, end in fragments
         if end - start >= 0.08
     ]
+
+
+def _exclude_timeline_regions(
+    regions: list[AudioRegion], excluded: list[AudioRegion]
+) -> list[AudioRegion]:
+    result: list[AudioRegion] = []
+    for region in regions:
+        fragments = [(region.start, region.end)]
+        for item in excluded:
+            updated: list[tuple[float, float]] = []
+            for start, end in fragments:
+                if item.end <= start or item.start >= end:
+                    updated.append((start, end))
+                    continue
+                if start < item.start:
+                    updated.append((start, item.start))
+                if item.end < end:
+                    updated.append((item.end, end))
+            fragments = updated
+        result.extend(
+            AudioRegion(**{**asdict(region), "start": start, "end": end})
+            for start, end in fragments
+            if end - start >= 0.08
+        )
+    return result
 
 
 def _merge_regions(regions: list[AudioRegion], maximum_gap: float) -> list[AudioRegion]:
@@ -1417,11 +1654,22 @@ def _load_cache(path: Path, signature: str) -> AudioAnalysis | None:
         ):
             return None
         result = AudioAnalysis(
-            speech=[AudioRegion(**item) for item in value["speech"]],
-            singing=[AudioRegion(**item) for item in value["singing"]],
-            ambiguous=[AudioRegion(**item) for item in value.get("ambiguous", [])],
+            speech=[_decode_audio_region(item) for item in value["speech"]],
+            singing=[_decode_audio_region(item) for item in value["singing"]],
+            ambiguous=[
+                _decode_audio_region(item) for item in value.get("ambiguous", [])
+            ],
+            diarization=[
+                _decode_audio_region(item) for item in value.get("diarization", [])
+            ],
         )
         return result
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         logger.warning("ignoring unreadable audio analysis cache %s: %s", path, exc)
         return None
+
+
+def _decode_audio_region(value: dict[str, object]) -> AudioRegion:
+    normalized = dict(value)
+    normalized["overlap_speakers"] = tuple(value.get("overlap_speakers", ()))
+    return AudioRegion(**normalized)

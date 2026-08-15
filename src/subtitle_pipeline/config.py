@@ -43,8 +43,15 @@ class AudioAnalysisConfig:
     enabled: bool = True
     debug_audio_artifacts: bool = False
     initial_analysis_concurrency: int = 1
-    diarization_backend: str = "moss"
+    diarization_backend: str = "pyannote"
     diarization_model: str = "pyannote/speaker-diarization-community-1"
+    overlap_boundary_seconds: float = 0.4
+    overlap_conditioned_asr_seconds: float = 1.0
+    overlap_context_seconds: float = 2.0
+    conditioned_asr_backend: str = "dicow"
+    conditioned_asr_model: str = "BUT-FIT/DiCoW_v3_3"
+    conditioned_asr_revision: str = "c34b64d9a9c5148c65fd355bb188d60343a6b44f"
+    conditioned_asr_worker_project: str = "tools/dicow"
     moss_transcribe_model: str = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
     moss_transcribe_worker_project: str = "tools/moss_transcribe"
     moss_window_seconds: float = 480.0
@@ -270,6 +277,33 @@ def load_config(path: Path) -> AppConfig:
     if analysis.diarization_backend not in {"moss", "pyannote"}:
         raise ConfigError(
             "audio_analysis.diarization_backend must be 'moss' or 'pyannote'"
+        )
+    if analysis.overlap_boundary_seconds < 0:
+        raise ConfigError(
+            "audio_analysis.overlap_boundary_seconds cannot be negative"
+        )
+    if not (
+        analysis.overlap_boundary_seconds
+        < analysis.overlap_conditioned_asr_seconds
+    ):
+        raise ConfigError(
+            "audio_analysis.overlap_conditioned_asr_seconds must exceed "
+            "overlap_boundary_seconds"
+        )
+    if analysis.overlap_context_seconds < 0:
+        raise ConfigError(
+            "audio_analysis.overlap_context_seconds cannot be negative"
+        )
+    if analysis.conditioned_asr_backend not in {"dicow", "disabled"}:
+        raise ConfigError(
+            "audio_analysis.conditioned_asr_backend must be 'dicow' or 'disabled'"
+        )
+    if analysis.conditioned_asr_backend == "dicow" and not (
+        analysis.conditioned_asr_model.strip()
+        and analysis.conditioned_asr_revision.strip()
+    ):
+        raise ConfigError(
+            "audio_analysis conditioned ASR model and revision cannot be empty"
         )
     if not analysis.moss_transcribe_model.strip():
         raise ConfigError("audio_analysis.moss_transcribe_model cannot be empty")

@@ -10,12 +10,16 @@ import numpy as np
 
 from subtitle_pipeline.audio_analysis import (
     AudioRegion,
+    DiarizationTimelines,
+    _annotate_exclusive_overlaps,
     _arbitrate_singing_regions,
     _coalesce_singing_phrases,
+    _exclude_timeline_regions,
     _extract_audio,
     _mark_overlaps,
     _maximum_concurrent_speakers,
     _merge_regions,
+    _overlap_route,
     _overlap_spans,
     _run_initial_audio_analysis,
     _run_mossformer2_worker,
@@ -51,7 +55,8 @@ class AudioAnalysisTests(unittest.TestCase):
 
         def diarize(*_args):
             barrier.wait(timeout=1)
-            return [AudioRegion(0, 1, "speech")]
+            regions = [AudioRegion(0, 1, "speech")]
+            return DiarizationTimelines(regions, regions)
 
         def singing(*_args):
             barrier.wait(timeout=1)
@@ -67,7 +72,7 @@ class AudioAnalysisTests(unittest.TestCase):
                 side_effect=singing,
             ),
         ):
-            speech, scores = _run_initial_audio_analysis(
+            timelines, scores = _run_initial_audio_analysis(
                 Path("source.mp4"),
                 Path("job"),
                 np.zeros((1, 16000), dtype=np.float32),
@@ -80,8 +85,67 @@ class AudioAnalysisTests(unittest.TestCase):
                 {},
             )
 
-        self.assertEqual(speech[0].kind, "speech")
+        self.assertEqual(timelines.exclusive[0].kind, "speech")
         self.assertEqual(scores[0].kind, "singing")
+
+    def test_overlap_routes_use_real_intersection_thresholds(self):
+        self.assertEqual(
+            _overlap_route(0.399, boundary_seconds=0.4, conditioned_seconds=1.0),
+            "exclusive",
+        )
+        self.assertEqual(
+            _overlap_route(0.4, boundary_seconds=0.4, conditioned_seconds=1.0),
+            "qwen_context",
+        )
+        self.assertEqual(
+            _overlap_route(1.0, boundary_seconds=0.4, conditioned_seconds=1.0),
+            "qwen_context",
+        )
+        self.assertEqual(
+            _overlap_route(1.001, boundary_seconds=0.4, conditioned_seconds=1.0),
+            "conditioned",
+        )
+
+    def test_exclusive_timeline_is_annotated_from_ordinary_overlap(self):
+        ordinary = [
+            AudioRegion(0, 4, "speech", "S0"),
+            AudioRegion(2.75, 4.5, "speech", "S1"),
+        ]
+        exclusive = [
+            AudioRegion(0, 3.5, "speech", "S0", anonymous_speaker="S0"),
+            AudioRegion(3.5, 4.5, "speech", "S1", anonymous_speaker="S1"),
+        ]
+
+        result = _annotate_exclusive_overlaps(
+            exclusive,
+            ordinary,
+            boundary_seconds=0.4,
+            conditioned_seconds=1.0,
+        )
+
+        overlap = [item for item in result if item.overlap]
+        clean = [item for item in result if not item.overlap]
+        self.assertEqual(
+            [(item.start, item.end) for item in overlap],
+            [(2.75, 3.5), (3.5, 4)],
+        )
+        self.assertEqual(
+            [(item.start, item.end) for item in clean], [(0, 2.75), (4, 4.5)]
+        )
+        self.assertTrue(all(item.overlap_seconds == 1.25 for item in overlap))
+        self.assertTrue(all(item.overlap_speakers == ("S0", "S1") for item in overlap))
+        self.assertTrue(all(item.asr_route == "conditioned" for item in overlap))
+
+    def test_song_regions_are_removed_from_overlap_diarization_timeline(self):
+        result = _exclude_timeline_regions(
+            [AudioRegion(0, 10, "speech", "S0", anonymous_speaker="S0")],
+            [AudioRegion(3, 7, "singing")],
+        )
+
+        self.assertEqual(
+            [(item.start, item.end, item.anonymous_speaker) for item in result],
+            [(0, 3, "S0"), (7, 10, "S0")],
+        )
 
     def test_moss_identity_candidates_exclude_overlap_and_trim_switch_edges(self):
         config = AudioAnalysisConfig(

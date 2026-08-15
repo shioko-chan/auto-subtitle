@@ -5,7 +5,7 @@ import logging
 import math
 import re
 import subprocess
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -179,7 +179,7 @@ def _transcribe_analyzed(
     cache_path = destination.parent / "asr-analysis-cache.json"
     signature = {
         **_cache_signature(video, duration, config),
-        "analysis_version": 5,
+        "analysis_version": 6,
         "analysis_config": asdict(analysis_config),
         "regions": [_analysis_region_signature(region) for region in regions],
     }
@@ -230,11 +230,22 @@ def _transcribe_analyzed(
         else:
             source_offset = region.source_offset if region.source_path else 0.0
             region_audio = _region_audio_buffer(region, video, audio_pool)
+            speech_config = (
+                replace(
+                    config,
+                    chunk_context_seconds=max(
+                        config.chunk_context_seconds,
+                        analysis_config.overlap_context_seconds,
+                    ),
+                )
+                if region.asr_route == "qwen_context"
+                else config
+            )
             record = _transcribe_range(
                 model,
                 Path(region.source_path) if region.source_path else video,
                 None,
-                config,
+                speech_config,
                 core_start=region.start - source_offset,
                 core_end=region.end - source_offset,
                 media_duration=region_audio.duration,
@@ -251,7 +262,7 @@ def _transcribe_analyzed(
             for cue in record["cues"]:
                 cue["speaker"] = region.speaker
                 cue["kind"] = "speech"
-            if region.overlap and record["cues"]:
+            if region.overlap and region.source_path and record["cues"]:
                 decoded = _decode_cached_cues(record["cues"], index)
                 utterance = merge_cues_at_boundaries(decoded, set())[0]
                 record["cues"] = [
@@ -277,6 +288,10 @@ def _transcribe_analyzed(
             len(record["cues"]),
         )
 
+    if model is not None:
+        del model
+        _release_cuda()
+
     cues: list[Cue] = []
     for index in range(len(regions)):
         record = cached.get(str(index))
@@ -286,6 +301,16 @@ def _transcribe_analyzed(
     cues.sort(key=lambda cue: (cue.start, cue.end, cue.speaker or ""))
     if not cues:
         raise RuntimeError("analyzed Qwen3-ASR did not produce any speech")
+    if analysis.diarization:
+        from .conditioned_asr import repair_long_overlaps
+
+        cues = repair_long_overlaps(
+            cues,
+            analysis.diarization,
+            audio_pool.main(),
+            destination.parent,
+            analysis_config,
+        )
     write_srt(cues, destination)
     _write_cue_sidecar(cues, destination.with_suffix(".cues.json"))
     return destination
@@ -330,19 +355,18 @@ def _analysis_regions(analysis: AudioAnalysis) -> list[AudioRegion]:
             and merged[-1].speaker == region.speaker
             and merged[-1].overlap == region.overlap
             and merged[-1].source_path == region.source_path
+            and merged[-1].asr_route == region.asr_route
+            and merged[-1].overlap_speakers == region.overlap_speakers
             and region.start - merged[-1].end <= 0.5
             and region.end - merged[-1].start <= 30.0
         ):
             previous = merged[-1]
-            merged[-1] = AudioRegion(
-                previous.start,
-                max(previous.end, region.end),
-                "speech",
-                previous.speaker,
-                confidence=previous.confidence,
-                overlap=previous.overlap,
-                source_path=previous.source_path,
-                source_offset=previous.source_offset,
+            merged[-1] = replace(
+                previous,
+                end=max(previous.end, region.end),
+                overlap_seconds=max(
+                    previous.overlap_seconds, region.overlap_seconds
+                ),
             )
         else:
             merged.append(region)
@@ -375,16 +399,7 @@ def _subtract_singing_regions(
                 updated.append((song.end, end))
         fragments = updated
     return [
-        AudioRegion(
-            start,
-            end,
-            region.kind,
-            region.speaker,
-            region.confidence,
-            region.overlap,
-            region.source_path,
-            region.source_offset,
-        )
+        replace(region, start=start, end=end)
         for start, end in fragments
         if end - start >= 0.08
     ]
@@ -783,6 +798,16 @@ def _load_qwen_model(config: ASRConfig) -> Any:
             "attn_implementation": "sdpa",
         },
     )
+
+
+def _release_cuda() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
 
 
 def _result_to_cues(

@@ -91,12 +91,15 @@ def _check(config: AppConfig) -> int:
             import transformers  # noqa: F401
 
             analysis = config.audio_analysis
+            workers: list[tuple[str, Path]] = []
             if analysis.diarization_backend == "moss":
-                worker_name = "MOSS transcription worker"
-                worker = (
-                    Path(analysis.moss_transcribe_worker_project)
-                    .resolve()
-                    .joinpath("worker.py")
+                workers.append(
+                    (
+                        "MOSS transcription worker",
+                        Path(analysis.moss_transcribe_worker_project)
+                        .resolve()
+                        .joinpath("worker.py"),
+                    )
                 )
             else:
                 with warnings.catch_warnings():
@@ -104,17 +107,21 @@ def _check(config: AppConfig) -> int:
                         "ignore", module=r"pyannote\.audio\.core\.io"
                     )
                     import pyannote.audio  # noqa: F401
-                worker_name = "MossFormer2 worker"
-                worker = (
-                    Path(analysis.overlap_separation_worker_project)
-                    .resolve()
-                    .joinpath("worker.py")
-                )
-            if shutil.which("uv") is None or not worker.is_file():
-                missing.append(worker_name)
-                logging.error("missing %s: %s", worker_name, worker)
-            else:
-                logging.info("found %s: %s", worker_name, worker)
+                if analysis.conditioned_asr_backend == "dicow":
+                    workers.append(
+                        (
+                            "DiCoW worker",
+                            Path(analysis.conditioned_asr_worker_project)
+                            .resolve()
+                            .joinpath("worker.py"),
+                        )
+                    )
+            for worker_name, worker in workers:
+                if shutil.which("uv") is None or not worker.is_file():
+                    missing.append(worker_name)
+                    logging.error("missing %s: %s", worker_name, worker)
+                else:
+                    logging.info("found %s: %s", worker_name, worker)
             logging.info("found diarization and singing runtimes")
     except ImportError:
         missing.append("qwen-asr")
