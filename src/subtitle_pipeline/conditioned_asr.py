@@ -14,7 +14,7 @@ from .subtitles import Cue
 
 logger = logging.getLogger(__name__)
 
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 _MAX_WINDOW_SECONDS = 30.0
 
 
@@ -96,14 +96,6 @@ def _expand_overlap(
 ) -> ConditionedWindow:
     start = max(0.0, overlap.start - context_seconds)
     end = min(duration, overlap.end + context_seconds)
-    relevant = [
-        region
-        for region in diarization
-        if region.end > start and region.start < end and region.speaker
-    ]
-    if relevant:
-        start = max(0.0, min(start, min(region.start for region in relevant)))
-        end = min(duration, max(end, max(region.end for region in relevant)))
     turns = tuple(
         AudioRegion(
             max(start, region.start),

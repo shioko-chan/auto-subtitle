@@ -27,8 +27,23 @@ class ConditionedASRTests(unittest.TestCase):
         result = _conditioned_windows(diarization, 20, config)
 
         self.assertEqual(len(result), 1)
-        self.assertEqual((result[0].start, result[0].end), (0, 5.0))
+        self.assertEqual((result[0].start, result[0].end), (1.8, 5.0))
         self.assertEqual(result[0].speakers, ("S0", "S1"))
+
+    def test_context_clips_long_surrounding_turn_to_model_window(self):
+        diarization = [
+            AudioRegion(0, 40, "speech", "A", anonymous_speaker="S0"),
+            AudioRegion(10, 13, "speech", "B", anonymous_speaker="S1"),
+        ]
+        config = AudioAnalysisConfig(overlap_context_seconds=2.0)
+
+        [result] = _conditioned_windows(diarization, 60, config)
+
+        self.assertEqual((result.start, result.end), (8.0, 15.0))
+        self.assertEqual(
+            [(turn.start, turn.end) for turn in result.turns],
+            [(8.0, 15.0), (10, 13)],
+        )
 
     def test_conditioned_repair_replaces_complete_local_window(self):
         baseline = [
