@@ -9,6 +9,7 @@ import numpy as np
 from subtitle_pipeline.asr import (
     _analysis_region_signature,
     _analysis_regions,
+    _asr_generation_token_limit,
     _load_cache,
     _record_timeline_is_healthy,
     _remove_text_overlap,
@@ -25,6 +26,57 @@ from subtitle_pipeline.config import ASRConfig, AudioAnalysisConfig
 
 
 class QwenASRTests(unittest.TestCase):
+    def test_short_audio_uses_bounded_generation_token_limit(self):
+        config = ASRConfig(max_new_tokens=2048)
+
+        self.assertEqual(_asr_generation_token_limit(config, 0.5), 128)
+        self.assertEqual(_asr_generation_token_limit(config, 4.5), 176)
+        self.assertEqual(_asr_generation_token_limit(config, 170), 2048)
+
+    def test_transcribe_range_temporarily_applies_dynamic_token_limit(self):
+        observed_limits = []
+        result = SimpleNamespace(
+            language="Japanese",
+            text="短い音声",
+            time_stamps=SimpleNamespace(
+                items=[
+                    SimpleNamespace(text="短い音声", start_time=0.1, end_time=0.4)
+                ]
+            ),
+        )
+
+        class Model:
+            max_new_tokens = 2048
+
+            def transcribe(self, **_kwargs):
+                observed_limits.append(self.max_new_tokens)
+                return [result]
+
+        model = Model()
+        audio = SimpleNamespace(
+            sample_rate=16000,
+            slice=lambda *_args, **_kwargs: np.zeros(8000, dtype=np.float32),
+        )
+
+        from subtitle_pipeline.asr import _transcribe_range
+
+        record = _transcribe_range(
+            model,
+            Path("source.mp4"),
+            None,
+            ASRConfig(chunk_context_seconds=0, max_new_tokens=2048),
+            core_start=0,
+            core_end=0.5,
+            media_duration=0.5,
+            final_chunk=True,
+            label="short",
+            audio_buffer=audio,
+        )
+
+        self.assertEqual(observed_limits, [128])
+        self.assertEqual(model.max_new_tokens, 2048)
+        self.assertEqual(record["generation_token_limit"], 128)
+
     def test_cache_signature_normalizes_json_container_types(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "cache.json"

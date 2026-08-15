@@ -37,8 +37,7 @@ diarization_backend = "pyannote"
 # exclusive timeline for baseline ASR. Overlap duration always refers to the
 # real ordinary-timeline intersection, before context padding.
 diarization_model = "pyannote/speaker-diarization-community-1"
-overlap_boundary_seconds = 0.4
-overlap_conditioned_asr_seconds = 1.0
+overlap_conditioned_asr_seconds = 1.5
 overlap_context_seconds = 2.0
 conditioned_asr_backend = "dicow"
 conditioned_asr_model = "BUT-FIT/DiCoW_v3_3"

@@ -90,19 +90,11 @@ class AudioAnalysisTests(unittest.TestCase):
 
     def test_overlap_routes_use_real_intersection_thresholds(self):
         self.assertEqual(
-            _overlap_route(0.399, boundary_seconds=0.4, conditioned_seconds=1.0),
+            _overlap_route(1.499, conditioned_seconds=1.5),
             "exclusive",
         )
         self.assertEqual(
-            _overlap_route(0.4, boundary_seconds=0.4, conditioned_seconds=1.0),
-            "qwen_context",
-        )
-        self.assertEqual(
-            _overlap_route(1.0, boundary_seconds=0.4, conditioned_seconds=1.0),
-            "qwen_context",
-        )
-        self.assertEqual(
-            _overlap_route(1.001, boundary_seconds=0.4, conditioned_seconds=1.0),
+            _overlap_route(1.5, conditioned_seconds=1.5),
             "conditioned",
         )
 
@@ -119,7 +111,6 @@ class AudioAnalysisTests(unittest.TestCase):
         result = _annotate_exclusive_overlaps(
             exclusive,
             ordinary,
-            boundary_seconds=0.4,
             conditioned_seconds=1.0,
         )
 

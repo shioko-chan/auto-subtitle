@@ -20,6 +20,9 @@ _CACHE_VERSION = 2
 _MIN_RETRY_CHUNK_SECONDS = 20.0
 _MIN_REPETITION_SPAN_CHARACTERS = 160
 _REPETITION_RE = re.compile(r"(.{12,200}?)\1{3,}", re.DOTALL)
+_MIN_ASR_GENERATION_TOKENS = 128
+_ASR_GENERATION_TOKENS_PER_SECOND = 32
+_ASR_GENERATION_TOKEN_OVERHEAD = 32
 
 
 class _StaleRuntimeAudio(RuntimeError):
@@ -230,22 +233,11 @@ def _transcribe_analyzed(
         else:
             source_offset = region.source_offset if region.source_path else 0.0
             region_audio = _region_audio_buffer(region, video, audio_pool)
-            speech_config = (
-                replace(
-                    config,
-                    chunk_context_seconds=max(
-                        config.chunk_context_seconds,
-                        analysis_config.overlap_context_seconds,
-                    ),
-                )
-                if region.asr_route == "qwen_context"
-                else config
-            )
             record = _transcribe_range(
                 model,
                 Path(region.source_path) if region.source_path else video,
                 None,
-                speech_config,
+                config,
                 core_start=region.start - source_offset,
                 core_end=region.end - source_offset,
                 media_duration=region_audio.duration,
@@ -652,13 +644,25 @@ def _transcribe_range(
         )
         audio = str(chunk_path)
     try:
+        generation_token_limit = _asr_generation_token_limit(
+            config,
+            extract_end - extract_start,
+        )
+        previous_token_limit = getattr(model, "max_new_tokens", None)
+        token_limit_changed = isinstance(previous_token_limit, int)
+        if token_limit_changed:
+            model.max_new_tokens = generation_token_limit
         with stage_metrics("asr.forced_aligned_chunk", config.device):
-            results = model.transcribe(
-                audio=audio,
-                context=config.context,
-                language=config.language,
-                return_time_stamps=True,
-            )
+            try:
+                results = model.transcribe(
+                    audio=audio,
+                    context=config.context,
+                    language=config.language,
+                    return_time_stamps=True,
+                )
+            finally:
+                if token_limit_changed:
+                    model.max_new_tokens = previous_token_limit
         if len(results) != 1:
             raise RuntimeError(
                 f"Qwen3-ASR returned {len(results)} results for one audio chunk"
@@ -730,10 +734,22 @@ def _transcribe_range(
             "language": str(getattr(result, "language", "")),
             "text": text,
             "cues": [asdict(cue) for cue in cues],
+            "generation_token_limit": generation_token_limit,
         }
     finally:
         if chunk_path is not None:
             chunk_path.unlink(missing_ok=True)
+
+
+def _asr_generation_token_limit(config: ASRConfig, audio_seconds: float) -> int:
+    duration_limit = (
+        math.ceil(max(0.0, audio_seconds) * _ASR_GENERATION_TOKENS_PER_SECOND)
+        + _ASR_GENERATION_TOKEN_OVERHEAD
+    )
+    return min(
+        config.max_new_tokens,
+        max(_MIN_ASR_GENERATION_TOKENS, duration_limit),
+    )
 
 
 def _region_audio_buffer(

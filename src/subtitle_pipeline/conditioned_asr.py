@@ -64,7 +64,7 @@ def _conditioned_windows(
     intersections = [
         item
         for item in _overlap_intersections(diarization)
-        if item.end - item.start > config.overlap_conditioned_asr_seconds
+        if item.end - item.start >= config.overlap_conditioned_asr_seconds
     ]
     windows = [
         _expand_overlap(item, diarization, duration, config.overlap_context_seconds)

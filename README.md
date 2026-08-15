@@ -260,8 +260,8 @@ B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服�
 - `asr.max_new_tokens`：单块 ASR 最多生成的 token 数，默认 `2048`。
 - `audio_analysis.diarization_backend`：默认 `pyannote`，使用 Community-1 的 ordinary 与
   exclusive 双时间轴；`moss` 仅保留作回归比较。
-- `audio_analysis.overlap_boundary_seconds` / `overlap_conditioned_asr_seconds`：默认
-  `0.4/1.0` 秒，控制 exclusive、带上下文 Qwen 和 DiCoW 三档路由。
+- `audio_analysis.overlap_conditioned_asr_seconds`：默认 `1.5` 秒；更短重叠视为
+  换人边界误差并使用 exclusive diarization，达到阈值后使用 DiCoW。
 - `audio_analysis.conditioned_asr_model` / `conditioned_asr_revision`：长重叠局部修复所用
   DiCoW 模型及固定代码 revision。
 - `audio_analysis.moss_window_seconds` / `moss_max_window_seconds`：MOSS 长窗目标和硬上限，

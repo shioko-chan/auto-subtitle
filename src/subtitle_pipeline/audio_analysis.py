@@ -397,7 +397,6 @@ def _run_diarization(
             _annotate_exclusive_overlaps(
                 exclusive,
                 ordinary,
-                boundary_seconds=config.overlap_boundary_seconds,
                 conditioned_seconds=config.overlap_conditioned_asr_seconds,
             ),
         )
@@ -1290,21 +1289,14 @@ def _overlap_intersections(regions: list[AudioRegion]) -> list[AudioRegion]:
     return intersections
 
 
-def _overlap_route(
-    duration: float, *, boundary_seconds: float, conditioned_seconds: float
-) -> str:
-    if duration < boundary_seconds:
-        return "exclusive"
-    if duration <= conditioned_seconds:
-        return "qwen_context"
-    return "conditioned"
+def _overlap_route(duration: float, *, conditioned_seconds: float) -> str:
+    return "conditioned" if duration >= conditioned_seconds else "exclusive"
 
 
 def _annotate_exclusive_overlaps(
     exclusive: list[AudioRegion],
     ordinary: list[AudioRegion],
     *,
-    boundary_seconds: float,
     conditioned_seconds: float,
 ) -> list[AudioRegion]:
     intersections = _overlap_intersections(ordinary)
@@ -1370,7 +1362,6 @@ def _annotate_exclusive_overlaps(
                         ),
                         "asr_route": _overlap_route(
                             maximum,
-                            boundary_seconds=boundary_seconds,
                             conditioned_seconds=conditioned_seconds,
                         ),
                     }

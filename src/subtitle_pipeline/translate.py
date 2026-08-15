@@ -45,12 +45,9 @@ class LLMHTTPError(TranslationError):
         super().__init__(f"LLM API returned HTTP {status}: {detail}")
 
 
-class _WindowShrinkError(TranslationError):
-    pass
-
-
 _JOINT_CACHE_VERSION = 3
 _JOINT_PROMPT_VERSION = 22
+_MAP_CONTENT_ATTEMPTS = 2
 
 _HONORIFIC_TRANSLATION_RULES = (
     "Apply these Japanese-honorific rules when translating into Chinese. Usually omit さん; "
@@ -62,7 +59,6 @@ _HONORIFIC_TRANSLATION_RULES = (
     "REFERENCE mapping for a complete name-plus-honorific form overrides these defaults. "
 )
 _JAPANESE_KANA_RE = re.compile(r"[\u3040-\u30ff]")
-_REPEATED_OUTPUT_RE = re.compile(r"(.{1,32}?)\1{20,}", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -393,7 +389,10 @@ class OpenAICompatibleTranslator:
     ) -> list[CueTranslationRecord]:
         last_error: Exception | None = None
         prompt_error: Exception | None = None
+        content_attempts = 0
+        attempts = 0
         for attempt in range(1, self.config.max_retries + 1):
+            attempts = attempt
             prompt = _joint_translation_prompt(
                 cues,
                 start,
@@ -430,10 +429,6 @@ class OpenAICompatibleTranslator:
                 content = response["choices"][0]["message"]["content"]
                 finish_reason = _finish_reason(response)
                 if finish_reason not in (None, "stop"):
-                    if finish_reason == "length" and _has_repeated_output(content):
-                        raise _WindowShrinkError(
-                            "finish_reason=length with repeated output loop"
-                        )
                     raise TranslationError(f"finish_reason={finish_reason}")
                 parsed = _parse_joint_records(content)
                 try:
@@ -477,13 +472,12 @@ class OpenAICompatibleTranslator:
             ) as exc:
                 last_error = exc
                 _log_invalid_response("joint cue translation", exc, content)
-                if isinstance(exc, _WindowShrinkError):
-                    raise
                 if _is_nontransient_http_error(exc):
                     raise
-                if attempt < self.config.max_retries:
-                    delay = _transient_retry_delay(exc, attempt)
-                    if delay is not None:
+                if _is_transient_failure(exc):
+                    if attempt < self.config.max_retries:
+                        delay = _transient_retry_delay(exc, attempt)
+                        assert delay is not None
                         logging.warning(
                             "joint cue translation attempt %d hit a transient "
                             "failure (%s); retrying in %ss",
@@ -492,18 +486,22 @@ class OpenAICompatibleTranslator:
                             delay,
                         )
                         time.sleep(delay)
-                    else:
-                        logging.warning(
-                            "joint cue translation attempt %d failed validation "
-                            "(%s); retrying immediately",
-                            attempt,
-                            exc,
-                        )
+                    continue
+                content_attempts += 1
+                if content_attempts >= _MAP_CONTENT_ATTEMPTS:
+                    break
+                if attempt < self.config.max_retries:
+                    logging.warning(
+                        "joint cue translation attempt %d failed validation "
+                        "(%s); retrying immediately",
+                        attempt,
+                        exc,
+                    )
         if isinstance(last_error, LLMHTTPError):
             raise last_error
         raise TranslationError(
             f"joint cue range {start}-{end - 1} failed after "
-            f"{self.config.max_retries} attempts: {last_error}"
+            f"{attempts} attempts: {last_error}"
         )
 
     def _plan_and_translate_window_resilient(
@@ -877,6 +875,14 @@ def _transient_retry_delay(exc: Exception, attempt: int) -> float | None:
     return None
 
 
+def _is_transient_failure(exc: Exception) -> bool:
+    return (
+        isinstance(exc, (urllib.error.URLError, TimeoutError))
+        or isinstance(exc, LLMHTTPError)
+        and (exc.status == 429 or 500 <= exc.status < 600)
+    )
+
+
 def _jittered_exponential_backoff(attempt: int) -> float:
     base_delay = float(2 ** (attempt - 1))
     return random.uniform(base_delay * 0.75, base_delay * 1.25)
@@ -995,10 +1001,6 @@ def _finish_reason(response: object) -> str | None:
         return None
     value = choices[0].get("finish_reason")
     return value if isinstance(value, str) else None
-
-
-def _has_repeated_output(content: object) -> bool:
-    return isinstance(content, str) and _REPEATED_OUTPUT_RE.search(content) is not None
 
 
 def _log_invalid_response(kind: str, error: Exception, content: object) -> None:

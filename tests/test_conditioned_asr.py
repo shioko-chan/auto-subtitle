@@ -18,7 +18,7 @@ class ConditionedASRTests(unittest.TestCase):
     def test_only_long_overlap_creates_conditioned_window(self):
         diarization = [
             AudioRegion(0, 4, "speech", "A", anonymous_speaker="S0"),
-            AudioRegion(2.8, 5, "speech", "B", anonymous_speaker="S1"),
+            AudioRegion(2.5, 5, "speech", "B", anonymous_speaker="S1"),
             AudioRegion(8, 10, "speech", "A", anonymous_speaker="S0"),
             AudioRegion(9.5, 11, "speech", "B", anonymous_speaker="S1"),
         ]
@@ -27,7 +27,7 @@ class ConditionedASRTests(unittest.TestCase):
         result = _conditioned_windows(diarization, 20, config)
 
         self.assertEqual(len(result), 1)
-        self.assertEqual((result[0].start, result[0].end), (1.8, 5.0))
+        self.assertEqual((result[0].start, result[0].end), (1.5, 5.0))
         self.assertEqual(result[0].speakers, ("S0", "S1"))
 
     def test_context_clips_long_surrounding_turn_to_model_window(self):
