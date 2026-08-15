@@ -20,7 +20,7 @@ from .telemetry import stage_metrics
 
 logger = logging.getLogger(__name__)
 
-_CACHE_VERSION = 7
+_CACHE_VERSION = 8
 _MIN_SEPARATED_SEGMENT_SECONDS = 0.08
 _MIN_SEPARATED_PEAK = 1e-4
 _MIN_SEPARATED_RMS = 1e-5
@@ -57,6 +57,7 @@ class AudioRegion:
     overlap: bool = False
     source_path: str | None = None
     source_offset: float = 0.0
+    anonymous_speaker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -99,9 +100,17 @@ def analyze_audio(
         _extract_audio(video, wav_path)
         waveform, sample_rate = _load_waveform(wav_path)
     speech, raw_scores = _run_initial_audio_analysis(
-        waveform, sample_rate, config
+        video,
+        job_dir,
+        waveform,
+        sample_rate,
+        config,
+        metadata or {},
+        audio_buffer=audio_pool.main() if audio_pool is not None else None,
     )
-    if any(region.overlap for region in speech):
+    if config.diarization_backend == "pyannote" and any(
+        region.overlap for region in speech
+    ):
         with stage_metrics("audio.overlap_separation", config.device):
             speech = _run_overlap_separation(
                 waveform,
@@ -182,7 +191,7 @@ def analyze_audio(
             speech,
             config,
             known_character=known_character,
-            excluded_regions=singing_windows,
+            excluded_regions=[*raw_candidates, *singing_windows, *ambiguous_windows],
             audio_pool=audio_pool,
         )
 
@@ -259,12 +268,41 @@ def analyze_audio(
 
 
 def _run_initial_audio_analysis(
+    video: Path,
+    job_dir: Path,
     waveform: Any,
     sample_rate: int,
     config: AudioAnalysisConfig,
+    metadata: dict[str, object],
+    *,
+    audio_buffer: AudioBuffer | None = None,
 ) -> tuple[list[AudioRegion], list[AudioRegion]]:
     def diarize() -> list[AudioRegion]:
         with stage_metrics("audio.diarization", config.device):
+            if config.diarization_backend == "moss":
+                from .moss_diarization import transcribe_and_diarize
+
+                result = transcribe_and_diarize(
+                    video,
+                    job_dir,
+                    config,
+                    metadata,
+                    audio_buffer=audio_buffer,
+                    waveform=waveform,
+                    sample_rate=sample_rate,
+                )
+                return _mark_overlaps(
+                    [
+                        AudioRegion(
+                            segment.start,
+                            segment.end,
+                            "speech",
+                            segment.speaker,
+                            anonymous_speaker=segment.speaker,
+                        )
+                        for segment in result.segments
+                    ]
+                )
             return _run_diarization(waveform, sample_rate, config)
 
     def detect_singing() -> list[AudioRegion]:
@@ -273,7 +311,10 @@ def _run_initial_audio_analysis(
 
     if config.initial_analysis_concurrency == 1:
         return diarize(), detect_singing()
-    logger.info("running pyannote and raw-audio AST concurrently")
+    logger.info(
+        "running %s diarization and raw-audio AST concurrently",
+        config.diarization_backend,
+    )
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="audio-analysis") as pool:
         diarization = pool.submit(diarize)
         singing = pool.submit(detect_singing)

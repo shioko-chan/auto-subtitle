@@ -28,15 +28,18 @@ from subtitle_pipeline.audio_analysis import (
 from subtitle_pipeline.audio_buffer import AudioBufferPool
 from subtitle_pipeline.config import AudioAnalysisConfig
 from subtitle_pipeline.speakers import (
+    _aggregate_profile_distances,
     _can_embed_region,
     _evenly_spaced,
     _extract_eres2netv2_embeddings,
     _identity_candidates,
     _load_profiles,
+    _moss_identity_candidates,
     _profile_centers,
     _profile_distance,
     _profile_match_is_confident,
     _update_profile,
+    identify_speakers,
     load_character_styles,
     metadata_character,
 )
@@ -54,21 +57,117 @@ class AudioAnalysisTests(unittest.TestCase):
             barrier.wait(timeout=1)
             return [AudioRegion(0, 1, "singing")]
 
-        with patch(
-            "subtitle_pipeline.audio_analysis._run_diarization",
-            side_effect=diarize,
-        ), patch(
-            "subtitle_pipeline.audio_analysis._score_singing_windows",
-            side_effect=singing,
+        with (
+            patch(
+                "subtitle_pipeline.audio_analysis._run_diarization",
+                side_effect=diarize,
+            ),
+            patch(
+                "subtitle_pipeline.audio_analysis._score_singing_windows",
+                side_effect=singing,
+            ),
         ):
             speech, scores = _run_initial_audio_analysis(
+                Path("source.mp4"),
+                Path("job"),
                 np.zeros((1, 16000), dtype=np.float32),
                 16000,
-                AudioAnalysisConfig(device="cpu", initial_analysis_concurrency=2),
+                AudioAnalysisConfig(
+                    device="cpu",
+                    initial_analysis_concurrency=2,
+                    diarization_backend="pyannote",
+                ),
+                {},
             )
 
         self.assertEqual(speech[0].kind, "speech")
         self.assertEqual(scores[0].kind, "singing")
+
+    def test_moss_identity_candidates_exclude_overlap_and_trim_switch_edges(self):
+        config = AudioAnalysisConfig(
+            speaker_identity_edge_trim_seconds=0.2,
+            speaker_identity_min_segment_seconds=1.5,
+            speaker_identity_max_weight_seconds=10.0,
+        )
+        regions = [
+            AudioRegion(0, 22, "speech", "MOSS_W000_S01"),
+            AudioRegion(30, 35, "speech", "MOSS_W000_S02", overlap=True),
+            AudioRegion(40, 41, "speech", "MOSS_W000_S01"),
+        ]
+
+        candidates = _moss_identity_candidates(regions, config)
+
+        self.assertEqual(len(candidates), 3)
+        self.assertTrue(all(item.speaker == "MOSS_W000_S01" for item in candidates))
+        self.assertAlmostEqual(candidates[0].start, 0.2)
+        self.assertAlmostEqual(candidates[-1].end, 21.8)
+        self.assertTrue(all(item.end - item.start <= 10.0 for item in candidates))
+
+    def test_moss_identity_distance_trims_outlier_before_duration_weighting(self):
+        evidence = [(np.asarray([1.0, 0.0], dtype=np.float32), 1.0) for _ in range(9)]
+        evidence.append((np.asarray([0.0, 1.0], dtype=np.float32), 10.0))
+        profiles = {
+            "member_a": np.asarray([[1.0, 0.0]], dtype=np.float32),
+            "member_b": np.asarray([[0.0, 1.0]], dtype=np.float32),
+        }
+
+        distances = _aggregate_profile_distances(
+            evidence,
+            profiles,
+            trim_ratio=0.15,
+            maximum_weight=10.0,
+        )
+
+        self.assertEqual(distances[0][1], "member_a")
+        self.assertAlmostEqual(distances[0][0], 0.0)
+
+    def test_moss_labels_map_independently_and_overlap_inherits_identity(self):
+        regions = [
+            AudioRegion(0, 4, "speech", "MOSS_W000_S01"),
+            AudioRegion(5, 9, "speech", "MOSS_W000_S02"),
+            AudioRegion(10, 12, "speech", "MOSS_W000_S01", overlap=True),
+        ]
+        seen_candidates = []
+
+        def snippets(_waveform, _rate, candidates, **_kwargs):
+            seen_candidates.extend(candidates)
+            return [(None, 16000) for _candidate in candidates]
+
+        profiles = {
+            "fuji_miyako": np.asarray([[1.0, 0.0]], dtype=np.float32),
+            "sengoku_yuno": np.asarray([[0.0, 1.0]], dtype=np.float32),
+        }
+        with (
+            patch(
+                "subtitle_pipeline.speakers._candidate_snippets", side_effect=snippets
+            ),
+            patch(
+                "subtitle_pipeline.speakers._extract_embeddings",
+                return_value=[np.asarray([1.0, 0.0]), np.asarray([1.0, 0.0])],
+            ),
+            patch("subtitle_pipeline.speakers._load_profiles", return_value=profiles),
+        ):
+            resolved = identify_speakers(
+                np.zeros((1, 16000), dtype=np.float32),
+                16000,
+                regions,
+                AudioAnalysisConfig(device="cpu"),
+            )
+
+        self.assertEqual(len(seen_candidates), 2)
+        self.assertTrue(all(not item.overlap for item in seen_candidates))
+        self.assertEqual(
+            [item.speaker for item in resolved],
+            [
+                "fuji_miyako",
+                "fuji_miyako",
+                "fuji_miyako",
+            ],
+        )
+        self.assertEqual(
+            [item.anonymous_speaker for item in resolved],
+            ["MOSS_W000_S01", "MOSS_W000_S02", "MOSS_W000_S01"],
+        )
 
     def test_mossformer_worker_uses_shared_memory_descriptors(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -82,10 +181,13 @@ class AudioAnalysisTests(unittest.TestCase):
                 stdout=json.dumps({"items": [{"id": 0}]}),
                 stderr="",
             )
-            with patch.object(pool, "main", return_value=source), patch(
-                "subtitle_pipeline.audio_analysis.subprocess.run",
-                return_value=response,
-            ) as invoke:
+            with (
+                patch.object(pool, "main", return_value=source),
+                patch(
+                    "subtitle_pipeline.audio_analysis.subprocess.run",
+                    return_value=response,
+                ) as invoke,
+            ):
                 outputs = _run_mossformer2_worker(
                     np.zeros((1, 16000), dtype=np.float32),
                     16000,
@@ -119,7 +221,9 @@ class AudioAnalysisTests(unittest.TestCase):
         payload = json.loads(invoke.call_args.kwargs["input"])
         self.assertIn("audio", payload)
         self.assertNotIn("paths", payload)
-        self.assertEqual(payload["items"], [{"id": 0, "start_sample": 0, "end_sample": 32000}])
+        self.assertEqual(
+            payload["items"], [{"id": 0, "start_sample": 0, "end_sample": 32000}]
+        )
         self.assertEqual(embeddings, [[0.1, 0.2]])
 
     def test_counts_distinct_simultaneous_speakers(self):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import shutil
 import subprocess
 from dataclasses import dataclass, replace
@@ -87,9 +88,14 @@ def identify_speakers(
     import numpy as np
     import torch
 
+    identity_candidates = (
+        _moss_identity_candidates(regions, config)
+        if any(_is_moss_speaker(region.speaker) for region in regions)
+        else _identity_candidates(regions)
+    )
     candidates = [
         region
-        for region in _identity_candidates(regions)
+        for region in identity_candidates
         if not any(
             min(region.end, excluded.end) > max(region.start, excluded.start)
             for excluded in (excluded_regions or [])
@@ -101,17 +107,14 @@ def identify_speakers(
         waveform, sample_rate, candidates, audio_pool=audio_pool
     )
     embeddings = _extract_embeddings(snippets, config)
-    by_label: dict[str, list[Any]] = {}
+    by_label: dict[str, list[tuple[Any, float]]] = {}
     for region, embedding in zip(candidates, embeddings):
         embedding = np.asarray(embedding, dtype=np.float32).reshape(-1)
         if embedding.size and np.isfinite(embedding).all():
-            by_label.setdefault(region.speaker or "unknown", []).append(embedding)
+            by_label.setdefault(region.speaker or "unknown", []).append(
+                (embedding, region.end - region.start)
+            )
     try:
-        centroids = {
-            label: _normalize(np.mean(values, axis=0))
-            for label, values in by_label.items()
-            if values
-        }
         profile_dir = Path(config.speaker_profiles_dir).expanduser()
         model_signature = _model_signature(config)
         profiles = _load_profiles(
@@ -121,17 +124,20 @@ def identify_speakers(
             min_samples_per_center=config.speaker_profile_min_samples_per_center,
         )
         enrollment_labels = {
-            region.speaker or "unknown"
-            for region in candidates
-            if not region.overlap
+            region.speaker or "unknown" for region in candidates if not region.overlap
         }
         enrollment = {
-            label: values
+            label: [embedding for embedding, _duration in values]
             for label, values in by_label.items()
             if label in enrollment_labels
         }
         if known_character and enrollment:
-            dominant = max(enrollment, key=lambda label: len(enrollment[label]))
+            dominant = max(
+                enrollment,
+                key=lambda label: sum(
+                    duration for _embedding, duration in by_label[label]
+                ),
+            )
             selected = _evenly_spaced(
                 enrollment[dominant],
                 config.speaker_enrollment_samples_per_video,
@@ -149,13 +155,12 @@ def identify_speakers(
                 min_samples_per_center=config.speaker_profile_min_samples_per_center,
             )
         mapping: dict[str, tuple[str, float]] = {}
-        for label, centroid in centroids.items():
-            distances = sorted(
-                (
-                    _profile_distance(centroid, profile_centers),
-                    character,
-                )
-                for character, profile_centers in profiles.items()
+        for label, evidence in by_label.items():
+            distances = _aggregate_profile_distances(
+                evidence,
+                profiles,
+                trim_ratio=config.speaker_identity_trim_ratio,
+                maximum_weight=config.speaker_identity_max_weight_seconds,
             )
             threshold = (
                 config.speaker_overlap_match_threshold
@@ -188,18 +193,23 @@ def identify_speakers(
                 character,
                 distance,
             )
-        return [
-            replace(
-                region,
-                speaker=mapping.get(region.speaker or "", (region.speaker, 0.0))[0],
-                confidence=(
-                    round(1.0 - mapping[region.speaker or ""][1], 4)
-                    if region.speaker in mapping
-                    else region.confidence
-                ),
+        resolved: list[AudioRegion] = []
+        for region in regions:
+            label = region.anonymous_speaker or region.speaker or ""
+            match = mapping.get(label)
+            resolved.append(
+                replace(
+                    region,
+                    speaker=match[0] if match else region.speaker,
+                    confidence=(
+                        round(1.0 - match[1], 4) if match else region.confidence
+                    ),
+                    anonymous_speaker=(
+                        label if _is_moss_speaker(label) else region.anonymous_speaker
+                    ),
+                )
             )
-            for region in regions
-        ]
+        return resolved
     finally:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -268,9 +278,7 @@ def _extract_wespeaker_embeddings(
     inference.to(torch.device(config.device))
     try:
         return [
-            np.asarray(
-                inference({"waveform": audio, "sample_rate": rate})
-            ).reshape(-1)
+            np.asarray(inference({"waveform": audio, "sample_rate": rate})).reshape(-1)
             for audio, rate in snippets
         ]
     finally:
@@ -374,14 +382,104 @@ def _identity_candidates(regions: list[AudioRegion]) -> list[AudioRegion]:
     return candidates
 
 
+def _is_moss_speaker(value: str | None) -> bool:
+    return bool(value and value.startswith("MOSS_W"))
+
+
+def _moss_identity_candidates(
+    regions: list[AudioRegion], config: AudioAnalysisConfig
+) -> list[AudioRegion]:
+    """Build clean, bounded evidence chunks without changing MOSS speaker groups."""
+    candidates: list[AudioRegion] = []
+    minimum = config.speaker_identity_min_segment_seconds
+    maximum = config.speaker_identity_max_weight_seconds
+    edge = config.speaker_identity_edge_trim_seconds
+    for region in regions:
+        if not _is_moss_speaker(region.speaker) or region.overlap:
+            continue
+        start = region.start + edge
+        end = region.end - edge
+        duration = end - start
+        if duration < minimum:
+            continue
+        count = max(1, math.ceil(duration / maximum))
+        chunk_seconds = duration / count
+        if chunk_seconds < minimum:
+            count = max(1, int(duration // minimum))
+            chunk_seconds = duration / count
+        for index in range(count):
+            chunk_start = start + index * chunk_seconds
+            chunk_end = (
+                end if index + 1 == count else start + (index + 1) * chunk_seconds
+            )
+            if chunk_end - chunk_start >= minimum:
+                candidates.append(
+                    replace(
+                        region,
+                        start=round(chunk_start, 3),
+                        end=round(chunk_end, 3),
+                        overlap=False,
+                        source_path=None,
+                        source_offset=0.0,
+                    )
+                )
+    return candidates
+
+
+def _aggregate_profile_distances(
+    evidence: list[tuple[Any, float]],
+    profiles: dict[str, Any],
+    *,
+    trim_ratio: float,
+    maximum_weight: float,
+) -> list[tuple[float, str]]:
+    """Trim segment outliers once, then compare weighted evidence to all profiles."""
+    import numpy as np
+
+    if not evidence or not profiles:
+        return []
+    weights = np.asarray(
+        [min(maximum_weight, max(0.0, duration)) for _embedding, duration in evidence],
+        dtype=np.float64,
+    )
+    per_character = {
+        character: np.asarray(
+            [
+                _profile_distance(embedding, centers)
+                for embedding, _duration in evidence
+            ],
+            dtype=np.float64,
+        )
+        for character, centers in profiles.items()
+    }
+    normalized = np.stack(
+        [
+            _normalize(np.asarray(embedding, dtype=np.float32))
+            for embedding, _ in evidence
+        ]
+    )
+    pairwise = 1.0 - np.clip(normalized @ normalized.T, -1.0, 1.0)
+    medoid = int(np.argmin(np.median(pairwise, axis=1)))
+    remove_count = int(len(evidence) * trim_ratio)
+    keep_count = max(1, len(evidence) - remove_count)
+    retained = np.argsort(pairwise[medoid], kind="stable")[:keep_count]
+    retained_weights = weights[retained]
+    return sorted(
+        (
+            float(np.average(distances[retained], weights=retained_weights)),
+            character,
+        )
+        for character, distances in per_character.items()
+    )
+
+
 def _evenly_spaced(values: list[Any], limit: int) -> list[Any]:
     if len(values) <= limit:
         return values.copy()
     if limit == 1:
         return [values[len(values) // 2]]
     return [
-        values[round(index * (len(values) - 1) / (limit - 1))]
-        for index in range(limit)
+        values[round(index * (len(values) - 1) / (limit - 1))] for index in range(limit)
     ]
 
 

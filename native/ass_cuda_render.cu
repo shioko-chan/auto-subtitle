@@ -236,10 +236,20 @@ static void initialize_output(
     output.encoder->time_base = input_stream->time_base;
     output.encoder->framerate = av_guess_frame_rate(nullptr, input_stream, nullptr);
     output.encoder->sample_aspect_ratio = first_frame->sample_aspect_ratio;
-    output.encoder->color_range = decoder->color_range;
-    output.encoder->colorspace = decoder->colorspace;
-    output.encoder->color_primaries = decoder->color_primaries;
-    output.encoder->color_trc = decoder->color_trc;
+    output.encoder->color_range = input_stream->codecpar->color_range != AVCOL_RANGE_UNSPECIFIED
+        ? input_stream->codecpar->color_range
+        : decoder->color_range;
+    output.encoder->colorspace = input_stream->codecpar->color_space != AVCOL_SPC_UNSPECIFIED
+        ? input_stream->codecpar->color_space
+        : decoder->colorspace;
+    output.encoder->color_primaries =
+        input_stream->codecpar->color_primaries != AVCOL_PRI_UNSPECIFIED
+        ? input_stream->codecpar->color_primaries
+        : decoder->color_primaries;
+    output.encoder->color_trc =
+        input_stream->codecpar->color_trc != AVCOL_TRC_UNSPECIFIED
+        ? input_stream->codecpar->color_trc
+        : decoder->color_trc;
     double frames_per_second = av_q2d(output.encoder->framerate);
     if (!std::isfinite(frames_per_second) || frames_per_second <= 0)
         frames_per_second = 30.0;
@@ -409,6 +419,15 @@ int main(int argc, char **argv) {
     AVFrame *decoded = av_frame_alloc();
     if (!packet || !decoded)
         fail("allocate decode objects");
+    AVRational frame_rate = av_guess_frame_rate(input_format, video_stream, nullptr);
+    int64_t frame_step = 1;
+    if (frame_rate.num > 0 && frame_rate.den > 0) {
+        frame_step = std::max<int64_t>(
+            1, av_rescale_q(1, av_inv_q(frame_rate), video_stream->time_base)
+        );
+    }
+    int64_t last_encoder_pts = AV_NOPTS_VALUE;
+    int64_t corrected_timestamps = 0;
     auto process_frames = [&]() {
         while (true) {
             int result = avcodec_receive_frame(decoder, decoded);
@@ -423,12 +442,24 @@ int main(int argc, char **argv) {
             if (!output.header_written)
                 initialize_output(output, output_path.c_str(), decoder, video_stream, decoded, preset, cq);
             AVFrame *rendered = copy_cuda_frame(decoded);
-            int64_t timestamp = rendered->best_effort_timestamp;
-            if (timestamp == AV_NOPTS_VALUE)
-                timestamp = rendered->pts;
-            int64_t time_ms = av_rescale_q(timestamp, video_stream->time_base, AVRational{1, 1000});
+            int64_t source_timestamp = rendered->best_effort_timestamp;
+            if (source_timestamp == AV_NOPTS_VALUE)
+                source_timestamp = rendered->pts;
+            if (source_timestamp == AV_NOPTS_VALUE)
+                source_timestamp = last_encoder_pts == AV_NOPTS_VALUE
+                    ? 0
+                    : last_encoder_pts + frame_step;
+            int64_t time_ms = av_rescale_q(
+                source_timestamp, video_stream->time_base, AVRational{1, 1000}
+            );
             render_ass(subtitles, rendered, time_ms);
-            rendered->pts = timestamp;
+            int64_t encoder_pts = source_timestamp;
+            if (last_encoder_pts != AV_NOPTS_VALUE && encoder_pts <= last_encoder_pts) {
+                encoder_pts = last_encoder_pts + frame_step;
+                ++corrected_timestamps;
+            }
+            rendered->pts = encoder_pts;
+            last_encoder_pts = encoder_pts;
             drain_encoder(output, rendered);
             av_frame_free(&rendered);
             av_frame_unref(decoded);
@@ -447,6 +478,11 @@ int main(int argc, char **argv) {
         fail("input produced no video frames");
     drain_encoder(output, nullptr);
     check_av(av_write_trailer(output.format), "write output trailer");
+    std::fprintf(
+        stderr,
+        "ass-cuda-render: corrected %lld non-monotonic frame timestamps\n",
+        static_cast<long long>(corrected_timestamps)
+    );
 
     av_frame_free(&decoded);
     av_packet_free(&packet);

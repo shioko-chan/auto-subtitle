@@ -90,19 +90,31 @@ def _check(config: AppConfig) -> int:
             import demucs  # noqa: F401
             import transformers  # noqa: F401
 
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", module=r"pyannote\.audio\.core\.io")
-                import pyannote.audio  # noqa: F401
-            worker = (
-                Path(config.audio_analysis.overlap_separation_worker_project)
-                .resolve()
-                .joinpath("worker.py")
-            )
-            if shutil.which("uv") is None or not worker.is_file():
-                missing.append("MossFormer2 worker")
-                logging.error("missing MossFormer2 worker: %s", worker)
+            analysis = config.audio_analysis
+            if analysis.diarization_backend == "moss":
+                worker_name = "MOSS transcription worker"
+                worker = (
+                    Path(analysis.moss_transcribe_worker_project)
+                    .resolve()
+                    .joinpath("worker.py")
+                )
             else:
-                logging.info("found MossFormer2 separation worker: %s", worker)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore", module=r"pyannote\.audio\.core\.io"
+                    )
+                    import pyannote.audio  # noqa: F401
+                worker_name = "MossFormer2 worker"
+                worker = (
+                    Path(analysis.overlap_separation_worker_project)
+                    .resolve()
+                    .joinpath("worker.py")
+                )
+            if shutil.which("uv") is None or not worker.is_file():
+                missing.append(worker_name)
+                logging.error("missing %s: %s", worker_name, worker)
+            else:
+                logging.info("found %s: %s", worker_name, worker)
             logging.info("found diarization and singing runtimes")
     except ImportError:
         missing.append("qwen-asr")

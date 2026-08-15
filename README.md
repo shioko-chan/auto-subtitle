@@ -161,20 +161,22 @@ URL 放在单引号中时不要再写 `\?` 或 `\=`。为兼容常见的复制�
 缺失块。上下文区的时间戳只归属相应核心区间，因此不会产生重复 cue。分块总长度受
 forced aligner 的 180 秒输入限制约束。
 
-启用 `[audio_analysis]` 后，管线会先用 pyannote `community-1` 做 VAD、全局说话人
-聚类和重叠检测。原音 AST 只提出歌声候选，Demucs 人声轨上的 AST 再确认实际歌唱；候选中存在
+启用 `[audio_analysis]` 后，默认由 `MOSS-Transcribe-Diarize` 生成带匿名说话人标签的
+长上下文时间轴。每个窗口目标长度 80 分钟，在附近低能量位置切开且不超过模型支持的
+90 分钟；跨窗口的 `S01` 不会被当成同一匿名人物。MOSS 原始转写和时间戳保存在 job
+目录的 `moss-transcribe-diarize.json` 供审计，最终日文字幕仍由 Qwen ASR 和 forced
+aligner 生成。原音 AST 只提出歌声候选，Demucs 人声轨上的 AST 再确认实际歌唱；候选中存在
 连续讲话但人声轨没有歌唱证据时按“讲话+BGM”处理。证据模糊时同时运行普通 forced
 aligner 与句级歌声 ASR，时间轴坍缩或循环输出时采用歌声结果。release hysteresis 只在
-确认进入歌唱状态后桥接短暂漏检，不会让一次 AST 误报扩成整段歌曲。检测到两人重叠
-说话时，独立 worker 中的 `MossFormer2_SS_16K` 会输出两条声源并分别转写；三人重叠、
-分离失败或存在空轨时保留原音，不会采用不完整的分离结果。所有音频分析结果和带说话人字段的
-cue sidecar 都写入 job 目录并可断点复用。
+确认进入歌唱状态后桥接短暂漏检，不会让一次 AST 误报扩成整段歌曲。所有音频分析结果和
+带说话人字段的 cue sidecar 都写入 job 目录并可断点复用。旧的 pyannote + MossFormer2
+路径仍可通过 `diarization_backend = "pyannote"` 显式启用，主要用于回归比较。
 
 作业只用 ffmpeg 解码一次完整的 16 kHz 单声道音频，并由 `AudioBufferPool` 在共享 CPU
-内存中提供给 Qwen、MossFormer2 和 ERes2NetV2。Qwen 直接接收 NumPy 切片，正常运行不再
+内存中提供给 MOSS、Qwen 和 ERes2NetV2。Qwen 直接接收 NumPy 切片，正常运行不再
 创建 `asr-chunks`、`asr-analysis-chunks` 或分离声源 WAV。MossFormer2 音轨仅在
 `audio_analysis.debug_audio_artifacts = true` 时落盘。Demucs 只按需解码候选歌曲区间的
-高质量立体声音频。各阶段日志包含耗时和可用时的峰值显存；pyannote 与原音 AST 可通过
+高质量立体声音频。各阶段日志包含耗时和可用时的峰值显存；MOSS 或 pyannote 与原音 AST 可通过
 `initial_analysis_concurrency = 2` 并行，其余重型 GPU 模型仍按阶段串行。
 
 人物身份使用独立 uv worker 中的 ERes2NetV2 embedding 和余弦距离匹配。成员个人频道
@@ -182,9 +184,11 @@ cue sidecar 都写入 job 目录并可断点复用。
 `work/speaker-profiles-eres2netv2/`；每人最多保留 400 条。profile 带模型签名，不能与
 旧 WeSpeaker embedding 混用。识别时保留原始样本，并用确定性的 cosine k-means 为
 每人建立最多 5 个中心；每个中心默认至少需要 20 条样本，小簇会通过减少中心数重新
-聚类。这样可以分别覆盖普通聊天、激动语气和带背景音等声音状态。匹配还要求第一候选
-相对第二候选保持足够距离；重叠分轨使用更严格的绝对阈值，证据不足时保留匿名标签。
-MossFormer2 使用独立 uv 环境，避免其 NumPy 1.x 依赖影响 pyannote 和 Qwen ASR。
+聚类。MOSS 同一窗口内同一匿名标签的非歌唱、非重叠干净片段会共同参与一次身份判断：
+先按该标签 embedding 的 medoid 删除最远 15%，再按片段时长加权，单段权重最多计 10 秒。
+重叠片段不参与投票，但会继承该匿名标签的身份。不同匿名标签独立匹配，允许都映射为同一
+成员；匹配仍要求第一候选相对第二候选保持足够距离，证据不足时保留匿名标签。
+MOSS 和 MossFormer2 使用独立 uv 环境，避免模型依赖影响 Qwen ASR。
 共享内存、按需高质量立体声和受控并行的实现说明见
 [音频管线内存与并行优化](docs/audio-pipeline-optimization.md)。
 
@@ -250,7 +254,11 @@ B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服�
 - `asr.chunk_seconds` / `chunk_context_seconds`：控制可恢复分块和切点上下文；总输入
   长度不能超过 180 秒。
 - `asr.max_new_tokens`：单块 ASR 最多生成的 token 数，默认 `2048`。
-- `audio_analysis.initial_analysis_concurrency`：`1` 为顺序执行 pyannote 与原音 AST；
+- `audio_analysis.diarization_backend`：默认 `moss`；设为 `pyannote` 可启用旧的
+  community-1 + MossFormer2 回退路径。
+- `audio_analysis.moss_window_seconds` / `moss_max_window_seconds`：MOSS 长窗目标和硬上限，
+  默认 480/540 秒，避免长直播的注意力张量耗尽显存。
+- `audio_analysis.initial_analysis_concurrency`：`1` 为顺序执行 diarization 与原音 AST；
   在显存和实测耗时允许时可设为 `2`。
 - `audio_analysis.debug_audio_artifacts`：仅调试时持久化分离音轨，默认 `false`。
 - `segmentation.model_window_cues`：每个并行联合请求的目标 forced aligner 单元数，默认

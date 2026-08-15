@@ -1,0 +1,22 @@
+[project]
+name = "subtitle-moss-transcribe-worker"
+version = "0.1.0"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "librosa>=0.11,<1",
+    "numpy>=1.26,<3",
+    "safetensors>=0.6.2",
+    "soxr>=0.5",
+    "torch==2.8.0+cu128",
+    "torchaudio==2.8.0+cu128",
+    "transformers>=5.6,<6",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }

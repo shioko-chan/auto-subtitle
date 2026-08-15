@@ -9,10 +9,10 @@ benchmark-driven follow-ups rather than assumptions.
 
 ## Current Process Boundaries
 
-The main Python process currently owns:
+The main Python process currently owns or orchestrates:
 
 - the 16 kHz mono analysis waveform;
-- pyannote diarization;
+- the MOSS/pyannote diarization result and cache lifecycle;
 - AST singing detection;
 - Demucs vocal separation;
 - Qwen ASR and the forced aligner;
@@ -20,7 +20,9 @@ The main Python process currently owns:
 
 The following components use separate address spaces:
 
-- MossFormer2: one batched uv worker invocation handles all eligible overlaps;
+- MOSS-Transcribe-Diarize: one isolated uv worker processes all long windows while
+  keeping the model loaded;
+- MossFormer2: used only by the explicit pyannote fallback path;
 - ERes2NetV2: one batched uv worker invocation handles all enrollment snippets;
 - PaddleOCR: one persistent uv worker process per song-identification run;
 - song search: a short-lived uv worker process per tool call;
@@ -35,7 +37,7 @@ every model:
 original 44.1/48 kHz stereo audio
 |- Demucs and singing/music processing
 `- resample once to 16 kHz mono
-   |- VAD and pyannote
+   |- MOSS diarization, or VAD and pyannote in fallback mode
    |- AST speech/singing evidence
    |- speaker embeddings
    `- Qwen ASR and forced alignment
@@ -75,8 +77,8 @@ segments can be cleaned after a crash.
 
 ## Worker Changes
 
-1. MossFormer2 and ERes2NetV2 accept persistent JSON-lines requests; the current
-   pipeline batches all same-model job items into one request, so each model loads once.
+1. MOSS, MossFormer2, and ERes2NetV2 workers batch all same-model job items into one
+   invocation, so each model loads once per job.
 2. Pass MossFormer2 and ERes2NetV2 input ranges through shared-memory descriptors.
 3. Return ERes2NetV2 embeddings as JSON because they are small.
 4. Write MossFormer2 outputs into preallocated shared memory and return descriptors.
@@ -98,9 +100,9 @@ Prefer pipeline parallelism and batching over unrestricted GPU-model concurrency
 
 - run independent CPU decoding, slicing, resampling, validation, and cache writes while
   a GPU model is working;
-- pyannote and raw-audio AST are logically independent, but enable concurrent GPU
+- MOSS/pyannote and raw-audio AST are logically independent, but enable concurrent GPU
   execution only if a benchmark shows lower wall time within the memory budget;
-- Demucs depends on song candidates; MossFormer2 depends on overlap detection;
+- Demucs depends on song candidates; fallback MossFormer2 depends on overlap detection;
 - speaker identity depends on diarization and exclusion of confirmed singing regions;
 - Qwen ASR starts after routing regions to speech, singing, and ambiguous paths;
 - Demucs, MossFormer2, and Qwen are GPU-heavy and should be mutually exclusive by
@@ -122,8 +124,14 @@ peak VRAM, and fallback count before changing concurrency defaults.
    in debug mode.
 6. Decode source-quality stereo only for song candidate ranges before Demucs.
 7. Stage timing and peak allocated VRAM are logged. `initial_analysis_concurrency=2`
-   can overlap pyannote and raw AST after a machine-specific memory check; the example
+   can overlap MOSS/pyannote and raw AST after a machine-specific memory check; the example
    remains at `1`. Demucs, MossFormer2, ERes2NetV2 and Qwen remain stage-serialized.
+8. MOSS runs in target 80-minute windows selected near low-energy boundaries, never
+   exceeding 90 minutes. Its raw speaker-aware transcript is cached for audit.
+9. Identity matching aggregates all clean evidence for one window-scoped MOSS label,
+   trims the farthest 15% around its embedding medoid, then applies capped duration
+   weights against the existing ERes2NetV2 multi-center profiles. Overlap inherits the
+   result but does not vote; different MOSS labels may map to the same member.
 
 ## Acceptance Checks
 

@@ -36,6 +36,9 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(config.audio_analysis.enabled)
             self.assertFalse(config.audio_analysis.debug_audio_artifacts)
             self.assertEqual(config.audio_analysis.initial_analysis_concurrency, 1)
+            self.assertEqual(config.audio_analysis.diarization_backend, "moss")
+            self.assertEqual(config.audio_analysis.moss_window_seconds, 480.0)
+            self.assertEqual(config.audio_analysis.moss_max_window_seconds, 540.0)
             self.assertEqual(
                 config.audio_analysis.speaker_embedding_backend, "eres2netv2"
             )
@@ -62,6 +65,10 @@ class ConfigTests(unittest.TestCase):
                 config.audio_analysis.speaker_overlap_match_threshold, 0.24
             )
             self.assertEqual(config.audio_analysis.speaker_match_margin, 0.03)
+            self.assertEqual(config.audio_analysis.speaker_identity_trim_ratio, 0.15)
+            self.assertEqual(
+                config.audio_analysis.speaker_identity_max_weight_seconds, 10.0
+            )
             self.assertEqual(config.audio_analysis.speaker_profile_max_centers, 5)
             self.assertEqual(
                 config.audio_analysis.speaker_profile_min_samples_per_center, 20

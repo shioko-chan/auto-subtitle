@@ -43,7 +43,14 @@ class AudioAnalysisConfig:
     enabled: bool = True
     debug_audio_artifacts: bool = False
     initial_analysis_concurrency: int = 1
+    diarization_backend: str = "moss"
     diarization_model: str = "pyannote/speaker-diarization-community-1"
+    moss_transcribe_model: str = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
+    moss_transcribe_worker_project: str = "tools/moss_transcribe"
+    moss_window_seconds: float = 480.0
+    moss_max_window_seconds: float = 540.0
+    moss_window_search_seconds: float = 60.0
+    moss_max_new_tokens: int = 8192
     # Retained for compatibility with older configuration files. MossFormer2
     # does not use a pyannote embedding model internally.
     overlap_embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
@@ -68,9 +75,13 @@ class AudioAnalysisConfig:
     singing_asr_window_seconds: float = 12.0
     singing_asr_overlap_seconds: float = 2.0
     speaker_profiles_dir: str = "work/speaker-profiles-eres2netv2"
-    speaker_match_threshold: float = 0.32
+    speaker_match_threshold: float = 0.40
     speaker_overlap_match_threshold: float = 0.24
     speaker_match_margin: float = 0.03
+    speaker_identity_trim_ratio: float = 0.15
+    speaker_identity_max_weight_seconds: float = 10.0
+    speaker_identity_edge_trim_seconds: float = 0.15
+    speaker_identity_min_segment_seconds: float = 1.5
     speaker_enrollment_samples_per_video: int = 40
     speaker_profile_max_centers: int = 5
     speaker_profile_min_samples_per_center: int = 20
@@ -256,6 +267,30 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError(
             "audio_analysis.initial_analysis_concurrency must be 1 or 2"
         )
+    if analysis.diarization_backend not in {"moss", "pyannote"}:
+        raise ConfigError(
+            "audio_analysis.diarization_backend must be 'moss' or 'pyannote'"
+        )
+    if not analysis.moss_transcribe_model.strip():
+        raise ConfigError("audio_analysis.moss_transcribe_model cannot be empty")
+    if analysis.moss_window_seconds <= 0:
+        raise ConfigError("audio_analysis.moss_window_seconds must be positive")
+    if not (
+        analysis.moss_window_seconds
+        <= analysis.moss_max_window_seconds
+        <= 900
+    ):
+        raise ConfigError(
+            "audio_analysis.moss_max_window_seconds must be between "
+            "moss_window_seconds and 900"
+        )
+    if not 0 <= analysis.moss_window_search_seconds < analysis.moss_window_seconds:
+        raise ConfigError(
+            "audio_analysis.moss_window_search_seconds must be non-negative and "
+            "smaller than moss_window_seconds"
+        )
+    if analysis.moss_max_new_tokens < 1:
+        raise ConfigError("audio_analysis.moss_max_new_tokens must be at least 1")
     if analysis.speaker_embedding_backend not in {"eres2netv2", "wespeaker"}:
         raise ConfigError(
             "audio_analysis.speaker_embedding_backend must be 'eres2netv2' or "
@@ -318,6 +353,22 @@ def load_config(path: Path) -> AppConfig:
         )
     if not 0 <= analysis.speaker_match_margin <= 2:
         raise ConfigError("audio_analysis.speaker_match_margin must be between 0 and 2")
+    if not 0 <= analysis.speaker_identity_trim_ratio < 0.5:
+        raise ConfigError(
+            "audio_analysis.speaker_identity_trim_ratio must be between 0 and 0.5"
+        )
+    if analysis.speaker_identity_max_weight_seconds <= 0:
+        raise ConfigError(
+            "audio_analysis.speaker_identity_max_weight_seconds must be positive"
+        )
+    if analysis.speaker_identity_edge_trim_seconds < 0:
+        raise ConfigError(
+            "audio_analysis.speaker_identity_edge_trim_seconds cannot be negative"
+        )
+    if analysis.speaker_identity_min_segment_seconds <= 0:
+        raise ConfigError(
+            "audio_analysis.speaker_identity_min_segment_seconds must be positive"
+        )
     if analysis.speaker_enrollment_samples_per_video < 1:
         raise ConfigError(
             "audio_analysis.speaker_enrollment_samples_per_video must be at least 1"
