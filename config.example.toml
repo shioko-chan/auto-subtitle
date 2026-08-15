@@ -23,6 +23,11 @@ chunk_context_seconds = 2.0
 # recursively halved down to about 20 seconds instead of being cached.
 max_inference_batch_size = 1
 max_new_tokens = 2048
+speech_window_target_seconds = 60.0
+speech_window_max_seconds = 90.0
+speech_window_max_gap_seconds = 2.0
+speech_window_max_silence_seconds = 15.0
+speech_window_min_coverage = 0.6
 
 [audio_analysis]
 # Run VAD/diarization and singing detection before Qwen ASR. Gated pyannote

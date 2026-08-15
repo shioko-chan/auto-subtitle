@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -16,6 +16,9 @@ from subtitle_pipeline.asr import (
     _repetition_hallucination,
     _result_to_cues,
     _song_windows,
+    _speaker_for_aligned_cue,
+    _speech_asr_windows,
+    _timeline_retry_split,
     _transcribe_ambiguous_range,
     _transcribe_analyzed,
     _valid_cached_record,
@@ -81,7 +84,7 @@ class QwenASRTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "cache.json"
             path.write_text(
-                '{"version":2,"signature":{"speakers":["A","B"]},'
+                '{"version":3,"signature":{"speakers":["A","B"]},'
                 '"chunks":{"0":{"text":"x","cues":[]}}}',
                 encoding="utf-8",
             )
@@ -125,7 +128,7 @@ class QwenASRTests(unittest.TestCase):
         self.assertEqual((result[0].start, result[0].end), (10.0, 14.0))
         self.assertEqual(result[0].source_offset, 9.0)
 
-    def test_analyzed_shared_audio_uses_buffer_duration_without_ffprobe(self):
+    def test_analyzed_speech_uses_original_mix_buffer_and_global_timeline(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             video = root / "source.mp4"
@@ -143,6 +146,7 @@ class QwenASRTests(unittest.TestCase):
             pool = SimpleNamespace(
                 contains=lambda _uri: True,
                 resolve=lambda _uri: buffer,
+                main=lambda: buffer,
             )
             record = {
                 "text": "字幕",
@@ -165,8 +169,147 @@ class QwenASRTests(unittest.TestCase):
                 )
 
             media_duration.assert_called_once_with(video)
-            self.assertEqual(transcribe.call_args.kwargs["media_duration"], 2.0)
+            self.assertEqual(transcribe.call_args.kwargs["media_duration"], 30.0)
             self.assertIs(transcribe.call_args.kwargs["audio_buffer"], buffer)
+            self.assertEqual(transcribe.call_args.kwargs["core_start"], 10.0)
+            self.assertEqual(transcribe.call_args.kwargs["core_end"], 11.0)
+            self.assertTrue(transcribe.call_args.kwargs["validate_timeline"])
+
+    def test_speech_windows_merge_nearby_turns_across_speakers(self):
+        analysis = AudioAnalysis(
+            speech=[],
+            singing=[],
+            diarization=[
+                AudioRegion(0, 25, "speech", "A"),
+                AudioRegion(26, 45, "speech", "B"),
+                AudioRegion(44, 70, "speech", "A"),
+            ],
+        )
+
+        windows = _speech_asr_windows(
+            analysis,
+            ASRConfig(
+                chunk_context_seconds=2,
+                speech_window_target_seconds=60,
+                speech_window_max_seconds=90,
+            ),
+        )
+
+        self.assertEqual(
+            [(window.start, window.end, window.kind) for window in windows],
+            [(0, 70, "speech")],
+        )
+
+    def test_speech_windows_do_not_cross_more_than_two_seconds_of_silence(self):
+        analysis = AudioAnalysis(
+            speech=[],
+            singing=[],
+            diarization=[
+                AudioRegion(0, 20, "speech", "A"),
+                AudioRegion(22.001, 40, "speech", "A"),
+            ],
+        )
+
+        windows = _speech_asr_windows(analysis, ASRConfig())
+
+        self.assertEqual(
+            [(window.start, window.end) for window in windows],
+            [(0, 20), (22.001, 40)],
+        )
+
+    def test_aligned_cue_speaker_uses_diarization_intersection(self):
+        diarization = [
+            AudioRegion(0, 3, "speech", "A"),
+            AudioRegion(2, 4, "speech", "B"),
+            AudioRegion(4, 6, "speech", "B"),
+        ]
+
+        self.assertEqual(_speaker_for_aligned_cue(0.5, 1.5, diarization), "A")
+        self.assertIsNone(_speaker_for_aligned_cue(2.2, 2.8, diarization))
+        self.assertEqual(_speaker_for_aligned_cue(4.2, 5.0, diarization), "B")
+        self.assertIsNone(
+            _speaker_for_aligned_cue(
+                1.8,
+                2.2,
+                [
+                    AudioRegion(0, 2, "speech", "A"),
+                    AudioRegion(2, 4, "speech", "B"),
+                ],
+            )
+        )
+
+    def test_timeline_retry_prefers_a_long_silence_over_the_midpoint(self):
+        record = {
+            "cues": [
+                {"start": 0, "end": 10, "text": "前"},
+                {"start": 32, "end": 40, "text": "中"},
+                {"start": 42, "end": 60, "text": "后"},
+            ]
+        }
+
+        self.assertEqual(_timeline_retry_split(record, 0, 60), 21)
+
+    def test_successful_retry_child_is_cached_before_its_sibling_finishes(self):
+        from subtitle_pipeline.asr import _transcribe_range
+
+        repeated = "私が食べてるのでちょっとこっちに移動します" * 10
+
+        def result(text, start, end):
+            return SimpleNamespace(
+                language="Japanese",
+                text=text,
+                time_stamps=SimpleNamespace(
+                    items=[SimpleNamespace(text=text, start_time=start, end_time=end)]
+                ),
+            )
+
+        first_model = SimpleNamespace(
+            max_new_tokens=2048,
+            transcribe=SimpleNamespace(),
+        )
+        first_model.transcribe = Mock(
+            side_effect=[
+                [result(repeated, 0, 40)],
+                [result("前半", 0, 10)],
+                RuntimeError("right child failed"),
+            ]
+        )
+        audio = SimpleNamespace(
+            sample_rate=16000,
+            slice=lambda *_args, **_kwargs: np.zeros(640000, dtype=np.float32),
+        )
+        completed = {}
+        writes = []
+        arguments = dict(
+            video=Path("source.mp4"),
+            chunk_dir=None,
+            config=ASRConfig(chunk_context_seconds=0),
+            core_start=0,
+            core_end=40,
+            media_duration=40,
+            final_chunk=True,
+            label="retry",
+            audio_buffer=audio,
+            completed_ranges=completed,
+            completed_range_callback=lambda: writes.append(dict(completed)),
+        )
+        with self.assertRaisesRegex(RuntimeError, "right child failed"):
+            _transcribe_range(first_model, **arguments)
+
+        self.assertIn("0.000:20.000:0", completed)
+        self.assertEqual(len(writes), 1)
+
+        second_model = SimpleNamespace(max_new_tokens=2048)
+        second_model.transcribe = Mock(
+            side_effect=[
+                [result(repeated, 0, 40)],
+                [result("后半", 0, 10)],
+            ]
+        )
+        recovered = _transcribe_range(second_model, **arguments)
+
+        self.assertEqual(second_model.transcribe.call_count, 2)
+        self.assertEqual([cue["text"] for cue in recovered["cues"]], ["前半", "后半"])
 
     def test_singing_regions_are_subtracted_from_speech_timing(self):
         result = _analysis_regions(

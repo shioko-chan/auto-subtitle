@@ -36,6 +36,11 @@ class ASRConfig:
     chunk_context_seconds: float = 2.0
     max_inference_batch_size: int = 1
     max_new_tokens: int = 2048
+    speech_window_target_seconds: float = 60.0
+    speech_window_max_seconds: float = 90.0
+    speech_window_max_gap_seconds: float = 2.0
+    speech_window_max_silence_seconds: float = 15.0
+    speech_window_min_coverage: float = 0.6
 
 
 @dataclass(frozen=True)
@@ -268,6 +273,24 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("asr.max_inference_batch_size must be at least 1")
     if config.asr.max_new_tokens < 1:
         raise ConfigError("asr.max_new_tokens must be at least 1")
+    if config.asr.speech_window_target_seconds <= 0:
+        raise ConfigError("asr.speech_window_target_seconds must be positive")
+    if not (
+        config.asr.speech_window_target_seconds
+        <= config.asr.speech_window_max_seconds
+        <= 180
+    ):
+        raise ConfigError(
+            "asr.speech_window_max_seconds must be between the target and 180"
+        )
+    if config.asr.speech_window_max_seconds <= 2 * config.asr.chunk_context_seconds:
+        raise ConfigError("asr speech window must be longer than both context margins")
+    if config.asr.speech_window_max_gap_seconds < 0:
+        raise ConfigError("asr.speech_window_max_gap_seconds cannot be negative")
+    if config.asr.speech_window_max_silence_seconds < 0:
+        raise ConfigError("asr.speech_window_max_silence_seconds cannot be negative")
+    if not 0 < config.asr.speech_window_min_coverage <= 1:
+        raise ConfigError("asr.speech_window_min_coverage must be between 0 and 1")
     analysis = config.audio_analysis
     if analysis.initial_analysis_concurrency not in {1, 2}:
         raise ConfigError(

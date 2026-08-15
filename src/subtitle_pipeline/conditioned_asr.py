@@ -26,16 +26,23 @@ class ConditionedWindow:
     turns: tuple[AudioRegion, ...]
 
 
+@dataclass(frozen=True)
+class ConditionedASRResult:
+    cues: list[Cue]
+    evidence: list[dict[str, object]]
+
+
 def repair_long_overlaps(
     cues: list[Cue],
     diarization: list[AudioRegion],
     audio: AudioBuffer,
     job_dir: Path,
     config: AudioAnalysisConfig,
-) -> list[Cue]:
+    qwen_windows: list[dict[str, object]] | None = None,
+) -> ConditionedASRResult:
     windows = _conditioned_windows(diarization, audio.duration, config)
     if not windows:
-        return cues
+        return ConditionedASRResult(cues, [])
     if config.conditioned_asr_backend == "disabled":
         first = windows[0]
         raise RuntimeError(
@@ -53,7 +60,83 @@ def repair_long_overlaps(
     if repaired is None:
         repaired = _run_dicow(audio, windows, config)
         _write_cache(cache_path, signature, repaired)
-    return _replace_windows(cues, repaired, windows)
+    evidence = _conditioned_evidence(windows, repaired, qwen_windows or [])
+    return ConditionedASRResult(
+        _replace_windows(cues, repaired, windows), evidence
+    )
+
+
+def _conditioned_evidence(
+    windows: list[ConditionedWindow],
+    repaired: list[Cue],
+    qwen_windows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    evidence: list[dict[str, object]] = []
+    for window in windows:
+        qwen = [
+            item
+            for record in qwen_windows
+            if (item := _qwen_window_evidence(record, window)) is not None
+        ]
+        dicow = [
+            asdict(cue)
+            for cue in repaired
+            if cue.end > window.start and cue.start < window.end
+        ]
+        evidence.append(
+            {
+                "kind": "overlap_reconciliation",
+                "start": window.start,
+                "end": window.end,
+                "qwen_mixed": qwen,
+                "dicow": dicow,
+                "turns": _window_payload(window)["turns"],
+            }
+        )
+    return evidence
+
+
+def _qwen_window_evidence(
+    record: dict[str, object], window: ConditionedWindow
+) -> dict[str, object] | None:
+    if (
+        float(record.get("core_end", 0.0)) <= window.start
+        or float(record.get("core_start", 0.0)) >= window.end
+    ):
+        return None
+    values = record.get("cues")
+    if not isinstance(values, list):
+        return None
+    units = []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        start = value.get("start")
+        end = value.get("end")
+        text = value.get("text")
+        if (
+            isinstance(start, (int, float))
+            and isinstance(end, (int, float))
+            and isinstance(text, str)
+            and float(end) > window.start
+            and float(start) < window.end
+            and text.strip()
+        ):
+            units.append(
+                {
+                    "start": float(start),
+                    "end": float(end),
+                    "text": text.strip(),
+                }
+            )
+    if not units:
+        return None
+    return {
+        "start": units[0]["start"],
+        "end": units[-1]["end"],
+        "text": "".join(str(unit["text"]) for unit in units),
+        "units": units,
+    }
 
 
 def _conditioned_windows(
@@ -265,6 +348,10 @@ def _replace_windows(
         matching = [
             window for window in windows if window.start <= midpoint <= window.end
         ]
+        if matching and cue.speaker is None and any(
+            _simultaneous_speakers(window, midpoint) > 1 for window in matching
+        ):
+            continue
         if not matching or all(
             cue.speaker not in repaired_speakers[(window.start, window.end)]
             for window in matching
@@ -272,6 +359,17 @@ def _replace_windows(
             retained.append(cue)
     return sorted(
         [*retained, *repaired], key=lambda cue: (cue.start, cue.end, cue.speaker or "")
+    )
+
+
+def _simultaneous_speakers(window: ConditionedWindow, timestamp: float) -> int:
+    return len(
+        {
+            turn.anonymous_speaker or turn.speaker
+            for turn in window.turns
+            if turn.start <= timestamp <= turn.end
+            and (turn.anonymous_speaker or turn.speaker)
+        }
     )
 
 

@@ -7,17 +7,17 @@ import re
 import subprocess
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .audio_analysis import AudioAnalysis, AudioRegion, analyze_audio
 from .audio_buffer import AudioBuffer, AudioBufferPool, is_shared_audio_uri
 from .commands import require_command, run
 from .config import ASRConfig, AudioAnalysisConfig
-from .subtitles import Cue, merge_cues_at_boundaries, write_srt
+from .subtitles import Cue, write_srt
 from .telemetry import stage_metrics
 
-_CACHE_VERSION = 2
-_MIN_RETRY_CHUNK_SECONDS = 20.0
+_CACHE_VERSION = 3
+_MIN_RETRY_CHUNK_SECONDS = 15.0
 _MIN_REPETITION_SPAN_CHARACTERS = 160
 _REPETITION_RE = re.compile(r"(.{12,200}?)\1{3,}", re.DOTALL)
 _MIN_ASR_GENERATION_TOKENS = 128
@@ -175,20 +175,32 @@ def _transcribe_analyzed(
     analysis: AudioAnalysis,
     audio_pool: AudioBufferPool,
 ) -> Path:
-    regions = _analysis_regions(analysis)
+    speech_windows = _speech_asr_windows(analysis, config)
+    routed_regions = [
+        region for region in _analysis_regions(analysis) if region.kind != "speech"
+    ]
+    regions = sorted([*speech_windows, *routed_regions], key=lambda item: item.start)
     if not regions:
         raise RuntimeError("audio analysis found no speech or singing regions")
     duration = _media_duration(video)
     cache_path = destination.parent / "asr-analysis-cache.json"
     signature = {
         **_cache_signature(video, duration, config),
-        "analysis_version": 6,
+        "analysis_version": 7,
         "analysis_config": asdict(analysis_config),
         "regions": [_analysis_region_signature(region) for region in regions],
     }
     cache = _load_cache(cache_path, signature)
     cached = cache["chunks"]
     assert isinstance(cached, dict)
+    completed_ranges = cache.setdefault("completed_ranges", {})
+    if not isinstance(completed_ranges, dict):
+        completed_ranges = {}
+        cache["completed_ranges"] = completed_ranges
+
+    def persist_completed_ranges() -> None:
+        _write_cache(cache_path, cache)
+
     missing = [
         index
         for index in range(len(regions))
@@ -231,44 +243,27 @@ def _transcribe_analyzed(
                 audio_pool=audio_pool,
             )
         else:
-            source_offset = region.source_offset if region.source_path else 0.0
-            region_audio = _region_audio_buffer(region, video, audio_pool)
             record = _transcribe_range(
                 model,
-                Path(region.source_path) if region.source_path else video,
+                video,
                 None,
                 config,
-                core_start=region.start - source_offset,
-                core_end=region.end - source_offset,
-                media_duration=region_audio.duration,
+                core_start=region.start,
+                core_end=region.end,
+                media_duration=duration,
                 final_chunk=True,
                 label=f"{index:05d}",
-                audio_buffer=region_audio,
+                audio_buffer=audio_pool.main(),
+                validate_timeline=True,
+                completed_ranges=completed_ranges,
+                completed_range_callback=persist_completed_ranges,
             )
-            if source_offset:
-                for cue in record["cues"]:
-                    cue["start"] = round(float(cue["start"]) + source_offset, 3)
-                    cue["end"] = round(float(cue["end"]) + source_offset, 3)
-                record["core_start"] = region.start
-                record["core_end"] = region.end
             for cue in record["cues"]:
-                cue["speaker"] = region.speaker
+                cue["speaker"] = _speaker_for_aligned_cue(
+                    float(cue["start"]), float(cue["end"]), analysis.diarization
+                )
                 cue["kind"] = "speech"
-            if region.overlap and region.source_path and record["cues"]:
-                decoded = _decode_cached_cues(record["cues"], index)
-                utterance = merge_cues_at_boundaries(decoded, set())[0]
-                record["cues"] = [
-                    asdict(
-                        Cue(
-                            utterance.start,
-                            utterance.end,
-                            utterance.text,
-                            region.speaker,
-                            "speech",
-                        )
-                    )
-                ]
-                record["overlap_utterance"] = True
+            record["window_kind"] = "mixed_speech"
         cached[str(index)] = record
         _write_cache(cache_path, cache)
         logging.info(
@@ -296,16 +291,135 @@ def _transcribe_analyzed(
     if analysis.diarization:
         from .conditioned_asr import repair_long_overlaps
 
-        cues = repair_long_overlaps(
+        conditioned = repair_long_overlaps(
             cues,
             analysis.diarization,
             audio_pool.main(),
             destination.parent,
             analysis_config,
+            qwen_windows=[
+                record
+                for index in range(len(regions))
+                if regions[index].kind == "speech"
+                and isinstance((record := cached.get(str(index))), dict)
+            ],
         )
+        cues = conditioned.cues
+        evidence = conditioned.evidence
+    else:
+        evidence = []
     write_srt(cues, destination)
-    _write_cue_sidecar(cues, destination.with_suffix(".cues.json"))
+    _write_cue_sidecar(
+        cues, destination.with_suffix(".cues.json"), evidence=evidence
+    )
     return destination
+
+
+def _speech_asr_windows(
+    analysis: AudioAnalysis, config: ASRConfig
+) -> list[AudioRegion]:
+    source = analysis.diarization or analysis.speech
+    spans = _union_spans(
+        [(region.start, region.end) for region in source if region.kind == "speech"]
+    )
+    if not spans:
+        return []
+    episodes: list[list[tuple[float, float]]] = []
+    for span in spans:
+        if episodes and span[0] - episodes[-1][-1][1] <= config.speech_window_max_gap_seconds:
+            episodes[-1].append(span)
+        else:
+            episodes.append([span])
+
+    target = max(
+        0.1,
+        config.speech_window_target_seconds - 2 * config.chunk_context_seconds,
+    )
+    maximum = max(
+        target,
+        config.speech_window_max_seconds - 2 * config.chunk_context_seconds,
+    )
+    windows: list[AudioRegion] = []
+    for episode in episodes:
+        cursor = episode[0][0]
+        episode_end = episode[-1][1]
+        while cursor < episode_end - 1e-6:
+            hard_end = min(episode_end, cursor + maximum)
+            boundaries = sorted(
+                {
+                    min(end, hard_end)
+                    for start, end in episode
+                    if end > cursor and start < hard_end
+                }
+                | {hard_end}
+            )
+            valid = [
+                end
+                for end in boundaries
+                if _speech_window_density_ok(cursor, end, episode, config)
+            ]
+            if not valid:
+                end = hard_end
+            elif episode_end <= hard_end:
+                end = valid[-1]
+            else:
+                after_target = [end for end in valid if end - cursor >= target]
+                end = (after_target or valid)[0 if after_target else -1]
+            windows.append(AudioRegion(round(cursor, 3), round(end, 3), "speech"))
+            following = next((start for start, _ in episode if start >= end - 1e-6), None)
+            cursor = max(end, following) if following is not None else end
+    return windows
+
+
+def _union_spans(spans: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted(spans):
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _speech_window_density_ok(
+    start: float,
+    end: float,
+    spans: list[tuple[float, float]],
+    config: ASRConfig,
+) -> bool:
+    duration = end - start
+    if duration <= 0:
+        return False
+    speech = sum(
+        max(0.0, min(end, right) - max(start, left)) for left, right in spans
+    )
+    silence = duration - speech
+    return (
+        silence <= config.speech_window_max_silence_seconds + 1e-6
+        and speech / duration >= config.speech_window_min_coverage - 1e-9
+    )
+
+
+def _speaker_for_aligned_cue(
+    start: float, end: float, diarization: list[AudioRegion]
+) -> str | None:
+    matches = [
+        region
+        for region in diarization
+        if region.speaker and region.end > start and region.start < end
+    ]
+    if len({region.speaker for region in matches}) > 1:
+        return None
+    scores: dict[str, float] = {}
+    for region in matches:
+        overlap = max(0.0, min(end, region.end) - max(start, region.start))
+        scores[region.speaker or ""] = scores.get(region.speaker or "", 0.0) + overlap
+    if not scores:
+        return None
+    speaker, overlap = max(scores.items(), key=lambda item: item[1])
+    return speaker if overlap >= (end - start) * 0.5 else None
 
 
 def _analysis_regions(analysis: AudioAnalysis) -> list[AudioRegion]:
@@ -624,7 +738,24 @@ def _transcribe_range(
     final_chunk: bool,
     label: str,
     audio_buffer: AudioBuffer | None = None,
+    validate_timeline: bool = False,
+    completed_ranges: dict[str, object] | None = None,
+    completed_range_callback: Callable[[], None] | None = None,
 ) -> dict[str, object]:
+    range_key = _completed_range_key(core_start, core_end, final_chunk)
+    if completed_ranges is not None:
+        cached_range = completed_ranges.get(range_key)
+        if (
+            isinstance(cached_range, dict)
+            and _valid_cached_record(cached_range)
+            and (
+                not validate_timeline
+                or _record_timeline_is_healthy(
+                    cached_range, AudioRegion(core_start, core_end, "speech")
+                )
+            )
+        ):
+            return cached_range
     extract_start = max(0.0, core_start - config.chunk_context_seconds)
     extract_end = min(media_duration, core_end + config.chunk_context_seconds)
     chunk_path = chunk_dir / f"chunk-{label}.wav" if chunk_dir is not None else None
@@ -699,6 +830,9 @@ def _transcribe_range(
                 final_chunk=False,
                 label=f"{label}-0",
                 audio_buffer=audio_buffer,
+                validate_timeline=validate_timeline,
+                completed_ranges=completed_ranges,
+                completed_range_callback=completed_range_callback,
             )
             right = _transcribe_range(
                 model,
@@ -711,8 +845,11 @@ def _transcribe_range(
                 final_chunk=final_chunk,
                 label=f"{label}-1",
                 audio_buffer=audio_buffer,
+                validate_timeline=validate_timeline,
+                completed_ranges=completed_ranges,
+                completed_range_callback=completed_range_callback,
             )
-            return {
+            recovered = {
                 "core_start": core_start,
                 "core_end": core_end,
                 "language": right["language"] or left["language"],
@@ -720,6 +857,13 @@ def _transcribe_range(
                 "cues": [*left["cues"], *right["cues"]],
                 "recovered_from_repetition": True,
             }
+            _store_completed_range(
+                completed_ranges,
+                range_key,
+                recovered,
+                completed_range_callback,
+            )
+            return recovered
 
         cues = _result_to_cues(
             result,
@@ -728,7 +872,7 @@ def _transcribe_range(
             keep_end=core_end,
             final_chunk=final_chunk,
         )
-        return {
+        record: dict[str, object] = {
             "core_start": core_start,
             "core_end": core_end,
             "language": str(getattr(result, "language", "")),
@@ -736,9 +880,129 @@ def _transcribe_range(
             "cues": [asdict(cue) for cue in cues],
             "generation_token_limit": generation_token_limit,
         }
+        if validate_timeline and not _record_timeline_is_healthy(
+            record, AudioRegion(core_start, core_end, "speech")
+        ):
+            duration = core_end - core_start
+            child_duration = duration / 2
+            if child_duration < _MIN_RETRY_CHUNK_SECONDS:
+                raise RuntimeError(
+                    "Qwen3 forced-alignment timeline remains invalid at minimum "
+                    f"speech window {core_start:.3f}-{core_end:.3f}s"
+                )
+            midpoint = _timeline_retry_split(record, core_start, core_end)
+            logging.warning(
+                "Qwen3 timeline validation failed in %.3f-%.3fs; splitting at %.3fs",
+                core_start,
+                core_end,
+                midpoint,
+            )
+            left = _transcribe_range(
+                model,
+                video,
+                chunk_dir,
+                config,
+                core_start=core_start,
+                core_end=midpoint,
+                media_duration=media_duration,
+                final_chunk=False,
+                label=f"{label}-timeline-0",
+                audio_buffer=audio_buffer,
+                validate_timeline=True,
+                completed_ranges=completed_ranges,
+                completed_range_callback=completed_range_callback,
+            )
+            right = _transcribe_range(
+                model,
+                video,
+                chunk_dir,
+                config,
+                core_start=midpoint,
+                core_end=core_end,
+                media_duration=media_duration,
+                final_chunk=final_chunk,
+                label=f"{label}-timeline-1",
+                audio_buffer=audio_buffer,
+                validate_timeline=True,
+                completed_ranges=completed_ranges,
+                completed_range_callback=completed_range_callback,
+            )
+            recovered = {
+                "core_start": core_start,
+                "core_end": core_end,
+                "language": right["language"] or left["language"],
+                "text": f'{left["text"]}\n{right["text"]}'.strip(),
+                "cues": [*left["cues"], *right["cues"]],
+                "recovered_from_timeline_failure": True,
+            }
+            _store_completed_range(
+                completed_ranges,
+                range_key,
+                recovered,
+                completed_range_callback,
+            )
+            return recovered
+        _store_completed_range(
+            completed_ranges,
+            range_key,
+            record,
+            completed_range_callback,
+        )
+        return record
     finally:
         if chunk_path is not None:
             chunk_path.unlink(missing_ok=True)
+
+
+def _completed_range_key(start: float, end: float, final_chunk: bool) -> str:
+    return f"{start:.3f}:{end:.3f}:{int(final_chunk)}"
+
+
+def _store_completed_range(
+    completed_ranges: dict[str, object] | None,
+    key: str,
+    record: dict[str, object],
+    callback: Callable[[], None] | None,
+) -> None:
+    if completed_ranges is None:
+        return
+    completed_ranges[key] = record
+    if callback is not None:
+        callback()
+
+
+def _timeline_retry_split(
+    record: dict[str, object], core_start: float, core_end: float
+) -> float:
+    midpoint = (core_start + core_end) / 2
+    values = record.get("cues")
+    if not isinstance(values, list):
+        return midpoint
+    candidates: list[tuple[float, float]] = []
+    ordered = sorted(
+        (value for value in values if isinstance(value, dict)),
+        key=lambda value: float(value.get("start", core_start)),
+    )
+    for left, right in zip(ordered, ordered[1:]):
+        try:
+            gap_start = float(left["end"])
+            gap_end = float(right["start"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        boundary = (gap_start + gap_end) / 2
+        if (
+            gap_end > gap_start
+            and boundary - core_start >= _MIN_RETRY_CHUNK_SECONDS
+            and core_end - boundary >= _MIN_RETRY_CHUNK_SECONDS
+        ):
+            candidates.append((gap_end - gap_start, boundary))
+    if not candidates:
+        return midpoint
+    _, boundary = max(
+        candidates,
+        key=lambda item: (item[0], -abs(item[1] - midpoint)),
+    )
+    return boundary
 
 
 def _asr_generation_token_limit(config: ASRConfig, audio_seconds: float) -> int:
@@ -982,11 +1246,20 @@ def _decode_cached_cues(values: list[object], chunk_index: int) -> list[Cue]:
     return cues
 
 
-def _write_cue_sidecar(cues: list[Cue], path: Path) -> None:
+def _write_cue_sidecar(
+    cues: list[Cue],
+    path: Path,
+    *,
+    evidence: list[dict[str, object]] | None = None,
+) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
         json.dumps(
-            {"version": 1, "cues": [asdict(cue) for cue in cues]},
+            {
+                "version": 2,
+                "cues": [asdict(cue) for cue in cues],
+                "evidence": evidence or [],
+            },
             ensure_ascii=False,
             indent=2,
         )
@@ -1001,6 +1274,18 @@ def read_cue_sidecar(path: Path) -> list[Cue]:
     if not isinstance(value, dict) or not isinstance(value.get("cues"), list):
         raise RuntimeError(f"invalid cue sidecar: {path}")
     return _decode_cached_cues(value["cues"], 0)
+
+
+def read_cue_evidence(path: Path) -> list[dict[str, object]]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    evidence = value.get("evidence") if isinstance(value, dict) else None
+    if evidence is None:
+        return []
+    if not isinstance(evidence, list) or not all(
+        isinstance(item, dict) for item in evidence
+    ):
+        raise RuntimeError(f"invalid cue evidence sidecar: {path}")
+    return evidence
 
 
 def _valid_cached_record(value: object) -> bool:

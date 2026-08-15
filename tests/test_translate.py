@@ -47,8 +47,8 @@ class TranslationTests(unittest.TestCase):
                     "message": {
                         "content": (
                             '{"cues":['
-                            '{"start_id":0,"end_id":1,"text":"梦想就是力量"},'
-                            '{"start_id":2,"end_id":2,"text":"Power"}'
+                            '{"start_id":0,"end_id":1,"source_text":"夢はパワー","text":"梦想就是力量"},'
+                            '{"start_id":2,"end_id":2,"source_text":"次","text":"Power"}'
                             "]}"
                         )
                     },
@@ -63,7 +63,7 @@ class TranslationTests(unittest.TestCase):
             )
         self.assertEqual(
             result.source_cues,
-            [Cue(0, 1.0, "夢パワー。"), Cue(1.0, 1.8, "次")],
+            [Cue(0, 1.0, "夢はパワー"), Cue(1.0, 1.8, "次")],
         )
         self.assertEqual(
             result.translated_cues,
@@ -103,6 +103,36 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(
             request.call_args.args[0]["response_format"], {"type": "json_object"}
         )
+
+    def test_joint_prompt_receives_only_time_overlapping_asr_evidence(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        cues = [Cue(10, 11, "ごめん", "A"), Cue(11, 12, "続けて", "A")]
+        response = {
+            "choices": [{"finish_reason": "stop", "message": {"content": (
+                '{"cues":['
+                '{"start_id":0,"end_id":0,"source_text":"ごめん","text":"抱歉"},'
+                '{"start_id":1,"end_id":1,"source_text":"続けて","text":"继续吧"}'
+                "]}"
+            )}}]
+        }
+        context = {
+            "asr_evidence": [
+                {"start": 9, "end": 11.5, "qwen_mixed": [{"text": "ごめん"}]},
+                {"start": 30, "end": 31, "qwen_mixed": [{"text": "范围外"}]},
+            ]
+        }
+        with patch.object(translator, "_request", return_value=response) as request:
+            translator.plan_and_translate(
+                cues,
+                SegmentationConfig(),
+                translation_context=context,
+                max_line_units=20,
+            )
+
+        prompt = request.call_args.args[0]["messages"][1]["content"]
+        self.assertIn("ごめん", prompt)
+        self.assertNotIn("范围外", prompt)
+        self.assertIn("source_text must be corrected natural Japanese", prompt)
 
     def test_joint_prompt_source_view_removes_unicode_punctuation(self):
         self.assertEqual(
@@ -725,10 +755,60 @@ class TranslationTests(unittest.TestCase):
         self.assertIn('"repair_id":2', repair_prompt)
         self.assertNotIn('"repair_id":1', repair_target)
         self.assertIn("never change, merge, split", repair_prompt)
+        self.assertIn('"after_source":"乙"', repair_prompt)
+        self.assertIn('"before_source":"乙"', repair_prompt)
+        self.assertIn('"forbidden_fragments":["まだ"]', repair_prompt)
+        self.assertIn("must contain no Japanese hiragana or katakana", repair_prompt)
+        self.assertIn("ASR misrecognition of a known name or term", repair_prompt)
+        self.assertIn("romanize its pronunciation using Latin letters", repair_prompt)
         self.assertLess(
             repair_prompt.index("REFERENCE:"),
             repair_prompt.index("DISPLAY_CONSTRAINT:"),
         )
+
+    def test_stalled_translation_repair_batch_splits_after_one_retry(self):
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(max_retries=5), "secret"
+        )
+        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙")]
+        invalid_batch = {
+            "choices": [{"finish_reason": "stop", "message": {"content": (
+                '{"repairs":['
+                '{"repair_id":0,"text":"まだ"},'
+                '{"repair_id":1,"text":"テスト"}'
+                "]}"
+            )}}]
+        }
+        responses = [
+            {"choices": [{"finish_reason": "stop", "message": {"content": (
+                '{"cues":['
+                '{"start_id":0,"end_id":0,"text":"まだ"},'
+                '{"start_id":1,"end_id":1,"text":"テスト"}'
+                "]}"
+            )}}]},
+            invalid_batch,
+            invalid_batch,
+            {"choices": [{"finish_reason": "stop", "message": {
+                "content": '{"repairs":[{"repair_id":0,"text":"还没有"}]}'
+            }}]},
+            {"choices": [{"finish_reason": "stop", "message": {
+                "content": '{"repairs":[{"repair_id":1,"text":"测试"}]}'
+            }}]},
+        ]
+        with patch.object(translator, "_request", side_effect=responses) as request:
+            result = translator.plan_and_translate(
+                cues,
+                SegmentationConfig(),
+                max_line_units=20,
+            )
+        self.assertEqual([cue.text for cue in result.translated_cues], ["还没有", "测试"])
+        self.assertEqual(request.call_count, 5)
+        first_single = request.call_args_list[3].args[0]["messages"][1]["content"]
+        second_single = request.call_args_list[4].args[0]["messages"][1]["content"]
+        self.assertIn('"repair_id":0', first_single)
+        self.assertNotIn('"repair_id":1', first_single.split("TARGET: ", 1)[1])
+        self.assertIn('"repair_id":1', second_single)
+        self.assertNotIn('"repair_id":0', second_single.split("TARGET: ", 1)[1])
 
     def test_partial_repairs_are_cached_and_only_missing_ids_are_retried(self):
         translator = OpenAICompatibleTranslator(

@@ -96,6 +96,49 @@ class ConditionedASRTests(unittest.TestCase):
         self.assertEqual(first, second)
         run.assert_called_once()
 
+    def test_qwen_overlap_units_are_preserved_as_read_only_evidence(self):
+        diarization = [
+            AudioRegion(0, 4, "speech", "A", anonymous_speaker="S0"),
+            AudioRegion(2, 5, "speech", "B", anonymous_speaker="S1"),
+        ]
+        qwen_windows = [
+            {
+                "core_start": 0,
+                "core_end": 60,
+                "text": "整窗文本不应直接发送",
+                "cues": [
+                    {"start": 0.5, "end": 1.0, "text": "范围外"},
+                    {"start": 1.5, "end": 2.0, "text": "お願いします"},
+                    {"start": 2.0, "end": 2.4, "text": "よろしく"},
+                    {"start": 8.0, "end": 9.0, "text": "范围外"},
+                ],
+            }
+        ]
+        audio = SimpleNamespace(duration=10)
+        config = AudioAnalysisConfig(overlap_context_seconds=0.5)
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch(
+                "subtitle_pipeline.conditioned_asr._run_dicow",
+                return_value=[Cue(1.5, 3.0, "googlegoogle", "A")],
+            ),
+        ):
+            result = repair_long_overlaps(
+                [],
+                diarization,
+                audio,
+                Path(temp),
+                config,
+                qwen_windows=qwen_windows,
+            )
+
+        self.assertEqual([cue.text for cue in result.cues], ["googlegoogle"])
+        [evidence] = result.evidence
+        [qwen] = evidence["qwen_mixed"]
+        self.assertEqual(qwen["text"], "お願いしますよろしく")
+        self.assertEqual(len(qwen["units"]), 2)
+        self.assertNotIn("整窗文本不应直接发送", str(evidence))
+
 
 if __name__ == "__main__":
     unittest.main()

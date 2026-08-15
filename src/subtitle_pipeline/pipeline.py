@@ -9,11 +9,11 @@ from importlib import resources
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .asr import read_cue_sidecar, transcribe_with_qwen
+from .asr import read_cue_evidence, read_cue_sidecar, transcribe_with_qwen
 from .config import AppConfig, llm_api_key
 from .media import download_youtube, render_subtitles, subtitle_layout
-from .speakers import load_character_styles
 from .song_identification import SongIdentificationResult, identify_and_align_songs
+from .speakers import load_character_styles
 from .subtitles import (
     Cue,
     clean_non_speech_markers,
@@ -23,7 +23,6 @@ from .subtitles import (
 )
 from .translate import OpenAICompatibleTranslator
 from .upload import upload_to_bilibili
-
 
 _BUILTIN_GLOSSARY_FILES = ("glossaries/bang-dream.json",)
 
@@ -61,7 +60,12 @@ def run_pipeline(
     )
 
     sidecar = source_subtitle.with_suffix(".cues.json")
-    cues = read_cue_sidecar(sidecar) if sidecar.is_file() else read_subtitles(source_subtitle)
+    cues = (
+        read_cue_sidecar(sidecar)
+        if sidecar.is_file()
+        else read_subtitles(source_subtitle)
+    )
+    asr_evidence = read_cue_evidence(sidecar) if sidecar.is_file() else []
     original_cue_count = len(cues)
     cues = clean_non_speech_markers(cues)
     logging.info(
@@ -75,6 +79,11 @@ def run_pipeline(
     translation_context = _translation_context(
         downloaded.metadata, config.llm.glossary_files
     )
+    if asr_evidence:
+        translation_context = {
+            **translation_context,
+            "asr_evidence": asr_evidence,
+        }
     if translation_context.get("franchises"):
         names = [
             item["name"]
