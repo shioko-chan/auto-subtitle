@@ -912,9 +912,10 @@ def _cache_signature(
 
 
 def _load_cache(path: Path, signature: dict[str, object]) -> dict[str, object]:
+    normalized_signature = json.loads(json.dumps(signature, ensure_ascii=False))
     empty: dict[str, object] = {
         "version": _CACHE_VERSION,
-        "signature": signature,
+        "signature": normalized_signature,
         "chunks": {},
     }
     if not path.is_file():
@@ -927,7 +928,7 @@ def _load_cache(path: Path, signature: dict[str, object]) -> dict[str, object]:
     if (
         not isinstance(value, dict)
         or value.get("version") != _CACHE_VERSION
-        or value.get("signature") != signature
+        or value.get("signature") != normalized_signature
         or not isinstance(value.get("chunks"), dict)
     ):
         logging.info("Qwen3-ASR cache signature changed; starting a fresh cache")

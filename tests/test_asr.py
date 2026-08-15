@@ -9,6 +9,7 @@ import numpy as np
 from subtitle_pipeline.asr import (
     _analysis_region_signature,
     _analysis_regions,
+    _load_cache,
     _record_timeline_is_healthy,
     _remove_text_overlap,
     _repetition_hallucination,
@@ -24,6 +25,19 @@ from subtitle_pipeline.config import ASRConfig, AudioAnalysisConfig
 
 
 class QwenASRTests(unittest.TestCase):
+    def test_cache_signature_normalizes_json_container_types(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "cache.json"
+            path.write_text(
+                '{"version":2,"signature":{"speakers":["A","B"]},'
+                '"chunks":{"0":{"text":"x","cues":[]}}}',
+                encoding="utf-8",
+            )
+
+            result = _load_cache(path, {"speakers": ("A", "B")})
+
+        self.assertIn("0", result["chunks"])
+
     def test_shared_audio_names_do_not_invalidate_asr_cache_signature(self):
         left = _analysis_region_signature(
             AudioRegion(1, 2, "speech", "A", source_path="shm://first")
