@@ -14,6 +14,7 @@ from subtitle_pipeline.translate import (
     LLMHTTPError,
     OpenAICompatibleTranslator,
     TranslationError,
+    _WindowShrinkError,
     _collapsed_start_runs,
     _is_nontransient_http_error,
     _joint_translation_signature,
@@ -291,6 +292,31 @@ class TranslationTests(unittest.TestCase):
         )
         self.assertEqual(planned.call_count, 3)
         repaired.assert_called_once()
+
+    def test_repeated_length_output_requests_immediate_window_shrink(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(max_retries=5), "secret")
+        response = {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"content": '{"text":"' + "我，" * 30},
+                }
+            ]
+        }
+
+        with patch.object(translator, "_request", return_value=response) as request:
+            with self.assertRaises(_WindowShrinkError):
+                translator._plan_and_translate_window(
+                    [Cue(0, 1, "私"), Cue(1, 2, "です")],
+                    0,
+                    2,
+                    {},
+                    [],
+                    20,
+                    40,
+                )
+
+        request.assert_called_once()
 
     def test_independent_windows_execute_concurrently(self):
         translator = OpenAICompatibleTranslator(

@@ -45,6 +45,10 @@ class LLMHTTPError(TranslationError):
         super().__init__(f"LLM API returned HTTP {status}: {detail}")
 
 
+class _WindowShrinkError(TranslationError):
+    pass
+
+
 _JOINT_CACHE_VERSION = 3
 _JOINT_PROMPT_VERSION = 22
 
@@ -58,6 +62,7 @@ _HONORIFIC_TRANSLATION_RULES = (
     "REFERENCE mapping for a complete name-plus-honorific form overrides these defaults. "
 )
 _JAPANESE_KANA_RE = re.compile(r"[\u3040-\u30ff]")
+_REPEATED_OUTPUT_RE = re.compile(r"(.{1,32}?)\1{20,}", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -425,6 +430,10 @@ class OpenAICompatibleTranslator:
                 content = response["choices"][0]["message"]["content"]
                 finish_reason = _finish_reason(response)
                 if finish_reason not in (None, "stop"):
+                    if finish_reason == "length" and _has_repeated_output(content):
+                        raise _WindowShrinkError(
+                            "finish_reason=length with repeated output loop"
+                        )
                     raise TranslationError(f"finish_reason={finish_reason}")
                 parsed = _parse_joint_records(content)
                 try:
@@ -468,6 +477,8 @@ class OpenAICompatibleTranslator:
             ) as exc:
                 last_error = exc
                 _log_invalid_response("joint cue translation", exc, content)
+                if isinstance(exc, _WindowShrinkError):
+                    raise
                 if _is_nontransient_http_error(exc):
                     raise
                 if attempt < self.config.max_retries:
@@ -984,6 +995,10 @@ def _finish_reason(response: object) -> str | None:
         return None
     value = choices[0].get("finish_reason")
     return value if isinstance(value, str) else None
+
+
+def _has_repeated_output(content: object) -> bool:
+    return isinstance(content, str) and _REPEATED_OUTPUT_RE.search(content) is not None
 
 
 def _log_invalid_response(kind: str, error: Exception, content: object) -> None:
