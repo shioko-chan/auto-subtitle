@@ -186,6 +186,42 @@ class ConfigTests(unittest.TestCase):
             with patch.dict(os.environ, {"TEST_LLM_KEY": "secret"}, clear=True):
                 self.assertEqual(llm_api_key(config.llm), "secret")
 
+    def test_loads_openai_responses_configuration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(
+                "[llm]\n"
+                'base_url = "https://api.openai.com/v1"\n'
+                'api_style = "responses"\n'
+                'api_key_pass_entry = ""\n'
+                'api_key_env = "OPENAI_API_KEY"\n'
+                'model = "gpt-5.6"\n'
+                'reasoning_effort = "low"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+        self.assertEqual(config.llm.api_style, "responses")
+        self.assertEqual(config.llm.reasoning_effort, "low")
+
+    def test_rejects_provider_specific_llm_options_on_wrong_api_style(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(
+                '[llm]\napi_style = "responses"\nthinking = "disabled"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ConfigError, "reasoning_effort"):
+                load_config(path)
+
+            path.write_text(
+                '[llm]\napi_style = "chat_completions"\nreasoning_effort = "low"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ConfigError, "only supported"):
+                load_config(path)
+
     def test_api_key_comes_from_first_line_of_pass_entry(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.toml"

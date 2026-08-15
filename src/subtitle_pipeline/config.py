@@ -126,6 +126,7 @@ class SegmentationConfig:
 @dataclass(frozen=True)
 class LLMConfig:
     base_url: str = "https://api.deepseek.com"
+    api_style: str = "chat_completions"
     api_key_pass_entry: str | None = "api/deepseek"
     api_key_env: str = "DEEPSEEK_API_KEY"
     model: str = "deepseek-chat"
@@ -137,6 +138,7 @@ class LLMConfig:
     context_cues: int = 3
     json_mode: bool = True
     thinking: str | None = None
+    reasoning_effort: str | None = None
     translate_metadata: bool = True
     metadata_description_max_chars: int = 6000
     metadata_tag_count: int = 5
@@ -243,8 +245,35 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("llm.max_tokens must be at least 1")
     if config.llm.context_cues < 0:
         raise ConfigError("llm.context_cues cannot be negative")
+    if config.llm.api_style not in {"chat_completions", "responses"}:
+        raise ConfigError(
+            "llm.api_style must be 'chat_completions' or 'responses'"
+        )
     if config.llm.thinking not in (None, "enabled", "disabled"):
         raise ConfigError("llm.thinking must be 'enabled' or 'disabled'")
+    if config.llm.reasoning_effort not in (
+        None,
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    ):
+        raise ConfigError(
+            "llm.reasoning_effort must be minimal, low, medium, high, or xhigh"
+        )
+    if config.llm.api_style == "responses" and config.llm.thinking is not None:
+        raise ConfigError(
+            "llm.thinking is only supported by chat_completions; use "
+            "llm.reasoning_effort with responses"
+        )
+    if (
+        config.llm.api_style == "chat_completions"
+        and config.llm.reasoning_effort is not None
+    ):
+        raise ConfigError(
+            "llm.reasoning_effort is only supported when api_style='responses'"
+        )
     if config.llm.metadata_description_max_chars < 0:
         raise ConfigError("llm.metadata_description_max_chars cannot be negative")
     if not 1 <= config.llm.metadata_tag_count <= 10:

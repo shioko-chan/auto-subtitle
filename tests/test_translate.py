@@ -19,9 +19,11 @@ from subtitle_pipeline.translate import (
     _joint_translation_signature,
     _load_joint_translation_cache,
     _log_response_usage,
+    _normalize_api_response,
     _parse_joint_records,
     _parse_json_object,
     _parse_retry_after,
+    _prepare_api_request,
     _prompt_translation_context,
     _transient_retry_delay,
     _translation_window_ranges,
@@ -154,6 +156,32 @@ class TranslationTests(unittest.TestCase):
             ["franchises", "characters", "terms", "video", "identified_songs"],
         )
 
+    def test_joint_cache_signature_changes_with_api_provider(self):
+        cues = [Cue(0, 1, "字幕")]
+        segmentation = SegmentationConfig()
+        deepseek = _joint_translation_signature(
+            cues,
+            segmentation,
+            LLMConfig(),
+            {},
+            20,
+        )
+        openai = _joint_translation_signature(
+            cues,
+            segmentation,
+            LLMConfig(
+                base_url="https://api.openai.com/v1",
+                api_style="responses",
+                model="gpt-5.6",
+                thinking=None,
+                reasoning_effort="low",
+            ),
+            {},
+            20,
+        )
+
+        self.assertNotEqual(deepseek, openai)
+
     def test_joint_parser_accepts_equivalent_record_containers(self):
         records = [
             {"start_id": 0, "end_id": 1, "text": "甲"},
@@ -191,6 +219,122 @@ class TranslationTests(unittest.TestCase):
         self.assertIn("cache_hit=750", message)
         self.assertIn("cache_miss=250", message)
         self.assertIn("cache_hit_rate=75.0%", message)
+
+    def test_openai_responses_request_converts_messages_json_and_tools(self):
+        config = LLMConfig(
+            base_url="https://api.openai.com/v1",
+            api_style="responses",
+            model="gpt-5.6",
+            reasoning_effort="low",
+            thinking=None,
+        )
+        url, body = _prepare_api_request(
+            config,
+            {
+                "model": "gpt-5.6",
+                "max_tokens": 1234,
+                "temperature": 0.1,
+                "messages": [
+                    {"role": "system", "content": "固定规则"},
+                    {"role": "user", "content": "判断歌曲"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "search_web",
+                                    "arguments": '{"query":"歌名"}',
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_1",
+                        "content": "搜索结果",
+                    },
+                ],
+                "response_format": {"type": "json_object"},
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "search_web",
+                            "description": "search",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                "tool_choice": "auto",
+            },
+        )
+
+        self.assertEqual(url, "https://api.openai.com/v1/responses")
+        self.assertEqual(body["instructions"], "固定规则")
+        self.assertEqual(body["max_output_tokens"], 1234)
+        self.assertEqual(body["text"], {"format": {"type": "json_object"}})
+        self.assertEqual(body["reasoning"], {"effort": "low"})
+        self.assertFalse(body["store"])
+        self.assertNotIn("temperature", body)
+        self.assertEqual(body["tools"][0]["name"], "search_web")
+        self.assertEqual(body["input"][1]["type"], "function_call")
+        self.assertEqual(body["input"][2]["type"], "function_call_output")
+
+    def test_openai_responses_output_normalizes_text_tools_and_usage(self):
+        config = LLMConfig(api_style="responses", thinking=None)
+        normalized = _normalize_api_response(
+            config,
+            {
+                "id": "resp_123",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [
+                            {"type": "output_text", "text": '{"title":"标题"}'}
+                        ],
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "search_web",
+                        "arguments": '{"query":"歌名"}',
+                    },
+                ],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "total_tokens": 120,
+                    "input_tokens_details": {"cached_tokens": 80},
+                },
+            },
+        )
+
+        choice = normalized["choices"][0]
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertEqual(choice["message"]["content"], '{"title":"标题"}')
+        self.assertEqual(
+            choice["message"]["tool_calls"][0]["function"]["name"],
+            "search_web",
+        )
+        self.assertEqual(normalized["usage"]["prompt_tokens"], 100)
+        self.assertEqual(
+            normalized["usage"]["prompt_tokens_details"]["cached_tokens"], 80
+        )
+
+    def test_openai_incomplete_response_maps_token_limit_to_length(self):
+        normalized = _normalize_api_response(
+            LLMConfig(api_style="responses", thinking=None),
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [],
+            },
+        )
+        self.assertEqual(normalized["choices"][0]["finish_reason"], "length")
 
     def test_parallel_windows_then_repair_only_two_edge_cues(self):
         translator = OpenAICompatibleTranslator(

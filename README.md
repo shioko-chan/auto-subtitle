@@ -85,6 +85,7 @@ pass show api/deepseek
 ```toml
 [llm]
 base_url = "https://api.deepseek.com"
+api_style = "chat_completions"
 api_key_pass_entry = "api/deepseek"
 model = "deepseek-v4-flash"
 thinking = "disabled"
@@ -94,6 +95,25 @@ max_concurrency = 16
 ```
 
 如需改用环境变量，将 `api_key_pass_entry = ""`，再通过 `api_key_env` 指定变量名。
+
+也可以使用 OpenAI 原生 Responses API。需要 OpenAI Platform API Key；ChatGPT 网页版
+订阅本身不等同于 API 额度：
+
+```toml
+[llm]
+base_url = "https://api.openai.com/v1"
+api_style = "responses"
+api_key_pass_entry = "api/openai"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-5.6"
+reasoning_effort = "low"
+max_tokens = 16384
+max_retries = 5
+max_concurrency = 16
+```
+
+`responses` 模式会自动转换消息、JSON mode、函数工具、工具返回值、token 上限和 usage；
+请求设置 `store = false`。不要同时设置 DeepSeek 专用的 `thinking`。
 
 LLM HTTPS 请求会在系统 CA 基础上补充 `certifi` CA bundle，兼容 uv 独立 Python、
 NixOS、macOS 和 Windows，同时保留 `SSL_CERT_FILE` 等自定义 CA 配置。

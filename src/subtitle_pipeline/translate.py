@@ -857,10 +857,10 @@ class OpenAICompatibleTranslator:
         )
 
     def _request(self, body: dict[str, object]) -> dict[str, object]:
-        url = self.config.base_url.rstrip("/") + "/chat/completions"
+        url, request_body = _prepare_api_request(self.config, body)
         request = urllib.request.Request(
             url,
-            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -874,14 +874,181 @@ class OpenAICompatibleTranslator:
                 context=self.ssl_context,
             ) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-                _log_response_usage(payload)
-                return payload
+                normalized = _normalize_api_response(self.config, payload)
+                _log_response_usage(normalized)
+                return normalized
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
             retry_after = None
             if exc.headers is not None:
                 retry_after = _parse_retry_after(exc.headers.get("Retry-After"))
             raise LLMHTTPError(exc.code, detail, retry_after) from exc
+
+
+def _prepare_api_request(
+    config: LLMConfig, body: dict[str, object]
+) -> tuple[str, dict[str, object]]:
+    base_url = config.base_url.rstrip("/")
+    if config.api_style == "chat_completions":
+        return f"{base_url}/chat/completions", body
+    return f"{base_url}/responses", _responses_request_body(config, body)
+
+
+def _responses_request_body(
+    config: LLMConfig, body: dict[str, object]
+) -> dict[str, object]:
+    converted: dict[str, object] = {
+        "model": body.get("model", config.model),
+        "max_output_tokens": body.get("max_tokens", config.max_tokens),
+        "store": False,
+    }
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        raise TypeError("LLM request messages must be a list")
+    instructions: list[str] = []
+    inputs: list[dict[str, object]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise TypeError("LLM request message must be an object")
+        role = message.get("role")
+        content = message.get("content")
+        if role in {"system", "developer"}:
+            if isinstance(content, str) and content:
+                instructions.append(content)
+            continue
+        if role == "tool":
+            inputs.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": str(message.get("tool_call_id") or ""),
+                    "output": str(content or ""),
+                }
+            )
+            continue
+        if role == "assistant" and isinstance(message.get("tool_calls"), list):
+            if isinstance(content, str) and content:
+                inputs.append({"role": "assistant", "content": content})
+            for call in message["tool_calls"]:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                if not isinstance(function, dict):
+                    continue
+                inputs.append(
+                    {
+                        "type": "function_call",
+                        "call_id": str(call.get("id") or ""),
+                        "name": str(function.get("name") or ""),
+                        "arguments": str(function.get("arguments") or "{}"),
+                    }
+                )
+            continue
+        if role not in {"user", "assistant"}:
+            raise ValueError(f"unsupported Responses API message role: {role!r}")
+        inputs.append({"role": role, "content": str(content or "")})
+    if instructions:
+        converted["instructions"] = "\n\n".join(instructions)
+    converted["input"] = inputs
+
+    response_format = body.get("response_format")
+    if isinstance(response_format, dict):
+        converted["text"] = {"format": response_format}
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        converted["tools"] = [_responses_tool_definition(tool) for tool in tools]
+    if "tool_choice" in body:
+        converted["tool_choice"] = body["tool_choice"]
+    if config.reasoning_effort is not None:
+        converted["reasoning"] = {"effort": config.reasoning_effort}
+    return converted
+
+
+def _responses_tool_definition(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or value.get("type") != "function":
+        raise ValueError("Responses API supports only function tools in this pipeline")
+    function = value.get("function")
+    if not isinstance(function, dict):
+        raise ValueError("function tool definition is malformed")
+    return {
+        "type": "function",
+        "name": function.get("name"),
+        "description": function.get("description", ""),
+        "parameters": function.get("parameters", {}),
+        "strict": function.get("strict", False),
+    }
+
+
+def _normalize_api_response(
+    config: LLMConfig, payload: object
+) -> dict[str, object]:
+    if config.api_style == "chat_completions":
+        if not isinstance(payload, dict):
+            raise TypeError("LLM response must be an object")
+        return payload
+    if not isinstance(payload, dict):
+        raise TypeError("Responses API response must be an object")
+    output = payload.get("output")
+    if not isinstance(output, list):
+        raise ValueError("Responses API response has no output array")
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, object]] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "function_call":
+            tool_calls.append(
+                {
+                    "id": str(item.get("call_id") or item.get("id") or ""),
+                    "type": "function",
+                    "function": {
+                        "name": str(item.get("name") or ""),
+                        "arguments": str(item.get("arguments") or "{}"),
+                    },
+                }
+            )
+        if item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "output_text":
+                text_parts.append(str(part.get("text") or ""))
+    status = payload.get("status")
+    incomplete = payload.get("incomplete_details")
+    reason = incomplete.get("reason") if isinstance(incomplete, dict) else None
+    if status == "completed":
+        finish_reason = "stop"
+    elif status == "incomplete" and reason == "max_output_tokens":
+        finish_reason = "length"
+    else:
+        finish_reason = str(reason or status or "unknown")
+    message: dict[str, object] = {"content": "".join(text_parts)}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return {
+        "id": payload.get("id"),
+        "choices": [{"finish_reason": finish_reason, "message": message}],
+        "usage": _normalize_responses_usage(payload.get("usage")),
+    }
+
+
+def _normalize_responses_usage(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        return {}
+    prompt = value.get("input_tokens")
+    completion = value.get("output_tokens")
+    details = value.get("input_tokens_details")
+    normalized: dict[str, object] = {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": value.get("total_tokens"),
+    }
+    if isinstance(details, dict) and isinstance(details.get("cached_tokens"), int):
+        normalized["prompt_tokens_details"] = {
+            "cached_tokens": details["cached_tokens"]
+        }
+    return normalized
 
 
 def _transient_retry_delay(exc: Exception, attempt: int) -> float | None:
@@ -2023,9 +2190,13 @@ def _joint_translation_signature(
     payload = {
         "cache_version": _JOINT_CACHE_VERSION,
         "prompt_version": _JOINT_PROMPT_VERSION,
+        "base_url": llm_config.base_url,
+        "api_style": llm_config.api_style,
         "model": llm_config.model,
         "target_language": llm_config.target_language,
+        "json_mode": llm_config.json_mode,
         "thinking": llm_config.thinking,
+        "reasoning_effort": llm_config.reasoning_effort,
         "context_cues": llm_config.context_cues,
         "model_window_cues": segmentation_config.model_window_cues,
         "prompt_maximum_units": round(prompt_maximum_units, 6),
