@@ -6,6 +6,7 @@ import math
 import re
 import subprocess
 from dataclasses import asdict, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -23,6 +24,8 @@ _REPETITION_RE = re.compile(r"(.{12,200}?)\1{3,}", re.DOTALL)
 _MIN_ASR_GENERATION_TOKENS = 128
 _ASR_GENERATION_TOKENS_PER_SECOND = 32
 _ASR_GENERATION_TOKEN_OVERHEAD = 32
+_MIN_SPEAKER_CUE_COVERAGE = 0.35
+_SPEAKER_CUE_BOUNDARY_TOLERANCE_SECONDS = 0.1
 
 
 class _StaleRuntimeAudio(RuntimeError):
@@ -144,6 +147,9 @@ def _transcribe_unanalyzed(
             final_chunk=index == chunk_count - 1,
             label=f"{index:05d}",
             audio_buffer=audio_pool.main(),
+            empty_speech_audit_path=(
+                destination.parent / "asr-empty-speech-audit.jsonl"
+            ),
         )
         cached_chunks[str(index)] = record
         _write_cache(cache_path, cache)
@@ -201,11 +207,15 @@ def _transcribe_analyzed(
     def persist_completed_ranges() -> None:
         _write_cache(cache_path, cache)
 
-    missing = [
-        index
-        for index in range(len(regions))
-        if not _valid_cached_record(cached.get(str(index)))
-    ]
+    missing = []
+    for index, region in enumerate(regions):
+        record = cached.get(str(index))
+        if not _valid_cached_record(record) or (
+            region.kind == "speech"
+            and isinstance(record, dict)
+            and not _record_timeline_is_healthy(record, region)
+        ):
+            missing.append(index)
     if missing and any(
         is_shared_audio_uri(regions[index].source_path)
         and not audio_pool.contains(str(regions[index].source_path))
@@ -213,8 +223,73 @@ def _transcribe_analyzed(
     ):
         raise _StaleRuntimeAudio("missing ephemeral source audio")
     model = _load_qwen_model(config) if missing else None
+    speech_missing = [index for index in missing if regions[index].kind == "speech"]
+    for batch_start in range(0, len(speech_missing), config.max_inference_batch_size):
+        indices = speech_missing[
+            batch_start : batch_start + config.max_inference_batch_size
+        ]
+        assert model is not None
+        if len(indices) == 1:
+            index = indices[0]
+            region = regions[index]
+            records = {
+                index: _transcribe_range(
+                    model,
+                    video,
+                    None,
+                    config,
+                    core_start=region.start,
+                    core_end=region.end,
+                    media_duration=duration,
+                    final_chunk=True,
+                    label=f"{index:05d}",
+                    audio_buffer=audio_pool.main(),
+                    validate_timeline=True,
+                    completed_ranges=completed_ranges,
+                    completed_range_callback=persist_completed_ranges,
+                    empty_speech_audit_path=(
+                        destination.parent / "asr-empty-speech-audit.jsonl"
+                    ),
+                )
+            }
+        else:
+            records = _transcribe_speech_batch(
+                model,
+                video,
+                config,
+                [(index, regions[index]) for index in indices],
+                media_duration=duration,
+                audio_buffer=audio_pool.main(),
+                completed_ranges=completed_ranges,
+                completed_range_callback=persist_completed_ranges,
+                empty_speech_audit_path=(
+                    destination.parent / "asr-empty-speech-audit.jsonl"
+                ),
+            )
+        for index in indices:
+            region = regions[index]
+            record = records[index]
+            for cue in record["cues"]:
+                cue["speaker"] = _speaker_for_aligned_cue(
+                    float(cue["start"]), float(cue["end"]), analysis.speech
+                )
+                cue["kind"] = "speech"
+            record["window_kind"] = "mixed_speech"
+            cached[str(index)] = record
+            _write_cache(cache_path, cache)
+            logging.info(
+                "cached analyzed ASR region %d/%d kind=%s speaker=%s cues=%d",
+                index + 1,
+                len(regions),
+                region.kind,
+                region.speaker or "unknown",
+                len(record["cues"]),
+            )
+
     for index in missing:
         region = regions[index]
+        if region.kind == "speech":
+            continue
         assert model is not None
         if region.kind == "singing":
             record = _transcribe_song_range(
@@ -242,28 +317,6 @@ def _transcribe_analyzed(
                 overlap_seconds=analysis_config.singing_asr_overlap_seconds,
                 audio_pool=audio_pool,
             )
-        else:
-            record = _transcribe_range(
-                model,
-                video,
-                None,
-                config,
-                core_start=region.start,
-                core_end=region.end,
-                media_duration=duration,
-                final_chunk=True,
-                label=f"{index:05d}",
-                audio_buffer=audio_pool.main(),
-                validate_timeline=True,
-                completed_ranges=completed_ranges,
-                completed_range_callback=persist_completed_ranges,
-            )
-            for cue in record["cues"]:
-                cue["speaker"] = _speaker_for_aligned_cue(
-                    float(cue["start"]), float(cue["end"]), analysis.diarization
-                )
-                cue["kind"] = "speech"
-            record["window_kind"] = "mixed_speech"
         cached[str(index)] = record
         _write_cache(cache_path, cache)
         logging.info(
@@ -285,6 +338,18 @@ def _transcribe_analyzed(
         if not isinstance(record, dict) or not isinstance(record.get("cues"), list):
             raise RuntimeError(f"analyzed ASR cache is missing region {index}")
         cues.extend(_decode_cached_cues(record["cues"], index))
+    if analysis.speech:
+        cues = [
+            replace(
+                cue,
+                speaker=_speaker_for_aligned_cue(
+                    cue.start, cue.end, analysis.speech
+                ),
+            )
+            if cue.kind == "speech"
+            else cue
+            for cue in cues
+        ]
     cues.sort(key=lambda cue: (cue.start, cue.end, cue.speaker or ""))
     if not cues:
         raise RuntimeError("analyzed Qwen3-ASR did not produce any speech")
@@ -405,21 +470,75 @@ def _speech_window_density_ok(
 def _speaker_for_aligned_cue(
     start: float, end: float, diarization: list[AudioRegion]
 ) -> str | None:
-    matches = [
-        region
-        for region in diarization
-        if region.speaker and region.end > start and region.start < end
-    ]
-    if len({region.speaker for region in matches}) > 1:
+    duration = end - start
+    if duration <= 0:
         return None
+    scores = _speaker_overlap_scores(start, end, diarization)
+    speaker, tied = _covered_speaker(scores, duration)
+    if speaker is not None or tied:
+        return speaker
+
+    padded_scores = _speaker_overlap_scores(
+        start,
+        end,
+        diarization,
+        padding=_SPEAKER_CUE_BOUNDARY_TOLERANCE_SECONDS,
+    )
+    padded_speaker, _ = _covered_speaker(padded_scores, duration)
+    if padded_speaker is None:
+        return None
+    initial_candidate = _unique_top_speaker(scores)
+    return (
+        padded_speaker
+        if initial_candidate is None or padded_speaker == initial_candidate
+        else None
+    )
+
+
+def _speaker_overlap_scores(
+    start: float,
+    end: float,
+    diarization: list[AudioRegion],
+    *,
+    padding: float = 0.0,
+) -> dict[str, float]:
     scores: dict[str, float] = {}
-    for region in matches:
-        overlap = max(0.0, min(end, region.end) - max(start, region.start))
+    for region in diarization:
+        if not region.speaker:
+            continue
+        overlap = max(
+            0.0,
+            min(end, region.end + padding) - max(start, region.start - padding),
+        )
         scores[region.speaker or ""] = scores.get(region.speaker or "", 0.0) + overlap
+    return {speaker: overlap for speaker, overlap in scores.items() if overlap > 0}
+
+
+def _unique_top_speaker(scores: dict[str, float]) -> str | None:
     if not scores:
         return None
-    speaker, overlap = max(scores.items(), key=lambda item: item[1])
-    return speaker if overlap >= (end - start) * 0.5 else None
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    speaker, overlap = ranked[0]
+    if len(ranked) > 1 and math.isclose(overlap, ranked[1][1], abs_tol=1e-9):
+        return None
+    return speaker
+
+
+def _covered_speaker(
+    scores: dict[str, float], duration: float
+) -> tuple[str | None, bool]:
+    if not scores:
+        return None, False
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    speaker, overlap = ranked[0]
+    tied = len(ranked) > 1 and math.isclose(
+        overlap, ranked[1][1], abs_tol=1e-9
+    )
+    if tied:
+        return None, True
+    if overlap < duration * _MIN_SPEAKER_CUE_COVERAGE:
+        return None, False
+    return speaker, False
 
 
 def _analysis_regions(analysis: AudioAnalysis) -> list[AudioRegion]:
@@ -625,6 +744,46 @@ def _record_timeline_is_healthy(
     return True
 
 
+def _write_empty_speech_audit(
+    path: Path,
+    *,
+    core_start: float,
+    core_end: float,
+    extract_start: float,
+    extract_end: float,
+    label: str,
+    text: str,
+    language: str,
+    generation_token_limit: int,
+    split_at: float,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    event = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "reason": "empty_aligned_cues",
+        "label": label,
+        "core_start": core_start,
+        "core_end": core_end,
+        "duration": core_end - core_start,
+        "extract_start": extract_start,
+        "extract_end": extract_end,
+        "language": language,
+        "text": text,
+        "generation_token_limit": generation_token_limit,
+        "action": "split",
+        "split_at": split_at,
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+        handle.write("\n")
+    logging.warning(
+        "recorded empty speech window before split: %.3f-%.3fs audit=%s",
+        core_start,
+        core_end,
+        path,
+    )
+
+
 def _transcribe_song_range(
     model: Any,
     video: Path,
@@ -741,6 +900,7 @@ def _transcribe_range(
     validate_timeline: bool = False,
     completed_ranges: dict[str, object] | None = None,
     completed_range_callback: Callable[[], None] | None = None,
+    empty_speech_audit_path: Path | None = None,
 ) -> dict[str, object]:
     range_key = _completed_range_key(core_start, core_end, final_chunk)
     if completed_ranges is not None:
@@ -833,6 +993,7 @@ def _transcribe_range(
                 validate_timeline=validate_timeline,
                 completed_ranges=completed_ranges,
                 completed_range_callback=completed_range_callback,
+                empty_speech_audit_path=empty_speech_audit_path,
             )
             right = _transcribe_range(
                 model,
@@ -848,6 +1009,7 @@ def _transcribe_range(
                 validate_timeline=validate_timeline,
                 completed_ranges=completed_ranges,
                 completed_range_callback=completed_range_callback,
+                empty_speech_audit_path=empty_speech_audit_path,
             )
             recovered = {
                 "core_start": core_start,
@@ -891,6 +1053,19 @@ def _transcribe_range(
                     f"speech window {core_start:.3f}-{core_end:.3f}s"
                 )
             midpoint = _timeline_retry_split(record, core_start, core_end)
+            if not cues and empty_speech_audit_path is not None:
+                _write_empty_speech_audit(
+                    empty_speech_audit_path,
+                    core_start=core_start,
+                    core_end=core_end,
+                    extract_start=extract_start,
+                    extract_end=extract_end,
+                    label=label,
+                    text=text,
+                    language=str(getattr(result, "language", "")),
+                    generation_token_limit=generation_token_limit,
+                    split_at=midpoint,
+                )
             logging.warning(
                 "Qwen3 timeline validation failed in %.3f-%.3fs; splitting at %.3fs",
                 core_start,
@@ -911,6 +1086,7 @@ def _transcribe_range(
                 validate_timeline=True,
                 completed_ranges=completed_ranges,
                 completed_range_callback=completed_range_callback,
+                empty_speech_audit_path=empty_speech_audit_path,
             )
             right = _transcribe_range(
                 model,
@@ -926,6 +1102,7 @@ def _transcribe_range(
                 validate_timeline=True,
                 completed_ranges=completed_ranges,
                 completed_range_callback=completed_range_callback,
+                empty_speech_audit_path=empty_speech_audit_path,
             )
             recovered = {
                 "core_start": core_start,
@@ -952,6 +1129,126 @@ def _transcribe_range(
     finally:
         if chunk_path is not None:
             chunk_path.unlink(missing_ok=True)
+
+
+def _transcribe_speech_batch(
+    model: Any,
+    video: Path,
+    config: ASRConfig,
+    indexed_regions: list[tuple[int, AudioRegion]],
+    *,
+    media_duration: float,
+    audio_buffer: AudioBuffer,
+    completed_ranges: dict[str, object] | None = None,
+    completed_range_callback: Callable[[], None] | None = None,
+    empty_speech_audit_path: Path | None = None,
+) -> dict[int, dict[str, object]]:
+    """Transcribe independent speech windows together, isolating bad results."""
+    audio_inputs: list[object] = []
+    extract_ranges: list[tuple[float, float]] = []
+    token_limits: list[int] = []
+    for _, region in indexed_regions:
+        extract_start = max(0.0, region.start - config.chunk_context_seconds)
+        extract_end = min(media_duration, region.end + config.chunk_context_seconds)
+        extract_ranges.append((extract_start, extract_end))
+        audio_inputs.append(
+            (
+                audio_buffer.slice(extract_start, extract_end, copy=True),
+                audio_buffer.sample_rate,
+            )
+        )
+        token_limits.append(
+            _asr_generation_token_limit(config, extract_end - extract_start)
+        )
+
+    previous_token_limit = getattr(model, "max_new_tokens", None)
+    token_limit_changed = isinstance(previous_token_limit, int)
+    if token_limit_changed:
+        model.max_new_tokens = max(token_limits)
+    logging.info(
+        "Qwen3-ASR speech batch size=%d ranges=%s",
+        len(indexed_regions),
+        ",".join(
+            f"{region.start:.1f}-{region.end:.1f}" for _, region in indexed_regions
+        ),
+    )
+    with stage_metrics("asr.forced_aligned_batch", config.device):
+        try:
+            results = model.transcribe(
+                audio=audio_inputs,
+                context=config.context,
+                language=config.language,
+                return_time_stamps=True,
+            )
+        finally:
+            if token_limit_changed:
+                model.max_new_tokens = previous_token_limit
+    if len(results) != len(indexed_regions):
+        raise RuntimeError(
+            "Qwen3-ASR returned "
+            f"{len(results)} results for {len(indexed_regions)} speech windows"
+        )
+
+    records: dict[int, dict[str, object]] = {}
+    for position, ((index, region), result) in enumerate(
+        zip(indexed_regions, results)
+    ):
+        extract_start, _ = extract_ranges[position]
+        text = str(getattr(result, "text", "")).strip()
+        try:
+            cues = _result_to_cues(
+                result,
+                offset=extract_start,
+                keep_start=region.start,
+                keep_end=region.end,
+                final_chunk=True,
+            )
+            record: dict[str, object] = {
+                "core_start": region.start,
+                "core_end": region.end,
+                "language": str(getattr(result, "language", "")),
+                "text": text,
+                "cues": [asdict(cue) for cue in cues],
+                "generation_token_limit": token_limits[position],
+            }
+            valid = _repetition_hallucination(
+                text
+            ) is None and _record_timeline_is_healthy(record, region)
+        except RuntimeError:
+            valid = False
+            record = {}
+        if not valid:
+            logging.warning(
+                "Qwen3-ASR batch result invalid in %.3f-%.3fs; "
+                "retrying that window with recursive recovery",
+                region.start,
+                region.end,
+            )
+            record = _transcribe_range(
+                model,
+                video,
+                None,
+                config,
+                core_start=region.start,
+                core_end=region.end,
+                media_duration=media_duration,
+                final_chunk=True,
+                label=f"{index:05d}-batch-retry",
+                audio_buffer=audio_buffer,
+                validate_timeline=True,
+                completed_ranges=completed_ranges,
+                completed_range_callback=completed_range_callback,
+                empty_speech_audit_path=empty_speech_audit_path,
+            )
+        else:
+            _store_completed_range(
+                completed_ranges,
+                _completed_range_key(region.start, region.end, True),
+                record,
+                completed_range_callback,
+            )
+        records[index] = record
+    return records
 
 
 def _completed_range_key(start: float, end: float, final_chunk: bool) -> str:

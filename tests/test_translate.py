@@ -1077,6 +1077,13 @@ class TranslationTests(unittest.TestCase):
                 [CueTranslationRecord(0, 0, "字幕")],
                 [Cue(1, 2, "甲"), Cue(1, 3, "乙")],
             )
+        _validate_joint_timing(
+            [CueTranslationRecord(0, 1, "完整句子")],
+            [
+                Cue(0, 0.5, "甲", "speaker_a"),
+                Cue(0.5, 1.0, "乙", "speaker_b"),
+            ],
+        )
 
     def test_joint_cache_keeps_only_longest_valid_prefix(self):
         cues = [Cue(index, index + 1, str(index)) for index in range(4)]

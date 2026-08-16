@@ -237,6 +237,7 @@ def _run_dicow(
         "revision": config.conditioned_asr_revision,
         "device": config.device,
         "language": "ja",
+        "batch_size": config.conditioned_asr_batch_size,
         "audio": audio.descriptor.as_dict(),
         "windows": [_window_payload(window) for window in windows],
     }

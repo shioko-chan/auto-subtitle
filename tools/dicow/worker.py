@@ -126,21 +126,16 @@ def _decode_segments(
     return cues
 
 
-def _transcribe_window(
+def _transcribe_windows(
     model: Any,
     feature_extractor: Any,
     tokenizer: Any,
-    audio: Any,
-    window: dict[str, object],
+    audio: list[Any],
+    windows: list[dict[str, object]],
     language: str,
 ) -> list[dict[str, object]]:
     import torch
 
-    start = float(window["start"])
-    end = float(window["end"])
-    speakers = [str(item) for item in window["speakers"]]
-    if not speakers:
-        raise RuntimeError("conditioned ASR window has no speakers")
     samples = feature_extractor(
         audio,
         sampling_rate=16000,
@@ -149,28 +144,62 @@ def _transcribe_window(
     )
     input_features = samples.input_features
     frames = input_features.shape[-1] // 2
-    stno_mask = _diarization_masks(speakers, list(window["turns"]), start, frames).to(
+    feature_rows: list[int] = []
+    masks = []
+    speaker_groups: list[list[str]] = []
+    for index, window in enumerate(windows):
+        start = float(window["start"])
+        speakers = [str(item) for item in window["speakers"]]
+        if not speakers:
+            raise RuntimeError("conditioned ASR window has no speakers")
+        feature_rows.extend([index] * len(speakers))
+        speaker_groups.append(speakers)
+        masks.append(
+            _diarization_masks(
+                speakers,
+                list(window["turns"]),
+                start,
+                frames,
+            )
+        )
+    row_index = torch.tensor(feature_rows, dtype=torch.long)
+    input_features = input_features.index_select(0, row_index).to(
         model.device, dtype=model.dtype
     )
-    input_features = input_features.repeat(len(speakers), 1, 1).to(
-        model.device, dtype=model.dtype
-    )
+    stno_mask = torch.cat(masks).to(model.device, dtype=model.dtype)
     attention_mask = torch.ones(
-        (len(speakers), input_features.shape[-1]),
+        (len(feature_rows), input_features.shape[-1]),
         dtype=torch.bool,
         device=model.device,
     )
-    generated = model.generate(
-        input_features=input_features,
-        attention_mask=attention_mask,
-        stno_mask=stno_mask,
-        language=language,
-        task="transcribe",
-        return_timestamps=True,
-        do_sample=False,
-    )
+    with torch.inference_mode():
+        generated = model.generate(
+            input_features=input_features,
+            attention_mask=attention_mask,
+            stno_mask=stno_mask,
+            language=language,
+            task="transcribe",
+            return_timestamps=True,
+            do_sample=False,
+        )
     sequences = generated.sequences if hasattr(generated, "sequences") else generated
-    return _decode_segments(tokenizer, sequences, speakers, start, end - start)
+    cues: list[dict[str, object]] = []
+    cursor = 0
+    for window, speakers in zip(windows, speaker_groups):
+        end_cursor = cursor + len(speakers)
+        start = float(window["start"])
+        end = float(window["end"])
+        cues.extend(
+            _decode_segments(
+                tokenizer,
+                sequences[cursor:end_cursor],
+                speakers,
+                start,
+                end - start,
+            )
+        )
+        cursor = end_cursor
+    return cues
 
 
 def _handle(request: dict[str, object]) -> dict[str, object]:
@@ -222,19 +251,24 @@ def _handle(request: dict[str, object]) -> dict[str, object]:
         if hasattr(model, "set_tokenizer"):
             model.set_tokenizer(tokenizer)
         cues: list[dict[str, object]] = []
-        for window in request["windows"]:
-            start = float(window["start"])
-            end = float(window["end"])
-            left = max(0, round(start * 16000))
-            right = min(len(source), round(end * 16000))
-            audio = np.asarray(source[left:right], dtype=np.float32).copy()
+        windows = list(request["windows"])
+        batch_size = max(1, int(request.get("batch_size") or 1))
+        for batch_start in range(0, len(windows), batch_size):
+            batch = windows[batch_start : batch_start + batch_size]
+            audio = []
+            for window in batch:
+                start = float(window["start"])
+                end = float(window["end"])
+                left = max(0, round(start * 16000))
+                right = min(len(source), round(end * 16000))
+                audio.append(np.asarray(source[left:right], dtype=np.float32).copy())
             cues.extend(
-                _transcribe_window(
+                _transcribe_windows(
                     model,
                     feature_extractor,
                     tokenizer,
                     audio,
-                    window,
+                    batch,
                     str(request.get("language") or "ja"),
                 )
             )

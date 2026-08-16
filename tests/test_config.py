@@ -38,9 +38,10 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.audio_analysis.initial_analysis_concurrency, 1)
             self.assertEqual(config.audio_analysis.diarization_backend, "pyannote")
             self.assertEqual(
-                config.audio_analysis.overlap_conditioned_asr_seconds, 1.5
+                config.audio_analysis.overlap_conditioned_asr_seconds, 0.5
             )
             self.assertEqual(config.audio_analysis.conditioned_asr_backend, "dicow")
+            self.assertEqual(config.audio_analysis.conditioned_asr_batch_size, 4)
             self.assertEqual(config.audio_analysis.moss_window_seconds, 480.0)
             self.assertEqual(config.audio_analysis.moss_max_window_seconds, 540.0)
             self.assertEqual(

@@ -34,7 +34,7 @@ class ASRConfig:
     context: str = ""
     chunk_seconds: float = 170.0
     chunk_context_seconds: float = 2.0
-    max_inference_batch_size: int = 1
+    max_inference_batch_size: int = 4
     max_new_tokens: int = 2048
     speech_window_target_seconds: float = 60.0
     speech_window_max_seconds: float = 90.0
@@ -50,12 +50,13 @@ class AudioAnalysisConfig:
     initial_analysis_concurrency: int = 1
     diarization_backend: str = "pyannote"
     diarization_model: str = "pyannote/speaker-diarization-community-1"
-    overlap_conditioned_asr_seconds: float = 1.5
+    overlap_conditioned_asr_seconds: float = 0.5
     overlap_context_seconds: float = 2.0
     conditioned_asr_backend: str = "dicow"
     conditioned_asr_model: str = "BUT-FIT/DiCoW_v3_3"
     conditioned_asr_revision: str = "c34b64d9a9c5148c65fd355bb188d60343a6b44f"
     conditioned_asr_worker_project: str = "tools/dicow"
+    conditioned_asr_batch_size: int = 4
     moss_transcribe_model: str = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
     moss_transcribe_worker_project: str = "tools/moss_transcribe"
     moss_window_seconds: float = 480.0
@@ -347,6 +348,10 @@ def load_config(path: Path) -> AppConfig:
     ):
         raise ConfigError(
             "audio_analysis conditioned ASR model and revision cannot be empty"
+        )
+    if analysis.conditioned_asr_batch_size < 1:
+        raise ConfigError(
+            "audio_analysis.conditioned_asr_batch_size must be at least 1"
         )
     if not analysis.moss_transcribe_model.strip():
         raise ConfigError("audio_analysis.moss_transcribe_model cannot be empty")

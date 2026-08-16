@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,6 +22,8 @@ from subtitle_pipeline.asr import (
     _timeline_retry_split,
     _transcribe_ambiguous_range,
     _transcribe_analyzed,
+    _transcribe_range,
+    _transcribe_speech_batch,
     _valid_cached_record,
     transcribe_with_qwen,
 )
@@ -29,12 +32,116 @@ from subtitle_pipeline.config import ASRConfig, AudioAnalysisConfig
 
 
 class QwenASRTests(unittest.TestCase):
+    def test_speech_batch_transcribes_four_windows_in_one_model_call(self):
+        calls = []
+
+        class Model:
+            max_new_tokens = 2048
+
+            def transcribe(self, **kwargs):
+                calls.append(kwargs)
+                return [
+                    SimpleNamespace(
+                        language="Japanese",
+                        text=f"字幕{index}",
+                        time_stamps=SimpleNamespace(
+                            items=[
+                                SimpleNamespace(
+                                    text=f"字幕{index}",
+                                    start_time=0.1,
+                                    end_time=0.5,
+                                )
+                            ]
+                        ),
+                    )
+                    for index in range(4)
+                ]
+
+        audio = SimpleNamespace(
+            sample_rate=16000,
+            slice=lambda *_args, **_kwargs: np.zeros(16000, dtype=np.float32),
+        )
+        regions = [
+            (index, AudioRegion(index * 2.0, index * 2.0 + 1.0, "speech"))
+            for index in range(4)
+        ]
+
+        records = _transcribe_speech_batch(
+            Model(),
+            Path("source.mp4"),
+            ASRConfig(chunk_context_seconds=0, max_inference_batch_size=4),
+            regions,
+            media_duration=8.0,
+            audio_buffer=audio,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0]["audio"]), 4)
+        self.assertEqual(list(records), [0, 1, 2, 3])
+
     def test_short_audio_uses_bounded_generation_token_limit(self):
         config = ASRConfig(max_new_tokens=2048)
 
         self.assertEqual(_asr_generation_token_limit(config, 0.5), 128)
         self.assertEqual(_asr_generation_token_limit(config, 4.5), 176)
         self.assertEqual(_asr_generation_token_limit(config, 170), 2048)
+
+    def test_empty_speech_is_never_a_healthy_record(self):
+        self.assertFalse(
+            _record_timeline_is_healthy(
+                {"text": "", "cues": []}, AudioRegion(10.0, 10.8, "speech")
+            )
+        )
+
+    def test_long_empty_speech_is_audited_before_recursive_split(self):
+        empty = SimpleNamespace(
+            language="Japanese",
+            text="",
+            time_stamps=SimpleNamespace(items=[]),
+        )
+
+        def spoken(text):
+            return SimpleNamespace(
+                language="Japanese",
+                text=text,
+                time_stamps=SimpleNamespace(
+                    items=[
+                        SimpleNamespace(text=text, start_time=0.1, end_time=1.0)
+                    ]
+                ),
+            )
+
+        model = SimpleNamespace(max_new_tokens=2048)
+        model.transcribe = Mock(
+            side_effect=[[empty], [spoken("前半")], [spoken("后半")]]
+        )
+        audio = SimpleNamespace(
+            sample_rate=16000,
+            slice=lambda *_args, **_kwargs: np.zeros(640000, dtype=np.float32),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            audit_path = Path(temp) / "empty.jsonl"
+            record = _transcribe_range(
+                model,
+                Path("source.mp4"),
+                None,
+                ASRConfig(chunk_context_seconds=0),
+                core_start=0,
+                core_end=40,
+                media_duration=40,
+                final_chunk=True,
+                label="empty",
+                audio_buffer=audio,
+                validate_timeline=True,
+                empty_speech_audit_path=audit_path,
+            )
+            events = [json.loads(line) for line in audit_path.read_text().splitlines()]
+
+        self.assertEqual([cue["text"] for cue in record["cues"]], ["前半", "后半"])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["reason"], "empty_aligned_cues")
+        self.assertEqual(events[0]["action"], "split")
+        self.assertEqual(events[0]["split_at"], 20)
 
     def test_transcribe_range_temporarily_applies_dynamic_token_limit(self):
         observed_limits = []
@@ -235,6 +342,55 @@ class QwenASRTests(unittest.TestCase):
                     AudioRegion(0, 2, "speech", "A"),
                     AudioRegion(2, 4, "speech", "B"),
                 ],
+            )
+        )
+        self.assertEqual(
+            _speaker_for_aligned_cue(
+                10.0,
+                10.4,
+                [
+                    AudioRegion(9.0, 10.38, "speech", "A"),
+                    AudioRegion(10.38, 12.0, "speech", "B"),
+                ],
+            ),
+            "A",
+        )
+        self.assertEqual(
+            _speaker_for_aligned_cue(
+                20.0,
+                21.0,
+                [AudioRegion(20.64, 21.0, "speech", "A")],
+            ),
+            "A",
+        )
+        self.assertIsNone(
+            _speaker_for_aligned_cue(
+                20.0,
+                21.0,
+                [AudioRegion(20.76, 21.0, "speech", "A")],
+            )
+        )
+        self.assertEqual(
+            _speaker_for_aligned_cue(
+                30.0,
+                30.4,
+                [AudioRegion(29.0, 30.1, "speech", "A")],
+            ),
+            "A",
+        )
+        self.assertEqual(
+            _speaker_for_aligned_cue(
+                40.0,
+                40.1,
+                [AudioRegion(39.0, 39.95, "speech", "A")],
+            ),
+            "A",
+        )
+        self.assertIsNone(
+            _speaker_for_aligned_cue(
+                50.0,
+                50.1,
+                [AudioRegion(49.0, 49.89, "speech", "A")],
             )
         )
 

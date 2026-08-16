@@ -15,7 +15,7 @@ from subtitle_pipeline.subtitles import Cue
 
 
 class ConditionedASRTests(unittest.TestCase):
-    def test_only_long_overlap_creates_conditioned_window(self):
+    def test_half_second_overlap_creates_conditioned_window_by_default(self):
         diarization = [
             AudioRegion(0, 4, "speech", "A", anonymous_speaker="S0"),
             AudioRegion(2.5, 5, "speech", "B", anonymous_speaker="S1"),
@@ -26,9 +26,27 @@ class ConditionedASRTests(unittest.TestCase):
 
         result = _conditioned_windows(diarization, 20, config)
 
-        self.assertEqual(len(result), 1)
+        self.assertEqual(len(result), 2)
         self.assertEqual((result[0].start, result[0].end), (1.5, 5.0))
         self.assertEqual(result[0].speakers, ("S0", "S1"))
+        self.assertEqual((result[1].start, result[1].end), (8.5, 11.0))
+
+    def test_explicit_long_overlap_threshold_filters_shorter_overlap(self):
+        diarization = [
+            AudioRegion(0, 4, "speech", "A", anonymous_speaker="S0"),
+            AudioRegion(2.5, 5, "speech", "B", anonymous_speaker="S1"),
+            AudioRegion(8, 10, "speech", "A", anonymous_speaker="S0"),
+            AudioRegion(9.5, 11, "speech", "B", anonymous_speaker="S1"),
+        ]
+        config = AudioAnalysisConfig(
+            overlap_conditioned_asr_seconds=1.5,
+            overlap_context_seconds=1.0,
+        )
+
+        result = _conditioned_windows(diarization, 20, config)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual((result[0].start, result[0].end), (1.5, 5.0))
 
     def test_context_clips_long_surrounding_turn_to_model_window(self):
         diarization = [

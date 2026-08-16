@@ -21,7 +21,7 @@ chunk_seconds = 170.0
 chunk_context_seconds = 2.0
 # Repeated ASR generation is detected automatically. Affected chunks are
 # recursively halved down to about 20 seconds instead of being cached.
-max_inference_batch_size = 1
+max_inference_batch_size = 4
 max_new_tokens = 2048
 speech_window_target_seconds = 60.0
 speech_window_max_seconds = 90.0
@@ -42,13 +42,14 @@ diarization_backend = "pyannote"
 # exclusive timeline for baseline ASR. Overlap duration always refers to the
 # real ordinary-timeline intersection, before context padding.
 diarization_model = "pyannote/speaker-diarization-community-1"
-overlap_conditioned_asr_seconds = 1.5
+overlap_conditioned_asr_seconds = 0.5
 overlap_context_seconds = 2.0
 conditioned_asr_backend = "dicow"
 conditioned_asr_model = "BUT-FIT/DiCoW_v3_3"
 # Pin trusted remote model code instead of executing a moving main branch.
 conditioned_asr_revision = "c34b64d9a9c5148c65fd355bb188d60343a6b44f"
 conditioned_asr_worker_project = "tools/dicow"
+conditioned_asr_batch_size = 4
 # MOSS jointly produces the spoken transcript and anonymous speaker timeline.
 # It remains available as a slower comparison backend.
 moss_transcribe_model = "OpenMOSS-Team/MOSS-Transcribe-Diarize"
