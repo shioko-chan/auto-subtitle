@@ -157,6 +157,37 @@ class ConditionedASRTests(unittest.TestCase):
         self.assertEqual(len(qwen["units"]), 2)
         self.assertNotIn("整窗文本不应直接发送", str(evidence))
 
+    def test_dicow_repetition_hallucination_preserves_qwen_baseline(self):
+        diarization = [
+            AudioRegion(0, 4, "speech", "A", anonymous_speaker="S0"),
+            AudioRegion(2, 5, "speech", "B", anonymous_speaker="S1"),
+        ]
+        baseline = [
+            Cue(1.5, 2.5, "Qwen A", "A"),
+            Cue(2.5, 3.5, "Qwen B", "B"),
+        ]
+        audio = SimpleNamespace(duration=10)
+        config = AudioAnalysisConfig(overlap_context_seconds=0.5)
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch(
+                "subtitle_pipeline.conditioned_asr._run_dicow",
+                return_value=[
+                    Cue(1.5, 3.0, "DiCoW A", "A"),
+                    Cue(2.0, 4.0, "私は" * 100, "B"),
+                ],
+            ),
+        ):
+            result = repair_long_overlaps(
+                baseline, diarization, audio, Path(temp), config
+            )
+
+        self.assertEqual(
+            [(cue.text, cue.speaker) for cue in result.cues],
+            [("DiCoW A", "A"), ("Qwen B", "B")],
+        )
+        self.assertNotIn("私は私は", str(result.evidence))
+
 
 if __name__ == "__main__":
     unittest.main()

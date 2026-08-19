@@ -20,7 +20,7 @@ from .telemetry import stage_metrics
 
 logger = logging.getLogger(__name__)
 
-_CACHE_VERSION = 9
+_CACHE_VERSION = 10
 _MIN_SEPARATED_SEGMENT_SECONDS = 0.08
 _MIN_SEPARATED_PEAK = 1e-4
 _MIN_SEPARATED_RMS = 1e-5
@@ -47,6 +47,14 @@ _SPEECH_LABELS = {
 }
 
 
+def _is_music_activity_label(label: str) -> bool:
+    return (
+        label in {"music", "musical instrument", "orchestra"}
+        or label.endswith(" music")
+        or "(musical)" in label
+    )
+
+
 @dataclass(frozen=True)
 class AudioRegion:
     start: float
@@ -61,6 +69,8 @@ class AudioRegion:
     overlap_seconds: float = 0.0
     overlap_speakers: tuple[str, ...] = ()
     asr_route: str = "qwen"
+    speech_confidence: float | None = None
+    music_confidence: float | None = None
 
 
 @dataclass(frozen=True)
@@ -120,12 +130,16 @@ def analyze_audio(
     )
     speech = timelines.exclusive
     ordinary_diarization = timelines.ordinary
+    song_detection_audit: dict[str, object] = {}
     raw_candidates = _singing_regions_from_scores(
         raw_scores,
         threshold=config.singing_threshold,
+        music_threshold=config.singing_music_threshold,
+        speech_takeover_threshold=config.singing_speech_takeover_threshold,
         smoothing_windows=config.singing_smoothing_windows,
-        release_seconds=0.0,
+        release_seconds=config.singing_release_seconds,
         merge_gap_seconds=config.singing_merge_gap_seconds,
+        audit=song_detection_audit,
     )
     singing_windows: list[AudioRegion] = []
     ambiguous_windows: list[AudioRegion] = []
@@ -168,6 +182,7 @@ def analyze_audio(
         vocal_anchors = _singing_regions_from_scores(
             vocal_scores,
             threshold=config.singing_vocal_threshold,
+            music_threshold=None,
             smoothing_windows=config.singing_smoothing_windows,
             release_seconds=0.0,
             merge_gap_seconds=config.singing_merge_gap_seconds,
@@ -263,6 +278,7 @@ def analyze_audio(
         "singing": [asdict(region) for region in singing],
         "ambiguous": [asdict(region) for region in ambiguous],
         "diarization": [asdict(region) for region in ordinary_diarization],
+        "song_detection": song_detection_audit,
     }
     temporary = cache_path.with_suffix(".tmp")
     temporary.write_text(
@@ -413,6 +429,8 @@ def _run_singing_detection(
     return _singing_regions_from_scores(
         _score_singing_windows(waveform, sample_rate, config),
         threshold=config.singing_threshold,
+        music_threshold=config.singing_music_threshold,
+        speech_takeover_threshold=config.singing_speech_takeover_threshold,
         smoothing_windows=config.singing_smoothing_windows,
         release_seconds=config.singing_release_seconds,
         merge_gap_seconds=config.singing_merge_gap_seconds,
@@ -478,6 +496,9 @@ def _score_singing_sources(
     }
     singing_ids = [index for index, label in labels.items() if label in _SINGING_LABELS]
     speech_ids = [index for index, label in labels.items() if label in _SPEECH_LABELS]
+    music_ids = [
+        index for index, label in labels.items() if _is_music_activity_label(label)
+    ]
     if not singing_ids:
         raise RuntimeError("AST singing detector exposes no recognized singing labels")
 
@@ -497,6 +518,7 @@ def _score_singing_sources(
             for (_audio, start, end), row in zip(batch, probabilities):
                 singing_score = sum(float(row[index]) for index in singing_ids)
                 speech_score = sum(float(row[index]) for index in speech_ids)
+                music_score = sum(float(row[index]) for index in music_ids)
                 score = _singing_evidence_score(singing_score, speech_score)
                 scored_windows.append(
                     AudioRegion(
@@ -504,6 +526,8 @@ def _score_singing_sources(
                         round(end, 3),
                         "singing",
                         confidence=round(score, 4),
+                        speech_confidence=round(speech_score, 4),
+                        music_confidence=round(music_score, 4),
                     )
                 )
     finally:
@@ -513,7 +537,11 @@ def _score_singing_sources(
 
 
 def _singing_evidence_score(singing_score: float, speech_score: float) -> float:
-    return max(0.0, singing_score - speech_score)
+    # AudioSet labels are evidence dimensions, not mutually exclusive routing
+    # decisions. Calls and spoken lines over a song can legitimately score as
+    # both speech and singing, so speech must not erase singing evidence.
+    del speech_score
+    return max(0.0, singing_score)
 
 
 def _arbitrate_singing_regions(
@@ -527,6 +555,7 @@ def _arbitrate_singing_regions(
     minimum_singing_seconds: float = 30.0,
 ) -> tuple[list[AudioRegion], list[AudioRegion]]:
     """Confirm vocal singing and retain uncertain candidates for dual ASR."""
+    del ambiguous_min_seconds, minimum_singing_seconds
     confirmed: list[AudioRegion] = []
     ambiguous: list[AudioRegion] = []
     episodes = _merge_regions(raw_candidates, release_seconds)
@@ -535,9 +564,6 @@ def _arbitrate_singing_regions(
             vocal for vocal in vocal_anchors if _overlap_duration(candidate, vocal) > 0
         ]
         if matching_vocals:
-            if candidate.end - candidate.start < minimum_singing_seconds:
-                ambiguous.append(candidate)
-                continue
             confirmed.append(
                 AudioRegion(
                     candidate.start,
@@ -550,10 +576,7 @@ def _arbitrate_singing_regions(
             )
             continue
         coverage = _region_coverage(candidate, speech)
-        if (
-            coverage < speech_bgm_coverage
-            or candidate.end - candidate.start >= ambiguous_min_seconds
-        ):
+        if coverage < speech_bgm_coverage:
             ambiguous.append(candidate)
 
     ambiguous = [
@@ -601,37 +624,196 @@ def _singing_regions_from_scores(
     smoothing_windows: int,
     release_seconds: float,
     merge_gap_seconds: float = 0.0,
+    music_threshold: float | None = None,
+    speech_takeover_threshold: float = 0.5,
+    audit: dict[str, object] | None = None,
 ) -> list[AudioRegion]:
-    """Turn noisy AST scores into song episodes with release hysteresis."""
+    """Build song episodes without treating every AST window as a boundary."""
     if not windows:
+        if audit is not None:
+            audit.update({"windows": [], "transitions": [], "episodes": []})
         return []
 
     radius = smoothing_windows // 2
     smoothed: list[AudioRegion] = []
     for index, window in enumerate(windows):
         nearby = windows[max(0, index - radius) : index + radius + 1]
-        scores = sorted(float(item.confidence or 0.0) for item in nearby)
-        scores.extend([0.0] * (smoothing_windows - len(scores)))
-        scores.sort()
-        score = scores[len(scores) // 2]
+        score = _padded_median(
+            [float(item.confidence or 0.0) for item in nearby], smoothing_windows
+        )
+        speech_score = _padded_median(
+            [float(item.speech_confidence or 0.0) for item in nearby],
+            smoothing_windows,
+        )
+        music_score = _padded_median(
+            [float(item.music_confidence or 0.0) for item in nearby],
+            smoothing_windows,
+        )
         smoothed.append(
             AudioRegion(
                 window.start,
                 window.end,
                 "singing",
                 confidence=round(score, 4),
+                speech_confidence=round(speech_score, 4),
+                music_confidence=round(music_score, 4),
             )
         )
 
-    anchors = [
-        raw
-        for raw, smooth in zip(windows, smoothed)
-        if float(smooth.confidence or 0.0) >= threshold
-    ]
-    # Offline release hysteresis: a negative run closes the song only when no
-    # later singing anchor arrives within the configured release interval.
-    episodes = _merge_regions(anchors, release_seconds)
-    return _merge_regions(episodes, merge_gap_seconds)
+    episodes: list[AudioRegion] = []
+    transitions: list[dict[str, object]] = []
+    window_audit: list[dict[str, object]] = []
+    active_start: float | None = None
+    active_end: float | None = None
+    last_anchor_end: float | None = None
+    active_confidence = 0.0
+
+    def close_episode(reason: str) -> None:
+        nonlocal active_start, active_end, last_anchor_end, active_confidence
+        if active_start is None or active_end is None:
+            return
+        episodes.append(
+            AudioRegion(
+                round(active_start, 3),
+                round(active_end, 3),
+                "singing",
+                confidence=round(active_confidence, 4),
+            )
+        )
+        transitions.append(
+            {
+                "at": round(active_end, 3),
+                "from": "in_song",
+                "to": "outside",
+                "reason": reason,
+            }
+        )
+        active_start = None
+        active_end = None
+        last_anchor_end = None
+        active_confidence = 0.0
+
+    anchor_flags = []
+    for raw, smooth in zip(windows, smoothed):
+        music_support = (
+            music_threshold is not None
+            and float(smooth.music_confidence or 0.0) >= music_threshold
+        )
+        anchor_flags.append(
+            float(smooth.confidence or 0.0) >= threshold
+            or (float(raw.confidence or 0.0) >= threshold and music_support)
+        )
+
+    next_anchor_starts: list[float | None] = [None] * len(smoothed)
+    next_anchor_start: float | None = None
+    for index in range(len(smoothed) - 1, -1, -1):
+        next_anchor_starts[index] = next_anchor_start
+        if anchor_flags[index]:
+            next_anchor_start = smoothed[index].start
+
+    for index, window in enumerate(smoothed):
+        raw_singing_score = float(windows[index].confidence or 0.0)
+        singing_score = float(window.confidence or 0.0)
+        speech_score = float(window.speech_confidence or 0.0)
+        music_score = float(window.music_confidence or 0.0)
+        singing_anchor = anchor_flags[index]
+        music_support = music_threshold is not None and music_score >= music_threshold
+
+        future_anchor_within_release = (
+            next_anchor_starts[index] is not None
+            and last_anchor_end is not None
+            and float(next_anchor_starts[index]) - last_anchor_end <= release_seconds
+        )
+        speech_takeover = (
+            not singing_anchor
+            and speech_score >= speech_takeover_threshold
+            and speech_score > music_score
+            and not future_anchor_within_release
+        )
+        if active_end is not None and speech_takeover:
+            active_end = min(active_end, window.start)
+            close_episode("sustained speech takeover after final singing anchor")
+        elif (
+            last_anchor_end is not None
+            and window.start - last_anchor_end > release_seconds
+        ):
+            close_episode("sustained absence of singing and music evidence")
+
+        if active_start is None and singing_anchor:
+            start = window.start
+            if music_threshold is not None:
+                for previous in reversed(smoothed[:index]):
+                    if float(previous.music_confidence or 0.0) < music_threshold:
+                        break
+                    if window.start - previous.start > release_seconds:
+                        break
+                    start = previous.start
+            active_start = start
+            active_end = window.end
+            last_anchor_end = window.end
+            active_confidence = raw_singing_score
+            transitions.append(
+                {
+                    "at": round(start, 3),
+                    "from": "outside",
+                    "to": "in_song",
+                    "reason": "singing anchor",
+                }
+            )
+        elif active_start is not None and singing_anchor:
+            active_end = max(float(active_end or window.end), window.end)
+            last_anchor_end = window.end
+            active_confidence = max(active_confidence, raw_singing_score)
+        elif (
+            active_start is not None
+            and music_support
+            and last_anchor_end is not None
+            and window.end - last_anchor_end <= release_seconds
+        ):
+            active_end = max(float(active_end or window.end), window.end)
+
+        state = "outside"
+        if active_start is not None:
+            state = "in_song" if singing_anchor or music_support else "releasing"
+        window_audit.append(
+            {
+                "start": round(window.start, 3),
+                "end": round(window.end, 3),
+                "raw_singing": round(raw_singing_score, 4),
+                "singing": round(singing_score, 4),
+                "speech": round(speech_score, 4),
+                "music": round(music_score, 4),
+                "singing_anchor": singing_anchor,
+                "music_support": music_support,
+                "speech_takeover": speech_takeover,
+                "state": state,
+            }
+        )
+
+    close_episode("end of analyzed audio")
+    result = _merge_regions(episodes, merge_gap_seconds)
+    if audit is not None:
+        audit.update(
+            {
+                "policy": {
+                    "singing_threshold": threshold,
+                    "music_threshold": music_threshold,
+                    "speech_takeover_threshold": speech_takeover_threshold,
+                    "release_seconds": release_seconds,
+                    "smoothing_windows": smoothing_windows,
+                },
+                "windows": window_audit,
+                "transitions": transitions,
+                "episodes": [asdict(region) for region in result],
+            }
+        )
+    return result
+
+
+def _padded_median(values: list[float], size: int) -> float:
+    padded = [*values, *([0.0] * (size - len(values)))]
+    padded.sort()
+    return padded[len(padded) // 2]
 
 
 def _run_overlap_separation(

@@ -324,6 +324,38 @@ class QwenASRTests(unittest.TestCase):
             [(0, 20), (22.001, 40)],
         )
 
+    def test_speech_windows_rebalance_instead_of_stranding_a_short_tail(self):
+        spans = [
+            (0.0, 1.435),
+            (2.346, 4.911),
+            (5.518, 6.497),
+            (7.527, 8.893),
+            (10.294, 13.517),
+            (13.568, 16.065),
+            (16.335, 17.533),
+            (18.613, 19.170),
+            (20.875, 22.157),
+            (23.743, 31.152),
+            (31.793, 32.502),
+            (33.902, 36.180),
+            (37.935, 38.880),
+            (39.302, 41.749),
+            (42.745, 44.348),
+            (46.086, 46.930),
+        ]
+        analysis = AudioAnalysis(
+            speech=[],
+            singing=[],
+            diarization=[AudioRegion(start, end, "speech", "A") for start, end in spans],
+        )
+
+        windows = _speech_asr_windows(analysis, ASRConfig())
+
+        self.assertEqual(
+            [(window.start, window.end) for window in windows],
+            [(0.0, 22.157), (23.743, 46.93)],
+        )
+
     def test_aligned_cue_speaker_uses_diarization_intersection(self):
         diarization = [
             AudioRegion(0, 3, "speech", "A"),

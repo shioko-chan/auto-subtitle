@@ -19,6 +19,7 @@ from subtitle_pipeline.translate import (
     _joint_translation_signature,
     _load_joint_translation_cache,
     _log_response_usage,
+    _majority_speaker,
     _normalize_api_response,
     _parse_joint_records,
     _parse_json_object,
@@ -35,6 +36,20 @@ from subtitle_pipeline.translate import (
 
 
 class TranslationTests(unittest.TestCase):
+    def test_majority_speaker_ignores_unknown_units(self):
+        cues = [
+            Cue(0, 1, "甲", "ritsu"),
+            Cue(1, 2, "乙", None),
+            Cue(2, 3, "丙", "yuno"),
+            Cue(3, 4, "丁", "ritsu"),
+            Cue(4, 5, "戊", None),
+        ]
+
+        self.assertEqual(_majority_speaker(cues, 0, 4), "ritsu")
+        self.assertEqual(_majority_speaker(cues, 0, 1), "ritsu")
+        self.assertIsNone(_majority_speaker(cues, 0, 2))
+        self.assertIsNone(_majority_speaker(cues, 1, 1))
+
     def test_joint_translation_restores_timing_and_compact_gap_input(self):
         translator = OpenAICompatibleTranslator(LLMConfig(thinking="disabled"), "secret")
         cues = [

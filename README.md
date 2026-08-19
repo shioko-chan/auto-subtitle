@@ -27,6 +27,9 @@ YouTube URL
 `source.semantic.srt`、`translated.metadata.json`、压制后的 MP4 和 `manifest.json`。
 LLM 密钥默认从 `pass` 读取。
 
+当前实际流程、各模型的职责、缓存边界及已知风险见
+[当前字幕管线与技术选型](docs/current-pipeline.md)。
+
 ## 环境要求
 
 - Python 3.11+

@@ -74,6 +74,12 @@ device = "cuda:0"
 singing_window_seconds = 5.0
 singing_stride_seconds = 2.5
 singing_threshold = 0.05
+# Music cannot start a song by itself, but it keeps a confirmed performance
+# active through calls, instrumental passages and short in-song speech.
+singing_music_threshold = 0.05
+# After the final singing anchor, sustained speech above this score can close
+# the performance at the start of the speech takeover.
+singing_speech_takeover_threshold = 0.5
 # Raw AST only proposes candidates. Vocal-stem AST confirms actual singing;
 # speech-heavy candidates without vocal singing remain ordinary speech+BGM.
 singing_vocal_threshold = 0.5
@@ -84,8 +90,8 @@ singing_merge_gap_seconds = 1.5
 singing_smoothing_windows = 3
 singing_release_seconds = 35.0
 singing_phrase_silence_seconds = 0.45
-# Confirmed songs and sentence-level singing ASR blocks must span at least this
-# long. Short vocal fragments are merged; short candidate episodes use dual ASR.
+# Coalesce lyric-phrase ASR blocks toward this duration. A short performance can
+# still be confirmed when vocal-stem AST supplies a real singing anchor.
 singing_min_phrase_seconds = 30.0
 singing_asr_window_seconds = 12.0
 singing_asr_overlap_seconds = 2.0

@@ -1282,9 +1282,7 @@ def _joint_translation_prompt(
                 if not _translation_text_errors(record.text, target_language)
                 else "pending"
             ),
-            "speaker": _uniform_attribute(
-                cues, record.start_id, record.end_id, "speaker", None
-            ),
+            "speaker": _majority_speaker(cues, record.start_id, record.end_id),
             "kind": _uniform_attribute(
                 cues, record.start_id, record.end_id, "kind", "mixed"
             ),
@@ -1499,9 +1497,7 @@ def _translation_repair_item(
         "current_text": record.text,
         "errors": _translation_text_errors(record.text, target_language),
         "forbidden_fragments": _JAPANESE_KANA_RUN_RE.findall(record.text),
-        "speaker": _uniform_attribute(
-            cues, record.start_id, record.end_id, "speaker", None
-        ),
+        "speaker": _majority_speaker(cues, record.start_id, record.end_id),
         "kind": _uniform_attribute(
             cues, record.start_id, record.end_id, "kind", "mixed"
         ),
@@ -1752,9 +1748,7 @@ def _joint_records_to_cues(
             cues[record.end_id].end,
             record.source_text
             or _source_text_for_range(cues, record.start_id, record.end_id),
-            _uniform_attribute(
-                cues, record.start_id, record.end_id, "speaker", None
-            ),
+            _majority_speaker(cues, record.start_id, record.end_id),
             _uniform_attribute(cues, record.start_id, record.end_id, "kind", "mixed"),
         )
         for record in records
@@ -2221,6 +2215,19 @@ def _uniform_attribute(
 ) -> Any:
     values = {getattr(cue, name) for cue in cues[start_id : end_id + 1]}
     return next(iter(values)) if len(values) == 1 else mixed
+
+
+def _majority_speaker(cues: list[Cue], start_id: int, end_id: int) -> str | None:
+    counts: dict[str, int] = {}
+    for cue in cues[start_id : end_id + 1]:
+        if cue.speaker is not None:
+            counts[cue.speaker] = counts.get(cue.speaker, 0) + 1
+    if not counts:
+        return None
+
+    highest = max(counts.values())
+    winners = [speaker for speaker, count in counts.items() if count == highest]
+    return winners[0] if len(winners) == 1 else None
 
 
 def _load_joint_translation_cache(

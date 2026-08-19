@@ -192,7 +192,7 @@ def _transcribe_analyzed(
     cache_path = destination.parent / "asr-analysis-cache.json"
     signature = {
         **_cache_signature(video, duration, config),
-        "analysis_version": 7,
+        "analysis_version": 8,
         "analysis_config": asdict(analysis_config),
         "regions": [_analysis_region_signature(region) for region in regions],
     }
@@ -427,6 +427,34 @@ def _speech_asr_windows(
                 end = hard_end
             elif episode_end <= hard_end:
                 end = valid[-1]
+                following = next(
+                    (start for start, _ in episode if start >= end - 1e-6), None
+                )
+                if (
+                    following is not None
+                    and episode_end - following < _MIN_RETRY_CHUNK_SECONDS
+                ):
+                    rebalanced = []
+                    for candidate in valid:
+                        tail_start = next(
+                            (
+                                start
+                                for start, _ in episode
+                                if start >= candidate - 1e-6
+                            ),
+                            None,
+                        )
+                        if (
+                            tail_start is not None
+                            and episode_end - tail_start
+                            >= _MIN_RETRY_CHUNK_SECONDS
+                            and _speech_window_density_ok(
+                                tail_start, episode_end, episode, config
+                            )
+                        ):
+                            rebalanced.append(candidate)
+                    if rebalanced:
+                        end = rebalanced[-1]
             else:
                 after_target = [end for end in valid if end - cursor >= target]
                 end = (after_target or valid)[0 if after_target else -1]

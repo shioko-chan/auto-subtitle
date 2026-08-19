@@ -60,10 +60,35 @@ def repair_long_overlaps(
     if repaired is None:
         repaired = _run_dicow(audio, windows, config)
         _write_cache(cache_path, signature, repaired)
-    evidence = _conditioned_evidence(windows, repaired, qwen_windows or [])
-    return ConditionedASRResult(
-        _replace_windows(cues, repaired, windows), evidence
+    usable_repaired = _without_repetition_hallucinations(repaired)
+    evidence = _conditioned_evidence(
+        windows, usable_repaired, qwen_windows or []
     )
+    return ConditionedASRResult(
+        _replace_windows(cues, usable_repaired, windows), evidence
+    )
+
+
+def _without_repetition_hallucinations(cues: list[Cue]) -> list[Cue]:
+    from .asr import _repetition_hallucination
+
+    usable = []
+    for cue in cues:
+        repetition = _repetition_hallucination(cue.text)
+        if repetition is None:
+            usable.append(cue)
+            continue
+        pattern, repeats = repetition
+        logger.warning(
+            "DiCoW repetition hallucination in %.3f-%.3fs speaker=%s "
+            "pattern=%r repeats=%d; preserving Qwen baseline",
+            cue.start,
+            cue.end,
+            cue.speaker or "unknown",
+            pattern[:80],
+            repeats,
+        )
+    return usable
 
 
 def _conditioned_evidence(

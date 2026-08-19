@@ -76,6 +76,8 @@ class AudioAnalysisConfig:
     singing_window_seconds: float = 5.0
     singing_stride_seconds: float = 2.5
     singing_threshold: float = 0.05
+    singing_music_threshold: float = 0.05
+    singing_speech_takeover_threshold: float = 0.5
     singing_vocal_threshold: float = 0.5
     singing_speech_bgm_coverage: float = 0.35
     singing_ambiguous_min_seconds: float = 15.0
@@ -387,6 +389,14 @@ def load_config(path: Path) -> AppConfig:
         )
     if not 0 <= analysis.singing_threshold <= 1:
         raise ConfigError("audio_analysis.singing_threshold must be between 0 and 1")
+    if not 0 <= analysis.singing_music_threshold <= 1:
+        raise ConfigError(
+            "audio_analysis.singing_music_threshold must be between 0 and 1"
+        )
+    if not 0 <= analysis.singing_speech_takeover_threshold <= 1:
+        raise ConfigError(
+            "audio_analysis.singing_speech_takeover_threshold must be between 0 and 1"
+        )
     if not 0 <= analysis.singing_vocal_threshold <= 1:
         raise ConfigError(
             "audio_analysis.singing_vocal_threshold must be between 0 and 1"

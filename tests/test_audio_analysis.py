@@ -322,9 +322,9 @@ class AudioAnalysisTests(unittest.TestCase):
 
             run.assert_called_once()
 
-    def test_singing_evidence_must_outscore_speech(self):
-        self.assertEqual(_singing_evidence_score(0.2, 0.6), 0.0)
-        self.assertAlmostEqual(_singing_evidence_score(0.8, 0.1), 0.7)
+    def test_speech_does_not_erase_independent_singing_evidence(self):
+        self.assertAlmostEqual(_singing_evidence_score(0.2, 0.6), 0.2)
+        self.assertAlmostEqual(_singing_evidence_score(0.8, 0.1), 0.8)
 
     def test_marks_simultaneous_different_speakers(self):
         result = _mark_overlaps(
@@ -383,6 +383,140 @@ class AudioAnalysisTests(unittest.TestCase):
                 AudioRegion(0, 15, "singing", confidence=0.8),
                 AudioRegion(60, 75, "singing", confidence=0.8),
             ],
+        )
+
+    def test_song_state_covers_calls_instrumentals_and_short_speech(self):
+        windows = [
+            AudioRegion(
+                0,
+                5,
+                "singing",
+                confidence=0.8,
+                speech_confidence=0.2,
+                music_confidence=0.7,
+            ),
+            AudioRegion(
+                5,
+                10,
+                "singing",
+                confidence=0.0,
+                speech_confidence=0.8,
+                music_confidence=0.7,
+            ),
+            AudioRegion(10, 15, "singing", music_confidence=0.8),
+            AudioRegion(15, 20, "singing", speech_confidence=0.9),
+            AudioRegion(
+                20,
+                25,
+                "singing",
+                confidence=0.8,
+                music_confidence=0.7,
+            ),
+        ]
+
+        result = _singing_regions_from_scores(
+            windows,
+            threshold=0.05,
+            music_threshold=0.05,
+            smoothing_windows=1,
+            release_seconds=35,
+        )
+
+        self.assertEqual(result, [AudioRegion(0, 25, "singing", confidence=0.8)])
+
+    def test_music_and_speech_cannot_start_song_without_singing_anchor(self):
+        windows = [
+            AudioRegion(
+                index * 5,
+                index * 5 + 5,
+                "singing",
+                speech_confidence=0.8,
+                music_confidence=0.7,
+            )
+            for index in range(4)
+        ]
+
+        result = _singing_regions_from_scores(
+            windows,
+            threshold=0.05,
+            music_threshold=0.05,
+            smoothing_windows=1,
+            release_seconds=35,
+        )
+
+        self.assertEqual(result, [])
+
+    def test_raw_singing_hit_with_music_rescues_short_song(self):
+        result = _singing_regions_from_scores(
+            [
+                AudioRegion(0, 5, "singing", music_confidence=0.7),
+                AudioRegion(
+                    5,
+                    10,
+                    "singing",
+                    confidence=0.06,
+                    music_confidence=0.7,
+                ),
+                AudioRegion(10, 15, "singing", music_confidence=0.7),
+            ],
+            threshold=0.05,
+            music_threshold=0.05,
+            smoothing_windows=3,
+            release_seconds=35,
+        )
+
+        self.assertEqual(result, [AudioRegion(0, 15, "singing", confidence=0.06)])
+
+    def test_sustained_speech_takeover_closes_after_final_anchor(self):
+        result = _singing_regions_from_scores(
+            [
+                AudioRegion(
+                    0,
+                    5,
+                    "singing",
+                    confidence=0.8,
+                    music_confidence=0.7,
+                ),
+                AudioRegion(
+                    5,
+                    10,
+                    "singing",
+                    speech_confidence=0.8,
+                    music_confidence=0.2,
+                ),
+            ],
+            threshold=0.05,
+            music_threshold=0.05,
+            smoothing_windows=1,
+            release_seconds=35,
+        )
+
+        self.assertEqual(result, [AudioRegion(0, 5, "singing", confidence=0.8)])
+
+    def test_song_state_audit_records_evidence_and_transitions(self):
+        audit = {}
+        _singing_regions_from_scores(
+            [
+                AudioRegion(
+                    0,
+                    5,
+                    "singing",
+                    confidence=0.8,
+                    music_confidence=0.6,
+                ),
+                AudioRegion(5, 10, "singing", music_confidence=0.7),
+            ],
+            threshold=0.05,
+            music_threshold=0.05,
+            smoothing_windows=1,
+            release_seconds=35,
+            audit=audit,
+        )
+
+        self.assertEqual(audit["windows"][1]["state"], "in_song")
+        self.assertEqual(
+            [(item["from"], item["to"]) for item in audit["transitions"]],
+            [("outside", "in_song"), ("in_song", "outside")],
         )
 
     def test_singing_score_smoothing_removes_isolated_ast_hit(self):
@@ -465,7 +599,7 @@ class AudioAnalysisTests(unittest.TestCase):
         )
         self.assertEqual(result, [AudioRegion(45.0, 117.5, "singing", confidence=0.7)])
 
-    def test_short_vocal_episode_remains_ambiguous(self):
+    def test_short_vocal_episode_is_confirmed_by_vocal_stem(self):
         singing, ambiguous = _arbitrate_singing_regions(
             [AudioRegion(0, 20, "singing", confidence=0.8)],
             [AudioRegion(0, 20, "singing", confidence=0.8)],
@@ -474,8 +608,8 @@ class AudioAnalysisTests(unittest.TestCase):
             release_seconds=35,
             minimum_singing_seconds=30,
         )
-        self.assertEqual(singing, [])
-        self.assertEqual(ambiguous, [AudioRegion(0, 20, "singing", confidence=0.8)])
+        self.assertEqual(singing, [AudioRegion(0, 20, "singing", confidence=0.8)])
+        self.assertEqual(ambiguous, [])
 
     def test_limits_separation_to_padded_overlap_region(self):
         regions = [
