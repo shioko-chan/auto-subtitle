@@ -228,7 +228,8 @@ class SubtitleRenderTests(unittest.TestCase):
         self.assertIn("PlayResX: 1080", content)
         self.assertIn("PlayResY: 1920", content)
         self.assertIn(
-            "Style: Default,Noto Sans CJK SC,48,", content
+            "Style: Default,Noto Sans CJK SC,48,&H00FFFFFF,&H000000FF,"
+            "&H00000000,&H00000000,", content
         )
         self.assertIn(",2,1,1,96,1", content)
         self.assertNotIn(r"\fs", content)
@@ -240,7 +241,7 @@ class SubtitleRenderTests(unittest.TestCase):
             path = Path(temp) / "subtitle.ass"
             styles = {
                 "fuji_miyako": CharacterStyle(
-                    "fuji_miyako", "藤都子", "#BC91FF", "#000000"
+                    "fuji_miyako", "藤都子", "#FFFFFF", "#BC91FF"
                 )
             }
             _write_ass(
@@ -259,10 +260,40 @@ class SubtitleRenderTests(unittest.TestCase):
             )
             content = path.read_text(encoding="utf-8")
 
-        self.assertIn("Style: Speaker_fuji_miyako", content)
-        self.assertIn("&H00FF91BC", content)
+        self.assertIn(
+            "Style: Speaker_fuji_miyako,Noto Sans CJK SC,48,"
+            "&H00FFFFFF,&H000000FF,&H00FF91BC,&H00000000,",
+            content,
+        )
         self.assertIn("Speaker_fuji_miyako,fuji_miyako,0,0,0,,都子", content)
         self.assertIn("Default,unknown,0,0,156,,默认", content)
+
+    def test_ass_skips_non_positive_duration_cues(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "subtitle.ass"
+            with self.assertLogs(level="WARNING") as logs:
+                _write_ass(
+                    [
+                        Cue(1, 1, "零时长"),
+                        Cue(3, 2, "负时长"),
+                        Cue(4, 5, "有效字幕"),
+                    ],
+                    path,
+                    width=1080,
+                    height=1920,
+                    font_name="Noto Sans CJK SC",
+                    font_size=48,
+                    margin_vertical=96,
+                    outline=2,
+                )
+            content = path.read_text(encoding="utf-8")
+
+        self.assertNotIn("零时长", content)
+        self.assertNotIn("负时长", content)
+        self.assertIn("有效字幕", content)
+        self.assertIn(
+            "skipped 2 non-positive-duration subtitle cue", "\n".join(logs.output)
+        )
 
     def test_video_dimensions_respect_rotation_metadata(self):
         response = subprocess.CompletedProcess(

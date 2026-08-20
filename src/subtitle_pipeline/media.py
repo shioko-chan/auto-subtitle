@@ -484,8 +484,12 @@ def _write_ass(
     )
     events = []
     active: list[tuple[float, int]] = []
+    skipped_nonpositive = 0
     for cue in sorted(cues, key=lambda item: (item.start, item.end)):
-        if not cue.text.strip() or cue.end <= cue.start:
+        if not cue.text.strip():
+            continue
+        if cue.end <= cue.start:
+            skipped_nonpositive += 1
             continue
         active = [(end, lane) for end, lane in active if end > cue.start]
         occupied = {lane for _end, lane in active}
@@ -505,6 +509,11 @@ def _write_ass(
             f"{_escape_ass_text(cue.text)}"
         )
     path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
+    if skipped_nonpositive:
+        logging.warning(
+            "skipped %d non-positive-duration subtitle cue(s) during ASS rendering",
+            skipped_nonpositive,
+        )
 
 
 def _ass_color(value: str) -> str:

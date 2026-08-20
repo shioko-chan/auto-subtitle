@@ -166,7 +166,7 @@ def trusted_sentence_boundaries(cues: list[Cue]) -> set[int]:
 
 
 def trim_overlapping_cues(cues: list[Cue]) -> list[Cue]:
-    """End each cue when the following cue starts so renderers never stack them."""
+    """Trim same/unknown-speaker overlap while preserving different speakers."""
     if len(cues) < 2:
         return cues.copy()
 

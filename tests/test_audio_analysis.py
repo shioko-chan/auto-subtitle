@@ -10,16 +10,14 @@ import numpy as np
 
 from subtitle_pipeline.audio_analysis import (
     AudioRegion,
-    DiarizationTimelines,
-    _annotate_exclusive_overlaps,
     _arbitrate_singing_regions,
+    _clean_speaker_timeline,
     _coalesce_singing_phrases,
     _exclude_timeline_regions,
     _extract_audio,
     _mark_overlaps,
     _maximum_concurrent_speakers,
     _merge_regions,
-    _overlap_route,
     _overlap_spans,
     _run_initial_audio_analysis,
     _run_mossformer2_worker,
@@ -55,8 +53,7 @@ class AudioAnalysisTests(unittest.TestCase):
 
         def diarize(*_args):
             barrier.wait(timeout=1)
-            regions = [AudioRegion(0, 1, "speech")]
-            return DiarizationTimelines(regions, regions)
+            return [AudioRegion(0, 1, "speech")]
 
         def singing(*_args):
             barrier.wait(timeout=1)
@@ -72,7 +69,7 @@ class AudioAnalysisTests(unittest.TestCase):
                 side_effect=singing,
             ),
         ):
-            timelines, scores = _run_initial_audio_analysis(
+            diarization, scores = _run_initial_audio_analysis(
                 Path("source.mp4"),
                 Path("job"),
                 np.zeros((1, 16000), dtype=np.float32),
@@ -85,47 +82,25 @@ class AudioAnalysisTests(unittest.TestCase):
                 {},
             )
 
-        self.assertEqual(timelines.exclusive[0].kind, "speech")
+        self.assertEqual(diarization[0].kind, "speech")
         self.assertEqual(scores[0].kind, "singing")
 
-    def test_overlap_routes_use_real_intersection_thresholds(self):
-        self.assertEqual(
-            _overlap_route(1.499, conditioned_seconds=1.5),
-            "exclusive",
-        )
-        self.assertEqual(
-            _overlap_route(1.5, conditioned_seconds=1.5),
-            "conditioned",
-        )
-
-    def test_exclusive_timeline_is_annotated_from_ordinary_overlap(self):
+    def test_clean_speaker_timeline_subtracts_ordinary_overlap(self):
         ordinary = [
             AudioRegion(0, 4, "speech", "S0"),
             AudioRegion(2.75, 4.5, "speech", "S1"),
         ]
-        exclusive = [
-            AudioRegion(0, 3.5, "speech", "S0", anonymous_speaker="S0"),
-            AudioRegion(3.5, 4.5, "speech", "S1", anonymous_speaker="S1"),
-        ]
 
-        result = _annotate_exclusive_overlaps(
-            exclusive,
-            ordinary,
-            conditioned_seconds=1.0,
-        )
+        result = _clean_speaker_timeline(ordinary)
 
-        overlap = [item for item in result if item.overlap]
-        clean = [item for item in result if not item.overlap]
         self.assertEqual(
-            [(item.start, item.end) for item in overlap],
-            [(2.75, 3.5), (3.5, 4)],
+            [
+                (item.start, item.end, item.speaker, item.anonymous_speaker)
+                for item in result
+            ],
+            [(0, 2.75, "S0", "S0"), (4, 4.5, "S1", "S1")],
         )
-        self.assertEqual(
-            [(item.start, item.end) for item in clean], [(0, 2.75), (4, 4.5)]
-        )
-        self.assertTrue(all(item.overlap_seconds == 1.25 for item in overlap))
-        self.assertTrue(all(item.overlap_speakers == ("S0", "S1") for item in overlap))
-        self.assertTrue(all(item.asr_route == "conditioned" for item in overlap))
+        self.assertTrue(all(not item.overlap for item in result))
 
     def test_song_regions_are_removed_from_overlap_diarization_timeline(self):
         result = _exclude_timeline_regions(
@@ -756,7 +731,8 @@ class AudioAnalysisTests(unittest.TestCase):
 
     def test_character_styles_are_separate_from_translation_glossary(self):
         styles = load_character_styles()
-        self.assertEqual(styles["minetsuki_ritsu"].primary_color, "#65A9FF")
+        self.assertEqual(styles["minetsuki_ritsu"].primary_color, "#FFFFFF")
+        self.assertEqual(styles["minetsuki_ritsu"].outline_color, "#65A9FF")
 
     def test_speaker_profiles_are_scoped_to_embedding_model(self):
         with tempfile.TemporaryDirectory() as temp:

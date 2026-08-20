@@ -17,6 +17,7 @@ from subtitle_pipeline.asr import (
     _repetition_hallucination,
     _result_to_cues,
     _song_windows,
+    _speaker_assignment_timeline,
     _speaker_for_aligned_cue,
     _speech_asr_windows,
     _timeline_retry_split,
@@ -424,6 +425,24 @@ class QwenASRTests(unittest.TestCase):
                 50.1,
                 [AudioRegion(49.0, 49.89, "speech", "A")],
             )
+        )
+
+    def test_speaker_assignment_prefers_ordinary_diarization(self):
+        exclusive = [AudioRegion(0, 2, "speech", "A")]
+        ordinary = [
+            AudioRegion(0, 2, "speech", "A"),
+            AudioRegion(1, 2, "speech", "B"),
+        ]
+
+        self.assertIs(
+            _speaker_assignment_timeline(
+                AudioAnalysis(exclusive, [], diarization=ordinary)
+            ),
+            ordinary,
+        )
+        self.assertIs(
+            _speaker_assignment_timeline(AudioAnalysis(exclusive, [])),
+            exclusive,
         )
 
     def test_timeline_retry_prefers_a_long_silence_over_the_midpoint(self):

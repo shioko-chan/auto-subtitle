@@ -95,7 +95,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.render.margin_horizontal_ratio, 0.075)
             self.assertEqual(config.render.portrait_margin_horizontal_ratio, 0.025)
             self.assertEqual(config.render.margin_vertical_ratio, 0.05)
-            self.assertEqual(config.render.outline_ratio, 0.003)
+            self.assertEqual(config.render.outline_ratio, 0.0045)
             self.assertEqual(config.render.backend, "auto")
             self.assertEqual(config.render.nvenc_preset, "p4")
             self.assertEqual(config.render.nvenc_cq, 23)
@@ -127,13 +127,6 @@ class ConfigTests(unittest.TestCase):
             path = Path(temp) / "config.toml"
             path.write_text("[llm]\nmax_concurrency = 0\n", encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, "max_concurrency"):
-                load_config(path)
-
-    def test_rejects_negative_context_cues(self):
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "config.toml"
-            path.write_text("[llm]\ncontext_cues = -1\n", encoding="utf-8")
-            with self.assertRaisesRegex(ConfigError, "context_cues"):
                 load_config(path)
 
     def test_rejects_invalid_song_ocr_interval(self):

@@ -10,7 +10,7 @@ flowchart TD
     B --> C[ffmpeg 一次解码<br/>16 kHz 单声道 float32]
     C --> D[(共享 CPU 内存<br/>AudioBufferPool)]
 
-    D --> E[pyannote Community-1<br/>ordinary 与 exclusive diarization]
+    D --> E[pyannote Community-1<br/>ordinary diarization]
     D --> F[AudioSet AST<br/>5 秒窗 / 2.5 秒步长]
     E --> G[ERes2NetV2 声纹匹配<br/>匿名 speaker 映射到成员]
     F --> H{原音歌唱候选?}
@@ -50,10 +50,12 @@ flowchart TD
     AA --> AC[待翻译源单元]
     AB --> AC
 
-    AC --> AD[LLM Map<br/>每窗最多 600 单元并行断句与翻译]
-    AD --> AE[LLM Reduce<br/>逐相邻窗口修复边界]
-    AE --> AF[定点修复空译文、假名残留等]
-    AF --> AG[完整性、时间轴与宽度校验]
+    AC --> AD{源单元类型}
+    AD -->|讲话| AE[日文 Cue Planner Map + Reduce<br/>并行规划并修复窗口边界]
+    AD -->|歌唱| AX[保留歌曲路径的句级边界]
+    AE --> AF[固定边界中文翻译<br/>同时处理可能的 ASR 误听]
+    AX --> AF
+    AF --> AG[定点修复假名残留等<br/>完整性与宽度校验]
 
     AG --> AH[source.semantic.srt<br/>translated.zh-CN.srt]
     AH --> AI[翻译标题、简介并生成标签]
@@ -86,12 +88,12 @@ Demucs `htdemucs` 是例外：歌曲分离需要较高质量的音频，因此�
 
 ### 2.1 说话人时间轴
 
-当前模型为 `pyannote/speaker-diarization-community-1`，一次推理产生两条时间轴：
+当前模型为 `pyannote/speaker-diarization-community-1`，管线只采用 ordinary 时间轴：
 
-- **ordinary diarization**：保留真实重叠以及重叠中的匿名 speaker，用于重叠检测、
-  身份聚合和 DiCoW 掩码。
-- **exclusive diarization**：每个时刻只保留一个主 speaker，用于普通 Qwen 讲话窗口和
-  词素归属，避免轻微换人边缘把一句话机械切碎。
+- **ordinary diarization**：保留真实重叠以及重叠中的匿名 speaker，用于普通 Qwen
+  讲话窗口、词素人物归属、重叠检测和 DiCoW 掩码。
+- 声纹身份阶段从每位 speaker 的 ordinary turn 中减去所有多人重叠交集，只将剩余的
+  干净单人片段作为身份匹配骨架。exclusive 时间轴不再读取或参与任何决策。
 
 当前 `initial_analysis_concurrency = 2`，所以 pyannote 与原音 AST 并行运行。
 
@@ -161,8 +163,8 @@ DiCoW 输出按 speaker 分路的**段级**日文文本与时间，不经过 Qwe
 - DiCoW 正常时，用其分路结果替换相应 speaker 的局部 Qwen 基线。
 - DiCoW 遗漏某个活跃 speaker 时，保留该 speaker 的 Qwen 基线。
 - DiCoW 出现强重复循环时，丢弃异常结果并保留 Qwen 基线。
-- 翻译 LLM 同时看到 Qwen 混合文本、DiCoW 分路文本和 diarization 活动区间，用于修正
-  明显文本幻觉，但不得伪造 speaker 或时间范围。
+- Cue Planner 同时看到 Qwen 混合文本、DiCoW 分路文本和 diarization 活动区间，用于判断
+  重叠区的 cue 边界；固定边界翻译再结合术语和上下文处理可能的文本误听。
 
 当前 DiCoW worker 尚未启用 token timestamp，因此不能把其文本描述为词级对齐结果。
 
@@ -193,32 +195,54 @@ LLM 综合以下证据判断歌名：
 匹配歌词，但只有 LLM 判断搜索歌词与实际 ASR 内容吻合时才校正歌词。单首识别失败只
 保留原 ASR 并记录警告，不阻塞其他内容。
 
-## 5. LLM 联合断句与翻译
+## 5. LLM Cue 规划与固定边界翻译
 
-所有时间单元统一表示为 `[id,duration_ms,gap_after_ms,speaker,kind,text]`。绝对时间只
-保存在本地，LLM 只能选择连续的 `start_id`/`end_id` 并生成简体中文译文，不能生成或
-修改时间戳。
+Planner 的讲话单元按时间顺序压缩为 `<speaker>`、`<id>文本` 和仅在停顿至少 500 ms
+时出现的 `<gap:Nms>` 标记。绝对时间只保存在本地，LLM 不能生成或修改时间戳。主处理
+拆成两个独立阶段：第一阶段只选择连续的 `start_id`/`end_id`；第二阶段翻译已经确认的
+日文 cue，并在翻译时处理可能的 ASR 误听。翻译阶段不能改变边界。
 
-### Map
+运行时提示词位于 `src/subtitle_pipeline/prompts/`：
+
+- `cue-planner.md`：并行 Map 的日文 cue 规划；
+- `cue-boundary-repair.md`：相邻 Map 窗口的人工边界修复；
+- `fixed-translation.md`：固定边界后的中文翻译、ASR 误听处理与定点修复。
+
+只有各文档 `SYSTEM_PROMPT`、`USER_PROMPT` 标记之间的内容会发给 LLM；动态数据使用
+`{{PLACEHOLDER}}`。加载器严格检查占位符，模板实际内容的哈希也属于缓存签名，修改后
+重跑不会误用旧提示词产生的规划或翻译缓存。
+
+### 日文 Cue Planner Map
 
 - 每个初始窗口最多 600 个源单元。
 - 最多 16 个窗口并行请求。
-- LLM 同时决定视觉友好的 cue 边界和翻译，不再先机械断句再逐 cue 翻译。
+- 仅连续讲话区间进入 Planner；`singing` cue 保留歌曲路径给出的句级边界，直接进入固定
+  边界翻译。Planner 窗口和 Reduce 都不会跨越歌曲边缘。
+- LLM 根据语义、停顿、speaker 证据和后续中文字幕的显示预算决定视觉友好的 cue 边界。
+- 每条记录只返回 `start_id` 和 `end_id`。程序按该范围从 aligner 单元恢复原始日文；
+  Planner 不再生成或校正 `source_text`。
 - 每个多单元窗口必须产生至少两条 cue。
 - 输出可为 JSON 对象、数组、NDJSON 或连续 JSON 对象，解析后执行同一套严格校验。
 - 内容校验失败立即重试一次，随后递归缩小窗口；HTTP 429/5xx 不缩窗。
 
-### Reduce
+### 日文 Cue Planner Reduce
 
 Map 窗口互不重叠，因此窗口边缘只是暂定边界。所有 Map 完成后，每对相邻窗口取左窗
-最后一条和右窗第一条作为可写范围，再并行交给 LLM 重规划。外侧 cue 只提供上下文。
-缩窗产生的新内部边界也执行同样的 Reduce，不把计算窗口边缘变成最终字幕边界。
+最后一条和右窗第一条组成一个独立 boundary 任务。程序按提示词预算把多个互不重叠的
+任务合并到同一请求中，只发送一次固定规则和 REFERENCE；模型按 `boundary_id` 分别返回
+规划。每个边界独立校验并立即缓存，缺失或非法结果只重试未完成项，连续失败时再拆小
+批次。缩窗产生的新内部边界也执行同样的 Reduce，不把计算窗口边缘变成最终字幕边界。
 
-### 定点修复与校验
+### 固定边界翻译与定点修复
 
-ID 缺失、重复、越界、时间轴无效或严重超宽说明 cue 分区不可信，需要重做相应窗口。
-空译文和日文假名残留等边界仍可信的问题先缓存为 `pending`；全部窗口完成后，把多个错误
-cue 连同原文、speaker 和相邻字幕组成修复批次。模型只能按 `repair_id` 修改 `text`。
+最终 cue 按 `cue_id` 组成独立并行批次。翻译请求包含原始 ASR 日文、speaker、相邻 cue、
+视频上下文和术语，并明确说明源文本可能含同音词、人名、漏词或重复等误听。模型结合
+证据还原意图后直接输出中文，只能返回 `cue_id` 与 `text`，不能改变、合并或拆分 ID 范围。
+空译文和日文假名残留等错误先缓存为 `pending`，后续请求只补失败的 `cue_id`；成功 cue
+立即写入缓存。Planner 已负责重叠区边界，翻译请求不重复附带整套 DiCoW 重叠证据。
+
+ID 缺失、重复、越界或时间轴无效只属于 Planner 校验，必须重做相应规划窗口。翻译阶段
+若固定 cue 无法在硬宽度内给出合格中文则停止，不会为了修译文悄悄重规划时间轴。
 
 译文建议宽度按画幅、标准字号和安全边距计算。超过建议宽度但仍能放进整帧时允许保持
 一行；超过整帧一行宽度但不超过两倍时，渲染阶段平衡成两行；超过整帧两倍宽度则拒绝。
@@ -230,18 +254,18 @@ cue 连同原文、speaker 和相邻字幕组成修复批次。模型只能按 `
 
 ## 6. 字幕、元数据与渲染
 
-联合结果分别生成：
+处理结果分别生成：
 
 - `source.semantic.srt`：按最终 cue 边界恢复的日文审计字幕；
 - `translated.zh-CN.srt`：简体中文字幕；
 - `translated.metadata.json`：标题、简介、内容摘要、歌曲报告和 B 站标签。
 
 相邻 cue 时间重叠时，前一条在后一条开始时立即结束。最终 cue 的人物取其中已知源单元
-数量最多的人物，unknown 不参与多数计算；并列或全部 unknown 时使用默认白字样式。
+数量最多的人物，unknown 不参与多数计算；并列或全部 unknown 时使用默认白字黑边样式。
 
 字号按视频短边计算：横屏 6.6%，竖屏 7.7%，限制在 28–144。提示词安全边距为横屏左右
 各 7.5%、竖屏各 2.5%，底边距为画面高度 5%；实际 ASS 左右边距统一为 1 px。描边为
-短边的 0.3%。人物样式来自 `character_styles.json`，不会发给翻译 LLM。
+短边的 0.45%。人物字幕使用白字和对应应援色描边；样式来自 `character_styles.json`，不会发给翻译 LLM。
 
 渲染前删除每个显示行末普通逗号、句号、分号、冒号和顿号，但保留问号、感叹号和省略号；
 该操作不修改审计 SRT。
@@ -261,7 +285,8 @@ cue 连同原文、speaker 和相邻字幕组成修复批次。模型只能按 `
 | `conditioned-asr-cache.json` | DiCoW 重叠分路结果 | 全部重叠窗口签名 |
 | `song-ocr-cache.json` | 每首歌的 OCR 候选 | 歌曲集合签名 |
 | `song-identification-cache.json` | 歌名、来源与歌词对齐报告 | 歌曲集合签名 |
-| `cue-translation-cache.json` | Map、Reduce、最终记录与 pending 修复 | 单窗、单边界、单 repair ID |
+| `cue-plan-cache.json` | 日文 Map、边界 Reduce 与最终 ID 计划 | 单窗、单边界 |
+| `cue-translation-cache.json` | 固定边界中文结果与 pending 状态 | 单 cue ID |
 | `manifest.json` | 最终产物与上传完成状态 | 整个作业 |
 
 缓存签名包含相关模型、配置、源时间轴和提示词版本。签名变化时不会误用旧结果；成功结果
@@ -277,8 +302,8 @@ cue 连同原文、speaker 和相邻字幕组成修复批次。模型只能按 `
    或幻觉，因此保留 Qwen 混合基线作为证据和回退。
 4. **说话人身份域偏移**：ERes2NetV2 预训练域与日语 VTuber 直播并不完全一致，角色声、
    情绪变化、BGM 和压缩失真都会增大声纹距离。
-5. **LLM 尾延迟**：少数窗口可能出现长输出、格式错误或内容校验失败；并发 Map、逐窗缓存、
-   快速缩窗和定点修复降低了影响，但不能消除服务端波动。
+5. **LLM 尾延迟**：少数 Planner 窗口或翻译批次可能出现长输出、格式错误或内容校验失败；
+   分阶段并发、独立缓存、快速缩窗和定点修复降低了影响，但不能消除服务端波动。
 
 ## 9. 代码入口
 
@@ -289,6 +314,6 @@ cue 连同原文、speaker 和相邻字幕组成修复批次。模型只能按 `
 - Qwen ASR 与 Forced Aligner：`src/subtitle_pipeline/asr.py`
 - DiCoW 重叠修复：`src/subtitle_pipeline/conditioned_asr.py`
 - 歌名识别：`src/subtitle_pipeline/song_identification.py`
-- 联合断句与翻译：`src/subtitle_pipeline/translate.py`
+- Cue 规划与固定边界翻译：`src/subtitle_pipeline/translate.py`
 - ASS 与视频渲染：`src/subtitle_pipeline/media.py`
 - Bilibili 投稿：`src/subtitle_pipeline/upload.py`

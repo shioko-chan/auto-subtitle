@@ -138,7 +138,6 @@ class LLMConfig:
     max_retries: int = 5
     max_concurrency: int = 16
     max_tokens: int = 16384
-    context_cues: int = 3
     json_mode: bool = True
     thinking: str | None = None
     reasoning_effort: str | None = None
@@ -161,7 +160,7 @@ class RenderConfig:
     margin_horizontal_ratio: float = 0.075
     portrait_margin_horizontal_ratio: float = 0.025
     margin_vertical_ratio: float = 0.05
-    outline_ratio: float = 0.003
+    outline_ratio: float = 0.0045
     crf: int = 20
     preset: str = "medium"
     nvenc_preset: str = "p4"
@@ -246,8 +245,6 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("llm.max_concurrency must be at least 1")
     if config.llm.max_tokens < 1:
         raise ConfigError("llm.max_tokens must be at least 1")
-    if config.llm.context_cues < 0:
-        raise ConfigError("llm.context_cues cannot be negative")
     if config.llm.api_style not in {"chat_completions", "responses"}:
         raise ConfigError(
             "llm.api_style must be 'chat_completions' or 'responses'"

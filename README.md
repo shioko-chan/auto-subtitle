@@ -16,7 +16,8 @@ YouTube URL
   → yt-dlp 下载视频和元数据
   → Qwen3-ASR-1.7B 分块转写音轨
   → Qwen3-ForcedAligner-0.6B 生成词级时间戳
-  → LLM 联合决定 cue 边界并翻译为单行中文字幕
+  → LLM 决定 cue 边界
+  → 固定边界翻译为中文字幕，同时处理可能的 ASR 误听
   → 本地按 ID 恢复时间轴并校验完整覆盖和整帧宽度
   → 用同一 LLM 翻译投稿标题和简介，并生成 B 站标签
   → 输出 SRT/ASS，由稀疏 libass/CUDA/NVENC 或 ffmpeg CPU 后端烧录硬字幕
@@ -121,26 +122,29 @@ max_concurrency = 16
 LLM HTTPS 请求会在系统 CA 基础上补充 `certifi` CA bundle，兼容 uv 独立 Python、
 NixOS、macOS 和 Windows，同时保留 `SSL_CERT_FILE` 等自定义 CA 配置。
 
-字幕使用联合 JSON 请求：LLM 直接把 forced aligner 单元组成 cue 并翻译，首选返回
-`{"cues":[{"start_id":...省略...}]}`。解析器也容忍模型偶尔返回 NDJSON、裸数组或连续
-JSON 对象，再统一执行相同校验。程序根据 ID 恢复日文原文和时间轴，并严格校验范围连续、
+字幕使用两阶段 JSON 请求。Cue Planner 先把 forced aligner 单元组成视觉友好的语义 cue，
+只返回 `start_id` 和 `end_id`；程序按范围恢复原始日文，固定边界翻译阶段再按 `cue_id`
+返回简体中文 `text`。翻译模型会被明确告知日文来自 ASR，可能存在误听，并结合术语、
+视频上下文和相邻 cue 还原意图，但不得改变 ID 范围。解析器也容忍 Planner 偶尔返回 NDJSON、裸数组
+或连续 JSON 对象，再统一执行相同校验。程序根据 ID 恢复时间轴，并严格校验范围连续、
 有序、无遗漏、无重复。助词、专名和术语完整性由模型结合上下文判断，不由本地规则禁止
 特定边界。时长、字符数、停顿和窗口边缘都不会成为硬边界；停顿只作为语义判断证据。
 
 forced aligner 单元会划分为互不重叠的固定窗口，并以 `llm.max_concurrency` 为上限并行
-规划和翻译。每个多单元窗口至少必须生成两条 cue；只生成一条时视为内容校验失败，立即
-重试同一范围而不缩窗。所有窗口完成后，程序把每个相邻窗口的末条与首条 cue 作为唯一
-可写范围并行交给 LLM 重规划；外侧 cue 只作为只读上下文。边界修复完成前所有窗口结果
+规划日文 cue。每个多单元窗口至少必须生成两条 cue；只生成一条时视为内容校验失败，立即
+重试同一范围而不缩窗。所有窗口完成后，程序把每个相邻窗口的末条与首条 cue 组成独立
+边界任务，再按提示词预算将多个互不重叠的任务合并请求 LLM 重规划。每个 boundary_id
+独立校验并立即缓存；缺失或非法结果只重试尚未完成的边界。边界修复完成前所有窗口结果
 均为暂定状态，不允许渲染或上传。
 
-`cue-translation-cache.json` 分别保存已完成的暂定窗口、边界修复和最终连续记录。每个
-并发请求成功后由主线程立即原子写入缓存；中断重跑时只补缺失窗口、缺失边界或未完成的
-定点文本修复。
+`cue-plan-cache.json` 保存已完成的暂定窗口、边界修复和最终连续 ID 计划；
+`cue-translation-cache.json` 保存固定 cue 的中文翻译。每个并发请求成功后立即原子写入
+对应缓存；中断重跑时只补缺失规划窗口、缺失边界或未完成翻译的 `cue_id`。
 
-窗口的 ID 覆盖、顺序、时间轴或硬宽度不合法时仍会重跑该窗口；空译文、目标语言中
-残留日文假名等可定位文本错误不会触发整窗重译，而是先以 `pending` 状态缓存。所有窗口
-完成后，管线把 pending cue 连同各自原文、说话人和已确认相邻字幕合并成定点修复请求，
-模型只能按 `repair_id` 修改译文，不能改变 cue 边界。一次响应中通过校验的修复会立即
+Planner 的 ID 覆盖、顺序或时间轴不合法时会重跑对应窗口；空译文、目标语言中残留日文
+假名等可定位文本错误不会触发 cue 重规划，而是先以 `pending` 状态缓存。管线把 pending cue
+连同各自原始日文、说话人和已确认相邻字幕合并成定点修复请求，模型只能按 `cue_id` 修改
+译文，不能改变 cue 边界。一次响应中通过校验的翻译会立即
 写回缓存，后续请求只包含尚未修好的 ID；只要仍有 pending cue，就禁止渲染和上传。
 网络错误和超时使用带随机抖动的指数退避；HTTP 5xx 也采用相同策略，但耗尽重试后直接
 终止而不缩小窗口。HTTP 429 优先遵守服务端的 `Retry-After` 响应头，并在规定等待时间
@@ -148,7 +152,7 @@ forced aligner 单元会划分为互不重叠的固定窗口，并以 `llm.max_c
 不缩窗。其他 HTTP 状态视为非暂时性错误，首次遇到便直接终止。本地输出校验失败会立即
 重试。
 
-联合输入使用 `[id,duration_ms,gap_after_ms,speaker,kind,text]`，绝对时间只在本地保存。固定规则、
+Planner 输入使用紧凑的 `<speaker>`、`<id>text` 和显著停顿标记，绝对时间只在本地保存。固定规则、
 术语表和视频信息位于请求前缀，窗口数据随后，重试错误放在末尾，以提高 DeepSeek
 上下文缓存命中。日志会记录 `prompt_cache_hit_tokens`、`prompt_cache_miss_tokens`、
 命中率及输出 token；同起始时间单元只发送紧凑的 ID 范围，不枚举所有合法终点。
@@ -281,10 +285,10 @@ B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服�
 - `asr.chunk_seconds` / `chunk_context_seconds`：控制可恢复分块和切点上下文；总输入
   长度不能超过 180 秒。
 - `asr.max_new_tokens`：单块 ASR 最多生成的 token 数，默认 `2048`。
-- `audio_analysis.diarization_backend`：默认 `pyannote`，使用 Community-1 的 ordinary 与
-  exclusive 双时间轴；`moss` 仅保留作回归比较。
-- `audio_analysis.overlap_conditioned_asr_seconds`：默认 `1.5` 秒；更短重叠视为
-  换人边界误差并使用 exclusive diarization，达到阈值后使用 DiCoW。
+- `audio_analysis.diarization_backend`：默认 `pyannote`，使用 Community-1 的 ordinary
+  diarization；`moss` 仅保留作回归比较。
+- `audio_analysis.overlap_conditioned_asr_seconds`：默认 `0.5` 秒；更短重叠视为
+  换人边界误差并保留 Qwen 基线，达到阈值后使用 DiCoW。
 - `audio_analysis.conditioned_asr_model` / `conditioned_asr_revision`：长重叠局部修复所用
   DiCoW 模型及固定代码 revision。
 - `audio_analysis.moss_window_seconds` / `moss_max_window_seconds`：MOSS 长窗目标和硬上限，
@@ -297,7 +301,6 @@ B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服�
 - `llm.max_tokens`：单次 LLM 响应的输出 token 上限，DeepSeek V4 建议设为 `16384`。
 - `llm.max_retries`：同一窗口、边界或定点修复请求的重试次数，建议设为 `5`。
 - `llm.max_concurrency`：窗口和边界 LLM 请求的最大并发数，默认 `16`。
-- `llm.context_cues`：窗口附带的相邻源单元及边界修复附带的只读 cue 数量，默认 `3`。
 - `llm.thinking`：DeepSeek V4 的严格 JSON 翻译应设为 `"disabled"`；其他服务不支持该参数时省略。
 - `llm.translate_metadata`：是否翻译 YouTube 标题和简介。
 - `llm.metadata_description_max_chars`：发送给 LLM 的源简介字符上限。
@@ -309,7 +312,7 @@ B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服�
 - `render.font_size_ratio` / `portrait_font_size_ratio`：横屏与竖屏字号相对于视频短边的比例，并受最小/最大字号限制。
 - `render.margin_horizontal_ratio` / `portrait_margin_horizontal_ratio`：横屏与竖屏左右安全边距各自占视频宽度的比例。
 - `render.margin_vertical_ratio`：字幕底边距占视频高度的比例。
-- `render.outline_ratio`：黑色描边相对于视频短边的比例，默认 `0.003`。
+- `render.outline_ratio`：字幕描边相对于视频短边的比例，默认 `0.0045`。
 - `upload.enabled`：生产环境才建议开启；命令行 `--no-upload` 始终优先关闭上传。
 - `upload.tags`：始终保留的固定标签；会与自动标签去重合并。
 - `upload.max_tags`：投稿使用的固定标签与自动标签总数上限。

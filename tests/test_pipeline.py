@@ -288,6 +288,14 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(
                 FakeTranslator.joint_context["hard_max_line_units"], 26
             )
+            self.assertEqual(
+                FakeTranslator.joint_context["plan_cache_path"].name,
+                "cue-plan-cache.json",
+            )
+            self.assertEqual(
+                FakeTranslator.joint_context["cache_path"].name,
+                "cue-translation-cache.json",
+            )
             upload.assert_not_called()
 
 

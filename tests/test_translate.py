@@ -1,6 +1,5 @@
 import json
 import tempfile
-import threading
 import unittest
 import urllib.error
 from datetime import datetime, timezone
@@ -14,12 +13,15 @@ from subtitle_pipeline.translate import (
     LLMHTTPError,
     OpenAICompatibleTranslator,
     TranslationError,
-    _collapsed_start_runs,
+    _compact_fixed_translation_text,
+    _compact_prompt_units_text,
+    _compact_reference_text,
+    _cue_plan_range_groups,
+    _cue_plan_signature,
     _is_nontransient_http_error,
-    _joint_translation_signature,
-    _load_joint_translation_cache,
     _log_response_usage,
     _majority_speaker,
+    _merge_planned_and_singing_records,
     _normalize_api_response,
     _parse_joint_records,
     _parse_json_object,
@@ -30,12 +32,508 @@ from subtitle_pipeline.translate import (
     _translation_window_ranges,
     _validate_joint_records,
     _validate_joint_target_language,
-    _validate_joint_timing,
+    _validated_boundary_repairs,
+    _validated_translation_repairs,
     _without_source_punctuation,
 )
 
 
 class TranslationTests(unittest.TestCase):
+    def test_split_planning_and_translation_have_independent_contracts_and_caches(self):
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(thinking="disabled"), "secret"
+        )
+        cues = [
+            Cue(0, 0.4, "夢"),
+            Cue(0.7, 1.0, "パワー。"),
+            Cue(1.0, 1.8, "次"),
+        ]
+
+        def response(body):
+            prompt = body["messages"][1]["content"]
+            if "Group every TARGET" in prompt:
+                content = (
+                    '{"cues":['
+                    '{"start_id":0,"end_id":1},'
+                    '{"start_id":2,"end_id":2}'
+                    "]}"
+                )
+            else:
+                self.assertIn("Cue boundaries are already final", prompt)
+                self.assertIn("Japanese comes from ASR", prompt)
+                self.assertIn("<0>夢パワー", prompt)
+                self.assertNotIn('"start_id":0,"end_id":2', prompt)
+                content = (
+                    '{"translations":['
+                    '{"cue_id":0,"text":"梦想就是力量"},'
+                    '{"cue_id":1,"text":"接下来"}'
+                    "]}"
+                )
+            return {
+                "choices": [{"finish_reason": "stop", "message": {"content": content}}]
+            }
+
+        with tempfile.TemporaryDirectory() as temp:
+            plan_cache = Path(temp) / "cue-plan-cache.json"
+            translation_cache = Path(temp) / "cue-translation-cache.json"
+            with patch.object(translator, "_request", side_effect=response) as request:
+                result = translator.plan_and_translate(
+                    cues,
+                    SegmentationConfig(),
+                    max_line_units=20,
+                    plan_cache_path=plan_cache,
+                    cache_path=translation_cache,
+                )
+            self.assertEqual(request.call_count, 2)
+            plan_payload = json.loads(plan_cache.read_text(encoding="utf-8"))
+            translation_payload = json.loads(
+                translation_cache.read_text(encoding="utf-8")
+            )
+
+            cached = OpenAICompatibleTranslator(
+                LLMConfig(thinking="disabled"), "secret"
+            )
+            with patch.object(cached, "_request") as cached_request:
+                cached_result = cached.plan_and_translate(
+                    cues,
+                    SegmentationConfig(),
+                    max_line_units=20,
+                    plan_cache_path=plan_cache,
+                    cache_path=translation_cache,
+                )
+
+        self.assertEqual(result, cached_result)
+        self.assertEqual([cue.text for cue in result.source_cues], ["夢パワー。", "次"])
+        self.assertEqual(
+            [cue.text for cue in result.translated_cues],
+            ["梦想就是力量", "接下来"],
+        )
+        self.assertEqual(
+            set(plan_payload["records"][0]),
+            {"start_id", "end_id", "source_text"},
+        )
+        self.assertEqual(translation_payload["records"][0]["cue_id"], 0)
+        self.assertEqual(translation_payload["records"][0]["status"], "confirmed")
+        cached_request.assert_not_called()
+
+    def test_singing_cues_bypass_planner_and_keep_existing_boundaries(self):
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(thinking="disabled"), "secret"
+        )
+        cues = [
+            Cue(0.0, 2.0, "夢はパワー", kind="singing"),
+            Cue(2.0, 4.0, "歌い続ける", kind="singing"),
+        ]
+        response = {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": (
+                            '{"translations":['
+                            '{"cue_id":0,"text":"梦想就是力量"},'
+                            '{"cue_id":1,"text":"继续歌唱"}'
+                            "]}"
+                        )
+                    },
+                }
+            ]
+        }
+
+        with patch.object(translator, "_request", return_value=response) as request:
+            result = translator.plan_and_translate(
+                cues,
+                SegmentationConfig(),
+                max_line_units=20,
+            )
+
+        self.assertEqual(request.call_count, 1)
+        prompt = request.call_args.args[0]["messages"][1]["content"]
+        self.assertNotIn("Group every TARGET", prompt)
+        self.assertEqual(
+            [(cue.start, cue.end, cue.text) for cue in result.source_cues],
+            [(0.0, 2.0, "夢はパワー"), (2.0, 4.0, "歌い続ける")],
+        )
+
+    def test_fixed_translation_retries_only_invalid_cue_text(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(max_retries=2), "secret")
+        cues = [Cue(0, 1, "みやこ"), Cue(1, 2, "です")]
+        responses = [
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": (
+                                '{"cues":['
+                                '{"start_id":0,"end_id":0},'
+                                '{"start_id":1,"end_id":1}'
+                                "]}"
+                            )
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": (
+                                '{"translations":['
+                                '{"cue_id":0,"text":"みやこ"},'
+                                '{"cue_id":1,"text":"是"}'
+                                "]}"
+                            )
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": ('{"translations":[{"cue_id":0,"text":"都子"}]}')
+                        },
+                    }
+                ]
+            },
+        ]
+        with patch.object(translator, "_request", side_effect=responses) as request:
+            result = translator.plan_and_translate(
+                cues,
+                SegmentationConfig(),
+                max_line_units=20,
+            )
+        self.assertEqual([cue.text for cue in result.translated_cues], ["都子", "是"])
+        retry_prompt = request.call_args_list[2].args[0]["messages"][1]["content"]
+        repair_target = retry_prompt.split("TARGET:\n", 1)[1]
+        repair = json.loads(repair_target.split("\nRETRY:", 1)[0])
+        self.assertEqual(repair["cue_id"], 0)
+        self.assertEqual(repair["source"], "みやこ")
+        self.assertEqual(repair["invalid_text"], "みやこ")
+        self.assertIn("Japanese kana", repair["errors"][0])
+        self.assertNotIn('"cue_id":1', repair_target)
+
+    def test_fixed_translation_repair_records_width_and_missing_reasons(self):
+        accepted, rejected = _validated_translation_repairs(
+            [{"cue_id": 11, "text": "一二三"}],
+            [11, 12],
+            2,
+            "简体中文",
+        )
+
+        self.assertEqual(accepted, {})
+        self.assertEqual(rejected[11]["invalid_text"], "一二三")
+        self.assertIn("exceeds maximum", rejected[11]["errors"][0])
+        self.assertEqual(rejected[12]["invalid_text"], "")
+        self.assertIn("missing", rejected[12]["errors"][0])
+
+    def test_split_planner_repairs_only_artificial_window_boundary(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(max_concurrency=1), "secret")
+        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁")]
+
+        def response(body):
+            prompt = body["messages"][1]["content"]
+            if "Required ID range: 0-1" in prompt:
+                content = (
+                    '{"cues":['
+                    '{"start_id":0,"end_id":0},'
+                    '{"start_id":1,"end_id":1}'
+                    "]}"
+                )
+            elif "Required ID range: 2-3" in prompt:
+                content = (
+                    '{"cues":['
+                    '{"start_id":2,"end_id":2},'
+                    '{"start_id":3,"end_id":3}'
+                    "]}"
+                )
+            elif "Independently replan every BOUNDARY block" in prompt:
+                self.assertIn("<boundary:1|2 range=1-2>", prompt)
+                self.assertNotIn("artificial Map boundary", prompt)
+                self.assertNotIn("READ_ONLY_CUES", prompt)
+                self.assertNotIn("WRITABLE", prompt)
+                self.assertNotIn('"translation"', prompt)
+                content = (
+                    '{"repairs":[{"boundary_id":"1|2","cues":['
+                    '{"start_id":1,"end_id":2}]}]}'
+                )
+            else:
+                self.assertIn("<1>乙丙", prompt)
+                content = (
+                    '{"translations":['
+                    '{"cue_id":0,"text":"一"},'
+                    '{"cue_id":1,"text":"二三"},'
+                    '{"cue_id":2,"text":"四"}'
+                    "]}"
+                )
+            return {
+                "choices": [{"finish_reason": "stop", "message": {"content": content}}]
+            }
+
+        with patch.object(translator, "_request", side_effect=response) as request:
+            result = translator.plan_and_translate(
+                cues,
+                SegmentationConfig(model_window_cues=2),
+                max_line_units=20,
+            )
+        self.assertEqual(request.call_count, 4)
+        self.assertEqual([cue.text for cue in result.source_cues], ["甲", "乙丙", "丁"])
+        self.assertEqual(
+            [cue.text for cue in result.translated_cues], ["一", "二三", "四"]
+        )
+
+    def test_boundary_reduce_batches_multiple_boundaries_in_one_request(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(max_concurrency=1), "secret")
+        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁戊己")]
+        boundary_prompts: list[str] = []
+
+        def response(body):
+            prompt = body["messages"][1]["content"]
+            if "Required ID range" in prompt:
+                match = next(
+                    value
+                    for value in ("0-1", "2-3", "4-5")
+                    if f"Required ID range: {value}" in prompt
+                )
+                start, end = (int(value) for value in match.split("-"))
+                content = json.dumps(
+                    {
+                        "cues": [
+                            {"start_id": cue_id, "end_id": cue_id}
+                            for cue_id in range(start, end + 1)
+                        ]
+                    }
+                )
+            elif "Independently replan every BOUNDARY block" in prompt:
+                boundary_prompts.append(prompt)
+                content = json.dumps(
+                    {
+                        "repairs": [
+                            {
+                                "boundary_id": "1|2",
+                                "cues": [
+                                    {"start_id": 1, "end_id": 1},
+                                    {"start_id": 2, "end_id": 2},
+                                ],
+                            },
+                            {
+                                "boundary_id": "3|4",
+                                "cues": [
+                                    {"start_id": 3, "end_id": 3},
+                                    {"start_id": 4, "end_id": 4},
+                                ],
+                            },
+                        ]
+                    }
+                )
+            else:
+                content = json.dumps(
+                    {
+                        "translations": [
+                            {"cue_id": cue_id, "text": text}
+                            for cue_id, text in enumerate("一二三四五六")
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            return {
+                "choices": [{"finish_reason": "stop", "message": {"content": content}}]
+            }
+
+        with patch.object(translator, "_request", side_effect=response) as request:
+            result = translator.plan_and_translate(
+                cues,
+                SegmentationConfig(model_window_cues=2),
+                max_line_units=20,
+            )
+
+        self.assertEqual(request.call_count, 5)
+        self.assertEqual(len(boundary_prompts), 1)
+        self.assertIn("<boundary:1|2 range=1-2>", boundary_prompts[0])
+        self.assertIn("<boundary:3|4 range=3-4>", boundary_prompts[0])
+        self.assertEqual([cue.text for cue in result.translated_cues], list("一二三四五六"))
+
+    def test_boundary_validation_accepts_independent_partial_results(self):
+        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁")]
+        specs = [
+            (
+                "0|1",
+                CueTranslationRecord(0, 0, "", "甲"),
+                CueTranslationRecord(1, 1, "", "乙"),
+            ),
+            (
+                "2|3",
+                CueTranslationRecord(2, 2, "", "丙"),
+                CueTranslationRecord(3, 3, "", "丁"),
+            ),
+        ]
+
+        accepted, rejected = _validated_boundary_repairs(
+            [
+                {
+                    "boundary_id": "0|1",
+                    "cues": [{"start_id": 0, "end_id": 1}],
+                }
+            ],
+            specs,
+            cues,
+        )
+
+        self.assertEqual(list(accepted), ["0|1"])
+        self.assertEqual(accepted["0|1"][0].source_text, "甲乙")
+        self.assertIn("missing", rejected["2|3"])
+
+    def test_boundary_reduce_retries_only_missing_boundary(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(max_retries=3), "secret")
+        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁")]
+        specs = [
+            (
+                "0|1",
+                CueTranslationRecord(0, 0, "", "甲"),
+                CueTranslationRecord(1, 1, "", "乙"),
+            ),
+            (
+                "2|3",
+                CueTranslationRecord(2, 2, "", "丙"),
+                CueTranslationRecord(3, 3, "", "丁"),
+            ),
+        ]
+        prompts: list[str] = []
+        accepted_callbacks: list[list[str]] = []
+
+        def response(body):
+            prompt = body["messages"][1]["content"]
+            prompts.append(prompt)
+            key = "0|1" if len(prompts) == 1 else "2|3"
+            start = 0 if key == "0|1" else 2
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "repairs": [
+                                        {
+                                            "boundary_id": key,
+                                            "cues": [
+                                                {
+                                                    "start_id": start,
+                                                    "end_id": start + 1,
+                                                }
+                                            ],
+                                        }
+                                    ]
+                                }
+                            )
+                        },
+                    }
+                ]
+            }
+
+        with patch.object(translator, "_request", side_effect=response) as request:
+            result = translator._repair_plan_boundaries(
+                cues,
+                specs,
+                {},
+                20,
+                on_accept=lambda values: accepted_callbacks.append(list(values)),
+            )
+
+        self.assertEqual(request.call_count, 2)
+        self.assertIn("<boundary:0|1 range=0-1>", prompts[0])
+        self.assertIn("<boundary:2|3 range=2-3>", prompts[0])
+        self.assertNotIn("<boundary:0|1 range=0-1>", prompts[1])
+        self.assertIn("<boundary:2|3 range=2-3>", prompts[1])
+        self.assertEqual(set(result), {"0|1", "2|3"})
+        self.assertEqual(accepted_callbacks, [["0|1"], ["2|3"]])
+
+    def test_split_planner_retries_content_error_before_translation(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(max_retries=3), "secret")
+        cues = [Cue(0, 1, "甲")]
+        responses = [
+            {"choices": [{"finish_reason": "stop", "message": {"content": "{"}}]},
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": (
+                                '{"cues":[{"start_id":0,"end_id":0}]}'
+                            )
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": ('{"translations":[{"cue_id":0,"text":"甲"}]}')
+                        },
+                    }
+                ]
+            },
+        ]
+        with patch.object(translator, "_request", side_effect=responses) as request:
+            result = translator.plan_and_translate(
+                cues,
+                SegmentationConfig(),
+                max_line_units=20,
+            )
+        self.assertEqual(result.translated_cues[0].text, "甲")
+        self.assertEqual(request.call_count, 3)
+        retry_prompt = request.call_args_list[1].args[0]["messages"][1]["content"]
+        self.assertNotIn("RETRY:", retry_prompt)
+
+    def test_fixed_translation_prompt_uses_safe_width_but_validation_uses_hard_width(
+        self,
+    ):
+        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        cues = [Cue(0, 1, "長い文")]
+
+        def response(body):
+            prompt = body["messages"][1]["content"]
+            if "Group every TARGET" in prompt:
+                return {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": (
+                                    '{"cues":[{"start_id":0,"end_id":0}]}'
+                                )
+                            },
+                        }
+                    ]
+                }
+            self.assertIn("no wider than 5.000", prompt)
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": (
+                                '{"translations":[{"cue_id":0,"text":"一二三四五六"}]}'
+                            )
+                        },
+                    }
+                ]
+            }
+
+        with patch.object(translator, "_request", side_effect=response):
+            result = translator.plan_and_translate(
+                cues,
+                SegmentationConfig(),
+                max_line_units=5,
+                hard_max_line_units=10,
+            )
+        self.assertEqual(result.translated_cues[0].text, "一二三四五六")
+
     def test_majority_speaker_ignores_unknown_units(self):
         cues = [
             Cue(0, 1, "甲", "ritsu"),
@@ -50,110 +548,9 @@ class TranslationTests(unittest.TestCase):
         self.assertIsNone(_majority_speaker(cues, 0, 2))
         self.assertIsNone(_majority_speaker(cues, 1, 1))
 
-    def test_joint_translation_restores_timing_and_compact_gap_input(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(thinking="disabled"), "secret")
-        cues = [
-            Cue(0, 0.4, "夢"),
-            Cue(0.7, 1.0, "パワー。"),
-            Cue(1.0, 1.8, "次"),
-        ]
-        response = {
-            "choices": [
-                {
-                    "finish_reason": "stop",
-                    "message": {
-                        "content": (
-                            '{"cues":['
-                            '{"start_id":0,"end_id":1,"source_text":"夢はパワー","text":"梦想就是力量"},'
-                            '{"start_id":2,"end_id":2,"source_text":"次","text":"Power"}'
-                            "]}"
-                        )
-                    },
-                }
-            ]
-        }
-        with patch.object(translator, "_request", return_value=response) as request:
-            result = translator.plan_and_translate(
-                cues,
-                SegmentationConfig(),
-                max_line_units=20,
-            )
-        self.assertEqual(
-            result.source_cues,
-            [Cue(0, 1.0, "夢はパワー"), Cue(1.0, 1.8, "次")],
-        )
-        self.assertEqual(
-            result.translated_cues,
-            [Cue(0, 1.0, "梦想就是力量"), Cue(1.0, 1.8, "Power")],
-        )
-        prompt = request.call_args.args[0]["messages"][1]["content"]
-        self.assertIn(
-            "Unit columns: [id,duration_ms,gap_after_ms,speaker,kind,text]",
-            prompt,
-        )
-        self.assertIn('[[0,400,300,null,"speech","夢"]', prompt)
-        self.assertIn('[1,300,0,null,"speech","パワー"]', prompt)
-        self.assertNotIn("パワー。", prompt)
-        self.assertIn("ASR punctuation has been removed", prompt)
-        self.assertNotIn("Required individual IDs", prompt)
-        self.assertNotIn("valid end_id values", prompt)
-        self.assertLess(prompt.index("REFERENCE:"), prompt.index("Required ID range:"))
-        self.assertLess(prompt.index("REFERENCE:"), prompt.index("DISPLAY_CONSTRAINT:"))
-        self.assertLess(
-            prompt.index("DISPLAY_CONSTRAINT:"), prompt.index("Required ID range:")
-        )
-        self.assertIn("20 full-width characters", prompt)
-        self.assertIn("REFERENCE.characters contains entity instances", prompt)
-        self.assertIn("context_only=true", prompt)
-        self.assertIn("Return exactly one JSON object with a cues array", prompt)
-        self.assertIn("Never omit, genericize, or paraphrase a source name", prompt)
-        self.assertIn("that record's text must explicitly contain the mapped target name", prompt)
-        self.assertIn("Usually omit さん", prompt)
-        self.assertIn("only in a formal context", prompt)
-        self.assertIn("Translate ちゃん as 酱", prompt)
-        self.assertIn("Usually omit くん", prompt)
-        self.assertIn("Translate さま or 様 as 大人", prompt)
-        self.assertIn("Translate 先生 as 老师, 医生, or 先生", prompt)
-        self.assertIn("complete name-plus-honorific form overrides", prompt)
-        self.assertEqual(request.call_args.args[0]["max_tokens"], 16384)
-        self.assertEqual(request.call_args.args[0]["thinking"], {"type": "disabled"})
-        self.assertEqual(
-            request.call_args.args[0]["response_format"], {"type": "json_object"}
-        )
-
-    def test_joint_prompt_receives_only_time_overlapping_asr_evidence(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
-        cues = [Cue(10, 11, "ごめん", "A"), Cue(11, 12, "続けて", "A")]
-        response = {
-            "choices": [{"finish_reason": "stop", "message": {"content": (
-                '{"cues":['
-                '{"start_id":0,"end_id":0,"source_text":"ごめん","text":"抱歉"},'
-                '{"start_id":1,"end_id":1,"source_text":"続けて","text":"继续吧"}'
-                "]}"
-            )}}]
-        }
-        context = {
-            "asr_evidence": [
-                {"start": 9, "end": 11.5, "qwen_mixed": [{"text": "ごめん"}]},
-                {"start": 30, "end": 31, "qwen_mixed": [{"text": "范围外"}]},
-            ]
-        }
-        with patch.object(translator, "_request", return_value=response) as request:
-            translator.plan_and_translate(
-                cues,
-                SegmentationConfig(),
-                translation_context=context,
-                max_line_units=20,
-            )
-
-        prompt = request.call_args.args[0]["messages"][1]["content"]
-        self.assertIn("ごめん", prompt)
-        self.assertNotIn("范围外", prompt)
-        self.assertIn("source_text must be corrected natural Japanese", prompt)
-
     def test_joint_prompt_source_view_removes_unicode_punctuation(self):
         self.assertEqual(
-            _without_source_punctuation('「使ってる。ね？」 BanG Dream!'),
+            _without_source_punctuation("「使ってる。ね？」 BanG Dream!"),
             "使ってるね BanG Dream",
         )
 
@@ -171,17 +568,66 @@ class TranslationTests(unittest.TestCase):
             ["franchises", "characters", "terms", "video", "identified_songs"],
         )
 
+    def test_prompt_reference_uses_compact_semantic_sections(self):
+        compact = _compact_reference_text(
+            {
+                "franchises": [{"name": "BanG Dream!", "background": "背景"}],
+                "characters": [
+                    {
+                        "id": "miyako",
+                        "source_name": "藤都子",
+                        "canonical": "藤都子",
+                        "aliases": ["ふじみやこ", "Miyako"],
+                        "short_names": [
+                            {
+                                "source": "みやこ",
+                                "target": "都子",
+                                "context_only": True,
+                            }
+                        ],
+                    }
+                ],
+                "terms": {"ゆめみた": "梦限大MewType"},
+                "video": {"title": "标题", "categories": ["Entertainment"]},
+            }
+        )
+
+        self.assertIn("<franchises>\nBanG Dream!｜背景", compact)
+        self.assertIn("<characters>\nmiyako｜藤都子=>藤都子", compact)
+        self.assertIn("aliases:ふじみやこ｜Miyako", compact)
+        self.assertIn("short:みやこ=>都子[context]", compact)
+        self.assertIn("<terms>\nゆめみた=>梦限大MewType", compact)
+        self.assertIn("<video>\ntitle:标题\ncategories:Entertainment", compact)
+        self.assertNotIn('"characters"', compact)
+
+    def test_compact_reference_preserves_trusted_text(self):
+        compact = _compact_reference_text(
+            {
+                "characters": [
+                    {
+                        "id": "a｜b",
+                        "source_name": "A=>B",
+                        "canonical": "<C>",
+                    }
+                ],
+                "terms": {"x｜y": "z=>w"},
+            }
+        )
+
+        self.assertIn("a｜b｜A=>B=><C>", compact)
+        self.assertIn("x｜y=>z=>w", compact)
+
     def test_joint_cache_signature_changes_with_api_provider(self):
         cues = [Cue(0, 1, "字幕")]
         segmentation = SegmentationConfig()
-        deepseek = _joint_translation_signature(
+        deepseek = _cue_plan_signature(
             cues,
             segmentation,
             LLMConfig(),
             {},
             20,
         )
-        openai = _joint_translation_signature(
+        openai = _cue_plan_signature(
             cues,
             segmentation,
             LLMConfig(
@@ -203,7 +649,9 @@ class TranslationTests(unittest.TestCase):
             {"start_id": 2, "end_id": 3, "text": "乙"},
         ]
         ndjson = "\n".join(json.dumps(record, ensure_ascii=False) for record in records)
-        adjacent = ",".join(json.dumps(record, ensure_ascii=False) for record in records)
+        adjacent = ",".join(
+            json.dumps(record, ensure_ascii=False) for record in records
+        )
 
         self.assertEqual(_parse_joint_records(json.dumps({"cues": records})), records)
         self.assertEqual(_parse_joint_records(json.dumps(records)), records)
@@ -212,9 +660,7 @@ class TranslationTests(unittest.TestCase):
 
     def test_joint_parser_rejects_explanatory_text(self):
         with self.assertRaisesRegex(ValueError, "invalid joint cue JSON"):
-            _parse_joint_records(
-                'Here you go: {"start_id":0,"end_id":0,"text":"甲"}'
-            )
+            _parse_joint_records('Here you go: {"start_id":0,"end_id":0,"text":"甲"}')
 
     def test_logs_deepseek_cache_usage(self):
         with self.assertLogs(level="INFO") as captured:
@@ -351,425 +797,151 @@ class TranslationTests(unittest.TestCase):
         )
         self.assertEqual(normalized["choices"][0]["finish_reason"], "length")
 
-    def test_parallel_windows_then_repair_only_two_edge_cues(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_concurrency=2), "secret"
-        )
-        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁戊")]
+    def test_window_ranges_never_leave_one_unit_chunk(self):
+        self.assertEqual(_translation_window_ranges(5, 2), [(0, 2), (2, 5)])
+        self.assertEqual(_translation_window_ranges(601, 600), [(0, 599), (599, 601)])
 
-        def response(body):
-            prompt = body["messages"][1]["content"]
-            system = body["messages"][0]["content"]
-            if "repair one provisional" in system:
-                self.assertIn("IDs 1-3", prompt)
-                self.assertIn('"start_id":1', prompt)
-                self.assertIn('"start_id":3', prompt)
-                return {"choices": [{"message": {"content": (
-                    '{"cues":['
-                    '{"start_id":1,"end_id":3,"text":"重新分组"}'
-                    "]}"
-                )}}]}
-            if "Required ID range: 0-2" in prompt:
-                content = (
-                    '{"cues":['
-                    '{"start_id":0,"end_id":0,"text":"一"},'
-                    '{"start_id":1,"end_id":2,"text":"暂定左边"}'
-                    "]}"
-                )
-            else:
-                self.assertIn("Required ID range: 3-4", prompt)
-                content = (
-                    '{"cues":['
-                    '{"start_id":3,"end_id":3,"text":"暂定右边"},'
-                    '{"start_id":4,"end_id":4,"text":"五"}'
-                    "]}"
-                )
-            return {"choices": [{"message": {"content": content}}]}
-
-        config = SegmentationConfig(model_window_cues=3)
-        with patch.object(translator, "_request", side_effect=response) as request:
-            result = translator.plan_and_translate(
-                cues,
-                config,
-                max_line_units=20,
-            )
-        self.assertEqual(
-            [cue.text for cue in result.translated_cues], ["一", "重新分组", "五"]
-        )
-        self.assertEqual(request.call_count, 3)
-        boundary_calls = [
-            call
-            for call in request.call_args_list
-            if "repair one provisional"
-            in call.args[0]["messages"][0]["content"]
+    def test_singing_cues_split_planner_ranges_and_bypass_planning(self):
+        cues = [
+            Cue(0.0, 0.4, "話", kind="speech"),
+            Cue(0.4, 0.8, "す", kind="speech"),
+            Cue(0.8, 1.8, "歌詞", kind="singing"),
+            Cue(1.8, 2.2, "続", kind="speech"),
+            Cue(2.2, 2.6, "き", kind="speech"),
         ]
-        self.assertEqual(len(boundary_calls), 1)
 
-    def test_boundary_repair_accepts_translation_field_alias(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=1, max_concurrency=1), "secret"
-        )
-        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁")]
-
-        def response(body):
-            prompt = body["messages"][1]["content"]
-            if "WRITABLE:" in prompt:
-                self.assertIn('"text":"中文字幕"', prompt)
-                content = (
-                    '{"cues":['
-                    '{"start_id":1,"end_id":1,"translation":"一"},'
-                    '{"start_id":2,"end_id":2,"translation":"二"}'
-                    "]}"
-                )
-            elif "Required ID range: 0-1" in prompt:
-                content = (
-                    '{"cues":['
-                    '{"start_id":0,"end_id":0,"text":"零"},'
-                    '{"start_id":1,"end_id":1,"text":"一"}'
-                    "]}"
-                )
-            else:
-                content = (
-                    '{"cues":['
-                    '{"start_id":2,"end_id":2,"text":"二"},'
-                    '{"start_id":3,"end_id":3,"text":"三"}'
-                    "]}"
-                )
-            return {"choices": [{"message": {"content": content}}]}
-
-        with patch.object(translator, "_request", side_effect=response):
-            result = translator.plan_and_translate(
-                cues,
-                SegmentationConfig(model_window_cues=2),
-                max_line_units=20,
-            )
-        self.assertEqual(
-            [cue.text for cue in result.translated_cues], ["零", "一", "二", "三"]
-        )
-
-    def test_failed_map_window_shrinks_and_repairs_new_boundary(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(max_retries=1), "secret")
-        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁")]
-
-        def plan(_cues, start, end, *_args):
-            if (start, end) == (0, 4):
-                raise TranslationError("finish_reason=length")
-            return [
-                CueTranslationRecord(index, index, str(index))
-                for index in range(start, end)
-            ]
-
-        with patch.object(
-            translator, "_plan_and_translate_window", side_effect=plan
-        ) as planned, patch.object(
-            translator,
-            "_repair_translation_boundary",
-            return_value=[CueTranslationRecord(1, 2, "一二")],
-        ) as repaired:
-            result = translator._plan_and_translate_window_resilient(
-                cues, 0, 4, {}, [], 20, 40
-            )
-
-        self.assertEqual(
-            result,
+        self.assertEqual(_cue_plan_range_groups(cues, 1), [[(0, 2)], [(3, 5)]])
+        records = _merge_planned_and_singing_records(
+            cues,
             [
-                CueTranslationRecord(0, 0, "0"),
-                CueTranslationRecord(1, 2, "一二"),
-                CueTranslationRecord(3, 3, "3"),
+                CueTranslationRecord(0, 1, "", "話す"),
+                CueTranslationRecord(3, 4, "", "続き"),
             ],
         )
-        self.assertEqual(planned.call_count, 3)
-        repaired.assert_called_once()
+        self.assertEqual(
+            [
+                (record.start_id, record.end_id, record.source_text)
+                for record in records
+            ],
+            [(0, 1, "話す"), (2, 2, "歌詞"), (3, 4, "続き")],
+        )
 
-    def test_length_output_retries_once_before_window_shrink(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(max_retries=5), "secret")
-        response = {
-            "choices": [
+    def test_planner_units_use_compact_speaker_and_gap_markers(self):
+        units = _compact_prompt_units_text(
+            [
+                Cue(0.0, 0.5, "こんにちは。", "speaker_00", "speech"),
+                Cue(0.7, 1.0, "まだ<確認>", "speaker_00", "speech"),
+                Cue(1.6, 2.0, "はい", "speaker_01", "speech"),
+                Cue(2.1, 2.4, "次", None, "speech"),
+            ],
+            0,
+            4,
+        )
+
+        self.assertEqual(
+            units,
+            "\n".join(
+                [
+                    "<speaker_00>",
+                    "<0>こんにちは <1>まだ＜確認＞",
+                    "<gap:600ms>",
+                    "<speaker_01>",
+                    "<2>はい",
+                    "<unknown>",
+                    "<3>次",
+                ]
+            ),
+        )
+
+    def test_fixed_translation_uses_compact_speaker_and_cue_markers(self):
+        cues = [
+            Cue(index, index + 1, "unused", "A", "speech")
+            for index in range(13)
+        ]
+        records = [
+            CueTranslationRecord(
+                index,
+                index,
+                "",
+                (
+                    "いやそれは違うと思うけど"
+                    if index == 11
+                    else "昨日の話じゃなくてその前のやつ"
+                    if index == 12
+                    else "unused"
+                ),
+            )
+            for index in range(13)
+        ]
+
+        self.assertEqual(
+            _compact_fixed_translation_text(cues, records, [11, 12]),
+            "\n".join(
+                [
+                    "<A>",
+                    "<11>いやそれは違うと思うけど",
+                    "<12>昨日の話じゃなくてその前のやつ",
+                ]
+            ),
+        )
+
+    def test_overlap_evidence_is_inserted_before_first_intersecting_unit(self):
+        cues = [Cue(216.0, 222.0, "対象", "minetsuki_ritsu", "speech")]
+        context = {
+            "asr_evidence": [
                 {
-                    "finish_reason": "length",
-                    "message": {"content": '{"text":"' + "我，" * 30},
+                    "kind": "overlap_reconciliation",
+                    "start": 216.427,
+                    "end": 221.068,
+                    "qwen_mixed": [
+                        {
+                            "start": 216.0,
+                            "end": 222.0,
+                            "text": "一で始めますね、行きますよ。はい三",
+                            "units": [{"start": 216.0, "end": 216.2, "text": "一"}],
+                        }
+                    ],
+                    "dicow": [
+                        {
+                            "start": 216.5,
+                            "end": 217.5,
+                            "text": "で始めますね",
+                            "speaker": "minetsuki_ritsu",
+                            "kind": "speech",
+                        },
+                        {
+                            "start": 218.0,
+                            "end": 218.5,
+                            "text": "right",
+                            "speaker": "sengoku_yuno",
+                            "kind": "speech",
+                        },
+                        {
+                            "start": 219.0,
+                            "end": 221.0,
+                            "text": "いきますよ。3",
+                            "speaker": "minetsuki_ritsu",
+                            "kind": "speech",
+                        },
+                    ],
+                    "turns": [{"start": 216.0, "end": 221.0, "speaker": "SPEAKER_00"}],
                 }
             ]
         }
 
-        with patch.object(translator, "_request", return_value=response) as request:
-            with self.assertRaisesRegex(TranslationError, "failed after 2 attempts"):
-                translator._plan_and_translate_window(
-                    [Cue(0, 1, "私"), Cue(1, 2, "です")],
-                    0,
-                    2,
-                    {},
-                    [],
-                    20,
-                    40,
-                )
-
-        self.assertEqual(request.call_count, 2)
-
-    def test_independent_windows_execute_concurrently(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=1, max_concurrency=2), "secret"
-        )
-        cues = [Cue(index, index + 1, str(index)) for index in range(4)]
-        barrier = threading.Barrier(2)
-        lock = threading.Lock()
-        active = 0
-        maximum_active = 0
-
-        def response(body):
-            nonlocal active, maximum_active
-            prompt = body["messages"][1]["content"]
-            if "WRITABLE:" in prompt:
-                content = (
-                    '{"cues":['
-                    '{"start_id":1,"end_id":1,"text":"一"},'
-                    '{"start_id":2,"end_id":2,"text":"二"}'
-                    "]}"
-                )
-                return {"choices": [{"message": {"content": content}}]}
-            with lock:
-                active += 1
-                maximum_active = max(maximum_active, active)
-            barrier.wait(timeout=2)
-            if "Required ID range: 0-1" in prompt:
-                content = (
-                    '{"cues":['
-                    '{"start_id":0,"end_id":0,"text":"零"},'
-                    '{"start_id":1,"end_id":1,"text":"一"}'
-                    "]}"
-                )
-            else:
-                content = (
-                    '{"cues":['
-                    '{"start_id":2,"end_id":2,"text":"二"},'
-                    '{"start_id":3,"end_id":3,"text":"三"}'
-                    "]}"
-                )
-            with lock:
-                active -= 1
-            return {"choices": [{"message": {"content": content}}]}
-
-        with patch.object(translator, "_request", side_effect=response):
-            result = translator.plan_and_translate(
-                cues,
-                SegmentationConfig(model_window_cues=2),
-                max_line_units=20,
-            )
-        self.assertEqual(maximum_active, 2)
         self.assertEqual(
-            [cue.text for cue in result.translated_cues], ["零", "一", "二", "三"]
+            _compact_prompt_units_text(cues, 0, 1, context),
+            "\n".join(
+                [
+                    "<overlap>",
+                    "<mixed>一で始めますね行きますよはい三",
+                    "<minetsuki_ritsu>で始めますね｜いきますよ3",
+                    "<sengoku_yuno>right",
+                    "<minetsuki_ritsu>",
+                    "<0>対象",
+                ]
+            ),
         )
-
-    def test_window_ranges_never_leave_one_unit_chunk(self):
-        self.assertEqual(_translation_window_ranges(5, 2), [(0, 2), (2, 5)])
-        self.assertEqual(
-            _translation_window_ranges(601, 600), [(0, 599), (599, 601)]
-        )
-
-    def test_joint_translation_tolerates_text_beyond_prompt_limit_within_frame(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
-        cues = [Cue(0, 1, "長い文")]
-        response = {
-            "choices": [{
-                "finish_reason": "stop",
-                "message": {
-                    "content": '{"start_id":0,"end_id":0,"text":"一二三四五六七八九十甲"}'
-                },
-            }]
-        }
-        with patch.object(translator, "_request", return_value=response) as request:
-            result = translator.plan_and_translate(
-                cues,
-                SegmentationConfig(),
-                max_line_units=10,
-                hard_max_line_units=12,
-            )
-
-        self.assertEqual(result.translated_cues[0].text, "一二三四五六七八九十甲")
-        prompt = request.call_args.args[0]["messages"][1]["content"]
-        self.assertIn("10 full-width characters", prompt)
-        self.assertNotIn("12 full-width characters", prompt)
-
-    def test_single_cue_window_retries_same_range_immediately(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=2, max_concurrency=1), "secret"
-        )
-        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁")]
-        responses = [
-            {"choices": [{"message": {"content": (
-                '{"start_id":0,"end_id":1,"text":"未完成"}'
-            )}}]},
-            {"choices": [{"message": {"content": (
-                '{"start_id":0,"end_id":0,"text":"一"}\n'
-                '{"start_id":1,"end_id":1,"text":"二"}'
-            )}}]},
-            {"choices": [{"message": {"content": (
-                '{"start_id":2,"end_id":2,"text":"三"}\n'
-                '{"start_id":3,"end_id":3,"text":"四"}'
-            )}}]},
-            {"choices": [{"message": {"content": (
-                '{"start_id":1,"end_id":1,"text":"二"}\n'
-                '{"start_id":2,"end_id":2,"text":"三"}'
-            )}}]},
-        ]
-        with patch.object(translator, "_request", side_effect=responses) as request:
-            result = translator.plan_and_translate(
-                cues,
-                SegmentationConfig(model_window_cues=2),
-                max_line_units=20,
-            )
-        self.assertEqual(
-            [cue.text for cue in result.translated_cues], ["一", "二", "三", "四"]
-        )
-        prompts = [
-            call.args[0]["messages"][1]["content"]
-            for call in request.call_args_list
-        ]
-        self.assertIn("Required ID range: 0-1", prompts[0])
-        self.assertIn("Required ID range: 0-1", prompts[1])
-        self.assertIn("RETRY:", prompts[1])
-        self.assertIn("only one cue", prompts[1])
-        self.assertNotIn("Required ID range: 0-3", "\n".join(prompts))
-
-    def test_collapsed_timing_runs_are_compact(self):
-        cues = [
-            Cue(0, 1, "甲"),
-            Cue(1, 1.2, "乙"),
-            Cue(1, 1.2, "丙"),
-            Cue(1, 2, "丁"),
-        ]
-        runs = _collapsed_start_runs(cues, 0, 4)
-        self.assertEqual(runs, [[1, 3]])
-
-    def test_failed_joint_range_retries_without_shrinking(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=2), "secret"
-        )
-        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁")]
-        responses = [
-            {"choices": [{"message": {"content": "not json"}}]},
-            {"choices": [{"message": {"content": (
-                '{"start_id":0,"end_id":1,"text":"前句"}\n'
-                '{"start_id":2,"end_id":3,"text":"后句"}'
-            )}}]},
-        ]
-        with patch.object(translator, "_request", side_effect=responses) as request:
-            result = translator.plan_and_translate(
-                cues,
-                SegmentationConfig(model_window_cues=4),
-                max_line_units=20,
-            )
-        self.assertEqual([cue.text for cue in result.translated_cues], ["前句", "后句"])
-        prompts = [call.args[0]["messages"][1]["content"] for call in request.call_args_list]
-        self.assertIn("Required ID range: 0-3", prompts[0])
-        self.assertIn("Required ID range: 0-3", prompts[1])
-        self.assertNotIn("Required ID range: 0-1", prompts[1])
-
-    def test_joint_finish_reason_is_retried_with_expected_range(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=2), "secret"
-        )
-        cues = [Cue(0, 1, "甲")]
-        record = '{"start_id":0,"end_id":0,"text":"一"}'
-        responses = [
-            {"choices": [{"finish_reason": "length", "message": {"content": record}}]},
-            {"choices": [{"finish_reason": "stop", "message": {"content": record}}]},
-        ]
-        with patch.object(translator, "_request", side_effect=responses) as request, patch(
-            "subtitle_pipeline.translate.time.sleep"
-        ) as sleep:
-            result = translator.plan_and_translate(
-                cues,
-                SegmentationConfig(),
-                max_line_units=20,
-            )
-        self.assertEqual([cue.text for cue in result.translated_cues], ["一"])
-        first_prompt = request.call_args_list[0].args[0]["messages"][1]["content"]
-        retry_prompt = request.call_args_list[1].args[0]["messages"][1]["content"]
-        self.assertEqual(first_prompt, retry_prompt)
-        self.assertNotIn("RETRY:", retry_prompt)
-        self.assertIn("Required ID range: 0-0", retry_prompt)
-        sleep.assert_not_called()
-
-    def test_joint_json_error_is_retried_without_prompt_feedback(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=2), "secret"
-        )
-        cues = [Cue(0, 1, "甲")]
-        responses = [
-            {"choices": [{"finish_reason": "stop", "message": {"content": "{"}}]},
-            {"choices": [{"finish_reason": "stop", "message": {"content": (
-                '{"start_id":0,"end_id":0,"text":"一"}'
-            )}}]},
-        ]
-        with patch.object(translator, "_request", side_effect=responses) as request:
-            result = translator.plan_and_translate(
-                cues,
-                SegmentationConfig(),
-                max_line_units=20,
-            )
-        self.assertEqual([cue.text for cue in result.translated_cues], ["一"])
-        first_prompt = request.call_args_list[0].args[0]["messages"][1]["content"]
-        second_prompt = request.call_args_list[1].args[0]["messages"][1]["content"]
-        self.assertEqual(first_prompt, second_prompt)
-        self.assertNotIn("RETRY:", second_prompt)
-
-    def test_joint_id_error_is_retried_with_prompt_feedback(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=2), "secret"
-        )
-        cues = [Cue(0, 1, "甲"), Cue(1, 2, "乙")]
-        responses = [
-            {"choices": [{"finish_reason": "stop", "message": {"content": (
-                '{"start_id":0,"end_id":0,"text":"一"}'
-            )}}]},
-            {"choices": [{"finish_reason": "stop", "message": {"content": (
-                '{"start_id":0,"end_id":0,"text":"一"}\n'
-                '{"start_id":1,"end_id":1,"text":"二"}'
-            )}}]},
-        ]
-        with patch.object(translator, "_request", side_effect=responses) as request:
-            result = translator.plan_and_translate(
-                cues,
-                SegmentationConfig(),
-                max_line_units=20,
-            )
-        self.assertEqual([cue.text for cue in result.translated_cues], ["一", "二"])
-        retry_prompt = request.call_args_list[1].args[0]["messages"][1]["content"]
-        self.assertIn("RETRY:", retry_prompt)
-        self.assertIn("missing IDs 1-1", retry_prompt)
-
-    def test_joint_network_failure_uses_exponential_backoff(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=2), "secret"
-        )
-        cues = [Cue(0, 1, "甲")]
-        response = {
-            "choices": [{
-                "finish_reason": "stop",
-                "message": {
-                    "content": '{"start_id":0,"end_id":0,"text":"一"}'
-                },
-            }]
-        }
-        with patch.object(
-            translator,
-            "_request",
-            side_effect=[urllib.error.URLError("temporary network failure"), response],
-        ) as request, patch(
-            "subtitle_pipeline.translate.random.uniform", return_value=1
-        ), patch("subtitle_pipeline.translate.time.sleep") as sleep:
-            translator.plan_and_translate(
-                cues,
-                SegmentationConfig(),
-                max_line_units=20,
-            )
-        sleep.assert_called_once_with(1)
-        first_prompt = request.call_args_list[0].args[0]["messages"][1]["content"]
-        second_prompt = request.call_args_list[1].args[0]["messages"][1]["content"]
-        self.assertEqual(first_prompt, second_prompt)
-        self.assertNotIn("RETRY:", second_prompt)
-
     def test_only_transient_transport_failures_receive_backoff(self):
         with patch(
             "subtitle_pipeline.translate.random.uniform",
@@ -815,18 +987,18 @@ class TranslationTests(unittest.TestCase):
         self.assertIsNone(_parse_retry_after("not-a-delay"))
 
     def test_429_exhaustion_stops_without_window_shrink(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=3), "secret"
-        )
+        translator = OpenAICompatibleTranslator(LLMConfig(max_retries=3), "secret")
         cues = [Cue(index, index + 1, str(index)) for index in range(4)]
         error = LLMHTTPError(429, "limited", retry_after_seconds=6)
-        with patch.object(
-            translator,
-            "_request",
-            side_effect=error,
-        ) as request, patch(
-            "subtitle_pipeline.translate.random.uniform", return_value=0
-        ), patch("subtitle_pipeline.translate.time.sleep") as sleep:
+        with (
+            patch.object(
+                translator,
+                "_request",
+                side_effect=error,
+            ) as request,
+            patch("subtitle_pipeline.translate.random.uniform", return_value=0),
+            patch("subtitle_pipeline.translate.time.sleep") as sleep,
+        ):
             with self.assertRaisesRegex(LLMHTTPError, "HTTP 429"):
                 translator.plan_and_translate(
                     cues,
@@ -837,18 +1009,18 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [6, 6])
 
     def test_5xx_exhaustion_stops_without_window_shrink(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=3), "secret"
-        )
+        translator = OpenAICompatibleTranslator(LLMConfig(max_retries=3), "secret")
         cues = [Cue(index, index + 1, str(index)) for index in range(4)]
         error = LLMHTTPError(503, "server overloaded")
-        with patch.object(
-            translator,
-            "_request",
-            side_effect=error,
-        ) as request, patch(
-            "subtitle_pipeline.translate.random.uniform", side_effect=[1, 2]
-        ), patch("subtitle_pipeline.translate.time.sleep") as sleep:
+        with (
+            patch.object(
+                translator,
+                "_request",
+                side_effect=error,
+            ) as request,
+            patch("subtitle_pipeline.translate.random.uniform", side_effect=[1, 2]),
+            patch("subtitle_pipeline.translate.time.sleep") as sleep,
+        ):
             with self.assertRaisesRegex(LLMHTTPError, "HTTP 503"):
                 translator.plan_and_translate(
                     cues,
@@ -859,15 +1031,16 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
 
     def test_nontransient_http_error_stops_without_retry_or_window_shrink(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=5), "secret"
-        )
+        translator = OpenAICompatibleTranslator(LLMConfig(max_retries=5), "secret")
         cues = [Cue(index, index + 1, str(index)) for index in range(4)]
-        with patch.object(
-            translator,
-            "_request",
-            side_effect=LLMHTTPError(401, "invalid API key"),
-        ) as request, patch("subtitle_pipeline.translate.time.sleep") as sleep:
+        with (
+            patch.object(
+                translator,
+                "_request",
+                side_effect=LLMHTTPError(401, "invalid API key"),
+            ) as request,
+            patch("subtitle_pipeline.translate.time.sleep") as sleep,
+        ):
             with self.assertRaisesRegex(LLMHTTPError, "HTTP 401"):
                 translator.plan_and_translate(
                     cues,
@@ -876,157 +1049,6 @@ class TranslationTests(unittest.TestCase):
                 )
         self.assertEqual(request.call_count, 1)
         sleep.assert_not_called()
-
-    def test_text_invalid_cues_are_repaired_together_after_planning(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=2), "secret"
-        )
-        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙")]
-        responses = [
-            {"choices": [{"finish_reason": "stop", "message": {"content": (
-                '{"cues":['
-                '{"start_id":0,"end_id":0,"text":"まだ"},'
-                '{"start_id":1,"end_id":1,"text":"正确"},'
-                '{"start_id":2,"end_id":2,"text":"テスト"}'
-                "]}"
-            )}}]},
-            {"choices": [{"finish_reason": "stop", "message": {"content": (
-                '{"repairs":['
-                '{"repair_id":0,"text":"还没有"},'
-                '{"repair_id":2,"text":"测试"}'
-                "]}"
-            )}}]},
-        ]
-        with patch.object(translator, "_request", side_effect=responses) as request:
-            result = translator.plan_and_translate(
-                cues,
-                SegmentationConfig(),
-                max_line_units=20,
-            )
-        self.assertEqual(
-            [cue.text for cue in result.translated_cues],
-            ["还没有", "正确", "测试"],
-        )
-        self.assertEqual(request.call_count, 2)
-        repair_prompt = request.call_args_list[1].args[0]["messages"][1]["content"]
-        repair_target = repair_prompt.split("TARGET: ", 1)[1]
-        self.assertIn('"repair_id":0', repair_prompt)
-        self.assertIn('"repair_id":2', repair_prompt)
-        self.assertNotIn('"repair_id":1', repair_target)
-        self.assertIn("never change, merge, split", repair_prompt)
-        self.assertIn('"after_source":"乙"', repair_prompt)
-        self.assertIn('"before_source":"乙"', repair_prompt)
-        self.assertIn('"forbidden_fragments":["まだ"]', repair_prompt)
-        self.assertIn("must contain no Japanese hiragana or katakana", repair_prompt)
-        self.assertIn("ASR misrecognition of a known name or term", repair_prompt)
-        self.assertIn("romanize its pronunciation using Latin letters", repair_prompt)
-        self.assertLess(
-            repair_prompt.index("REFERENCE:"),
-            repair_prompt.index("DISPLAY_CONSTRAINT:"),
-        )
-
-    def test_stalled_translation_repair_batch_splits_after_one_retry(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=5), "secret"
-        )
-        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙")]
-        invalid_batch = {
-            "choices": [{"finish_reason": "stop", "message": {"content": (
-                '{"repairs":['
-                '{"repair_id":0,"text":"まだ"},'
-                '{"repair_id":1,"text":"テスト"}'
-                "]}"
-            )}}]
-        }
-        responses = [
-            {"choices": [{"finish_reason": "stop", "message": {"content": (
-                '{"cues":['
-                '{"start_id":0,"end_id":0,"text":"まだ"},'
-                '{"start_id":1,"end_id":1,"text":"テスト"}'
-                "]}"
-            )}}]},
-            invalid_batch,
-            invalid_batch,
-            {"choices": [{"finish_reason": "stop", "message": {
-                "content": '{"repairs":[{"repair_id":0,"text":"还没有"}]}'
-            }}]},
-            {"choices": [{"finish_reason": "stop", "message": {
-                "content": '{"repairs":[{"repair_id":1,"text":"测试"}]}'
-            }}]},
-        ]
-        with patch.object(translator, "_request", side_effect=responses) as request:
-            result = translator.plan_and_translate(
-                cues,
-                SegmentationConfig(),
-                max_line_units=20,
-            )
-        self.assertEqual([cue.text for cue in result.translated_cues], ["还没有", "测试"])
-        self.assertEqual(request.call_count, 5)
-        first_single = request.call_args_list[3].args[0]["messages"][1]["content"]
-        second_single = request.call_args_list[4].args[0]["messages"][1]["content"]
-        self.assertIn('"repair_id":0', first_single)
-        self.assertNotIn('"repair_id":1', first_single.split("TARGET: ", 1)[1])
-        self.assertIn('"repair_id":1', second_single)
-        self.assertNotIn('"repair_id":0', second_single.split("TARGET: ", 1)[1])
-
-    def test_partial_repairs_are_cached_and_only_missing_ids_are_retried(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=2), "secret"
-        )
-        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙")]
-        responses = [
-            {"choices": [{"finish_reason": "stop", "message": {"content": (
-                '{"cues":['
-                '{"start_id":0,"end_id":0,"text":"まだ"},'
-                '{"start_id":1,"end_id":1,"text":"テスト"}'
-                "]}"
-            )}}]},
-            {"choices": [{"finish_reason": "stop", "message": {"content": (
-                '{"repairs":[{"repair_id":0,"text":"还没有"}]}'
-            )}}]},
-            {"choices": [{"finish_reason": "stop", "message": {"content": (
-                '{"repairs":[{"repair_id":1,"text":"测试"}]}'
-            )}}]},
-        ]
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "cue-translation-cache.json"
-            with patch.object(translator, "_request", side_effect=responses) as request:
-                result = translator.plan_and_translate(
-                    cues,
-                    SegmentationConfig(),
-                    max_line_units=20,
-                    cache_path=path,
-                )
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual([cue.text for cue in result.translated_cues], ["还没有", "测试"])
-        second_repair = request.call_args_list[2].args[0]["messages"][1]["content"]
-        self.assertNotIn('"repair_id":0', second_repair)
-        self.assertIn('"repair_id":1', second_repair)
-        self.assertEqual(
-            [record["status"] for record in payload["records"]],
-            ["confirmed", "confirmed"],
-        )
-
-    def test_unrepaired_text_error_blocks_completion(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(max_retries=1), "secret"
-        )
-        cues = [Cue(0, 1, "甲")]
-        responses = [
-            {"choices": [{"finish_reason": "stop", "message": {
-                "content": '{"cues":[{"start_id":0,"end_id":0,"text":"まだ"}]}'
-            }}]},
-            {"choices": [{"finish_reason": "stop", "message": {
-                "content": '{"repairs":[{"repair_id":0,"text":"まだ"}]}'
-            }}]},
-        ]
-        with patch.object(translator, "_request", side_effect=responses):
-            with self.assertRaisesRegex(TranslationError, "repair"):
-                translator.plan_and_translate(
-                    cues,
-                    SegmentationConfig(),
-                    max_line_units=20,
-                )
 
     def test_joint_validation_rejects_gaps_empty_and_width(self):
         records = _validate_joint_records(
@@ -1087,154 +1109,13 @@ class TranslationTests(unittest.TestCase):
             _validate_joint_target_language(
                 [CueTranslationRecord(0, 0, "実存でもない")], "简体中文"
             )
-        with self.assertRaisesRegex(TranslationError, "non-positive"):
-            _validate_joint_timing(
-                [CueTranslationRecord(0, 0, "字幕")],
-                [Cue(1, 2, "甲"), Cue(1, 3, "乙")],
-            )
-        _validate_joint_timing(
-            [CueTranslationRecord(0, 1, "完整句子")],
-            [
-                Cue(0, 0.5, "甲", "speaker_a"),
-                Cue(0.5, 1.0, "乙", "speaker_b"),
-            ],
-        )
-
-    def test_joint_cache_keeps_only_longest_valid_prefix(self):
-        cues = [Cue(index, index + 1, str(index)) for index in range(4)]
-        config = SegmentationConfig(model_window_cues=2)
-        llm = LLMConfig()
-        signature = _joint_translation_signature(cues, config, llm, {}, 10)
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "cue-translation-cache.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "signature": signature,
-                        "records": [
-                            {"start_id": 0, "end_id": 0, "text": "零"},
-                            {"start_id": 2, "end_id": 2, "text": "坏"},
-                        ],
-                        "next_window_end": 4,
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            records, next_end = _load_joint_translation_cache(
-                path, signature, cues, 10, "简体中文"
-            )
-        self.assertEqual(records, [CueTranslationRecord(0, 0, "零")])
-        self.assertEqual(next_end, 4)
-
-    def test_parallel_cache_resumes_only_missing_windows_then_boundaries(self):
-        config = SegmentationConfig(model_window_cues=2)
-        llm = LLMConfig(max_retries=1, max_concurrency=1)
-        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁")]
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "cue-translation-cache.json"
-            first = OpenAICompatibleTranslator(llm, "secret")
-            first_responses = [
-                {"choices": [{"message": {"content": (
-                    '{"start_id":0,"end_id":0,"text":"一"}\n'
-                    '{"start_id":1,"end_id":1,"text":"二"}'
-                )}}]},
-                {"choices": [{"message": {"content": "invalid"}}]},
-                {"choices": [{"message": {"content": "invalid"}}]},
-            ]
-            with patch.object(first, "_request", side_effect=first_responses):
-                with self.assertRaises(TranslationError):
-                    first.plan_and_translate(
-                        cues,
-                        config,
-                        max_line_units=20,
-                        cache_path=path,
-                    )
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            self.assertNotIn("records", payload)
-            self.assertEqual(set(payload["windows"]), {"0:2"})
-
-            second = OpenAICompatibleTranslator(llm, "secret")
-            responses = [
-                {"choices": [{"message": {"content": (
-                    '{"start_id":2,"end_id":2,"text":"三"}\n'
-                    '{"start_id":3,"end_id":3,"text":"四"}'
-                )}}]},
-                {"choices": [{"message": {"content": (
-                    '{"start_id":1,"end_id":1,"text":"二"}\n'
-                    '{"start_id":2,"end_id":2,"text":"三"}'
-                )}}]},
-            ]
-            with patch.object(second, "_request", side_effect=responses) as request:
-                result = second.plan_and_translate(
-                    cues,
-                    config,
-                    max_line_units=20,
-                    cache_path=path,
-                )
-            final_payload = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(
-            [cue.text for cue in result.translated_cues], ["一", "二", "三", "四"]
-        )
-        self.assertEqual(request.call_count, 2)
-        prompts = [call.args[0]["messages"][1]["content"] for call in request.call_args_list]
-        self.assertIn("Required ID range: 2-3", prompts[0])
-        self.assertNotIn("Required ID range: 0-1", "\n".join(prompts))
-        self.assertEqual(set(final_payload["windows"]), {"0:2", "2:4"})
-        self.assertEqual(set(final_payload["boundaries"]), {"1|2"})
-
-    def test_complete_cached_plan_resumes_at_pending_repairs_only(self):
-        config = SegmentationConfig()
-        llm = LLMConfig(max_retries=1)
-        cues = [Cue(0, 1, "甲"), Cue(1, 2, "乙")]
-        signature = _joint_translation_signature(cues, config, llm, {}, 20)
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "cue-translation-cache.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "signature": signature,
-                        "records": [
-                            {
-                                "start_id": 0,
-                                "end_id": 0,
-                                "text": "正确",
-                                "status": "confirmed",
-                                "errors": [],
-                            },
-                            {
-                                "start_id": 1,
-                                "end_id": 1,
-                                "text": "まだ",
-                                "status": "pending",
-                                "errors": ["contains Japanese kana"],
-                            },
-                        ],
-                        "next_window_end": 2,
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            translator = OpenAICompatibleTranslator(llm, "secret")
-            response = {"choices": [{"finish_reason": "stop", "message": {
-                "content": '{"repairs":[{"repair_id":1,"text":"还没有"}]}'
-            }}]}
-            with patch.object(translator, "_request", return_value=response) as request:
-                result = translator.plan_and_translate(
-                    cues,
-                    config,
-                    max_line_units=20,
-                    cache_path=path,
-                )
-        self.assertEqual([cue.text for cue in result.translated_cues], ["正确", "还没有"])
-        body = request.call_args.args[0]
-        self.assertIn("repair specific translated subtitle", body["messages"][0]["content"])
-        self.assertNotIn("Group every TARGET", body["messages"][1]["content"])
-
     def test_ssl_context_combines_platform_and_certifi_ca(self):
-        with patch("subtitle_pipeline.translate.ssl.create_default_context") as create, patch(
-            "subtitle_pipeline.translate.certifi.where", return_value="/ca/certifi.pem"
+        with (
+            patch("subtitle_pipeline.translate.ssl.create_default_context") as create,
+            patch(
+                "subtitle_pipeline.translate.certifi.where",
+                return_value="/ca/certifi.pem",
+            ),
         ):
             translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
         self.assertIs(translator.ssl_context, create.return_value)

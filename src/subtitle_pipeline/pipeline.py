@@ -121,10 +121,12 @@ def run_pipeline(
         translation_context=translation_context,
         max_line_units=layout.max_line_units,
         hard_max_line_units=layout.frame_line_units * 2,
+        plan_cache_path=job_dir / "cue-plan-cache.json",
         cache_path=job_dir / "cue-translation-cache.json",
     )
     logging.info(
-        "joint cue planning and translation: %d aligned cues -> %d subtitle cues",
+        "cue planning and ASR-aware fixed translation: "
+        "%d aligned cues -> %d subtitle cues",
         original_cue_count,
         len(joint.source_cues),
     )

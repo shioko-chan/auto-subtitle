@@ -223,6 +223,7 @@ def _transcribe_analyzed(
     ):
         raise _StaleRuntimeAudio("missing ephemeral source audio")
     model = _load_qwen_model(config) if missing else None
+    speaker_timeline = _speaker_assignment_timeline(analysis)
     speech_missing = [index for index in missing if regions[index].kind == "speech"]
     for batch_start in range(0, len(speech_missing), config.max_inference_batch_size):
         indices = speech_missing[
@@ -271,7 +272,7 @@ def _transcribe_analyzed(
             record = records[index]
             for cue in record["cues"]:
                 cue["speaker"] = _speaker_for_aligned_cue(
-                    float(cue["start"]), float(cue["end"]), analysis.speech
+                    float(cue["start"]), float(cue["end"]), speaker_timeline
                 )
                 cue["kind"] = "speech"
             record["window_kind"] = "mixed_speech"
@@ -338,12 +339,12 @@ def _transcribe_analyzed(
         if not isinstance(record, dict) or not isinstance(record.get("cues"), list):
             raise RuntimeError(f"analyzed ASR cache is missing region {index}")
         cues.extend(_decode_cached_cues(record["cues"], index))
-    if analysis.speech:
+    if speaker_timeline:
         cues = [
             replace(
                 cue,
                 speaker=_speaker_for_aligned_cue(
-                    cue.start, cue.end, analysis.speech
+                    cue.start, cue.end, speaker_timeline
                 ),
             )
             if cue.kind == "speech"
@@ -627,6 +628,10 @@ def _analysis_regions(analysis: AudioAnalysis) -> list[AudioRegion]:
         [*merged, *singing, *ambiguous],
         key=lambda item: (item.start, item.end),
     )
+
+
+def _speaker_assignment_timeline(analysis: AudioAnalysis) -> list[AudioRegion]:
+    return analysis.diarization or analysis.speech
 
 
 def _analysis_region_signature(region: AudioRegion) -> dict[str, object]:

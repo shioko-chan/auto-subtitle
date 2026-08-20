@@ -12,7 +12,7 @@ benchmark-driven follow-ups rather than assumptions.
 The main Python process currently owns or orchestrates:
 
 - the 16 kHz mono analysis waveform;
-- the pyannote ordinary/exclusive diarization result and cache lifecycle;
+- the pyannote ordinary diarization result and cache lifecycle;
 - AST singing detection;
 - Demucs vocal separation;
 - Qwen ASR and the forced aligner;
@@ -37,7 +37,7 @@ every model:
 original 44.1/48 kHz stereo audio
 |- Demucs and singing/music processing
 `- resample once to 16 kHz mono
-   |- pyannote Community-1 ordinary and exclusive diarization
+   |- pyannote Community-1 ordinary diarization
    |- AST speech/singing evidence
    |- speaker embeddings
    `- Qwen ASR and forced alignment
@@ -119,14 +119,14 @@ peak VRAM, and fallback count before changing concurrency defaults.
 2. Change Qwen to accept NumPy slices and remove `asr-analysis-chunks` WAV traffic.
 3. Add shared-memory ownership and crash cleanup.
 4. Convert ERes2NetV2 to a persistent shared-memory worker.
-5. Route true overlap by duration: under 0.4 seconds uses exclusive diarization,
-   0.4–1.0 seconds uses Qwen with context, and over 1.0 second uses DiCoW.
+5. Route true overlap by duration: overlap under 0.5 seconds retains the Qwen
+   baseline; overlap from 0.5 seconds uses DiCoW.
 6. Decode source-quality stereo only for song candidate ranges before Demucs.
 7. Stage timing and peak allocated VRAM are logged. `initial_analysis_concurrency=2`
    can overlap MOSS/pyannote and raw AST after a machine-specific memory check; the example
    remains at `1`. Demucs, MossFormer2, ERes2NetV2 and Qwen remain stage-serialized.
-8. Community-1 ordinary diarization preserves overlap participants while exclusive
-   diarization provides the baseline ASR timeline.
+8. Community-1 ordinary diarization is the sole speaker timeline. Clean identity
+   candidates are derived by subtracting all multi-speaker intersections per speaker.
 9. Identity matching aggregates all clean evidence for one global anonymous label,
    trims the farthest 15% around its embedding medoid, then applies capped duration
    weights against the existing ERes2NetV2 multi-center profiles. Overlap inherits the

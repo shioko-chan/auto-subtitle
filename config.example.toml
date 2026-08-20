@@ -146,7 +146,6 @@ timeout_seconds = 120
 max_retries = 5
 max_concurrency = 16
 max_tokens = 16384
-context_cues = 3
 # Joint subtitles and metadata use json_object.
 # Set false if an OpenAI-compatible provider rejects response_format=json_object.
 json_mode = true
@@ -184,7 +183,7 @@ max_font_size = 144
 margin_horizontal_ratio = 0.075
 portrait_margin_horizontal_ratio = 0.025
 margin_vertical_ratio = 0.05
-outline_ratio = 0.003
+outline_ratio = 0.0045
 crf = 20
 preset = "medium"
 nvenc_preset = "p4"
