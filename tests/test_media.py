@@ -268,6 +268,36 @@ class SubtitleRenderTests(unittest.TestCase):
         self.assertIn("Speaker_fuji_miyako,fuji_miyako,0,0,0,,都子", content)
         self.assertIn("Default,unknown,0,0,156,,默认", content)
 
+    def test_ass_underlines_only_singing_cues(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "subtitle.ass"
+            styles = {
+                "fuji_miyako": CharacterStyle(
+                    "fuji_miyako", "藤都子", "#FFFFFF", "#BC91FF"
+                )
+            }
+            _write_ass(
+                [
+                    Cue(1, 2, "歌词", "fuji_miyako", "singing"),
+                    Cue(2, 3, "讲话", "fuji_miyako", "speech"),
+                ],
+                path,
+                width=1920,
+                height=1080,
+                font_name="Noto Sans CJK SC",
+                font_size=71,
+                margin_vertical=54,
+                outline=5,
+                character_styles=styles,
+            )
+            content = path.read_text(encoding="utf-8")
+
+        self.assertIn(
+            r"Speaker_fuji_miyako,fuji_miyako,0,0,0,,{\u1}歌词", content
+        )
+        self.assertIn("Speaker_fuji_miyako,fuji_miyako,0,0,0,,讲话", content)
+        self.assertNotIn(r"{\u1}讲话", content)
+
     def test_ass_skips_non_positive_duration_cues(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "subtitle.ass"

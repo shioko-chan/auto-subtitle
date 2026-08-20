@@ -501,12 +501,15 @@ def _write_ass(
             if speaker is not None and speaker in (character_styles or {})
             else "Default"
         )
+        event_text = _escape_ass_text(cue.text)
+        if getattr(cue, "kind", "speech") == "singing":
+            event_text = r"{\u1}" + event_text
         event_margin = 0 if lane == 0 else margin_vertical + lane * round(font_size * 1.25)
         events.append(
             "Dialogue: 0,"
             f"{_ass_timestamp(cue.start)},{_ass_timestamp(cue.end)},"
             f"{style_name},{speaker or ''},0,0,{event_margin},,"
-            f"{_escape_ass_text(cue.text)}"
+            f"{event_text}"
         )
     path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
     if skipped_nonpositive:
