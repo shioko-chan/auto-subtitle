@@ -53,7 +53,7 @@ class LLMHTTPError(TranslationError):
 
 
 _PLAN_CACHE_VERSION = 1
-_PLAN_PROMPT_VERSION = 1
+_PLAN_PROMPT_VERSION = 2
 _PLANNER_BYPASS_KINDS = frozenset({"singing", "conditioned_speech"})
 _TRANSLATION_CACHE_VERSION = 1
 _TRANSLATION_PROMPT_VERSION = 1
@@ -127,7 +127,6 @@ class OpenAICompatibleTranslator:
             cues,
             config,
             self.config,
-            context,
             prompt_maximum_units,
         )
         range_groups = _cue_plan_range_groups(cues, config.model_window_cues)
@@ -168,7 +167,6 @@ class OpenAICompatibleTranslator:
                                 cues,
                                 start,
                                 end,
-                                context,
                                 prompt_maximum_units,
                             ): (start, end)
                             for start, end in missing_ranges
@@ -229,7 +227,6 @@ class OpenAICompatibleTranslator:
                 boundary_batches = _boundary_repair_batches(
                     cues,
                     missing_boundaries,
-                    context,
                     max_chars=max(8000, min(48000, self.config.max_tokens * 2)),
                 )
                 logging.info(
@@ -270,7 +267,6 @@ class OpenAICompatibleTranslator:
                                 self._repair_plan_boundaries,
                                 cues,
                                 batch,
-                                context,
                                 prompt_maximum_units,
                                 on_accept=accept_boundaries,
                             ): batch
@@ -344,14 +340,12 @@ class OpenAICompatibleTranslator:
         cues: list[Cue],
         left: CueTranslationRecord,
         right: CueTranslationRecord,
-        translation_context: dict[str, object],
         prompt_maximum_units: float,
     ) -> list[CueTranslationRecord]:
         key = f"{left.end_id}|{right.start_id}"
         return self._repair_plan_boundaries(
             cues,
             [(key, left, right)],
-            translation_context,
             prompt_maximum_units,
         )[key]
 
@@ -359,7 +353,6 @@ class OpenAICompatibleTranslator:
         self,
         cues: list[Cue],
         specs: list[tuple[str, CueTranslationRecord, CueTranslationRecord]],
-        translation_context: dict[str, object],
         prompt_maximum_units: float,
         *,
         on_accept: (
@@ -379,7 +372,6 @@ class OpenAICompatibleTranslator:
                 prompt = _cue_plan_boundaries_prompt(
                     cues,
                     unresolved,
-                    translation_context,
                     prompt_maximum_units,
                     self.config.target_language,
                     previous_error=prompt_error,
@@ -485,7 +477,6 @@ class OpenAICompatibleTranslator:
         cues: list[Cue],
         start: int,
         end: int,
-        translation_context: dict[str, object],
         prompt_maximum_units: float,
     ) -> list[CueTranslationRecord]:
         last_error: Exception | None = None
@@ -498,9 +489,7 @@ class OpenAICompatibleTranslator:
                 cues,
                 start,
                 end,
-                translation_context,
                 prompt_maximum_units,
-                self.config.target_language,
                 previous_error=prompt_error,
             )
             body: dict[str, object] = {
@@ -603,7 +592,6 @@ class OpenAICompatibleTranslator:
         cues: list[Cue],
         start: int,
         end: int,
-        translation_context: dict[str, object],
         prompt_maximum_units: float,
     ) -> list[CueTranslationRecord]:
         try:
@@ -611,7 +599,6 @@ class OpenAICompatibleTranslator:
                 cues,
                 start,
                 end,
-                translation_context,
                 prompt_maximum_units,
             )
         except LLMHTTPError:
@@ -633,21 +620,18 @@ class OpenAICompatibleTranslator:
                 cues,
                 start,
                 middle,
-                translation_context,
                 prompt_maximum_units,
             )
             right = self._plan_cue_window_resilient(
                 cues,
                 middle,
                 end,
-                translation_context,
                 prompt_maximum_units,
             )
             repaired = self._repair_plan_boundary(
                 cues,
                 left[-1],
                 right[0],
-                translation_context,
                 prompt_maximum_units,
             )
             return [*left[:-1], *repaired, *right[1:]]
@@ -1373,14 +1357,11 @@ def _cue_plan_prompt(
     cues: list[Cue],
     start: int,
     end: int,
-    translation_context: dict[str, object],
     maximum_units: float,
-    target_language: str,
     *,
     previous_error: Exception | None,
 ) -> str:
     maximum_full_width_characters = max(1, math.floor(maximum_units))
-    reference = _compact_reference_text(translation_context)
     units = _compact_prompt_units_text(cues, start, end)
     retry = ""
     if previous_error is not None:
@@ -1390,7 +1371,6 @@ def _cue_plan_prompt(
         )
     return render_user_prompt(
         "cue-planner.md",
-        REFERENCE_TEXT=reference,
         MAXIMUM_UNITS=f"{maximum_units:.3f}",
         MAX_FULL_WIDTH_CHARACTERS=maximum_full_width_characters,
         REQUIRED_START_ID=start,
@@ -1445,7 +1425,6 @@ def _boundary_repair_block(
     key: str,
     left: CueTranslationRecord,
     right: CueTranslationRecord,
-    translation_context: dict[str, object],
 ) -> str:
     units = _compact_prompt_units_text(
         cues,
@@ -1462,20 +1441,17 @@ def _boundary_repair_block(
 def _boundary_repair_batches(
     cues: list[Cue],
     specs: list[tuple[str, CueTranslationRecord, CueTranslationRecord]],
-    translation_context: dict[str, object],
     *,
     max_chars: int,
 ) -> list[list[tuple[str, CueTranslationRecord, CueTranslationRecord]]]:
-    reference_chars = len(_compact_reference_text(translation_context))
-    available = max(1000, max_chars - reference_chars)
     batches: list[list[tuple[str, CueTranslationRecord, CueTranslationRecord]]] = []
     current: list[tuple[str, CueTranslationRecord, CueTranslationRecord]] = []
     current_chars = 0
     for spec in specs:
         item_chars = len(
-            _boundary_repair_block(cues, spec[0], spec[1], spec[2], translation_context)
+            _boundary_repair_block(cues, spec[0], spec[1], spec[2])
         )
-        if current and current_chars + item_chars > available:
+        if current and current_chars + item_chars > max_chars:
             batches.append(current)
             current = []
             current_chars = 0
@@ -1489,7 +1465,6 @@ def _boundary_repair_batches(
 def _cue_plan_boundaries_prompt(
     cues: list[Cue],
     specs: list[tuple[str, CueTranslationRecord, CueTranslationRecord]],
-    translation_context: dict[str, object],
     maximum_units: float,
     target_language: str,
     *,
@@ -1502,14 +1477,12 @@ def _cue_plan_boundaries_prompt(
             f"{str(previous_error)[:700]}\n"
         )
     maximum_characters = max(1, math.floor(maximum_units))
-    reference = _compact_reference_text(translation_context)
     return render_user_prompt(
         "cue-boundary-repair.md",
         TARGET_LANGUAGE=target_language,
         MAXIMUM_CHARACTERS=maximum_characters,
-        REFERENCE_TEXT=reference,
         BOUNDARY_BLOCKS="\n\n".join(
-            _boundary_repair_block(cues, key, left, right, translation_context)
+            _boundary_repair_block(cues, key, left, right)
             for key, left, right in specs
         ),
         RETRY_SECTION=retry,
@@ -1520,7 +1493,6 @@ def _cue_plan_boundary_prompt(
     cues: list[Cue],
     left: CueTranslationRecord,
     right: CueTranslationRecord,
-    translation_context: dict[str, object],
     maximum_units: float,
     target_language: str,
     *,
@@ -1530,7 +1502,6 @@ def _cue_plan_boundary_prompt(
     return _cue_plan_boundaries_prompt(
         cues,
         [(key, left, right)],
-        translation_context,
         maximum_units,
         target_language,
         previous_error=previous_error,
@@ -2385,7 +2356,6 @@ def _cue_plan_signature(
     cues: list[Cue],
     segmentation_config: SegmentationConfig,
     llm_config: LLMConfig,
-    translation_context: dict[str, object],
     prompt_maximum_units: float,
 ) -> str:
     payload = {
@@ -2402,7 +2372,6 @@ def _cue_plan_signature(
         "reasoning_effort": llm_config.reasoning_effort,
         "model_window_cues": segmentation_config.model_window_cues,
         "prompt_maximum_units": round(prompt_maximum_units, 6),
-        "translation_context": translation_context,
         "cues": [
             {
                 "start_ms": round(cue.start * 1000),

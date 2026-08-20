@@ -400,6 +400,10 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(len(boundary_prompts), 1)
         self.assertIn("<boundary:1|2 range=1-2>", boundary_prompts[0])
         self.assertIn("<boundary:3|4 range=3-4>", boundary_prompts[0])
+        self.assertNotIn("REFERENCE:", boundary_prompts[0])
+        self.assertIn(
+            "display budget as a primary boundary constraint", boundary_prompts[0]
+        )
         self.assertEqual([cue.text for cue in result.translated_cues], list("一二三四五六"))
 
     def test_boundary_validation_accepts_independent_partial_results(self):
@@ -484,7 +488,6 @@ class TranslationTests(unittest.TestCase):
             result = translator._repair_plan_boundaries(
                 cues,
                 specs,
-                {},
                 20,
                 on_accept=lambda values: accepted_callbacks.append(list(values)),
             )
@@ -670,7 +673,6 @@ class TranslationTests(unittest.TestCase):
             cues,
             segmentation,
             LLMConfig(),
-            {},
             20,
         )
         openai = _cue_plan_signature(
@@ -683,7 +685,6 @@ class TranslationTests(unittest.TestCase):
                 thinking=None,
                 reasoning_effort="low",
             ),
-            {},
             20,
         )
 
@@ -937,62 +938,21 @@ class TranslationTests(unittest.TestCase):
             ),
         )
 
-    def test_planner_ignores_overlap_evidence(self):
+    def test_planner_prompt_omits_reference_and_overlap_evidence(self):
         cues = [Cue(216.0, 222.0, "対象", "minetsuki_ritsu", "speech")]
-        context = {
-            "asr_evidence": [
-                {
-                    "kind": "overlap_reconciliation",
-                    "start": 216.427,
-                    "end": 221.068,
-                    "qwen_mixed": [
-                        {
-                            "start": 216.0,
-                            "end": 222.0,
-                            "text": "一で始めますね、行きますよ。はい三",
-                            "units": [{"start": 216.0, "end": 216.2, "text": "一"}],
-                        }
-                    ],
-                    "dicow": [
-                        {
-                            "start": 216.5,
-                            "end": 217.5,
-                            "text": "で始めますね",
-                            "speaker": "minetsuki_ritsu",
-                            "kind": "speech",
-                        },
-                        {
-                            "start": 218.0,
-                            "end": 218.5,
-                            "text": "right",
-                            "speaker": "sengoku_yuno",
-                            "kind": "speech",
-                        },
-                        {
-                            "start": 219.0,
-                            "end": 221.0,
-                            "text": "いきますよ。3",
-                            "speaker": "minetsuki_ritsu",
-                            "kind": "speech",
-                        },
-                    ],
-                    "turns": [{"start": 216.0, "end": 221.0, "speaker": "SPEAKER_00"}],
-                }
-            ]
-        }
-
         prompt = _cue_plan_prompt(
             cues,
             0,
             1,
-            context,
             20,
-            "Simplified Chinese",
             previous_error=None,
         )
         self.assertIn("TARGET:\n<minetsuki_ritsu>\n<0>対象", prompt)
+        self.assertNotIn("REFERENCE:", prompt)
+        self.assertIn("display budget as a primary cue-boundary constraint", prompt)
         self.assertNotIn("<overlap>", prompt)
         self.assertNotIn("一で始めますね", prompt)
+
     def test_only_transient_transport_failures_receive_backoff(self):
         with patch(
             "subtitle_pipeline.translate.random.uniform",
