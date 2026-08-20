@@ -19,6 +19,7 @@ from subtitle_pipeline.translate import (
     _cue_plan_prompt,
     _cue_plan_range_groups,
     _cue_plan_signature,
+    _fixed_translation_batches,
     _is_nontransient_http_error,
     _log_response_usage,
     _majority_speaker,
@@ -33,6 +34,7 @@ from subtitle_pipeline.translate import (
     _translation_window_ranges,
     _validate_joint_records,
     _validate_joint_target_language,
+    _validate_plan_source_width,
     _validated_boundary_repairs,
     _validated_translation_repairs,
     _without_source_punctuation,
@@ -40,6 +42,18 @@ from subtitle_pipeline.translate import (
 
 
 class TranslationTests(unittest.TestCase):
+    def test_plan_source_width_reports_every_invalid_range(self):
+        records = [
+            CueTranslationRecord(10, 12, "", "一二三四五六"),
+            CueTranslationRecord(13, 15, "", "七八九十一二"),
+        ]
+
+        with self.assertRaisesRegex(
+            TranslationError,
+            r"IDs 10-12.*IDs 13-15",
+        ):
+            _validate_plan_source_width(records, 5)
+
     def test_split_planning_and_translation_have_independent_contracts_and_caches(self):
         translator = OpenAICompatibleTranslator(
             LLMConfig(thinking="disabled"), "secret"
@@ -52,7 +66,7 @@ class TranslationTests(unittest.TestCase):
 
         def response(body):
             prompt = body["messages"][1]["content"]
-            if "Group every TARGET" in prompt:
+            if "Create natural, visually readable Japanese subtitle cues" in prompt:
                 content = (
                     '{"cues":['
                     '{"start_id":0,"end_id":1},'
@@ -402,8 +416,10 @@ class TranslationTests(unittest.TestCase):
         self.assertIn("<boundary:3|4 range=3-4>", boundary_prompts[0])
         self.assertNotIn("REFERENCE:", boundary_prompts[0])
         self.assertIn(
-            "display budget as a primary boundary constraint", boundary_prompts[0]
+            "Japanese subtitle cues", boundary_prompts[0]
         )
+        self.assertNotIn("translation fits", boundary_prompts[0])
+        self.assertIn("HARD CONSTRAINT", boundary_prompts[0])
         self.assertEqual([cue.text for cue in result.translated_cues], list("一二三四五六"))
 
     def test_boundary_validation_accepts_independent_partial_results(self):
@@ -430,6 +446,7 @@ class TranslationTests(unittest.TestCase):
             ],
             specs,
             cues,
+            20,
         )
 
         self.assertEqual(list(accepted), ["0|1"])
@@ -547,7 +564,7 @@ class TranslationTests(unittest.TestCase):
 
         def response(body):
             prompt = body["messages"][1]["content"]
-            if "Group every TARGET" in prompt:
+            if "Create natural, visually readable Japanese subtitle cues" in prompt:
                 return {
                     "choices": [
                         {
@@ -879,7 +896,7 @@ class TranslationTests(unittest.TestCase):
             ],
         )
 
-    def test_planner_units_use_compact_speaker_and_gap_markers(self):
+    def test_planner_units_use_compact_speaker_markers_without_gaps(self):
         units = _compact_prompt_units_text(
             [
                 Cue(0.0, 0.5, "こんにちは。", "speaker_00", "speech"),
@@ -897,13 +914,54 @@ class TranslationTests(unittest.TestCase):
                 [
                     "<speaker_00>",
                     "<0>こんにちは <1>まだ＜確認＞",
-                    "<gap:600ms>",
                     "<speaker_01>",
                     "<2>はい",
                     "<unknown>",
                     "<3>次",
                 ]
             ),
+        )
+
+    def test_fixed_translation_batches_limit_cues_even_when_text_is_short(self):
+        cues = [Cue(index, index + 1, "x", "A", "speech") for index in range(5)]
+        records = [
+            CueTranslationRecord(index, index, "", "x") for index in range(5)
+        ]
+
+        self.assertEqual(
+            _fixed_translation_batches(
+                cues,
+                records,
+                list(range(5)),
+                max_chars=1000,
+                max_cues=2,
+            ),
+            [[0, 1], [2, 3], [4]],
+        )
+
+    def test_fixed_translation_batches_remeasure_failed_cue_payloads(self):
+        cues = [Cue(index, index + 1, "x", "A", "speech") for index in range(3)]
+        records = [
+            CueTranslationRecord(index, index, "", "x") for index in range(3)
+        ]
+        issues = {
+            index: {
+                "invalid_text": "错" * 40,
+                "errors": ["translation remains invalid"],
+            }
+            for index in range(3)
+        }
+
+        self.assertEqual(
+            _fixed_translation_batches(
+                cues,
+                records,
+                list(range(3)),
+                max_chars=150,
+                max_cues=200,
+                repair_issues=issues,
+            ),
+            [[0], [1], [2]],
         )
 
     def test_fixed_translation_uses_compact_speaker_and_cue_markers(self):
@@ -949,7 +1007,9 @@ class TranslationTests(unittest.TestCase):
         )
         self.assertIn("TARGET:\n<minetsuki_ritsu>\n<0>対象", prompt)
         self.assertNotIn("REFERENCE:", prompt)
-        self.assertIn("display budget as a primary cue-boundary constraint", prompt)
+        self.assertIn("Create natural, visually readable Japanese subtitle cues", prompt)
+        self.assertIn("HARD CONSTRAINT", prompt)
+        self.assertNotIn("all-Chinese translation", prompt)
         self.assertNotIn("<overlap>", prompt)
         self.assertNotIn("一で始めますね", prompt)
 

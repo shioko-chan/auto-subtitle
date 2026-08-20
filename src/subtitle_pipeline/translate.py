@@ -53,12 +53,13 @@ class LLMHTTPError(TranslationError):
 
 
 _PLAN_CACHE_VERSION = 1
-_PLAN_PROMPT_VERSION = 2
+_PLAN_PROMPT_VERSION = 3
 _PLANNER_BYPASS_KINDS = frozenset({"singing", "conditioned_speech"})
 _TRANSLATION_CACHE_VERSION = 1
 _TRANSLATION_PROMPT_VERSION = 1
 _MAP_CONTENT_ATTEMPTS = 2
-_PROMPT_GAP_MARKER_MS = 500
+_FIXED_TRANSLATION_BATCH_MAX_CHARS = 8000
+_FIXED_TRANSLATION_BATCH_MAX_CUES = 200
 
 _HONORIFIC_TRANSLATION_RULES = (
     "Apply these Japanese-honorific rules when translating into Chinese. Usually omit さん; "
@@ -202,13 +203,6 @@ class OpenAICompatibleTranslator:
             ordered_windows = [
                 window for group in ordered_window_groups for window in group
             ]
-            if any(
-                len(group) > 1 and any(len(window) < 2 for window in group)
-                for group in ordered_window_groups
-            ):
-                raise TranslationError(
-                    "parallel subtitle window contains fewer than two cues"
-                )
             boundary_specs = [
                 spec
                 for group in ordered_window_groups
@@ -373,7 +367,6 @@ class OpenAICompatibleTranslator:
                     cues,
                     unresolved,
                     prompt_maximum_units,
-                    self.config.target_language,
                     previous_error=prompt_error,
                 )
                 body: dict[str, object] = {
@@ -404,6 +397,7 @@ class OpenAICompatibleTranslator:
                         values,
                         unresolved,
                         cues,
+                        prompt_maximum_units,
                     )
                     if not accepted:
                         raise TranslationError(
@@ -526,12 +520,13 @@ class OpenAICompatibleTranslator:
                         skip_first_width=start > 0,
                         skip_last_width=end < len(cues),
                     )
-                    if end - start > 1 and len(records) < 2:
-                        raise TranslationError(
-                            "window produced only one cue; every multi-unit window "
-                            "must produce at least two cues"
-                        )
                     records = _restore_raw_source_text(records, cues)
+                    _validate_plan_source_width(
+                        records,
+                        prompt_maximum_units,
+                        skip_first=start > 0,
+                        skip_last=end < len(cues),
+                    )
                 except TranslationError as exc:
                     prompt_error = exc
                     raise
@@ -653,7 +648,8 @@ class OpenAICompatibleTranslator:
             cues,
             repaired,
             pending,
-            max_chars=max(8000, min(48000, self.config.max_tokens * 2)),
+            max_chars=_FIXED_TRANSLATION_BATCH_MAX_CHARS,
+            max_cues=_FIXED_TRANSLATION_BATCH_MAX_CUES,
         )
 
         def repair_batch(
@@ -667,6 +663,30 @@ class OpenAICompatibleTranslator:
             content_failures = 0
             transient_failures = 0
             while unresolved:
+                request_batches = _fixed_translation_batches(
+                    cues,
+                    repaired,
+                    unresolved,
+                    max_chars=_FIXED_TRANSLATION_BATCH_MAX_CHARS,
+                    max_cues=_FIXED_TRANSLATION_BATCH_MAX_CUES,
+                    repair_issues=repair_issues or None,
+                )
+                if len(request_batches) > 1:
+                    logging.info(
+                        "splitting %d failed translations into %d bounded batches",
+                        len(unresolved),
+                        len(request_batches),
+                    )
+                    for request_batch in request_batches:
+                        repair_batch(
+                            request_batch,
+                            {
+                                repair_id: repair_issues[repair_id]
+                                for repair_id in request_batch
+                                if repair_id in repair_issues
+                            },
+                        )
+                    return
                 prompt = _fixed_translation_prompt(
                     cues,
                     repaired,
@@ -1404,14 +1424,6 @@ def _compact_prompt_units_text(
             _without_source_punctuation(cues[index].text)
         )
         tokens.append(f"<{index}>{text}")
-        gap_after_ms = 0
-        if index + 1 < len(cues):
-            gap_after_ms = max(
-                0, round((cues[index + 1].start - cues[index].end) * 1000)
-            )
-        if gap_after_ms >= _PROMPT_GAP_MARKER_MS and index + 1 < end:
-            flush_tokens()
-            lines.append(f"<gap:{gap_after_ms}ms>")
     flush_tokens()
     return "\n".join(lines)
 
@@ -1466,7 +1478,6 @@ def _cue_plan_boundaries_prompt(
     cues: list[Cue],
     specs: list[tuple[str, CueTranslationRecord, CueTranslationRecord]],
     maximum_units: float,
-    target_language: str,
     *,
     previous_error: Exception | None,
 ) -> str:
@@ -1479,7 +1490,6 @@ def _cue_plan_boundaries_prompt(
     maximum_characters = max(1, math.floor(maximum_units))
     return render_user_prompt(
         "cue-boundary-repair.md",
-        TARGET_LANGUAGE=target_language,
         MAXIMUM_CHARACTERS=maximum_characters,
         BOUNDARY_BLOCKS="\n\n".join(
             _boundary_repair_block(cues, key, left, right)
@@ -1494,7 +1504,6 @@ def _cue_plan_boundary_prompt(
     left: CueTranslationRecord,
     right: CueTranslationRecord,
     maximum_units: float,
-    target_language: str,
     *,
     previous_error: Exception | None,
 ) -> str:
@@ -1503,7 +1512,6 @@ def _cue_plan_boundary_prompt(
         cues,
         [(key, left, right)],
         maximum_units,
-        target_language,
         previous_error=previous_error,
     )
 
@@ -1553,15 +1561,27 @@ def _fixed_translation_batches(
     pending: list[int],
     *,
     max_chars: int,
+    max_cues: int,
+    repair_issues: dict[int, dict[str, object]] | None = None,
 ) -> list[list[int]]:
     batches: list[list[int]] = []
     current: list[int] = []
     current_chars = 0
     for repair_id in pending:
-        item_chars = len(
-            _compact_fixed_translation_text(cues, records, [repair_id])
+        item_text = (
+            _fixed_translation_repair_text(
+                cues,
+                records,
+                [repair_id],
+                repair_issues,
+            )
+            if repair_issues is not None
+            else _compact_fixed_translation_text(cues, records, [repair_id])
         )
-        if current and current_chars + item_chars > max_chars:
+        item_chars = len(item_text)
+        if current and (
+            current_chars + item_chars > max_chars or len(current) >= max_cues
+        ):
             batches.append(current)
             current = []
             current_chars = 0
@@ -1909,6 +1929,7 @@ def _validated_boundary_repairs(
     values: list[object],
     specs: list[tuple[str, CueTranslationRecord, CueTranslationRecord]],
     cues: list[Cue],
+    maximum_units: float,
 ) -> tuple[dict[str, list[CueTranslationRecord]], dict[str, str]]:
     expected = {key: (left, right) for key, left, right in specs}
     accepted: dict[str, list[CueTranslationRecord]] = {}
@@ -1937,7 +1958,9 @@ def _validated_boundary_repairs(
                 right.end_id + 1,
                 math.inf,
             )
-            accepted[key] = _restore_raw_source_text(records, cues)
+            restored = _restore_raw_source_text(records, cues)
+            _validate_plan_source_width(restored, maximum_units)
+            accepted[key] = restored
         except TranslationError as exc:
             rejected[key] = str(exc)
     for key in expected:
@@ -2074,10 +2097,8 @@ def _translation_boundary_specs(
 ) -> list[tuple[str, CueTranslationRecord, CueTranslationRecord]]:
     specs: list[tuple[str, CueTranslationRecord, CueTranslationRecord]] = []
     for left_window, right_window in pairwise(windows):
-        if len(left_window) < 2 or len(right_window) < 2:
-            raise TranslationError(
-                "each window adjacent to a boundary must contain at least two cues"
-            )
+        if not left_window or not right_window:
+            raise TranslationError("window adjacent to a boundary has no cues")
         left = left_window[-1]
         right = right_window[0]
         if left.end_id + 1 != right.start_id:
@@ -2137,6 +2158,34 @@ def _validate_plan_source(records: list[CueTranslationRecord]) -> None:
             )
 
 
+def _validate_plan_source_width(
+    records: list[CueTranslationRecord],
+    maximum_units: float,
+    *,
+    skip_first: bool = False,
+    skip_last: bool = False,
+) -> None:
+    invalid: list[str] = []
+    for position, record in enumerate(records):
+        if (skip_first and position == 0) or (
+            skip_last and position == len(records) - 1
+        ):
+            continue
+        source_text = record.source_text or ""
+        width = text_display_width(source_text)
+        if width > maximum_units + 1e-9:
+            minimum_cues = max(2, math.ceil(width / maximum_units))
+            invalid.append(
+                f"cue {position} IDs {record.start_id}-{record.end_id}: "
+                f"width={width:.3f}, split into at least {minimum_cues} cues"
+            )
+    if invalid:
+        raise TranslationError(
+            f"Japanese cue width limit={maximum_units:.3f} was exceeded. "
+            "Correct every invalid range in one response: " + "; ".join(invalid)
+        )
+
+
 def _cached_records_for_range(
     values: object,
     start: int,
@@ -2145,7 +2194,6 @@ def _cached_records_for_range(
     *,
     skip_first_width: bool = False,
     skip_last_width: bool = False,
-    require_two_cues: bool = False,
 ) -> list[CueTranslationRecord] | None:
     if not isinstance(values, list):
         return None
@@ -2159,8 +2207,6 @@ def _cached_records_for_range(
             skip_last_width=skip_last_width,
         )
     except TranslationError:
-        return None
-    if require_two_cues and end - start > 1 and len(records) < 2:
         return None
     return records
 
@@ -2229,7 +2275,6 @@ def _load_parallel_translation_cache(
                 maximum_units,
                 skip_first_width=start > 0,
                 skip_last_width=end < len(cues),
-                require_two_cues=True,
             )
             if records is not None:
                 try:
