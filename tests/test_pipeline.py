@@ -279,6 +279,19 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertTrue((result.job_dir / "manifest.json").is_file())
             self.assertTrue((result.job_dir / "source.semantic.srt").is_file())
+            performance = json.loads(
+                (result.job_dir / "performance.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(performance["status"], "completed")
+            self.assertEqual(performance["summary"]["pipeline.total"]["calls"], 1)
+            self.assertIn("pipeline.download", performance["summary"])
+            self.assertIn("pipeline.audio_and_asr", performance["summary"])
+            self.assertIn(
+                "pipeline.subtitle_planning_and_translation", performance["summary"]
+            )
+            self.assertIn("pipeline.metadata_translation", performance["summary"])
+            self.assertIn("pipeline.render", performance["summary"])
+            self.assertNotIn("pipeline.upload", performance["summary"])
             metadata = result.translated_metadata.read_text(encoding="utf-8")
             self.assertIn("中文标题", metadata)
             self.assertIn("中文简介", metadata)

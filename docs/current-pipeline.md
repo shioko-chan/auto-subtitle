@@ -4,6 +4,11 @@
 `src/subtitle_pipeline/config.py` 为准；实验计划见
 [音频管线内存与并行优化](audio-pipeline-optimization.md)。
 
+每次运行都会在任务目录写入 `performance.json`。其中 `stages` 保留各阶段及各批次的
+墙钟耗时、状态和可获取的 PyTorch 峰值显存，`summary` 汇总同名阶段的调用次数、总耗时
+和最大耗时；`pipeline.total` 是完整管线墙钟时间。报告使用临时文件原子替换，管线失败
+或被中断时也会保留已完成阶段和错误原因。
+
 ```mermaid
 flowchart TD
     A[YouTube 视频与元数据] --> B[yt-dlp 下载 VP9 或 H.264 视频]
@@ -34,9 +39,9 @@ flowchart TD
     S -->|是| T[DiCoW v3.3<br/>按 speaker 分路的段级转写]
     G --> T
     S -->|否| U[保留 Qwen 基线]
-    T --> V[重叠区协调<br/>DiCoW 分路 + Qwen 混合文本证据]
-    R --> V
-    U --> V
+    T --> V[保留 DiCoW 段级边界<br/>异常时回退 Qwen]
+    R --> W
+    U --> W
 
     N --> W[统一带时间源单元]
     O --> W
@@ -51,9 +56,11 @@ flowchart TD
     AB --> AC
 
     AC --> AD{源单元类型}
-    AD -->|讲话| AE[日文 Cue Planner Map + Reduce<br/>并行规划并修复窗口边界]
+    AD -->|普通讲话| AE[日文 Cue Planner Map + Reduce<br/>并行规划并修复窗口边界]
+    AD -->|DiCoW 重叠讲话| AY[保留 DiCoW 段级边界]
     AD -->|歌唱| AX[保留歌曲路径的句级边界]
     AE --> AF[固定边界中文翻译<br/>同时处理可能的 ASR 误听]
+    AY --> AF
     AX --> AF
     AF --> AG[定点修复假名残留等<br/>完整性与宽度校验]
 
@@ -158,13 +165,13 @@ ordinary diarization 中真实同时讲话达到 `0.5` 秒时，管线把重叠�
 30 秒。
 
 DiCoW 输出按 speaker 分路的**段级**日文文本与时间，不经过 Qwen Forced Aligner。
-管线保留同时间范围的 Qwen 混合文本和词素作为证据：
+这些段落标记为 `conditioned_speech`，其句级边界直接固定，不进入 Cue Planner：
 
 - DiCoW 正常时，用其分路结果替换相应 speaker 的局部 Qwen 基线。
 - DiCoW 遗漏某个活跃 speaker 时，保留该 speaker 的 Qwen 基线。
 - DiCoW 出现强重复循环时，丢弃异常结果并保留 Qwen 基线。
-- Cue Planner 同时看到 Qwen 混合文本、DiCoW 分路文本和 diarization 活动区间，用于判断
-  重叠区的 cue 边界；固定边界翻译再结合术语和上下文处理可能的文本误听。
+- 正常 DiCoW 段直接进入固定边界翻译，翻译模型结合术语和相邻 cue 处理可能的误听，
+  但不能合并或拆分 DiCoW 时间段。
 
 当前 DiCoW worker 尚未启用 token timestamp，因此不能把其文本描述为词级对齐结果。
 
@@ -239,7 +246,8 @@ Map 窗口互不重叠，因此窗口边缘只是暂定边界。所有 Map 完�
 视频上下文和术语，并明确说明源文本可能含同音词、人名、漏词或重复等误听。模型结合
 证据还原意图后直接输出中文，只能返回 `cue_id` 与 `text`，不能改变、合并或拆分 ID 范围。
 空译文和日文假名残留等错误先缓存为 `pending`，后续请求只补失败的 `cue_id`；成功 cue
-立即写入缓存。Planner 已负责重叠区边界，翻译请求不重复附带整套 DiCoW 重叠证据。
+立即写入缓存。DiCoW 段绕过 Planner，并以自身文本直接进入翻译请求；同时间 Qwen 混合
+文本仅用于本地异常回退和审计，不重复发送给翻译模型。
 
 ID 缺失、重复、越界或时间轴无效只属于 Planner 校验，必须重做相应规划窗口。翻译阶段
 若固定 cue 无法在硬宽度内给出合格中文则停止，不会为了修译文悄悄重规划时间轴。

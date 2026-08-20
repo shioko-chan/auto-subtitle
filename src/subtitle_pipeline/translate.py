@@ -33,6 +33,7 @@ from .subtitles import (
     merge_cues_at_boundaries,
     text_display_width,
 )
+from .telemetry import stage_metrics
 
 
 class TranslationError(RuntimeError):
@@ -53,6 +54,7 @@ class LLMHTTPError(TranslationError):
 
 _PLAN_CACHE_VERSION = 1
 _PLAN_PROMPT_VERSION = 1
+_PLANNER_BYPASS_KINDS = frozenset({"singing", "conditioned_speech"})
 _TRANSLATION_CACHE_VERSION = 1
 _TRANSLATION_PROMPT_VERSION = 1
 _MAP_CONTENT_ATTEMPTS = 2
@@ -149,44 +151,49 @@ class OpenAICompatibleTranslator:
                     len(ranges),
                     self.config.max_concurrency,
                 )
-                with ThreadPoolExecutor(
-                    max_workers=min(self.config.max_concurrency, len(missing_ranges)),
-                    thread_name_prefix="subtitle-window",
-                ) as executor:
-                    futures: dict[
-                        Future[list[CueTranslationRecord]], tuple[int, int]
-                    ] = {
-                        executor.submit(
-                            self._plan_cue_window_resilient,
-                            cues,
-                            start,
-                            end,
-                            context,
-                            prompt_maximum_units,
-                        ): (start, end)
-                        for start, end in missing_ranges
-                    }
-                    for future in as_completed(futures):
-                        start, end = futures[future]
-                        try:
-                            windows[_range_key(start, end)] = future.result()
-                        except Exception as exc:
-                            errors.append(exc)
-                            logging.error(
-                                "parallel subtitle window %d-%d failed: %s",
+                with (
+                    stage_metrics("llm.cue_planner_map"),
+                    ThreadPoolExecutor(
+                        max_workers=min(
+                            self.config.max_concurrency, len(missing_ranges)
+                        ),
+                        thread_name_prefix="subtitle-window",
+                    ) as executor,
+                ):
+                        futures: dict[
+                            Future[list[CueTranslationRecord]], tuple[int, int]
+                        ] = {
+                            executor.submit(
+                                self._plan_cue_window_resilient,
+                                cues,
                                 start,
-                                end - 1,
-                                exc,
-                            )
-                        else:
-                            _write_parallel_translation_cache(
-                                plan_cache_path,
-                                plan_signature,
-                                ranges,
-                                windows,
-                                boundaries,
-                                None,
-                            )
+                                end,
+                                context,
+                                prompt_maximum_units,
+                            ): (start, end)
+                            for start, end in missing_ranges
+                        }
+                        for future in as_completed(futures):
+                            start, end = futures[future]
+                            try:
+                                windows[_range_key(start, end)] = future.result()
+                            except Exception as exc:
+                                errors.append(exc)
+                                logging.error(
+                                    "parallel subtitle window %d-%d failed: %s",
+                                    start,
+                                    end - 1,
+                                    exc,
+                                )
+                            else:
+                                _write_parallel_translation_cache(
+                                    plan_cache_path,
+                                    plan_signature,
+                                    ranges,
+                                    windows,
+                                    boundaries,
+                                    None,
+                                )
             if errors:
                 raise errors[0]
 
@@ -249,40 +256,43 @@ class OpenAICompatibleTranslator:
                             None,
                         )
 
-                with ThreadPoolExecutor(
-                    max_workers=min(
-                        self.config.max_concurrency, len(boundary_batches)
-                    ),
-                    thread_name_prefix="subtitle-boundary",
-                ) as executor:
-                    futures = {
-                        executor.submit(
-                            self._repair_plan_boundaries,
-                            cues,
-                            batch,
-                            context,
-                            prompt_maximum_units,
-                            on_accept=accept_boundaries,
-                        ): batch
-                        for batch in boundary_batches
-                    }
-                    for future in as_completed(futures):
-                        batch = futures[future]
-                        try:
-                            future.result()
-                        except Exception as exc:
-                            errors.append(exc)
-                            logging.error(
-                                "parallel subtitle boundary batch %s failed: %s",
-                                ",".join(spec[0] for spec in batch),
-                                exc,
-                            )
+                with (
+                    stage_metrics("llm.cue_planner_reduce"),
+                    ThreadPoolExecutor(
+                        max_workers=min(
+                            self.config.max_concurrency, len(boundary_batches)
+                        ),
+                        thread_name_prefix="subtitle-boundary",
+                    ) as executor,
+                ):
+                        futures = {
+                            executor.submit(
+                                self._repair_plan_boundaries,
+                                cues,
+                                batch,
+                                context,
+                                prompt_maximum_units,
+                                on_accept=accept_boundaries,
+                            ): batch
+                            for batch in boundary_batches
+                        }
+                        for future in as_completed(futures):
+                            batch = futures[future]
+                            try:
+                                future.result()
+                            except Exception as exc:
+                                errors.append(exc)
+                                logging.error(
+                                    "parallel subtitle boundary batch %s failed: %s",
+                                    ",".join(spec[0] for spec in batch),
+                                    exc,
+                                )
             if errors:
                 raise errors[0]
             planned_records = _apply_translation_boundaries(
                 ordered_windows, boundary_specs, boundaries
             )
-            records = _merge_planned_and_singing_records(cues, planned_records)
+            records = _merge_planned_and_fixed_records(cues, planned_records)
             _validate_complete_joint_records(records, len(cues), math.inf)
             _validate_plan_source(records)
             _write_parallel_translation_cache(
@@ -314,16 +324,17 @@ class OpenAICompatibleTranslator:
                 "translating %d fixed subtitle cues after cue planning completed",
                 len(pending),
             )
-            records = self._translate_fixed_cues(
-                cues,
-                records,
-                pending,
-                context,
-                prompt_maximum_units,
-                validation_maximum_units,
-                translation_signature,
-                cache_path,
-            )
+            with stage_metrics("llm.fixed_translation"):
+                records = self._translate_fixed_cues(
+                    cues,
+                    records,
+                    pending,
+                    context,
+                    prompt_maximum_units,
+                    validation_maximum_units,
+                    translation_signature,
+                    cache_path,
+                )
         if _pending_translation_indices(records, self.config.target_language):
             raise TranslationError("fixed cue translation is incomplete")
         return _joint_records_to_cues(cues, records)
@@ -1370,7 +1381,7 @@ def _cue_plan_prompt(
 ) -> str:
     maximum_full_width_characters = max(1, math.floor(maximum_units))
     reference = _compact_reference_text(translation_context)
-    units = _compact_prompt_units_text(cues, start, end, translation_context)
+    units = _compact_prompt_units_text(cues, start, end)
     retry = ""
     if previous_error is not None:
         retry = (
@@ -1393,17 +1404,10 @@ def _compact_prompt_units_text(
     cues: list[Cue],
     start: int,
     end: int,
-    context: dict[str, object] | None = None,
 ) -> str:
     lines: list[str] = []
     tokens: list[str] = []
     active_speaker: str | None = None
-    overlap_blocks = _compact_overlap_evidence_blocks(
-        cues, start, end, context or {}
-    )
-    blocks_by_id: dict[int, list[str]] = {}
-    for anchor_id, block in overlap_blocks:
-        blocks_by_id.setdefault(anchor_id, []).append(block)
 
     def flush_tokens() -> None:
         if tokens:
@@ -1411,10 +1415,6 @@ def _compact_prompt_units_text(
             tokens.clear()
 
     for index in range(start, end):
-        if index in blocks_by_id:
-            flush_tokens()
-            lines.extend(blocks_by_id[index])
-            active_speaker = None
         speaker = _escape_prompt_marker_text(cues[index].speaker or "unknown")
         if speaker != active_speaker:
             flush_tokens()
@@ -1451,7 +1451,6 @@ def _boundary_repair_block(
         cues,
         left.start_id,
         right.end_id + 1,
-        translation_context,
     )
     return (
         f"<boundary:{key} range={left.start_id}-{right.end_id}>\n"
@@ -1785,95 +1784,6 @@ def _compact_reference_scalar(value: object) -> str:
     return " ".join(str(value).split())
 
 
-def _asr_evidence_for_range(
-    cues: list[Cue],
-    start: int,
-    end: int,
-    context: dict[str, object],
-) -> list[dict[str, object]]:
-    values = context.get("asr_evidence")
-    if not isinstance(values, list) or start >= end:
-        return []
-    range_start = min(cue.start for cue in cues[start:end])
-    range_end = max(cue.end for cue in cues[start:end])
-    return [
-        item
-        for item in values
-        if isinstance(item, dict)
-        and isinstance(item.get("start"), (int, float))
-        and isinstance(item.get("end"), (int, float))
-        and float(item["end"]) > range_start
-        and float(item["start"]) < range_end
-    ]
-
-
-def _compact_overlap_evidence_blocks(
-    cues: list[Cue],
-    start: int,
-    end: int,
-    context: dict[str, object],
-) -> list[tuple[int, str]]:
-    blocks: list[tuple[int, str]] = []
-    for evidence in _asr_evidence_for_range(cues, start, end, context):
-        if evidence.get("kind") != "overlap_reconciliation":
-            continue
-
-        mixed_parts: list[str] = []
-        qwen_mixed = evidence.get("qwen_mixed")
-        if isinstance(qwen_mixed, list):
-            for item in qwen_mixed:
-                if not isinstance(item, dict) or not isinstance(item.get("text"), str):
-                    continue
-                text = _compact_overlap_text(item["text"])
-                if text:
-                    mixed_parts.append(text)
-
-        speaker_parts: dict[str, list[str]] = {}
-        dicow = evidence.get("dicow")
-        if isinstance(dicow, list):
-            for item in dicow:
-                if not isinstance(item, dict) or not isinstance(item.get("text"), str):
-                    continue
-                text = _compact_overlap_text(item["text"])
-                if not text:
-                    continue
-                raw_speaker = item.get("speaker")
-                speaker = (
-                    raw_speaker
-                    if isinstance(raw_speaker, str) and raw_speaker.strip()
-                    else "unknown"
-                )
-                speaker_parts.setdefault(
-                    _escape_prompt_marker_text(speaker.strip()), []
-                ).append(text)
-
-        if not mixed_parts and not speaker_parts:
-            continue
-        lines = ["<overlap>"]
-        if mixed_parts:
-            lines.append("<mixed>" + "｜".join(mixed_parts))
-        lines.extend(
-            f"<{speaker}>{'｜'.join(parts)}" for speaker, parts in speaker_parts.items()
-        )
-        evidence_start = float(evidence["start"])
-        evidence_end = float(evidence["end"])
-        anchor_id = next(
-            (
-                index
-                for index in range(start, end)
-                if cues[index].end > evidence_start
-                and cues[index].start < evidence_end
-            ),
-            start,
-        )
-        blocks.append((anchor_id, "\n".join(lines)))
-    return sorted(blocks, key=lambda item: item[0])
-
-
-def _compact_overlap_text(text: str) -> str:
-    return _escape_prompt_marker_text(_without_source_punctuation(text))
-
-
 def _validate_joint_records(
     values: list[object],
     start: int,
@@ -2154,11 +2064,11 @@ def _cue_plan_range_groups(
     groups: list[list[tuple[int, int]]] = []
     start = 0
     while start < len(cues):
-        if cues[start].kind == "singing":
+        if cues[start].kind in _PLANNER_BYPASS_KINDS:
             start += 1
             continue
         end = start + 1
-        while end < len(cues) and cues[end].kind != "singing":
+        while end < len(cues) and cues[end].kind not in _PLANNER_BYPASS_KINDS:
             end += 1
         groups.append(
             [
@@ -2172,14 +2082,14 @@ def _cue_plan_range_groups(
     return groups
 
 
-def _merge_planned_and_singing_records(
+def _merge_planned_and_fixed_records(
     cues: list[Cue], planned: list[CueTranslationRecord]
 ) -> list[CueTranslationRecord]:
     records = list(planned)
     records.extend(
         CueTranslationRecord(index, index, "", " ".join(cue.text.split()))
         for index, cue in enumerate(cues)
-        if cue.kind == "singing"
+        if cue.kind in _PLANNER_BYPASS_KINDS
     )
     return sorted(records, key=lambda record: record.start_id)
 

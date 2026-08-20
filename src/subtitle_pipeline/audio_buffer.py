@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .commands import require_command
+from .telemetry import stage_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +104,8 @@ class AudioBufferPool:
 
     def main(self) -> AudioBuffer:
         if self._main is None:
-            self._main = self._decode_main()
+            with stage_metrics("audio.shared_memory_decode"):
+                self._main = self._decode_main()
         return self._main
 
     def source(self, path: Path) -> AudioBuffer:
@@ -113,26 +115,27 @@ class AudioBufferPool:
         if resolved == self.video.resolve():
             return self.main()
         if resolved not in self._sources:
-            ffmpeg = require_command("ffmpeg")
-            result = subprocess.run(
-                [
-                    ffmpeg,
-                    "-v",
-                    "error",
-                    "-i",
-                    str(resolved),
-                    "-vn",
-                    "-ac",
-                    "1",
-                    "-ar",
-                    "16000",
-                    "-f",
-                    "f32le",
-                    "pipe:1",
-                ],
-                check=False,
-                capture_output=True,
-            )
+            with stage_metrics("audio.secondary_source_decode"):
+                ffmpeg = require_command("ffmpeg")
+                result = subprocess.run(
+                    [
+                        ffmpeg,
+                        "-v",
+                        "error",
+                        "-i",
+                        str(resolved),
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-f",
+                        "f32le",
+                        "pipe:1",
+                    ],
+                    check=False,
+                    capture_output=True,
+                )
             if result.returncode != 0:
                 raise RuntimeError(
                     f"could not decode audio source {resolved}: "

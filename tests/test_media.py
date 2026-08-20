@@ -268,7 +268,7 @@ class SubtitleRenderTests(unittest.TestCase):
         self.assertIn("Speaker_fuji_miyako,fuji_miyako,0,0,0,,都子", content)
         self.assertIn("Default,unknown,0,0,156,,默认", content)
 
-    def test_ass_underlines_only_singing_cues(self):
+    def test_ass_underlines_and_decorates_only_singing_cues(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "subtitle.ass"
             styles = {
@@ -295,8 +295,40 @@ class SubtitleRenderTests(unittest.TestCase):
         self.assertIn(
             r"Speaker_fuji_miyako,fuji_miyako,0,0,0,,{\u1}歌词", content
         )
+        self.assertIn(
+            r"Dialogue: 1,0:00:01.00,0:00:02.00,Speaker_fuji_miyako,"
+            r"fuji_miyako,0,0,0,,{\an6\pos(864,990)\fs51}♪",
+            content,
+        )
+        self.assertIn(
+            r"Dialogue: 1,0:00:01.00,0:00:02.00,Speaker_fuji_miyako,"
+            r"fuji_miyako,0,0,0,,{\an4\pos(1056,990)\fs51}♫",
+            content,
+        )
         self.assertIn("Speaker_fuji_miyako,fuji_miyako,0,0,0,,讲话", content)
         self.assertNotIn(r"{\u1}讲话", content)
+        self.assertEqual(content.count("♪"), 1)
+        self.assertEqual(content.count("♫"), 1)
+        self.assertNotIn(r"{\u1}歌词 ♪", content)
+
+    def test_singing_decorations_center_on_multiline_lyrics_without_changing_text(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "subtitle.ass"
+            _write_ass(
+                [RenderCue(1, 2, "第一行歌词\n第二行", kind="singing")],
+                path,
+                width=1080,
+                height=1920,
+                font_name="Noto Sans CJK SC",
+                font_size=48,
+                margin_vertical=96,
+                outline=2,
+            )
+            content = path.read_text(encoding="utf-8")
+
+        self.assertIn(r",,{\u1}第一行歌词\N第二行", content)
+        self.assertIn(r"{\an6\pos(403,1776)\fs35}♪", content)
+        self.assertIn(r"{\an4\pos(677,1776)\fs35}♫", content)
 
     def test_ass_skips_non_positive_duration_cues(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -21,6 +21,7 @@ from .subtitles import (
     trim_overlapping_cues,
     write_srt,
 )
+from .telemetry import pipeline_metrics, stage_metrics
 from .translate import OpenAICompatibleTranslator
 from .upload import upload_to_bilibili
 
@@ -50,14 +51,36 @@ def run_pipeline(
     job_dir.mkdir(parents=True, exist_ok=True)
     logging.info("job directory: %s", job_dir)
 
-    downloaded = download_youtube(url, job_dir, config.download)
-    source_subtitle = transcribe_with_qwen(
-        downloaded.video,
-        job_dir / "source.qwen3-asr.srt",
-        config.asr,
-        config.audio_analysis,
-        downloaded.metadata,
-    )
+    with (
+        pipeline_metrics(job_dir / "performance.json"),
+        stage_metrics("pipeline.total"),
+    ):
+        return _run_pipeline_stages(
+            url,
+            config,
+            job_dir,
+            upload_override=upload_override,
+        )
+
+
+def _run_pipeline_stages(
+    url: str,
+    config: AppConfig,
+    job_dir: Path,
+    *,
+    upload_override: bool | None,
+) -> PipelineResult:
+    with stage_metrics("pipeline.download"):
+        downloaded = download_youtube(url, job_dir, config.download)
+
+    with stage_metrics("pipeline.audio_and_asr"):
+        source_subtitle = transcribe_with_qwen(
+            downloaded.video,
+            job_dir / "source.qwen3-asr.srt",
+            config.asr,
+            config.audio_analysis,
+            downloaded.metadata,
+        )
 
     sidecar = source_subtitle.with_suffix(".cues.json")
     cues = (
@@ -92,17 +115,18 @@ def run_pipeline(
         ]
         logging.info("using translation glossary: %s", ", ".join(names))
     translator = OpenAICompatibleTranslator(config.llm, llm_api_key(config.llm))
-    if config.song_identification.enabled:
-        song_result = identify_and_align_songs(
-            downloaded.video,
-            cues,
-            downloaded.metadata,
-            job_dir,
-            config.song_identification,
-            translator.request,
-        )
-    else:
-        song_result = SongIdentificationResult(cues, [])
+    with stage_metrics("pipeline.song_identification"):
+        if config.song_identification.enabled:
+            song_result = identify_and_align_songs(
+                downloaded.video,
+                cues,
+                downloaded.metadata,
+                job_dir,
+                config.song_identification,
+                translator.request,
+            )
+        else:
+            song_result = SongIdentificationResult(cues, [])
     cues = song_result.corrected_cues
     if song_result.reports:
         write_srt(cues, job_dir / "source.lyrics-corrected.srt")
@@ -115,15 +139,16 @@ def run_pipeline(
             len(song_result.reports),
         )
     layout = subtitle_layout(downloaded.video, config.render)
-    joint = translator.plan_and_translate(
-        cues,
-        config.segmentation,
-        translation_context=translation_context,
-        max_line_units=layout.max_line_units,
-        hard_max_line_units=layout.frame_line_units * 2,
-        plan_cache_path=job_dir / "cue-plan-cache.json",
-        cache_path=job_dir / "cue-translation-cache.json",
-    )
+    with stage_metrics("pipeline.subtitle_planning_and_translation"):
+        joint = translator.plan_and_translate(
+            cues,
+            config.segmentation,
+            translation_context=translation_context,
+            max_line_units=layout.max_line_units,
+            hard_max_line_units=layout.frame_line_units * 2,
+            plan_cache_path=job_dir / "cue-plan-cache.json",
+            cache_path=job_dir / "cue-translation-cache.json",
+        )
     logging.info(
         "cue planning and ASR-aware fixed translation: "
         "%d aligned cues -> %d subtitle cues",
@@ -152,17 +177,20 @@ def run_pipeline(
     title, description = source_title, source_description
     content_summary = ""
     generated_tags: list[str] = []
-    if config.llm.translate_metadata:
-        logging.info("translating video title and description and generating tags")
-        title, description, content_summary, generated_tags = translator.translate_metadata(
-            source_title,
-            source_description,
-            youtube_context=youtube_context,
-            subtitle_evidence=subtitle_evidence,
-            ip_aliases=ip_aliases,
-            bilibili_tag_catalog=tag_catalog,
-            translation_context=translation_context,
-        )
+    with stage_metrics("pipeline.metadata_translation"):
+        if config.llm.translate_metadata:
+            logging.info("translating video title and description and generating tags")
+            title, description, content_summary, generated_tags = (
+                translator.translate_metadata(
+                    source_title,
+                    source_description,
+                    youtube_context=youtube_context,
+                    subtitle_evidence=subtitle_evidence,
+                    ip_aliases=ip_aliases,
+                    bilibili_tag_catalog=tag_catalog,
+                    translation_context=translation_context,
+                )
+            )
     generated_tags, tag_catalog_matches = _canonicalize_catalog_tags(
         generated_tags, tag_catalog
     )
@@ -194,27 +222,29 @@ def run_pipeline(
     )
 
     rendered_path = job_dir / "translated.mp4"
-    render_subtitles(
-        downloaded.video,
-        translated_path,
-        rendered_path,
-        config.render,
-        cues=translated,
-        character_styles=load_character_styles(
-            config.audio_analysis.character_styles_file
-        ),
-    )
+    with stage_metrics("pipeline.render"):
+        render_subtitles(
+            downloaded.video,
+            translated_path,
+            rendered_path,
+            config.render,
+            cues=translated,
+            character_styles=load_character_styles(
+                config.audio_analysis.character_styles_file
+            ),
+        )
 
     should_upload = config.upload.enabled if upload_override is None else upload_override
     if should_upload:
-        upload_to_bilibili(
-            rendered_path,
-            title=title,
-            description=description,
-            source_url=url,
-            tags=upload_tags,
-            config=config.upload,
-        )
+        with stage_metrics("pipeline.upload"):
+            upload_to_bilibili(
+                rendered_path,
+                title=title,
+                description=description,
+                source_url=url,
+                tags=upload_tags,
+                config=config.upload,
+            )
 
     result = PipelineResult(
         job_dir=job_dir,

@@ -14,8 +14,9 @@ from .subtitles import Cue
 
 logger = logging.getLogger(__name__)
 
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
 _MAX_WINDOW_SECONDS = 30.0
+_CONDITIONED_CUE_KIND = "conditioned_speech"
 
 
 @dataclass(frozen=True)
@@ -58,7 +59,10 @@ def repair_long_overlaps(
     }
     repaired = _load_cache(cache_path, signature)
     if repaired is None:
-        repaired = _run_dicow(audio, windows, config)
+        repaired = [
+            Cue(cue.start, cue.end, cue.text, cue.speaker, _CONDITIONED_CUE_KIND)
+            for cue in _run_dicow(audio, windows, config)
+        ]
         _write_cache(cache_path, signature, repaired)
     usable_repaired = _without_repetition_hallucinations(repaired)
     evidence = _conditioned_evidence(
@@ -329,7 +333,13 @@ def _decode_cues(value: object, windows: list[ConditionedWindow]) -> list[Cue]:
         ):
             raise RuntimeError("DiCoW worker returned an invalid cue range")
         cues.append(
-            Cue(start, end, text, label_to_character.get(label, label), "speech")
+            Cue(
+                start,
+                end,
+                text,
+                label_to_character.get(label, label),
+                _CONDITIONED_CUE_KIND,
+            )
         )
     if not cues:
         raise RuntimeError("DiCoW returned no speech for a long-overlap window")

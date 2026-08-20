@@ -42,46 +42,51 @@ def transcribe_with_qwen(
     duration = _media_duration(video)
     with AudioBufferPool(video, destination.parent, duration) as audio_pool:
         if analysis_config is not None and analysis_config.enabled:
-            analysis = analyze_audio(
-                video,
-                destination.parent,
-                analysis_config,
-                metadata=metadata,
-                audio_pool=audio_pool,
-            )
-            try:
-                return _transcribe_analyzed(
-                    video,
-                    destination,
-                    config,
-                    analysis_config,
-                    analysis,
-                    audio_pool,
-                )
-            except _StaleRuntimeAudio:
-                logging.info(
-                    "cached analysis needs ephemeral source tracks for missing ASR; "
-                    "recomputing audio analysis"
-                )
+            with stage_metrics("audio.analysis_total", analysis_config.device):
                 analysis = analyze_audio(
                     video,
                     destination.parent,
                     analysis_config,
                     metadata=metadata,
                     audio_pool=audio_pool,
-                    force_runtime_sources=True,
                 )
-                return _transcribe_analyzed(
-                    video,
-                    destination,
-                    config,
-                    analysis_config,
-                    analysis,
-                    audio_pool,
+            try:
+                with stage_metrics("asr.transcription_total", config.device):
+                    return _transcribe_analyzed(
+                        video,
+                        destination,
+                        config,
+                        analysis_config,
+                        analysis,
+                        audio_pool,
+                    )
+            except _StaleRuntimeAudio:
+                logging.info(
+                    "cached analysis needs ephemeral source tracks for missing ASR; "
+                    "recomputing audio analysis"
                 )
-        return _transcribe_unanalyzed(
-            video, destination, config, duration, audio_pool
-        )
+                with stage_metrics("audio.analysis_total", analysis_config.device):
+                    analysis = analyze_audio(
+                        video,
+                        destination.parent,
+                        analysis_config,
+                        metadata=metadata,
+                        audio_pool=audio_pool,
+                        force_runtime_sources=True,
+                    )
+                with stage_metrics("asr.transcription_total", config.device):
+                    return _transcribe_analyzed(
+                        video,
+                        destination,
+                        config,
+                        analysis_config,
+                        analysis,
+                        audio_pool,
+                    )
+        with stage_metrics("asr.transcription_total", config.device):
+            return _transcribe_unanalyzed(
+                video, destination, config, duration, audio_pool
+            )
 
 
 def _transcribe_unanalyzed(
@@ -357,19 +362,20 @@ def _transcribe_analyzed(
     if analysis.diarization:
         from .conditioned_asr import repair_long_overlaps
 
-        conditioned = repair_long_overlaps(
-            cues,
-            analysis.diarization,
-            audio_pool.main(),
-            destination.parent,
-            analysis_config,
-            qwen_windows=[
-                record
-                for index in range(len(regions))
-                if regions[index].kind == "speech"
-                and isinstance((record := cached.get(str(index))), dict)
-            ],
-        )
+        with stage_metrics("asr.conditioned_overlap", analysis_config.device):
+            conditioned = repair_long_overlaps(
+                cues,
+                analysis.diarization,
+                audio_pool.main(),
+                destination.parent,
+                analysis_config,
+                qwen_windows=[
+                    record
+                    for index in range(len(regions))
+                    if regions[index].kind == "speech"
+                    and isinstance((record := cached.get(str(index))), dict)
+                ],
+            )
         cues = conditioned.cues
         evidence = conditioned.evidence
     else:

@@ -16,12 +16,13 @@ from subtitle_pipeline.translate import (
     _compact_fixed_translation_text,
     _compact_prompt_units_text,
     _compact_reference_text,
+    _cue_plan_prompt,
     _cue_plan_range_groups,
     _cue_plan_signature,
     _is_nontransient_http_error,
     _log_response_usage,
     _majority_speaker,
-    _merge_planned_and_singing_records,
+    _merge_planned_and_fixed_records,
     _normalize_api_response,
     _parse_joint_records,
     _parse_json_object,
@@ -153,6 +154,51 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(
             [(cue.start, cue.end, cue.text) for cue in result.source_cues],
             [(0.0, 2.0, "夢はパワー"), (2.0, 4.0, "歌い続ける")],
+        )
+
+    def test_conditioned_speech_bypasses_planner_and_keeps_dicow_boundaries(self):
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(thinking="disabled"), "secret"
+        )
+        cues = [
+            Cue(1.0, 2.5, "お願いします", "A", "conditioned_speech"),
+            Cue(1.8, 3.0, "よろしくお願いします", "B", "conditioned_speech"),
+        ]
+        response = {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": (
+                            '{"translations":['
+                            '{"cue_id":0,"text":"拜托了"},'
+                            '{"cue_id":1,"text":"请多关照"}'
+                            "]}"
+                        )
+                    },
+                }
+            ]
+        }
+
+        with patch.object(translator, "_request", return_value=response) as request:
+            result = translator.plan_and_translate(
+                cues,
+                SegmentationConfig(),
+                max_line_units=20,
+            )
+
+        self.assertEqual(request.call_count, 1)
+        prompt = request.call_args.args[0]["messages"][1]["content"]
+        self.assertNotIn("Group every TARGET", prompt)
+        self.assertEqual(
+            [
+                (cue.start, cue.end, cue.text, cue.speaker, cue.kind)
+                for cue in result.source_cues
+            ],
+            [
+                (1.0, 2.5, "お願いします", "A", "conditioned_speech"),
+                (1.8, 3.0, "よろしくお願いします", "B", "conditioned_speech"),
+            ],
         )
 
     def test_fixed_translation_retries_only_invalid_cue_text(self):
@@ -801,21 +847,22 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(_translation_window_ranges(5, 2), [(0, 2), (2, 5)])
         self.assertEqual(_translation_window_ranges(601, 600), [(0, 599), (599, 601)])
 
-    def test_singing_cues_split_planner_ranges_and_bypass_planning(self):
+    def test_fixed_cues_split_planner_ranges_and_bypass_planning(self):
         cues = [
             Cue(0.0, 0.4, "話", kind="speech"),
             Cue(0.4, 0.8, "す", kind="speech"),
             Cue(0.8, 1.8, "歌詞", kind="singing"),
-            Cue(1.8, 2.2, "続", kind="speech"),
-            Cue(2.2, 2.6, "き", kind="speech"),
+            Cue(1.8, 2.2, "重複話者", kind="conditioned_speech"),
+            Cue(2.2, 2.6, "続", kind="speech"),
+            Cue(2.6, 3.0, "き", kind="speech"),
         ]
 
-        self.assertEqual(_cue_plan_range_groups(cues, 1), [[(0, 2)], [(3, 5)]])
-        records = _merge_planned_and_singing_records(
+        self.assertEqual(_cue_plan_range_groups(cues, 1), [[(0, 2)], [(4, 6)]])
+        records = _merge_planned_and_fixed_records(
             cues,
             [
                 CueTranslationRecord(0, 1, "", "話す"),
-                CueTranslationRecord(3, 4, "", "続き"),
+                CueTranslationRecord(4, 5, "", "続き"),
             ],
         )
         self.assertEqual(
@@ -823,7 +870,12 @@ class TranslationTests(unittest.TestCase):
                 (record.start_id, record.end_id, record.source_text)
                 for record in records
             ],
-            [(0, 1, "話す"), (2, 2, "歌詞"), (3, 4, "続き")],
+            [
+                (0, 1, "話す"),
+                (2, 2, "歌詞"),
+                (3, 3, "重複話者"),
+                (4, 5, "続き"),
+            ],
         )
 
     def test_planner_units_use_compact_speaker_and_gap_markers(self):
@@ -885,7 +937,7 @@ class TranslationTests(unittest.TestCase):
             ),
         )
 
-    def test_overlap_evidence_is_inserted_before_first_intersecting_unit(self):
+    def test_planner_ignores_overlap_evidence(self):
         cues = [Cue(216.0, 222.0, "対象", "minetsuki_ritsu", "speech")]
         context = {
             "asr_evidence": [
@@ -929,19 +981,18 @@ class TranslationTests(unittest.TestCase):
             ]
         }
 
-        self.assertEqual(
-            _compact_prompt_units_text(cues, 0, 1, context),
-            "\n".join(
-                [
-                    "<overlap>",
-                    "<mixed>一で始めますね行きますよはい三",
-                    "<minetsuki_ritsu>で始めますね｜いきますよ3",
-                    "<sengoku_yuno>right",
-                    "<minetsuki_ritsu>",
-                    "<0>対象",
-                ]
-            ),
+        prompt = _cue_plan_prompt(
+            cues,
+            0,
+            1,
+            context,
+            20,
+            "Simplified Chinese",
+            previous_error=None,
         )
+        self.assertIn("TARGET:\n<minetsuki_ritsu>\n<0>対象", prompt)
+        self.assertNotIn("<overlap>", prompt)
+        self.assertNotIn("一で始めますね", prompt)
     def test_only_transient_transport_failures_receive_backoff(self):
         with patch(
             "subtitle_pipeline.translate.random.uniform",

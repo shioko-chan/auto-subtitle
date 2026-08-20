@@ -12,6 +12,7 @@ from .commands import CommandError, require_command, run
 from .config import DownloadConfig, RenderConfig
 from .speakers import CharacterStyle
 from .subtitles import Cue, read_subtitles, text_display_width
+from .telemetry import stage_metrics
 
 _RENDER_TERMINAL_PLAIN_PUNCTUATION_RE = re.compile(
     r'''[，、；：。．,;:]+(?=["'”’」』）)\]]*$)'''
@@ -132,25 +133,26 @@ def render_subtitles(
     if local_subtitle.parent != local_destination.parent:
         raise ValueError("subtitle and rendered video must share a work directory")
 
-    source_cues = cues if cues is not None else read_subtitles(local_subtitle)
-    render_cues = _layout_subtitle_cues(
-        source_cues,
-        max_line_units=layout.max_line_units,
-        hard_max_line_units=layout.frame_line_units,
-        semantic_segments=semantic_segments,
-    )
-    ass_path = local_subtitle.with_suffix(".render.ass")
-    _write_ass(
-        render_cues,
-        ass_path,
-        width=layout.width,
-        height=layout.height,
-        font_name=config.font_name,
-        font_size=layout.font_size,
-        margin_vertical=layout.margin_vertical,
-        outline=layout.outline,
-        character_styles=character_styles,
-    )
+    with stage_metrics("render.layout_and_ass"):
+        source_cues = cues if cues is not None else read_subtitles(local_subtitle)
+        render_cues = _layout_subtitle_cues(
+            source_cues,
+            max_line_units=layout.max_line_units,
+            hard_max_line_units=layout.frame_line_units,
+            semantic_segments=semantic_segments,
+        )
+        ass_path = local_subtitle.with_suffix(".render.ass")
+        _write_ass(
+            render_cues,
+            ass_path,
+            width=layout.width,
+            height=layout.height,
+            font_name=config.font_name,
+            font_size=layout.font_size,
+            margin_vertical=layout.margin_vertical,
+            outline=layout.outline,
+            character_styles=character_styles,
+        )
     logging.info(
         "adaptive subtitle style: %dx%d font=%d prompt_margin=%d "
         "ass_margins=1/%d outline=%d cues=%d->%d wrapped=%d",
@@ -166,12 +168,13 @@ def render_subtitles(
     )
     if config.backend in {"auto", "cuda"}:
         try:
-            return _render_subtitles_cuda(
-                local_video,
-                ass_path,
-                local_destination,
-                config,
-            )
+            with stage_metrics("render.cuda_encode"):
+                return _render_subtitles_cuda(
+                    local_video,
+                    ass_path,
+                    local_destination,
+                    config,
+                )
         except (CommandError, RuntimeError) as exc:
             if config.backend == "cuda":
                 raise
@@ -179,28 +182,29 @@ def render_subtitles(
 
     subtitle_name = ass_path.name.replace("'", r"\'").replace(":", r"\:")
     filter_value = f"subtitles=filename='{subtitle_name}'"
-    run(
-        [
-            ffmpeg,
-            "-y",
-            "-i",
-            str(local_video),
-            "-vf",
-            filter_value,
-            "-c:v",
-            "libx264",
-            "-preset",
-            config.preset,
-            "-crf",
-            str(config.crf),
-            "-c:a",
-            "copy",
-            "-movflags",
-            "+faststart",
-            str(local_destination),
-        ],
-        cwd=local_destination.parent,
-    )
+    with stage_metrics("render.cpu_encode"):
+        run(
+            [
+                ffmpeg,
+                "-y",
+                "-i",
+                str(local_video),
+                "-vf",
+                filter_value,
+                "-c:v",
+                "libx264",
+                "-preset",
+                config.preset,
+                "-crf",
+                str(config.crf),
+                "-c:a",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(local_destination),
+            ],
+            cwd=local_destination.parent,
+        )
     return destination
 
 
@@ -502,15 +506,50 @@ def _write_ass(
             else "Default"
         )
         event_text = _escape_ass_text(cue.text)
-        if getattr(cue, "kind", "speech") == "singing":
+        is_singing = getattr(cue, "kind", "speech") == "singing"
+        if is_singing:
             event_text = r"{\u1}" + event_text
         event_margin = 0 if lane == 0 else margin_vertical + lane * round(font_size * 1.25)
+        start = _ass_timestamp(cue.start)
+        end = _ass_timestamp(cue.end)
         events.append(
             "Dialogue: 0,"
-            f"{_ass_timestamp(cue.start)},{_ass_timestamp(cue.end)},"
+            f"{start},{end},"
             f"{style_name},{speaker or ''},0,0,{event_margin},,"
             f"{event_text}"
         )
+        if is_singing:
+            effective_margin = event_margin or margin_vertical
+            decoration_y = round(
+                height
+                - effective_margin
+                - font_size * max(1, len(cue.text.splitlines())) / 2
+            )
+            widest_line_units = max(
+                text_display_width(line) for line in cue.text.splitlines()
+            )
+            half_text_width = widest_line_units * font_size / 2
+            decoration_gap = max(1, round(font_size * 0.35))
+            decoration_size = max(1, round(font_size * 0.72))
+            edge_padding = outline + decoration_size
+            left_x = max(
+                edge_padding,
+                round(width / 2 - half_text_width - decoration_gap),
+            )
+            right_x = min(
+                width - edge_padding,
+                round(width / 2 + half_text_width + decoration_gap),
+            )
+            events.extend(
+                [
+                    "Dialogue: 1,"
+                    f"{start},{end},{style_name},{speaker or ''},0,0,0,,"
+                    rf"{{\an6\pos({left_x},{decoration_y})\fs{decoration_size}}}♪",
+                    "Dialogue: 1,"
+                    f"{start},{end},{style_name},{speaker or ''},0,0,0,,"
+                    rf"{{\an4\pos({right_x},{decoration_y})\fs{decoration_size}}}♫",
+                ]
+            )
     path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
     if skipped_nonpositive:
         logging.warning(

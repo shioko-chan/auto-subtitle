@@ -112,6 +112,7 @@ class ConditionedASRTests(unittest.TestCase):
             second = repair_long_overlaps([], diarization, audio, Path(temp), config)
 
         self.assertEqual(first, second)
+        self.assertEqual(first.cues[0].kind, "conditioned_speech")
         run.assert_called_once()
 
     def test_qwen_overlap_units_are_preserved_as_read_only_evidence(self):
@@ -183,8 +184,11 @@ class ConditionedASRTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            [(cue.text, cue.speaker) for cue in result.cues],
-            [("DiCoW A", "A"), ("Qwen B", "B")],
+            [(cue.text, cue.speaker, cue.kind) for cue in result.cues],
+            [
+                ("DiCoW A", "A", "conditioned_speech"),
+                ("Qwen B", "B", "speech"),
+            ],
         )
         self.assertNotIn("私は私は", str(result.evidence))
 

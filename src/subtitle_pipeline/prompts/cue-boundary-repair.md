@@ -19,7 +19,7 @@ Plan each cue so its later {{TARGET_LANGUAGE}} translation can fit within about 
 
 REFERENCE:
 {{REFERENCE_TEXT}}
-Each <boundary:ID range=START-END> block contains compact chronological SOURCE_UNITS for one independent repair. <A> changes the active speaker, <821>いや is unit ID 821 with its source text, and <gap:720ms> is non-binding pause evidence between adjacent units. An inline <overlap> block appears immediately before its first intersecting unit; <mixed> is Qwen's mixed transcription and named speaker lines are simultaneous DiCoW lanes separated by ｜. It ends when normal speaker and numeric unit markers resume. Only numeric unit markers are valid output boundaries; boundary, speaker, gap, and overlap markers are not units.
+Each <boundary:ID range=START-END> block contains compact chronological SOURCE_UNITS for one independent repair. <A> changes the active speaker, <821>いや is unit ID 821 with its source text, and <gap:720ms> is non-binding pause evidence between adjacent units. Only numeric unit markers are valid output boundaries; boundary, speaker, and gap markers are not units. DiCoW conditioned-speech cues already have fixed sentence boundaries and never appear inside a boundary block.
 BOUNDARIES:
 {{BOUNDARY_BLOCKS}}{{RETRY_SECTION}}
 <!-- USER_PROMPT_END -->

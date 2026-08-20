@@ -20,8 +20,6 @@ Treat names as high priority: use REFERENCE and video/channel metadata to recogn
 
 TARGET is one provisional fixed window. Its left and right edges are explicit chunk boundaries, not semantic boundaries. A later boundary-repair request will replan the edge cue on each side. Do not output IDs outside Required ID range. Every multi-unit TARGET window must produce at least two cues.
 
-When an inline <overlap> block is present, use its <mixed> Qwen text and named DiCoW speaker lanes only as evidence for semantic boundaries. Do not assign mixed Qwen words to a speaker without support from a named speaker lane.
-
 Return exactly one JSON object with a cues array and no other fields: {"cues":[{"start_id":120,"end_id":128}]}. Do not return source text, translations, timestamps, NDJSON, a bare array, Markdown, or explanations.
 
 REFERENCE:
@@ -31,7 +29,7 @@ Required ID range: {{REQUIRED_START_ID}}-{{REQUIRED_END_ID}}
 
 Speaker labels are approximate evidence and can flicker on short aligned units. Prefer a cue boundary at a coherent speaker-turn change, but do not fragment one sentence solely because isolated unit labels differ. Never combine simultaneous speakers into one cue; cues belonging to different known speakers may overlap in time and display simultaneously. TARGET contains speech only.
 
-TARGET uses compact chronological text. A line such as <A> changes the active speaker for following units. <821>いや is source unit ID 821 with text いや. <gap:720ms> reports the silence between the preceding and following units; it is semantic evidence, never a mandatory boundary. An inline <overlap> block is placed immediately before the first intersecting TARGET unit: <mixed> is Qwen's mixed transcription and each named <speaker> line is DiCoW's simultaneous lane; ｜ separates fragments. The block ends when the normal TARGET speaker marker and numeric units resume. Overlap lines are evidence, not source units. Only numeric unit markers are IDs and valid output boundaries. Speaker, gap, and overlap markers are not units. Full-width ＜ and ＞ inside source text are literal escaped characters.
+TARGET uses compact chronological text. A line such as <A> changes the active speaker for following units. <821>いや is source unit ID 821 with text いや. <gap:720ms> reports the silence between the preceding and following units; it is semantic evidence, never a mandatory boundary. Only numeric unit markers are IDs and valid output boundaries. Speaker and gap markers are not units. Full-width ＜ and ＞ inside source text are literal escaped characters. DiCoW conditioned-speech cues already have fixed sentence boundaries and are not included in TARGET.
 TARGET:
 {{TARGET_UNITS_TEXT}}{{RETRY_SECTION}}
 <!-- USER_PROMPT_END -->
