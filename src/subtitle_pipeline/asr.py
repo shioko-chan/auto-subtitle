@@ -409,6 +409,15 @@ def _speech_asr_windows(
     for episode in episodes:
         cursor = episode[0][0]
         episode_end = episode[-1][1]
+        if episode_end - cursor < _MIN_RETRY_CHUNK_SECONDS:
+            windows.append(
+                AudioRegion(
+                    round(max(0.0, cursor - config.chunk_context_seconds), 3),
+                    round(episode_end + config.chunk_context_seconds, 3),
+                    "speech",
+                )
+            )
+            continue
         while cursor < episode_end - 1e-6:
             hard_end = min(episode_end, cursor + maximum)
             boundaries = sorted(
@@ -788,7 +797,8 @@ def _write_empty_speech_audit(
     text: str,
     language: str,
     generation_token_limit: int,
-    split_at: float,
+    action: str,
+    split_at: float | None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     event = {
@@ -803,14 +813,15 @@ def _write_empty_speech_audit(
         "language": language,
         "text": text,
         "generation_token_limit": generation_token_limit,
-        "action": "split",
+        "action": action,
         "split_at": split_at,
     }
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
         handle.write("\n")
     logging.warning(
-        "recorded empty speech window before split: %.3f-%.3fs audit=%s",
+        "recorded empty speech window before %s: %.3f-%.3fs audit=%s",
+        action,
         core_start,
         core_end,
         path,
@@ -1080,11 +1091,6 @@ def _transcribe_range(
         ):
             duration = core_end - core_start
             child_duration = duration / 2
-            if child_duration < _MIN_RETRY_CHUNK_SECONDS:
-                raise RuntimeError(
-                    "Qwen3 forced-alignment timeline remains invalid at minimum "
-                    f"speech window {core_start:.3f}-{core_end:.3f}s"
-                )
             midpoint = _timeline_retry_split(record, core_start, core_end)
             if not cues and empty_speech_audit_path is not None:
                 _write_empty_speech_audit(
@@ -1097,7 +1103,21 @@ def _transcribe_range(
                     text=text,
                     language=str(getattr(result, "language", "")),
                     generation_token_limit=generation_token_limit,
-                    split_at=midpoint,
+                    action=(
+                        "terminal_failure"
+                        if child_duration < _MIN_RETRY_CHUNK_SECONDS
+                        else "split"
+                    ),
+                    split_at=(
+                        None
+                        if child_duration < _MIN_RETRY_CHUNK_SECONDS
+                        else midpoint
+                    ),
+                )
+            if child_duration < _MIN_RETRY_CHUNK_SECONDS:
+                raise RuntimeError(
+                    "Qwen3 forced-alignment timeline remains invalid at minimum "
+                    f"speech window {core_start:.3f}-{core_end:.3f}s"
                 )
             logging.warning(
                 "Qwen3 timeline validation failed in %.3f-%.3fs; splitting at %.3fs",

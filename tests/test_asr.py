@@ -144,6 +144,41 @@ class QwenASRTests(unittest.TestCase):
         self.assertEqual(events[0]["action"], "split")
         self.assertEqual(events[0]["split_at"], 20)
 
+    def test_short_empty_speech_is_audited_before_terminal_failure(self):
+        empty = SimpleNamespace(
+            language="Japanese",
+            text="",
+            time_stamps=SimpleNamespace(items=[]),
+        )
+        model = SimpleNamespace(max_new_tokens=2048)
+        model.transcribe = Mock(return_value=[empty])
+        audio = SimpleNamespace(
+            sample_rate=16000,
+            slice=lambda *_args, **_kwargs: np.zeros(16000, dtype=np.float32),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            audit_path = Path(temp) / "empty.jsonl"
+            with self.assertRaisesRegex(RuntimeError, "minimum speech window"):
+                _transcribe_range(
+                    model,
+                    Path("source.mp4"),
+                    None,
+                    ASRConfig(chunk_context_seconds=0),
+                    core_start=10,
+                    core_end=11,
+                    media_duration=20,
+                    final_chunk=True,
+                    label="short-empty",
+                    audio_buffer=audio,
+                    validate_timeline=True,
+                    empty_speech_audit_path=audit_path,
+                )
+            events = [json.loads(line) for line in audit_path.read_text().splitlines()]
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["action"], "terminal_failure")
+        self.assertIsNone(events[0]["split_at"])
+
     def test_transcribe_range_temporarily_applies_dynamic_token_limit(self):
         observed_limits = []
         result = SimpleNamespace(
@@ -279,8 +314,8 @@ class QwenASRTests(unittest.TestCase):
             media_duration.assert_called_once_with(video)
             self.assertEqual(transcribe.call_args.kwargs["media_duration"], 30.0)
             self.assertIs(transcribe.call_args.kwargs["audio_buffer"], buffer)
-            self.assertEqual(transcribe.call_args.kwargs["core_start"], 10.0)
-            self.assertEqual(transcribe.call_args.kwargs["core_end"], 11.0)
+            self.assertEqual(transcribe.call_args.kwargs["core_start"], 8.0)
+            self.assertEqual(transcribe.call_args.kwargs["core_end"], 13.0)
             self.assertTrue(transcribe.call_args.kwargs["validate_timeline"])
 
     def test_speech_windows_merge_nearby_turns_across_speakers(self):
@@ -323,6 +358,23 @@ class QwenASRTests(unittest.TestCase):
         self.assertEqual(
             [(window.start, window.end) for window in windows],
             [(0, 20), (22.001, 40)],
+        )
+
+    def test_short_isolated_speech_window_owns_its_context(self):
+        analysis = AudioAnalysis(
+            speech=[],
+            singing=[],
+            diarization=[AudioRegion(100.0, 100.7, "speech", "A")],
+        )
+
+        windows = _speech_asr_windows(
+            analysis,
+            ASRConfig(chunk_context_seconds=2.0),
+        )
+
+        self.assertEqual(
+            [(window.start, window.end) for window in windows],
+            [(98.0, 102.7)],
         )
 
     def test_speech_windows_rebalance_instead_of_stranding_a_short_tail(self):
