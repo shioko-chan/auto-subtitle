@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -19,6 +20,10 @@ from .config import AudioAnalysisConfig
 from .telemetry import stage_metrics
 
 logger = logging.getLogger(__name__)
+
+# Transformers/Accelerate can temporarily install meta-device initialization
+# hooks. Keep unrelated model construction out of that process-global context.
+_MODEL_LOAD_LOCK = threading.Lock()
 
 _CACHE_VERSION = 11
 _MIN_SEPARATED_SEGMENT_SECONDS = 0.08
@@ -360,12 +365,13 @@ def _run_diarization(
         ) from exc
 
     logger.info("loading speaker diarization model %s", config.diarization_model)
-    pipeline = Pipeline.from_pretrained(config.diarization_model)
-    if pipeline is None:
-        raise RuntimeError(
-            f"could not load gated diarization model {config.diarization_model}"
-        )
-    pipeline.to(torch.device(config.device))
+    with _MODEL_LOAD_LOCK:
+        pipeline = Pipeline.from_pretrained(config.diarization_model)
+        if pipeline is None:
+            raise RuntimeError(
+                f"could not load gated diarization model {config.diarization_model}"
+            )
+        pipeline.to(torch.device(config.device))
     try:
         output = pipeline({"waveform": waveform, "sample_rate": sample_rate})
         ordinary_annotation = getattr(output, "speaker_diarization", output)
@@ -451,10 +457,11 @@ def _score_singing_sources(
         )
 
     logger.info("loading singing detector %s", config.singing_model)
-    extractor = AutoFeatureExtractor.from_pretrained(config.singing_model)
-    model = ASTForAudioClassification.from_pretrained(config.singing_model).to(
-        config.device
-    )
+    with _MODEL_LOAD_LOCK:
+        extractor = AutoFeatureExtractor.from_pretrained(config.singing_model)
+        model = ASTForAudioClassification.from_pretrained(config.singing_model).to(
+            config.device
+        )
     model.eval()
     labels = {
         int(index): str(label).casefold()
