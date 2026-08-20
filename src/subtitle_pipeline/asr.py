@@ -396,6 +396,7 @@ def _speech_asr_windows(
             episodes[-1].append(span)
         else:
             episodes.append([span])
+    episodes = _merge_short_speech_episodes(episodes, config)
 
     target = max(
         0.1,
@@ -409,15 +410,6 @@ def _speech_asr_windows(
     for episode in episodes:
         cursor = episode[0][0]
         episode_end = episode[-1][1]
-        if episode_end - cursor < _MIN_RETRY_CHUNK_SECONDS:
-            windows.append(
-                AudioRegion(
-                    round(max(0.0, cursor - config.chunk_context_seconds), 3),
-                    round(episode_end + config.chunk_context_seconds, 3),
-                    "speech",
-                )
-            )
-            continue
         while cursor < episode_end - 1e-6:
             hard_end = min(episode_end, cursor + maximum)
             boundaries = sorted(
@@ -483,6 +475,39 @@ def _union_spans(spans: list[tuple[float, float]]) -> list[tuple[float, float]]:
             merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         else:
             merged.append((start, end))
+    return merged
+
+
+def _merge_short_speech_episodes(
+    episodes: list[list[tuple[float, float]]], config: ASRConfig
+) -> list[list[tuple[float, float]]]:
+    merged = [list(episode) for episode in episodes]
+    index = 0
+    while index < len(merged) and len(merged) > 1:
+        episode = merged[index]
+        if episode[-1][1] - episode[0][0] >= _MIN_RETRY_CHUNK_SECONDS:
+            index += 1
+            continue
+        candidates: list[tuple[float, int]] = []
+        if index > 0:
+            candidates.append((episode[0][0] - merged[index - 1][-1][1], index - 1))
+        if index + 1 < len(merged):
+            candidates.append((merged[index + 1][0][0] - episode[-1][1], index + 1))
+        candidates = [
+            candidate
+            for candidate in candidates
+            if candidate[0] <= config.speech_window_max_silence_seconds
+        ]
+        if not candidates:
+            index += 1
+            continue
+        _, neighbor = min(candidates, key=lambda item: (item[0], item[1]))
+        if neighbor < index:
+            merged[neighbor].extend(episode)
+            merged.pop(index)
+            index = max(0, neighbor)
+        else:
+            episode.extend(merged.pop(neighbor))
     return merged
 
 
@@ -758,6 +783,8 @@ def _record_timeline_is_healthy(
 ) -> bool:
     if not _valid_cached_record(record):
         return False
+    if record.get("skipped_empty") is True:
+        return record.get("cues") == []
     text = str(record.get("text") or "")
     if _repetition_hallucination(text):
         return False
@@ -791,37 +818,21 @@ def _write_empty_speech_audit(
     *,
     core_start: float,
     core_end: float,
-    extract_start: float,
-    extract_end: float,
-    label: str,
-    text: str,
-    language: str,
-    generation_token_limit: int,
-    action: str,
-    split_at: float | None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     event = {
         "timestamp": datetime.now(UTC).isoformat(),
         "reason": "empty_aligned_cues",
-        "label": label,
         "core_start": core_start,
         "core_end": core_end,
         "duration": core_end - core_start,
-        "extract_start": extract_start,
-        "extract_end": extract_end,
-        "language": language,
-        "text": text,
-        "generation_token_limit": generation_token_limit,
-        "action": action,
-        "split_at": split_at,
+        "action": "skip",
     }
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
         handle.write("\n")
     logging.warning(
-        "recorded empty speech window before %s: %.3f-%.3fs audit=%s",
-        action,
+        "recorded and skipped empty speech window: %.3f-%.3fs audit=%s",
         core_start,
         core_end,
         path,
@@ -1086,34 +1097,28 @@ def _transcribe_range(
             "cues": [asdict(cue) for cue in cues],
             "generation_token_limit": generation_token_limit,
         }
+        if validate_timeline and not cues:
+            record["text"] = ""
+            record["skipped_empty"] = True
+            if empty_speech_audit_path is not None:
+                _write_empty_speech_audit(
+                    empty_speech_audit_path,
+                    core_start=core_start,
+                    core_end=core_end,
+                )
+            _store_completed_range(
+                completed_ranges,
+                range_key,
+                record,
+                completed_range_callback,
+            )
+            return record
         if validate_timeline and not _record_timeline_is_healthy(
             record, AudioRegion(core_start, core_end, "speech")
         ):
             duration = core_end - core_start
             child_duration = duration / 2
             midpoint = _timeline_retry_split(record, core_start, core_end)
-            if not cues and empty_speech_audit_path is not None:
-                _write_empty_speech_audit(
-                    empty_speech_audit_path,
-                    core_start=core_start,
-                    core_end=core_end,
-                    extract_start=extract_start,
-                    extract_end=extract_end,
-                    label=label,
-                    text=text,
-                    language=str(getattr(result, "language", "")),
-                    generation_token_limit=generation_token_limit,
-                    action=(
-                        "terminal_failure"
-                        if child_duration < _MIN_RETRY_CHUNK_SECONDS
-                        else "split"
-                    ),
-                    split_at=(
-                        None
-                        if child_duration < _MIN_RETRY_CHUNK_SECONDS
-                        else midpoint
-                    ),
-                )
             if child_duration < _MIN_RETRY_CHUNK_SECONDS:
                 raise RuntimeError(
                     "Qwen3 forced-alignment timeline remains invalid at minimum "

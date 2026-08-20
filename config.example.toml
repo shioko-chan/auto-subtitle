@@ -18,7 +18,7 @@ language = "Japanese"
 # context = "BanG Dream!、夢限大みゅーたいぷ、MewTypeに関する日本語配信。"
 # 每块连同两侧上下文必须不超过 forced aligner 的 180 秒限制。
 chunk_seconds = 170.0
-chunk_context_seconds = 2.0
+chunk_context_seconds = 0.5
 # Repeated ASR generation is detected automatically. Affected chunks are
 # recursively halved down to about 20 seconds instead of being cached.
 max_inference_batch_size = 4

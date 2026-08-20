@@ -33,7 +33,7 @@ class ASRConfig:
     language: str = "Japanese"
     context: str = ""
     chunk_seconds: float = 170.0
-    chunk_context_seconds: float = 2.0
+    chunk_context_seconds: float = 0.5
     max_inference_batch_size: int = 4
     max_new_tokens: int = 2048
     speech_window_target_seconds: float = 60.0
