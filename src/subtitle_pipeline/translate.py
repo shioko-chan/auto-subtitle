@@ -53,11 +53,13 @@ class LLMHTTPError(TranslationError):
 
 
 _PLAN_CACHE_VERSION = 1
-_PLAN_PROMPT_VERSION = 3
+_PLAN_PROMPT_VERSION = 6
 _PLANNER_BYPASS_KINDS = frozenset({"singing", "conditioned_speech"})
 _TRANSLATION_CACHE_VERSION = 1
 _TRANSLATION_PROMPT_VERSION = 1
 _MAP_CONTENT_ATTEMPTS = 2
+_JAPANESE_PLAN_WIDTH_MULTIPLIER = 1.25
+_JAPANESE_PLAN_VALIDATION_MULTIPLIER = 1.25
 _FIXED_TRANSLATION_BATCH_MAX_CHARS = 8000
 _FIXED_TRANSLATION_BATCH_MAX_CUES = 200
 
@@ -85,6 +87,20 @@ class CueTranslationRecord:
 class CueTranslationResult:
     source_cues: list[Cue]
     translated_cues: list[Cue]
+
+
+@dataclass(frozen=True)
+class _PlannerTokenSpan:
+    start: int
+    end: int
+    cue_id: int
+
+
+@dataclass(frozen=True)
+class _PlannerTextView:
+    baseline: str
+    candidate_text: str
+    token_spans: tuple[_PlannerTokenSpan, ...]
 
 
 class OpenAICompatibleTranslator:
@@ -116,11 +132,17 @@ class OpenAICompatibleTranslator:
         if not cues:
             return CueTranslationResult([], [])
         context = translation_context or {}
-        prompt_maximum_units = max_line_units
+        translation_prompt_maximum_units = max_line_units
+        prompt_maximum_units = (
+            max_line_units * _JAPANESE_PLAN_WIDTH_MULTIPLIER
+        )
+        plan_validation_maximum_units = (
+            prompt_maximum_units * _JAPANESE_PLAN_VALIDATION_MULTIPLIER
+        )
         validation_maximum_units = (
             max_line_units if hard_max_line_units is None else hard_max_line_units
         )
-        if validation_maximum_units < prompt_maximum_units:
+        if validation_maximum_units < translation_prompt_maximum_units:
             raise ValueError(
                 "hard_max_line_units cannot be smaller than max_line_units"
             )
@@ -129,6 +151,7 @@ class OpenAICompatibleTranslator:
             config,
             self.config,
             prompt_maximum_units,
+            plan_validation_maximum_units,
         )
         range_groups = _cue_plan_range_groups(cues, config.model_window_cues)
         ranges = [item for group in range_groups for item in group]
@@ -169,6 +192,7 @@ class OpenAICompatibleTranslator:
                                 start,
                                 end,
                                 prompt_maximum_units,
+                                plan_validation_maximum_units,
                             ): (start, end)
                             for start, end in missing_ranges
                         }
@@ -262,6 +286,7 @@ class OpenAICompatibleTranslator:
                                 cues,
                                 batch,
                                 prompt_maximum_units,
+                                plan_validation_maximum_units,
                                 on_accept=accept_boundaries,
                             ): batch
                             for batch in boundary_batches
@@ -298,7 +323,7 @@ class OpenAICompatibleTranslator:
             records,
             self.config,
             context,
-            prompt_maximum_units,
+            translation_prompt_maximum_units,
             validation_maximum_units,
         )
         records = _load_fixed_translation_cache(
@@ -320,7 +345,7 @@ class OpenAICompatibleTranslator:
                     records,
                     pending,
                     context,
-                    prompt_maximum_units,
+                    translation_prompt_maximum_units,
                     validation_maximum_units,
                     translation_signature,
                     cache_path,
@@ -335,12 +360,14 @@ class OpenAICompatibleTranslator:
         left: CueTranslationRecord,
         right: CueTranslationRecord,
         prompt_maximum_units: float,
+        validation_maximum_units: float | None = None,
     ) -> list[CueTranslationRecord]:
         key = f"{left.end_id}|{right.start_id}"
         return self._repair_plan_boundaries(
             cues,
             [(key, left, right)],
             prompt_maximum_units,
+            validation_maximum_units,
         )[key]
 
     def _repair_plan_boundaries(
@@ -348,11 +375,17 @@ class OpenAICompatibleTranslator:
         cues: list[Cue],
         specs: list[tuple[str, CueTranslationRecord, CueTranslationRecord]],
         prompt_maximum_units: float,
+        validation_maximum_units: float | None = None,
         *,
         on_accept: (
             Callable[[dict[str, list[CueTranslationRecord]]], None] | None
         ) = None,
     ) -> dict[str, list[CueTranslationRecord]]:
+        effective_validation_maximum_units = (
+            prompt_maximum_units
+            if validation_maximum_units is None
+            else validation_maximum_units
+        )
         accepted_all: dict[str, list[CueTranslationRecord]] = {}
 
         def repair_batch(
@@ -397,11 +430,15 @@ class OpenAICompatibleTranslator:
                         values,
                         unresolved,
                         cues,
-                        prompt_maximum_units,
+                        effective_validation_maximum_units,
                     )
                     if not accepted:
                         raise TranslationError(
-                            "boundary response completed no pending boundaries"
+                            "boundary repairs rejected: "
+                            + "; ".join(
+                                f"{spec[0]}: {rejected.get(spec[0], 'missing')}"
+                                for spec in unresolved
+                            )
                         )
                     accepted_all.update(accepted)
                     if on_accept is not None:
@@ -472,7 +509,13 @@ class OpenAICompatibleTranslator:
         start: int,
         end: int,
         prompt_maximum_units: float,
+        validation_maximum_units: float | None = None,
     ) -> list[CueTranslationRecord]:
+        effective_validation_maximum_units = (
+            prompt_maximum_units
+            if validation_maximum_units is None
+            else validation_maximum_units
+        )
         last_error: Exception | None = None
         prompt_error: Exception | None = None
         content_attempts = 0
@@ -509,21 +552,16 @@ class OpenAICompatibleTranslator:
                 finish_reason = _finish_reason(response)
                 if finish_reason not in (None, "stop"):
                     raise TranslationError(f"finish_reason={finish_reason}")
-                parsed = _parse_joint_records(content)
-                parsed = _normalize_plan_fields(parsed)
                 try:
-                    records = _validate_joint_records(
-                        parsed,
+                    records = _records_from_segmented_text(
+                        cues,
                         start,
                         end,
-                        math.inf,
-                        skip_first_width=start > 0,
-                        skip_last_width=end < len(cues),
+                        _parse_segmented_text(content),
                     )
-                    records = _restore_raw_source_text(records, cues)
                     _validate_plan_source_width(
                         records,
-                        prompt_maximum_units,
+                        effective_validation_maximum_units,
                         skip_first=start > 0,
                         skip_last=end < len(cues),
                     )
@@ -588,6 +626,7 @@ class OpenAICompatibleTranslator:
         start: int,
         end: int,
         prompt_maximum_units: float,
+        validation_maximum_units: float | None = None,
     ) -> list[CueTranslationRecord]:
         try:
             return self._plan_cue_window(
@@ -595,13 +634,14 @@ class OpenAICompatibleTranslator:
                 start,
                 end,
                 prompt_maximum_units,
+                validation_maximum_units,
             )
         except LLMHTTPError:
             raise
         except TranslationError:
             if end - start <= 1:
                 raise
-            middle = start + (end - start) // 2
+            middle = _planner_split_index(cues, start, end)
             logging.warning(
                 "shrinking failed subtitle window %d-%d into %d-%d and %d-%d",
                 start,
@@ -616,18 +656,21 @@ class OpenAICompatibleTranslator:
                 start,
                 middle,
                 prompt_maximum_units,
+                validation_maximum_units,
             )
             right = self._plan_cue_window_resilient(
                 cues,
                 middle,
                 end,
                 prompt_maximum_units,
+                validation_maximum_units,
             )
             repaired = self._repair_plan_boundary(
                 cues,
                 left[-1],
                 right[0],
                 prompt_maximum_units,
+                validation_maximum_units,
             )
             return [*left[:-1], *repaired, *right[1:]]
 
@@ -1293,6 +1336,14 @@ def _parse_boundary_repairs(content: object) -> list[object]:
     return values
 
 
+def _parse_segmented_text(content: object) -> str:
+    parsed = _parse_json_object(content)
+    value = parsed.get("segmented_text")
+    if not isinstance(value, str):
+        raise ValueError('cue-plan response requires a "segmented_text" string')
+    return value
+
+
 def _parse_json_sequence(value: str) -> list[object]:
     decoder = json.JSONDecoder()
     records: list[object] = []
@@ -1382,7 +1433,7 @@ def _cue_plan_prompt(
     previous_error: Exception | None,
 ) -> str:
     maximum_full_width_characters = max(1, math.floor(maximum_units))
-    units = _compact_prompt_units_text(cues, start, end)
+    view = _planner_text_view(cues, start, end)
     retry = ""
     if previous_error is not None:
         retry = (
@@ -1393,43 +1444,154 @@ def _cue_plan_prompt(
         "cue-planner.md",
         MAXIMUM_UNITS=f"{maximum_units:.3f}",
         MAX_FULL_WIDTH_CHARACTERS=maximum_full_width_characters,
-        REQUIRED_START_ID=start,
-        REQUIRED_END_ID=end - 1,
-        TARGET_UNITS_TEXT=units,
+        TARGET_TEXT=view.candidate_text,
         RETRY_SECTION=retry,
     )
 
 
-def _compact_prompt_units_text(
+def _planner_text_view(
     cues: list[Cue],
     start: int,
     end: int,
-) -> str:
-    lines: list[str] = []
-    tokens: list[str] = []
+) -> _PlannerTextView:
+    baseline_parts: list[str] = []
+    candidate_parts: list[str] = []
+    token_spans: list[_PlannerTokenSpan] = []
     active_speaker: str | None = None
+    baseline_length = 0
 
-    def flush_tokens() -> None:
-        if tokens:
-            lines.append(" ".join(tokens))
-            tokens.clear()
+    def append(value: str) -> None:
+        nonlocal baseline_length
+        baseline_parts.append(value)
+        candidate_parts.append(value)
+        baseline_length += len(value)
 
     for index in range(start, end):
         speaker = _escape_prompt_marker_text(cues[index].speaker or "unknown")
         if speaker != active_speaker:
-            flush_tokens()
-            lines.append(f"<{speaker}>")
+            if baseline_parts:
+                append("\n")
+            append(f"<{speaker}>\n")
             active_speaker = speaker
-        text = _escape_prompt_marker_text(
+        text = _escape_planner_source_text(
             _without_source_punctuation(cues[index].text)
         )
-        tokens.append(f"<{index}>{text}")
-    flush_tokens()
-    return "\n".join(lines)
+        token_start = baseline_length
+        append(text)
+        token_spans.append(_PlannerTokenSpan(token_start, baseline_length, index))
+        if (
+            index + 1 < end
+            and (cues[index].speaker or "unknown")
+            == (cues[index + 1].speaker or "unknown")
+            and _is_planner_candidate_boundary(cues, index)
+        ):
+            candidate_parts.append("｜")
+    return _PlannerTextView(
+        "".join(baseline_parts),
+        "".join(candidate_parts),
+        tuple(token_spans),
+    )
+
+
+def _compact_prompt_units_text(cues: list[Cue], start: int, end: int) -> str:
+    """Backward-compatible helper name for the compact Planner source view."""
+    return _planner_text_view(cues, start, end).candidate_text
+
+
+def _records_from_segmented_text(
+    cues: list[Cue], start: int, end: int, segmented_text: str
+) -> list[CueTranslationRecord]:
+    view = _planner_text_view(cues, start, end)
+    baseline = segmented_text.replace("｜", "")
+    if baseline != view.baseline:
+        raise TranslationError(
+            "segmented_text changed source text; only the ｜ separators may change"
+        )
+
+    offsets: list[int] = []
+    cursor = 0
+    for character in segmented_text:
+        if character == "｜":
+            offsets.append(cursor)
+        else:
+            cursor += 1
+
+    boundaries: set[int] = set()
+    for offset in offsets:
+        boundary = _rounded_planner_boundary(view.token_spans, offset)
+        if boundary is None:
+            raise TranslationError(
+                "segmented_text placed a separator outside source text"
+            )
+        boundaries.add(boundary)
+    boundaries.update(
+        index
+        for index in range(start, end - 1)
+        if (cues[index].speaker or "unknown")
+        != (cues[index + 1].speaker or "unknown")
+    )
+    boundaries.discard(end - 1)
+
+    records: list[CueTranslationRecord] = []
+    cue_start = start
+    for cue_end in sorted(boundaries):
+        if cue_end < cue_start or cue_end >= end:
+            continue
+        records.append(
+            CueTranslationRecord(
+                cue_start,
+                cue_end,
+                "",
+                _source_text_for_range(cues, cue_start, cue_end),
+            )
+        )
+        cue_start = cue_end + 1
+    records.append(
+        CueTranslationRecord(
+            cue_start,
+            end - 1,
+            "",
+            _source_text_for_range(cues, cue_start, end - 1),
+        )
+    )
+    return _restore_raw_source_text(records, cues)
+
+
+def _rounded_planner_boundary(
+    spans: tuple[_PlannerTokenSpan, ...], offset: int
+) -> int | None:
+    if not spans or offset <= spans[0].start or offset >= spans[-1].end:
+        return None
+    previous: _PlannerTokenSpan | None = None
+    for span in spans:
+        if offset <= span.start:
+            return previous.cue_id if previous is not None else None
+        if offset <= span.end:
+            # A separator inside a token rounds to its end, so the whole token
+            # remains in the preceding subtitle.
+            return span.cue_id
+        previous = span
+    return None
+
+
+def _is_planner_candidate_boundary(cues: list[Cue], index: int) -> bool:
+    if index < 0 or index + 1 >= len(cues):
+        return False
+    current = cues[index]
+    following = cues[index + 1]
+    if (current.speaker or "unknown") != (following.speaker or "unknown"):
+        return True
+    if current.boundary_hint in {"strong", "weak"}:
+        return True
+    return following.start - current.end >= 0.25
 
 
 def _escape_prompt_marker_text(text: str) -> str:
     return text.replace("<", "＜").replace(">", "＞")
+
+
+def _escape_planner_source_text(text: str) -> str:
+    return _escape_prompt_marker_text(text).replace("｜", "￤").replace("\n", " ")
 
 
 def _boundary_repair_block(
@@ -1438,14 +1600,10 @@ def _boundary_repair_block(
     left: CueTranslationRecord,
     right: CueTranslationRecord,
 ) -> str:
-    units = _compact_prompt_units_text(
-        cues,
-        left.start_id,
-        right.end_id + 1,
-    )
+    view = _planner_text_view(cues, left.start_id, right.end_id + 1)
     return (
-        f"<boundary:{key} range={left.start_id}-{right.end_id}>\n"
-        f"{units}\n"
+        f"<boundary:{key}>\n"
+        f"{view.candidate_text}\n"
         f"</boundary:{key}>"
     )
 
@@ -1946,21 +2104,20 @@ def _validated_boundary_repairs(
         if key in seen:
             raise TranslationError(f"duplicate boundary_id={key}")
         seen.add(key)
-        raw_records = value.get("cues")
-        if not isinstance(raw_records, list):
-            rejected[key] = "cues is not an array"
+        segmented_text = value.get("segmented_text")
+        if not isinstance(segmented_text, str):
+            rejected[key] = "segmented_text is not a string"
             continue
         left, right = expected[key]
         try:
-            records = _validate_joint_records(
-                _normalize_plan_fields(raw_records),
+            records = _records_from_segmented_text(
+                cues,
                 left.start_id,
                 right.end_id + 1,
-                math.inf,
+                segmented_text,
             )
-            restored = _restore_raw_source_text(records, cues)
-            _validate_plan_source_width(restored, maximum_units)
-            accepted[key] = restored
+            _validate_plan_source_width(records, maximum_units)
+            accepted[key] = records
         except TranslationError as exc:
             rejected[key] = str(exc)
     for key in expected:
@@ -2064,16 +2221,41 @@ def _cue_plan_range_groups(
         end = start + 1
         while end < len(cues) and cues[end].kind not in _PLANNER_BYPASS_KINDS:
             end += 1
-        groups.append(
-            [
-                (start + relative_start, start + relative_end)
-                for relative_start, relative_end in _translation_window_ranges(
-                    end - start, maximum
-                )
-            ]
-        )
+        phrase_ranges: list[tuple[int, int]] = []
+        phrase_start = start
+        for index in range(start, end - 1):
+            if _is_planner_candidate_boundary(cues, index):
+                phrase_ranges.append((phrase_start, index + 1))
+                phrase_start = index + 1
+        phrase_ranges.append((phrase_start, end))
+
+        windows: list[tuple[int, int]] = []
+        window_start, window_end = phrase_ranges[0]
+        for phrase_start, phrase_end in phrase_ranges[1:]:
+            if window_end - window_start + phrase_end - phrase_start > maximum:
+                windows.append((window_start, window_end))
+                window_start, window_end = phrase_start, phrase_end
+            else:
+                window_end = phrase_end
+        windows.append((window_start, window_end))
+        groups.append(windows)
         start = end
     return groups
+
+
+def _planner_split_index(cues: list[Cue], start: int, end: int) -> int:
+    candidates = [
+        index + 1
+        for index in range(start, end - 1)
+        if _is_planner_candidate_boundary(cues, index)
+    ]
+    if not candidates:
+        raise TranslationError(
+            f"cue-plan range {start}-{end - 1} has no local phrase boundary "
+            "available for shrinking"
+        )
+    midpoint = start + (end - start) / 2
+    return min(candidates, key=lambda value: (abs(value - midpoint), value))
 
 
 def _merge_planned_and_fixed_records(
@@ -2402,6 +2584,7 @@ def _cue_plan_signature(
     segmentation_config: SegmentationConfig,
     llm_config: LLMConfig,
     prompt_maximum_units: float,
+    validation_maximum_units: float | None = None,
 ) -> str:
     payload = {
         "cache_version": _PLAN_CACHE_VERSION,
@@ -2417,6 +2600,12 @@ def _cue_plan_signature(
         "reasoning_effort": llm_config.reasoning_effort,
         "model_window_cues": segmentation_config.model_window_cues,
         "prompt_maximum_units": round(prompt_maximum_units, 6),
+        "validation_maximum_units": round(
+            prompt_maximum_units
+            if validation_maximum_units is None
+            else validation_maximum_units,
+            6,
+        ),
         "cues": [
             {
                 "start_ms": round(cue.start * 1000),
@@ -2424,6 +2613,7 @@ def _cue_plan_signature(
                 "text": cue.text,
                 "speaker": cue.speaker,
                 "kind": cue.kind,
+                "boundary_hint": cue.boundary_hint,
             }
             for cue in cues
         ],

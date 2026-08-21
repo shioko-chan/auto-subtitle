@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from subtitle_pipeline.asr import (
+    _add_punctuation_boundary_hints,
     _analysis_region_signature,
     _analysis_regions,
     _asr_generation_token_limit,
@@ -26,13 +27,24 @@ from subtitle_pipeline.asr import (
     _transcribe_range,
     _transcribe_speech_batch,
     _valid_cached_record,
+    read_cue_sidecar,
     transcribe_with_qwen,
 )
 from subtitle_pipeline.audio_analysis import AudioAnalysis, AudioRegion
 from subtitle_pipeline.config import ASRConfig, AudioAnalysisConfig
+from subtitle_pipeline.subtitles import Cue
 
 
 class QwenASRTests(unittest.TestCase):
+    def test_asr_punctuation_becomes_boundary_metadata_only_when_text_matches(self):
+        cues = [Cue(0, 1, "まもなく"), Cue(1, 2, "開演"), Cue(2, 3, "です")]
+
+        hinted = _add_punctuation_boundary_hints("まもなく開演、です。", cues)
+        mismatched = _add_punctuation_boundary_hints("完全に別の文章、です。", cues)
+
+        self.assertEqual([cue.boundary_hint for cue in hinted], [None, "weak", None])
+        self.assertEqual([cue.boundary_hint for cue in mismatched], [None, None, None])
+
     def test_speech_batch_transcribes_four_windows_in_one_model_call(self):
         calls = []
 
@@ -216,7 +228,7 @@ class QwenASRTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "cache.json"
             path.write_text(
-                '{"version":3,"signature":{"speakers":["A","B"]},'
+                '{"version":4,"signature":{"speakers":["A","B"]},'
                 '"chunks":{"0":{"text":"x","cues":[]}}}',
                 encoding="utf-8",
             )
@@ -224,6 +236,17 @@ class QwenASRTests(unittest.TestCase):
             result = _load_cache(path, {"speakers": ("A", "B")})
 
         self.assertIn("0", result["chunks"])
+
+    def test_old_cue_sidecar_version_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "source.cues.json"
+            path.write_text(
+                '{"version":2,"cues":[{"start":0,"end":1,"text":"字幕"}]}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "invalid cue sidecar"):
+                read_cue_sidecar(path)
 
     def test_shared_audio_names_do_not_invalidate_asr_cache_signature(self):
         left = _analysis_region_signature(

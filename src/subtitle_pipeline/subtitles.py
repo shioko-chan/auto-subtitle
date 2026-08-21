@@ -13,6 +13,7 @@ class Cue:
     text: str
     speaker: str | None = None
     kind: str = "speech"
+    boundary_hint: str | None = None
 
 
 _TIMING_RE = re.compile(

@@ -5,8 +5,10 @@ import logging
 import math
 import re
 import subprocess
+import unicodedata
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
@@ -17,7 +19,8 @@ from .config import ASRConfig, AudioAnalysisConfig
 from .subtitles import Cue, write_srt
 from .telemetry import stage_metrics
 
-_CACHE_VERSION = 3
+_CACHE_VERSION = 4
+_CUE_SIDECAR_VERSION = 3
 _MIN_RETRY_CHUNK_SECONDS = 15.0
 _MIN_REPETITION_SPAN_CHARACTERS = 160
 _REPETITION_RE = re.compile(r"(.{12,200}?)\1{3,}", re.DOTALL)
@@ -170,7 +173,11 @@ def _transcribe_unanalyzed(
         record = cached_chunks.get(str(index))
         if not isinstance(record, dict) or not isinstance(record.get("cues"), list):
             raise RuntimeError(f"Qwen3-ASR cache is missing chunk {index}")
-        all_cues.extend(_decode_cached_cues(record["cues"], index))
+        all_cues.extend(
+            _decode_cached_cues(
+                record["cues"], index, raw_text=str(record.get("text") or "")
+            )
+        )
     if not all_cues:
         raise RuntimeError("Qwen3-ASR did not produce any aligned speech")
     write_srt(all_cues, destination)
@@ -343,7 +350,11 @@ def _transcribe_analyzed(
         record = cached.get(str(index))
         if not isinstance(record, dict) or not isinstance(record.get("cues"), list):
             raise RuntimeError(f"analyzed ASR cache is missing region {index}")
-        cues.extend(_decode_cached_cues(record["cues"], index))
+        cues.extend(
+            _decode_cached_cues(
+                record["cues"], index, raw_text=str(record.get("text") or "")
+            )
+        )
     if speaker_timeline:
         cues = [
             replace(
@@ -1585,7 +1596,9 @@ def _write_cache(path: Path, cache: dict[str, object]) -> None:
     temporary.replace(path)
 
 
-def _decode_cached_cues(values: list[object], chunk_index: int) -> list[Cue]:
+def _decode_cached_cues(
+    values: list[object], chunk_index: int, *, raw_text: str = ""
+) -> list[Cue]:
     cues: list[Cue] = []
     try:
         for value in values:
@@ -1598,13 +1611,92 @@ def _decode_cached_cues(values: list[object], chunk_index: int) -> list[Cue]:
                     str(value["text"]),
                     str(value["speaker"]) if value.get("speaker") else None,
                     str(value.get("kind") or "speech"),
+                    str(value["boundary_hint"])
+                    if value.get("boundary_hint")
+                    else None,
                 )
             )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError(
             f"Qwen3-ASR cache contains an invalid chunk {chunk_index}"
         ) from exc
-    return cues
+    return _add_punctuation_boundary_hints(raw_text, cues) if raw_text else cues
+
+
+def _add_punctuation_boundary_hints(
+    text: str, cues: list[Cue]
+) -> list[Cue]:
+    """Project trustworthy ASR punctuation onto aligned-unit boundaries."""
+    normalized_cues = [
+        "".join(
+            character
+            for character in cue.text
+            if not character.isspace()
+            and not unicodedata.category(character).startswith("P")
+        )
+        for cue in cues
+    ]
+    aligned_text = "".join(normalized_cues)
+    normalized_asr = "".join(
+        character
+        for character in text
+        if not character.isspace()
+        and not unicodedata.category(character).startswith("P")
+    )
+    if not aligned_text or not normalized_asr:
+        return cues
+
+    matcher = SequenceMatcher(None, normalized_asr, aligned_text, autojunk=False)
+    if matcher.ratio() < 0.6:
+        return cues
+    matching_blocks = [block for block in matcher.get_matching_blocks() if block.size]
+
+    cue_ends: list[int] = []
+    cursor = 0
+    for fragment in normalized_cues:
+        cursor += len(fragment)
+        cue_ends.append(cursor)
+
+    hints: dict[int, str] = {}
+    consumed = 0
+    for character in text:
+        if character.isspace():
+            continue
+        if not unicodedata.category(character).startswith("P"):
+            consumed += 1
+            continue
+        strength = (
+            "strong"
+            if character in "。！？!?：:"
+            else "weak"
+            if character in "、,，"
+            else None
+        )
+        if strength is None or consumed <= 0 or consumed >= len(normalized_asr):
+            continue
+        aligned_position = next(
+            (
+                block.b + consumed - block.a
+                for block in matching_blocks
+                if block.size >= 4 and block.a < consumed < block.a + block.size
+            ),
+            None,
+        )
+        if aligned_position is None:
+            continue
+        cue_index = next(
+            (index for index, end in enumerate(cue_ends) if end >= aligned_position),
+            None,
+        )
+        if cue_index is not None and (
+            strength == "strong" or hints.get(cue_index) is None
+        ):
+            hints[cue_index] = strength
+
+    return [
+        replace(cue, boundary_hint=hints.get(index, cue.boundary_hint))
+        for index, cue in enumerate(cues)
+    ]
 
 
 def _write_cue_sidecar(
@@ -1617,7 +1709,7 @@ def _write_cue_sidecar(
     temporary.write_text(
         json.dumps(
             {
-                "version": 2,
+                "version": _CUE_SIDECAR_VERSION,
                 "cues": [asdict(cue) for cue in cues],
                 "evidence": evidence or [],
             },
@@ -1632,7 +1724,11 @@ def _write_cue_sidecar(
 
 def read_cue_sidecar(path: Path) -> list[Cue]:
     value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or not isinstance(value.get("cues"), list):
+    if (
+        not isinstance(value, dict)
+        or value.get("version") != _CUE_SIDECAR_VERSION
+        or not isinstance(value.get("cues"), list)
+    ):
         raise RuntimeError(f"invalid cue sidecar: {path}")
     return _decode_cached_cues(value["cues"], 0)
 

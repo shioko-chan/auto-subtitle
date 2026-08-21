@@ -28,6 +28,7 @@ from subtitle_pipeline.translate import (
     _parse_joint_records,
     _parse_json_object,
     _parse_retry_after,
+    _records_from_segmented_text,
     _prepare_api_request,
     _prompt_translation_context,
     _transient_retry_delay,
@@ -67,12 +68,7 @@ class TranslationTests(unittest.TestCase):
         def response(body):
             prompt = body["messages"][1]["content"]
             if "Create natural, visually readable Japanese subtitle cues" in prompt:
-                content = (
-                    '{"cues":['
-                    '{"start_id":0,"end_id":1},'
-                    '{"start_id":2,"end_id":2}'
-                    "]}"
-                )
+                content = '{"segmented_text":"<unknown>\\n夢パワー｜次"}'
             else:
                 self.assertIn("Cue boundaries are already final", prompt)
                 self.assertIn("Japanese comes from ASR", prompt)
@@ -224,12 +220,7 @@ class TranslationTests(unittest.TestCase):
                     {
                         "finish_reason": "stop",
                         "message": {
-                            "content": (
-                                '{"cues":['
-                                '{"start_id":0,"end_id":0},'
-                                '{"start_id":1,"end_id":1}'
-                                "]}"
-                            )
+                            "content": '{"segmented_text":"<unknown>\\nみやこ｜です"}'
                         },
                     }
                 ]
@@ -292,33 +283,26 @@ class TranslationTests(unittest.TestCase):
 
     def test_split_planner_repairs_only_artificial_window_boundary(self):
         translator = OpenAICompatibleTranslator(LLMConfig(max_concurrency=1), "secret")
-        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁")]
+        cues = [
+            Cue(index, index + 1, text, boundary_hint="weak")
+            for index, text in enumerate("甲乙丙丁")
+        ]
 
         def response(body):
             prompt = body["messages"][1]["content"]
-            if "Required ID range: 0-1" in prompt:
-                content = (
-                    '{"cues":['
-                    '{"start_id":0,"end_id":0},'
-                    '{"start_id":1,"end_id":1}'
-                    "]}"
-                )
-            elif "Required ID range: 2-3" in prompt:
-                content = (
-                    '{"cues":['
-                    '{"start_id":2,"end_id":2},'
-                    '{"start_id":3,"end_id":3}'
-                    "]}"
-                )
+            if "TARGET:\n<unknown>\n甲｜乙" in prompt:
+                content = '{"segmented_text":"<unknown>\\n甲｜乙"}'
+            elif "TARGET:\n<unknown>\n丙｜丁" in prompt:
+                content = '{"segmented_text":"<unknown>\\n丙｜丁"}'
             elif "Independently replan every BOUNDARY block" in prompt:
-                self.assertIn("<boundary:1|2 range=1-2>", prompt)
+                self.assertIn("<boundary:1|2>", prompt)
                 self.assertNotIn("artificial Map boundary", prompt)
                 self.assertNotIn("READ_ONLY_CUES", prompt)
                 self.assertNotIn("WRITABLE", prompt)
                 self.assertNotIn('"translation"', prompt)
                 content = (
-                    '{"repairs":[{"boundary_id":"1|2","cues":['
-                    '{"start_id":1,"end_id":2}]}]}'
+                    '{"repairs":[{"boundary_id":"1|2",'
+                    '"segmented_text":"<unknown>\\n乙丙"}]}'
                 )
             else:
                 self.assertIn("<1>乙丙", prompt)
@@ -347,26 +331,17 @@ class TranslationTests(unittest.TestCase):
 
     def test_boundary_reduce_batches_multiple_boundaries_in_one_request(self):
         translator = OpenAICompatibleTranslator(LLMConfig(max_concurrency=1), "secret")
-        cues = [Cue(index, index + 1, text) for index, text in enumerate("甲乙丙丁戊己")]
+        cues = [
+            Cue(index, index + 1, text, boundary_hint="weak")
+            for index, text in enumerate("甲乙丙丁戊己")
+        ]
         boundary_prompts: list[str] = []
 
         def response(body):
             prompt = body["messages"][1]["content"]
-            if "Required ID range" in prompt:
-                match = next(
-                    value
-                    for value in ("0-1", "2-3", "4-5")
-                    if f"Required ID range: {value}" in prompt
-                )
-                start, end = (int(value) for value in match.split("-"))
-                content = json.dumps(
-                    {
-                        "cues": [
-                            {"start_id": cue_id, "end_id": cue_id}
-                            for cue_id in range(start, end + 1)
-                        ]
-                    }
-                )
+            if "Create natural, visually readable Japanese subtitle cues" in prompt:
+                target = next(value for value in ("甲｜乙", "丙｜丁", "戊｜己") if value in prompt)
+                content = json.dumps({"segmented_text": f"<unknown>\n{target}"}, ensure_ascii=False)
             elif "Independently replan every BOUNDARY block" in prompt:
                 boundary_prompts.append(prompt)
                 content = json.dumps(
@@ -374,17 +349,11 @@ class TranslationTests(unittest.TestCase):
                         "repairs": [
                             {
                                 "boundary_id": "1|2",
-                                "cues": [
-                                    {"start_id": 1, "end_id": 1},
-                                    {"start_id": 2, "end_id": 2},
-                                ],
+                                "segmented_text": "<unknown>\n乙｜丙",
                             },
                             {
                                 "boundary_id": "3|4",
-                                "cues": [
-                                    {"start_id": 3, "end_id": 3},
-                                    {"start_id": 4, "end_id": 4},
-                                ],
+                                "segmented_text": "<unknown>\n丁｜戊",
                             },
                         ]
                     }
@@ -412,8 +381,8 @@ class TranslationTests(unittest.TestCase):
 
         self.assertEqual(request.call_count, 5)
         self.assertEqual(len(boundary_prompts), 1)
-        self.assertIn("<boundary:1|2 range=1-2>", boundary_prompts[0])
-        self.assertIn("<boundary:3|4 range=3-4>", boundary_prompts[0])
+        self.assertIn("<boundary:1|2>", boundary_prompts[0])
+        self.assertIn("<boundary:3|4>", boundary_prompts[0])
         self.assertNotIn("REFERENCE:", boundary_prompts[0])
         self.assertIn(
             "Japanese subtitle cues", boundary_prompts[0]
@@ -441,7 +410,7 @@ class TranslationTests(unittest.TestCase):
             [
                 {
                     "boundary_id": "0|1",
-                    "cues": [{"start_id": 0, "end_id": 1}],
+                    "segmented_text": "<unknown>\n甲乙",
                 }
             ],
             specs,
@@ -475,7 +444,7 @@ class TranslationTests(unittest.TestCase):
             prompt = body["messages"][1]["content"]
             prompts.append(prompt)
             key = "0|1" if len(prompts) == 1 else "2|3"
-            start = 0 if key == "0|1" else 2
+            text = "甲乙" if key == "0|1" else "丙丁"
             return {
                 "choices": [
                     {
@@ -486,12 +455,7 @@ class TranslationTests(unittest.TestCase):
                                     "repairs": [
                                         {
                                             "boundary_id": key,
-                                            "cues": [
-                                                {
-                                                    "start_id": start,
-                                                    "end_id": start + 1,
-                                                }
-                                            ],
+                                            "segmented_text": f"<unknown>\n{text}",
                                         }
                                     ]
                                 }
@@ -510,12 +474,50 @@ class TranslationTests(unittest.TestCase):
             )
 
         self.assertEqual(request.call_count, 2)
-        self.assertIn("<boundary:0|1 range=0-1>", prompts[0])
-        self.assertIn("<boundary:2|3 range=2-3>", prompts[0])
-        self.assertNotIn("<boundary:0|1 range=0-1>", prompts[1])
-        self.assertIn("<boundary:2|3 range=2-3>", prompts[1])
+        self.assertIn("<boundary:0|1>", prompts[0])
+        self.assertIn("<boundary:2|3>", prompts[0])
+        self.assertNotIn("<boundary:0|1>", prompts[1])
+        self.assertIn("<boundary:2|3>", prompts[1])
         self.assertEqual(set(result), {"0|1", "2|3"})
         self.assertEqual(accepted_callbacks, [["0|1"], ["2|3"]])
+
+    def test_boundary_reduce_reports_rejection_reason_when_none_are_accepted(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(max_retries=2), "secret")
+        cues = [Cue(0, 1, "甲"), Cue(1, 2, "乙")]
+        specs = [
+            (
+                "0|1",
+                CueTranslationRecord(0, 0, "", "甲"),
+                CueTranslationRecord(1, 1, "", "乙"),
+            )
+        ]
+        response = {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "repairs": [
+                                    {
+                                        "boundary_id": "0|1",
+                                        "segmented_text": "<unknown>\n甲丙",
+                                    }
+                                ]
+                            }
+                        )
+                    },
+                }
+            ]
+        }
+
+        with patch.object(translator, "_request", return_value=response):
+            with self.assertRaisesRegex(
+                TranslationError,
+                "subtitle boundary 0\\|1 failed: boundary repairs rejected: "
+                "0\\|1: segmented_text changed source text",
+            ):
+                translator._repair_plan_boundaries(cues, specs, 20)
 
     def test_split_planner_retries_content_error_before_translation(self):
         translator = OpenAICompatibleTranslator(LLMConfig(max_retries=3), "secret")
@@ -527,9 +529,7 @@ class TranslationTests(unittest.TestCase):
                     {
                         "finish_reason": "stop",
                         "message": {
-                            "content": (
-                                '{"cues":[{"start_id":0,"end_id":0}]}'
-                            )
+                            "content": '{"segmented_text":"<unknown>\\n甲"}'
                         },
                     }
                 ]
@@ -560,18 +560,19 @@ class TranslationTests(unittest.TestCase):
         self,
     ):
         translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
-        cues = [Cue(0, 1, "長い文")]
+        cues = [Cue(0, 1, "一二三四五六七")]
 
         def response(body):
             prompt = body["messages"][1]["content"]
             if "Create natural, visually readable Japanese subtitle cues" in prompt:
+                self.assertIn("6.250 display-width units", prompt)
                 return {
                     "choices": [
                         {
                             "finish_reason": "stop",
                             "message": {
                                 "content": (
-                                    '{"cues":[{"start_id":0,"end_id":0}]}'
+                                    '{"segmented_text":"<unknown>\\n一二三四五六七"}'
                                 )
                             },
                         }
@@ -913,14 +914,55 @@ class TranslationTests(unittest.TestCase):
             "\n".join(
                 [
                     "<speaker_00>",
-                    "<0>こんにちは <1>まだ＜確認＞",
+                    "こんにちはまだ＜確認＞",
                     "<speaker_01>",
-                    "<2>はい",
+                    "はい",
                     "<unknown>",
-                    "<3>次",
+                    "次",
                 ]
             ),
         )
+
+    def test_planner_separator_inside_token_rounds_to_token_end(self):
+        cues = [Cue(0, 1, "ベビーチャー"), Cue(1, 2, "です")]
+
+        records = _records_from_segmented_text(
+            cues,
+            0,
+            2,
+            "<unknown>\nベビー｜チャーです",
+        )
+
+        self.assertEqual(
+            [(record.start_id, record.end_id) for record in records],
+            [(0, 0), (1, 1)],
+        )
+
+    def test_planner_separator_at_token_edge_stays_at_that_edge(self):
+        cues = [Cue(0, 1, "違う"), Cue(1, 2, "と思う")]
+
+        records = _records_from_segmented_text(
+            cues,
+            0,
+            2,
+            "<unknown>\n違う｜と思う",
+        )
+
+        self.assertEqual(
+            [(record.start_id, record.end_id) for record in records],
+            [(0, 0), (1, 1)],
+        )
+
+    def test_planner_rejects_source_rewrite(self):
+        cues = [Cue(0, 1, "違う"), Cue(1, 2, "と思う")]
+
+        with self.assertRaisesRegex(TranslationError, "changed source text"):
+            _records_from_segmented_text(
+                cues,
+                0,
+                2,
+                "<unknown>\n正しい｜と思う",
+            )
 
     def test_fixed_translation_batches_limit_cues_even_when_text_is_short(self):
         cues = [Cue(index, index + 1, "x", "A", "speech") for index in range(5)]
@@ -1005,7 +1047,7 @@ class TranslationTests(unittest.TestCase):
             20,
             previous_error=None,
         )
-        self.assertIn("TARGET:\n<minetsuki_ritsu>\n<0>対象", prompt)
+        self.assertIn("TARGET:\n<minetsuki_ritsu>\n対象", prompt)
         self.assertNotIn("REFERENCE:", prompt)
         self.assertIn("Create natural, visually readable Japanese subtitle cues", prompt)
         self.assertIn("HARD CONSTRAINT", prompt)
