@@ -68,8 +68,8 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(
                 config.audio_analysis.speaker_profile_min_samples_per_center, 20
             )
-            self.assertEqual(config.audio_analysis.singing_threshold, 0.05)
-            self.assertEqual(config.audio_analysis.singing_vocal_threshold, 0.5)
+            self.assertEqual(config.audio_analysis.singing_threshold, 0.015)
+            self.assertEqual(config.audio_analysis.singing_vocal_threshold, 0.15)
             self.assertEqual(config.audio_analysis.singing_speech_bgm_coverage, 0.35)
             self.assertEqual(config.audio_analysis.singing_ambiguous_min_seconds, 15.0)
             self.assertEqual(config.audio_analysis.singing_smoothing_windows, 3)

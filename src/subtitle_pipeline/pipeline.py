@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from importlib import resources
@@ -11,13 +12,14 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .asr import read_cue_evidence, read_cue_sidecar, transcribe_with_qwen
-from .config import AppConfig, llm_api_key
+from .config import AppConfig, LLMConfig, llm_api_key
 from .media import download_youtube, render_subtitles, subtitle_layout
 from .song_identification import SongIdentificationResult, identify_and_align_songs
 from .speakers import load_character_styles
 from .subtitles import (
     Cue,
     clean_non_speech_markers,
+    filter_long_cue_pairs,
     read_subtitles,
     trim_overlapping_cues,
     write_srt,
@@ -28,6 +30,8 @@ from .upload import upload_to_bilibili
 
 _BUILTIN_GLOSSARY_FILES = ("glossaries/bang-dream.json",)
 _JAPANESE_SCRIPT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
+_DEEPSEEK_BLOCKED_UTC_HOURS = ((1, 4), (6, 10))
+_MAX_SUBTITLE_DURATION_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,7 @@ def run_pipeline(
     *,
     upload_override: bool | None = None,
 ) -> PipelineResult:
+    _wait_for_deepseek_task_window(config.llm)
     url = normalize_youtube_url(url)
     job_id = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
     job_dir = config.work_dir.resolve() / job_id
@@ -63,6 +68,38 @@ def run_pipeline(
             job_dir,
             upload_override=upload_override,
         )
+
+
+def _deepseek_task_delay(config: LLMConfig, now: datetime) -> float:
+    hostname = urlsplit(config.base_url).hostname
+    normalized = hostname.lower().rstrip(".") if hostname else ""
+    if normalized != "deepseek.com" and not normalized.endswith(".deepseek.com"):
+        return 0.0
+    current = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
+    for start_hour, end_hour in _DEEPSEEK_BLOCKED_UTC_HOURS:
+        if start_hour <= current.hour < end_hour:
+            resume_at = current.replace(
+                hour=end_hour,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            return max(0.0, (resume_at - current).total_seconds())
+    return 0.0
+
+
+def _wait_for_deepseek_task_window(config: LLMConfig) -> None:
+    current = datetime.now(UTC)
+    delay = _deepseek_task_delay(config, current)
+    if delay <= 0:
+        return
+    resume_at = datetime.fromtimestamp(current.timestamp() + delay, UTC)
+    logging.info(
+        "DeepSeek blocked window active; pausing task for %.0fs until %s",
+        delay,
+        resume_at.isoformat(timespec="seconds"),
+    )
+    time.sleep(delay)
 
 
 def _run_pipeline_stages(
@@ -176,6 +213,27 @@ def _run_pipeline_stages(
     cues = trim_overlapping_cues(joint.source_cues)
     translated = trim_overlapping_cues(joint.translated_cues)
     logging.info("timing overlap cleanup: adjusted %d cues", overlap_count)
+    cues, translated, dropped_long_cues = filter_long_cue_pairs(
+        cues,
+        translated,
+        maximum_seconds=_MAX_SUBTITLE_DURATION_SECONDS,
+    )
+    for cue in dropped_long_cues:
+        logging.warning(
+            "dropping overlong subtitle cue start=%.3fs end=%.3fs duration=%.3fs "
+            "speaker=%s text=%r",
+            cue.start,
+            cue.end,
+            cue.end - cue.start,
+            cue.speaker or "unknown",
+            cue.text[:120],
+        )
+    if dropped_long_cues:
+        logging.warning(
+            "dropped %d subtitle cue(s) longer than %.1fs",
+            len(dropped_long_cues),
+            _MAX_SUBTITLE_DURATION_SECONDS,
+        )
     write_srt(cues, job_dir / "source.semantic.srt")
 
     translated_path = job_dir / "translated.zh-CN.srt"

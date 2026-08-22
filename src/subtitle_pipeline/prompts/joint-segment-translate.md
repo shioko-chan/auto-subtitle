@@ -16,7 +16,7 @@ Group every numbered TARGET unit into natural subtitle cues and translate each c
 Return exactly one JSON object and no explanation:
 {"cues":[{"start_id":0,"end_id":2,"text":"中文字幕"}]}
 
-TARGET IDs are zero-based and valid only inside this request. The first cue must start at 0, and the final cue must end at the number of TARGET units. Ranges are left-closed and right-open: start_id=0,end_id=2 consumes units 0 and 1. A one-unit cue uses end_id=start_id+1. Output ranges must be ordered, contiguous, non-overlapping, and cover every TARGET unit exactly once. Do not output Japanese source text, timestamps, speaker names, Markdown, or extra fields.
+TARGET IDs are zero-based and valid only inside this request. Ranges include both endpoints: start_id=0,end_id=2 consumes units 0, 1, and 2. A one-unit cue uses the same start_id and end_id, for example start_id=3,end_id=3. The first cue must start at 0, the final cue must end at the largest TARGET ID, and each cue after the first must start at the previous cue's end_id plus 1. Output ranges must be ordered, contiguous, non-overlapping, and cover every TARGET unit exactly once. Do not output Japanese source text, timestamps, speaker names, Markdown, or extra fields.
 
 TARGET belongs to one speaker track. Choose boundaries using Japanese meaning and subtitle readability. Never cross a TARGET window edge. Units are local candidates, not mandatory subtitle boundaries: merge adjacent units when they form one coherent sentence and split only between units. Atomic singing or conditioned-speech TARGETs contain exactly one unit and must remain one cue.
 

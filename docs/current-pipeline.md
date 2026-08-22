@@ -151,8 +151,16 @@ singing、speech、music 分数、状态和转换原因都会写入 `audio-analy
 
 当前固定批量大小为 4。`Qwen/Qwen3-ASR-1.7B` 负责日文文本，
 `Qwen/Qwen3-ForcedAligner-0.6B` 只对 **Qwen 文本**产生细粒度时间轴，不处理 DiCoW
-文本。词素 speaker 取 diarization 时间交集最大的已知人物；最低覆盖率为 35%，边界
-不足时额外使用 0.1 秒容差。
+文本。词素 speaker 首先按 ordinary diarization 的真实时间交集判断：单 speaker 的
+交集至少覆盖词素时长 30% 时直接归属；同时与多个 speaker 相交时取总交集最大的一个。
+这里不再扩张 diarization 边界，因此不会使用人工的 0.1 秒容差制造交集。
+
+仍未归属的普通讲话词素在进入 LLM 前分层处理。短 unknown 段左右是同一 speaker 时
+优先桥接；左右人物不同时，Sudachi 的词性/活用连接必须与 GiNZA 的依存关系和文节分析
+共同指向同一侧，才执行 `grammar_left` 或 `grammar_right` 回填。最后仍无归属的词素交给
+时间最近的 ordinary diarization speaker，距离不超过 0.5 秒时记为 `nearest_fallback`；
+超过 0.5 秒则记为 `discarded`，不进入本地划句、LLM 或渲染。具名与匿名 speaker 都能
+成为归属目标。
 
 本地检查非单调时间、相同起点坍缩、异常长词素、空结果和重复循环。异常窗口优先在已有
 时间边界附近递归缩短，子窗口不能短于约 15 秒；仍不能得到可信时间轴时整条任务停止，
@@ -206,9 +214,9 @@ LLM 综合以下证据判断歌名：
 
 ## 5. 本地分段与联合翻译
 
-普通讲话先按 speaker 建立独立时间轨。`unknown` 使用自己的轨，但已知人物活动会切断
-unknown episode；同一 speaker 的相邻发言间隔达到 2 秒也会建立硬边界。这样 A 可以跨过
-B 的短插话继续组成一句，同时不同人物最终可以拥有相互重叠的字幕时间。
+普通讲话完成上述归属后按 speaker 建立独立时间轨，不再为 unresolved unknown 建轨。
+同一 speaker 的相邻发言间隔达到 2 秒会建立硬边界。这样 A 可以跨过 B 的短插话继续
+组成一句，同时不同人物最终可以拥有相互重叠的字幕时间。
 
 每个 episode 使用 SudachiPy `SplitMode.A` 分析连续日文，补充词性、活用型和活用形。
 相邻 Forced Aligner 单元的候选边界累计评分：静音 120/250/400/600 ms 分别贡献
@@ -217,8 +225,9 @@ B 的短插话继续组成一句，同时不同人物最终可以拥有相互重
 总分达到 3 时贪心切分。若 6 秒仍没有切点，则从当前块 2 秒之后选择最高分边界，分数
 相同取最靠后的一个。Qwen 标点不参与评分。
 
-`local-segmentation.json` 保存每个候选的总分、命中因素、两侧 Sudachi 形态、Nagisa POS
-和最终本地单元范围。Sudachi 或核心词典不可用时直接终止，不静默退化。
+`local-segmentation.json` 保存每个词素的 speaker 归属原因、最近 speaker 距离、回填与
+删除记录，以及每个边界候选的总分、命中因素、两侧 Sudachi 形态、Nagisa POS 和最终
+本地单元范围。Sudachi、GiNZA 或所需词典不可用时直接终止，不静默退化。
 
 LLM 使用单阶段划句与翻译。每个请求只覆盖一条 speaker 轨，TARGET 采用紧凑格式：
 
@@ -236,14 +245,15 @@ Context 按真实时间排列，覆盖目标前后各 5 秒且最多 4000 字符
 TARGET 最多 160 个本地单元或 8000 个源字符，触及上限时在末段选择评分最高的边界作为
 硬窗口边缘，不再运行 Boundary Reduce。
 
-模型同时选择自然 cue 范围并翻译，返回左闭右开的 JSON：
+模型同时选择自然 cue 范围并翻译，返回左闭右闭的 JSON：
 
 ```json
 {"cues":[{"start_id":0,"end_id":2,"text":"中文字幕"}]}
 ```
 
 每个请求窗口都使用从 0 开始的相对 ID；范围必须连续、无遗漏、无重复地覆盖 TARGET，且
-`end_id = start_id + 1` 合法。校验成功后相对 ID 映射回 speaker 轨全局 ID，缓存和最终字幕
+单单元 cue 使用 `end_id = start_id`。下一条 cue 的 `start_id` 必须等于上一条的
+`end_id + 1`。校验成功后闭区间相对 ID 转换为内部半开范围，再映射回 speaker 轨全局 ID；缓存和最终字幕
 仍保存全局 ID。日文原文由本地按范围恢复，模型不能回传或修改日文；ASR 纠错只反映在中文译文。`singing` 与
 `conditioned_speech` 各自作为不可拆分、不可跨越的单单元 TARGET，但仍使用同一契约。
 

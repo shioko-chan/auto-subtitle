@@ -69,7 +69,7 @@ singing_model = "MIT/ast-finetuned-audioset-10-10-0.4593"
 device = "cuda:0"
 singing_window_seconds = 5.0
 singing_stride_seconds = 2.5
-singing_threshold = 0.05
+singing_threshold = 0.015
 # Music cannot start a song by itself, but it keeps a confirmed performance
 # active through calls, instrumental passages and short in-song speech.
 singing_music_threshold = 0.05
@@ -78,7 +78,7 @@ singing_music_threshold = 0.05
 singing_speech_takeover_threshold = 0.5
 # Raw AST only proposes candidates. Vocal-stem AST confirms actual singing;
 # speech-heavy candidates without vocal singing remain ordinary speech+BGM.
-singing_vocal_threshold = 0.5
+singing_vocal_threshold = 0.15
 singing_speech_bgm_coverage = 0.35
 singing_ambiguous_min_seconds = 15.0
 # Smooth isolated AST misses/hits, then keep the song state through short gaps.
@@ -92,8 +92,8 @@ singing_min_phrase_seconds = 30.0
 singing_asr_window_seconds = 12.0
 singing_asr_overlap_seconds = 2.0
 speaker_profiles_dir = "work/speaker-profiles-eres2netv2"
-speaker_match_threshold = 0.40
-speaker_match_margin = 0.03
+speaker_match_threshold = 0.42
+speaker_match_margin = 0.025
 # Resolve every MOSS anonymous speaker independently. Discard the farthest 15%
 # of segment evidence, then weight retained evidence by up to 10 seconds each.
 speaker_identity_trim_ratio = 0.15
@@ -204,7 +204,7 @@ max_tags = 10
 # tag_catalog_file = "bilibili-tags.json"
 source = ""
 title_prefix = "【中字】"
-description_suffix = "\n\n字幕由自动化工具生成，请以原视频为准。"
+description_prefix = "翻译：yunoseek，校对：你\n字幕由yunoseek生成，请以原视频为准。\n\n"
 # Keep a margin below Bilibili's nominal limit; truncation preserves the suffix.
 description_max_chars = 1800
 # line = "kodo"

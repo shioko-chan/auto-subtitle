@@ -19,6 +19,7 @@ from subtitle_pipeline.asr import (
     _repetition_hallucination,
     _result_to_cues,
     _song_windows,
+    _speaker_assignment_for_aligned_cue,
     _speaker_assignment_timeline,
     _speaker_for_aligned_cue,
     _speech_asr_windows,
@@ -488,9 +489,9 @@ class QwenASRTests(unittest.TestCase):
         ]
 
         self.assertEqual(_speaker_for_aligned_cue(0.5, 1.5, diarization), "A")
-        self.assertIsNone(_speaker_for_aligned_cue(2.2, 2.8, diarization))
+        self.assertEqual(_speaker_for_aligned_cue(2.2, 2.8, diarization), "A")
         self.assertEqual(_speaker_for_aligned_cue(4.2, 5.0, diarization), "B")
-        self.assertIsNone(
+        self.assertEqual(
             _speaker_for_aligned_cue(
                 1.8,
                 2.2,
@@ -498,7 +499,8 @@ class QwenASRTests(unittest.TestCase):
                     AudioRegion(0, 2, "speech", "A"),
                     AudioRegion(2, 4, "speech", "B"),
                 ],
-            )
+            ),
+            "B",
         )
         self.assertEqual(
             _speaker_for_aligned_cue(
@@ -510,6 +512,17 @@ class QwenASRTests(unittest.TestCase):
                 ],
             ),
             "A",
+        )
+        self.assertEqual(
+            _speaker_for_aligned_cue(
+                12.0,
+                13.0,
+                [
+                    AudioRegion(12.0, 12.1, "speech", "A"),
+                    AudioRegion(12.8, 13.0, "speech", "B"),
+                ],
+            ),
+            "B",
         )
         self.assertEqual(
             _speaker_for_aligned_cue(
@@ -526,21 +539,19 @@ class QwenASRTests(unittest.TestCase):
                 [AudioRegion(20.81, 21.0, "speech", "A")],
             )
         )
-        self.assertEqual(
+        self.assertIsNone(
             _speaker_for_aligned_cue(
                 30.0,
                 30.4,
                 [AudioRegion(29.0, 30.1, "speech", "A")],
             ),
-            "A",
         )
-        self.assertEqual(
+        self.assertIsNone(
             _speaker_for_aligned_cue(
                 40.0,
                 40.1,
                 [AudioRegion(39.0, 39.95, "speech", "A")],
             ),
-            "A",
         )
         self.assertIsNone(
             _speaker_for_aligned_cue(
@@ -549,6 +560,19 @@ class QwenASRTests(unittest.TestCase):
                 [AudioRegion(49.0, 49.89, "speech", "A")],
             )
         )
+
+        overlapping = _speaker_assignment_for_aligned_cue(
+            20.0, 21.0, [AudioRegion(20.81, 21.0, "speech", "A")]
+        )
+        nearby = _speaker_assignment_for_aligned_cue(
+            40.0, 40.1, [AudioRegion(39.0, 39.95, "speech", "A")]
+        )
+        self.assertEqual(
+            (overlapping.fallback_speaker, overlapping.fallback_distance),
+            ("A", 0.0),
+        )
+        self.assertEqual(nearby.fallback_speaker, "A")
+        self.assertAlmostEqual(nearby.fallback_distance or 0.0, 0.05)
 
     def test_speaker_assignment_prefers_ordinary_diarization(self):
         exclusive = [AudioRegion(0, 2, "speech", "A")]

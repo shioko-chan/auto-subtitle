@@ -24,8 +24,14 @@ class FakeAnalyzer:
     def analyze(self, text):
         return []
 
+    def dependency_boundary_strengths(self, left, middle, right):
+        return 0, 0
+
 
 class ParticleAnalyzer(FakeAnalyzer):
+    def dependency_boundary_strengths(self, left, middle, right):
+        return 3, 0
+
     def analyze(self, text):
         if text == "私は猫です":
             return [
@@ -85,15 +91,14 @@ class LocalSegmentationTests(unittest.TestCase):
         self.assertTrue(cuts)
         self.assertGreaterEqual(cuts[0], 2)
 
-    def test_tracks_are_independent_unknown_is_cut_by_known_activity(self):
+    def test_tracks_are_independent_and_unresolved_unknown_is_discarded(self):
         cues = [
             Cue(0, 1, "A1", "A"), Cue(0.5, 1.2, "U1"),
             Cue(1, 2, "B", "B"), Cue(1.3, 2.0, "U2"), Cue(1.2, 2.2, "A2", "A"),
         ]
         tracks, _ = build_speaker_tracks(cues, SegmentationConfig(), analyzer=FakeAnalyzer())
         values = {track.key: track for track in tracks}
-        self.assertEqual(set(values), {"A", "B", "unknown"})
-        self.assertEqual(len(values["unknown"].units), 2)
+        self.assertEqual(set(values), {"A", "B"})
         self.assertEqual(len(values["A"].units), 1)
 
     def test_unknown_between_same_speaker_is_bridged_before_segmentation(self):
@@ -118,7 +123,7 @@ class LocalSegmentationTests(unittest.TestCase):
         tracks, _ = build_speaker_tracks(
             cues, SegmentationConfig(), analyzer=ParticleAnalyzer()
         )
-        self.assertIn("unknown", {track.key for track in tracks})
+        self.assertNotIn("unknown", {track.key for track in tracks})
 
     def test_unknown_between_different_speakers_follows_stronger_grammar(self):
         cues = [
@@ -142,9 +147,55 @@ class LocalSegmentationTests(unittest.TestCase):
         self.assertEqual([unit.kind for unit in tracks[0].units], ["singing", "conditioned_speech"])
         self.assertIn("episodes", payload)
 
+    def test_remaining_unknown_uses_nearest_speaker_within_half_second(self):
+        cues = [
+            Cue(
+                1.0,
+                1.2,
+                "はい",
+                speaker_fallback="A",
+                speaker_fallback_distance=0.5,
+            )
+        ]
+        tracks, _ = build_speaker_tracks(
+            cues, SegmentationConfig(), analyzer=FakeAnalyzer()
+        )
+        self.assertEqual([track.key for track in tracks], ["A"])
+
+    def test_remaining_unknown_beyond_half_second_is_discarded_and_audited(self):
+        cues = [
+            Cue(
+                1.0,
+                1.2,
+                "はい",
+                speaker_fallback="A",
+                speaker_fallback_distance=0.501,
+            )
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "local-segmentation.json"
+            tracks, _ = build_speaker_tracks(
+                cues,
+                SegmentationConfig(),
+                analyzer=FakeAnalyzer(),
+                audit_path=path,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(tracks, [])
+        self.assertEqual(
+            payload["speaker_reattributions"][-1]["reason"], "discarded"
+        )
+        self.assertEqual(payload["speaker_assignments"][0]["reason"], "discarded")
+
     def test_real_sudachi_exposes_conjugation(self):
         values = SudachiAnalyzer().analyze("行きました")
         self.assertTrue(any(item.conjugation_form != "*" for item in values))
+
+    def test_real_ginza_prefers_boundary_inside_bunsetsu(self):
+        left, right = SudachiAnalyzer().dependency_boundary_strengths(
+            "私", "は", "猫です"
+        )
+        self.assertGreater(left, right)
 
 
 if __name__ == "__main__":

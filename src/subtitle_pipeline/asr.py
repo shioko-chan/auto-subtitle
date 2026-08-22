@@ -6,7 +6,7 @@ import math
 import re
 import subprocess
 import unicodedata
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -20,7 +20,7 @@ from .subtitles import Cue, write_srt
 from .telemetry import stage_metrics
 
 _CACHE_VERSION = 6
-_CUE_SIDECAR_VERSION = 5
+_CUE_SIDECAR_VERSION = 6
 _MIN_RETRY_CHUNK_SECONDS = 15.0
 _MIN_REPETITION_SPAN_CHARACTERS = 160
 _REPETITION_RE = re.compile(r"(.{12,200}?)\1{3,}", re.DOTALL)
@@ -28,11 +28,18 @@ _MIN_ASR_GENERATION_TOKENS = 128
 _ASR_GENERATION_TOKENS_PER_SECOND = 32
 _ASR_GENERATION_TOKEN_OVERHEAD = 32
 _MIN_SPEAKER_CUE_COVERAGE = 0.30
-_SPEAKER_CUE_BOUNDARY_TOLERANCE_SECONDS = 0.1
 
 
 class _StaleRuntimeAudio(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class _SpeakerAssignment:
+    speaker: str | None
+    reason: str | None
+    fallback_speaker: str | None
+    fallback_distance: float | None
 
 
 def transcribe_with_qwen(
@@ -373,17 +380,24 @@ def _transcribe_analyzed(
             )
         )
     if speaker_timeline:
-        cues = [
-            replace(
-                cue,
-                speaker=_speaker_for_aligned_cue(
-                    cue.start, cue.end, speaker_timeline
-                ),
+        assigned_cues: list[Cue] = []
+        for cue in cues:
+            if cue.kind != "speech":
+                assigned_cues.append(cue)
+                continue
+            assignment = _speaker_assignment_for_aligned_cue(
+                cue.start, cue.end, speaker_timeline
             )
-            if cue.kind == "speech"
-            else cue
-            for cue in cues
-        ]
+            assigned_cues.append(
+                replace(
+                    cue,
+                    speaker=assignment.speaker,
+                    speaker_assignment=assignment.reason,
+                    speaker_fallback=assignment.fallback_speaker,
+                    speaker_fallback_distance=assignment.fallback_distance,
+                )
+            )
+        cues = assigned_cues
     cues.sort(key=lambda cue: (cue.start, cue.end, cue.speaker or ""))
     if not cues:
         raise RuntimeError("analyzed Qwen3-ASR did not produce any speech")
@@ -567,29 +581,43 @@ def _speech_window_density_ok(
 def _speaker_for_aligned_cue(
     start: float, end: float, diarization: list[AudioRegion]
 ) -> str | None:
+    return _speaker_assignment_for_aligned_cue(start, end, diarization).speaker
+
+
+def _speaker_assignment_for_aligned_cue(
+    start: float, end: float, diarization: list[AudioRegion]
+) -> _SpeakerAssignment:
     duration = end - start
     if duration <= 0:
-        return None
+        return _SpeakerAssignment(None, None, None, None)
     scores = _speaker_overlap_scores(start, end, diarization)
-    speaker, tied = _covered_speaker(scores, duration)
-    if speaker is not None or tied:
-        return speaker
+    speaker, _ = _covered_speaker(scores, duration)
+    if speaker is not None:
+        return _SpeakerAssignment(speaker, "time_overlap", None, None)
+    overlap_candidate = _unique_top_speaker(scores)
+    if overlap_candidate is not None:
+        return _SpeakerAssignment(None, None, overlap_candidate, 0.0)
+    nearest_speaker, distance = _nearest_speaker(start, end, diarization)
+    return _SpeakerAssignment(None, None, nearest_speaker, distance)
 
-    padded_scores = _speaker_overlap_scores(
-        start,
-        end,
-        diarization,
-        padding=_SPEAKER_CUE_BOUNDARY_TOLERANCE_SECONDS,
-    )
-    padded_speaker, _ = _covered_speaker(padded_scores, duration)
-    if padded_speaker is None:
-        return None
-    initial_candidate = _unique_top_speaker(scores)
-    return (
-        padded_speaker
-        if initial_candidate is None or padded_speaker == initial_candidate
-        else None
-    )
+
+def _nearest_speaker(
+    start: float, end: float, diarization: list[AudioRegion]
+) -> tuple[str | None, float | None]:
+    candidates: list[tuple[float, float, float, str]] = []
+    midpoint = (start + end) / 2
+    for region in diarization:
+        if not region.speaker:
+            continue
+        distance = max(region.start - end, start - region.end, 0.0)
+        center_distance = abs(midpoint - (region.start + region.end) / 2)
+        candidates.append(
+            (distance, center_distance, -(region.end - region.start), region.speaker)
+        )
+    if not candidates:
+        return None, None
+    distance, _, _, speaker = min(candidates)
+    return speaker, distance
 
 
 def _speaker_overlap_scores(
@@ -615,10 +643,7 @@ def _unique_top_speaker(scores: dict[str, float]) -> str | None:
     if not scores:
         return None
     ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
-    speaker, overlap = ranked[0]
-    if len(ranked) > 1 and math.isclose(overlap, ranked[1][1], abs_tol=1e-9):
-        return None
-    return speaker
+    return ranked[0][0]
 
 
 def _covered_speaker(
@@ -628,11 +653,8 @@ def _covered_speaker(
         return None, False
     ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
     speaker, overlap = ranked[0]
-    tied = len(ranked) > 1 and math.isclose(
-        overlap, ranked[1][1], abs_tol=1e-9
-    )
-    if tied:
-        return None, True
+    if len(ranked) > 1:
+        return speaker, False
     if overlap < duration * _MIN_SPEAKER_CUE_COVERAGE:
         return None, False
     return speaker, False
@@ -1636,15 +1658,39 @@ def _decode_cached_cues(
                 raise TypeError
             cues.append(
                 Cue(
-                    float(value["start"]),
-                    float(value["end"]),
-                    str(value["text"]),
-                    str(value["speaker"]) if value.get("speaker") else None,
-                    str(value.get("kind") or "speech"),
-                    str(value["boundary_hint"])
-                    if value.get("boundary_hint")
-                    else None,
-                    str(value["pos"]) if value.get("pos") else None,
+                    start=float(value["start"]),
+                    end=float(value["end"]),
+                    text=str(value["text"]),
+                    speaker=(
+                        str(value["speaker"]) if value.get("speaker") else None
+                    ),
+                    kind=str(value.get("kind") or "speech"),
+                    boundary_hint=(
+                        str(value["boundary_hint"])
+                        if value.get("boundary_hint")
+                        else None
+                    ),
+                    pos=str(value["pos"]) if value.get("pos") else None,
+                    source_text=(
+                        str(value["source_text"])
+                        if value.get("source_text")
+                        else None
+                    ),
+                    speaker_assignment=(
+                        str(value["speaker_assignment"])
+                        if value.get("speaker_assignment")
+                        else None
+                    ),
+                    speaker_fallback=(
+                        str(value["speaker_fallback"])
+                        if value.get("speaker_fallback")
+                        else None
+                    ),
+                    speaker_fallback_distance=(
+                        float(value["speaker_fallback_distance"])
+                        if value.get("speaker_fallback_distance") is not None
+                        else None
+                    ),
                 )
             )
     except (KeyError, TypeError, ValueError) as exc:

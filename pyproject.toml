@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "certifi>=2025.1.31",
+    "ja-ginza>=5.2,<6",
     "SudachiDict-core>=20250515",
     "SudachiPy>=0.6.10",
     "yt-dlp[default,curl-cffi]>=2025.1.15",

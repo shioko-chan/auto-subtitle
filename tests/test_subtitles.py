@@ -7,6 +7,7 @@ from subtitle_pipeline.subtitles import (
     Cue,
     apply_translations,
     clean_non_speech_markers,
+    filter_long_cue_pairs,
     merge_cues_at_boundaries,
     read_subtitles,
     trim_overlapping_cues,
@@ -136,6 +137,26 @@ class SubtitleTests(unittest.TestCase):
             Cue(2, 4, "乙", "fuji_miyako"),
         ]
         self.assertEqual(trim_overlapping_cues(cues), cues)
+
+    def test_filters_overlong_source_and_translation_as_a_pair(self):
+        source = [
+            Cue(0, 30, "kept"),
+            Cue(40, 70.001, "dropped", "SPEAKER_00"),
+            Cue(80, 82, "also kept"),
+        ]
+        translated = [
+            Cue(0, 30, "保留"),
+            Cue(40, 70.001, "删除", "SPEAKER_00"),
+            Cue(80, 82, "也保留"),
+        ]
+
+        kept_source, kept_translated, dropped = filter_long_cue_pairs(
+            source, translated, maximum_seconds=30.0
+        )
+
+        self.assertEqual(kept_source, [source[0], source[2]])
+        self.assertEqual(kept_translated, [translated[0], translated[2]])
+        self.assertEqual(dropped, [source[1]])
 
 
 if __name__ == "__main__":

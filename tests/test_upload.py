@@ -25,23 +25,23 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(result, "a" * 1999)
         self.assertEqual(len(result.encode("utf-16-le")) // 2, 1999)
 
-    def test_prepares_description_at_paragraph_boundary_and_preserves_suffix(self):
+    def test_prepares_description_at_paragraph_boundary_and_preserves_prefix(self):
         result = _prepare_description(
             "first paragraph\n\n" + "x" * 80 + "\n\nlast paragraph",
-            suffix="generated subtitle",
+            prefix="generated subtitle",
             max_chars=70,
         )
-        self.assertEqual(result, "first paragraph\n\ngenerated subtitle")
+        self.assertEqual(result, "generated subtitle\n\nfirst paragraph")
         self.assertLessEqual(len(result), 70)
         self.assertLessEqual(_utf16_units(result), 70)
 
     def test_prepares_description_with_unicode_under_both_limits(self):
         result = _prepare_description(
             "字幕🎶" * 100,
-            suffix="固定说明",
+            prefix="固定说明",
             max_chars=80,
         )
-        self.assertTrue(result.endswith("固定说明"))
+        self.assertTrue(result.startswith("固定说明"))
         self.assertLessEqual(len(result), 80)
         self.assertLessEqual(_utf16_units(result), 80)
 

@@ -34,7 +34,7 @@ def _response(content):
 
 
 class JointTranslationTests(unittest.TestCase):
-    def test_end_exclusive_ranges_allow_single_unit_and_require_full_coverage(self):
+    def test_inclusive_ranges_allow_single_unit_and_require_full_coverage(self):
         track = SpeakerTrack(
             "A", "A",
             (
@@ -44,14 +44,14 @@ class JointTranslationTests(unittest.TestCase):
         )
         records = _validate_records(
             [
-                {"start_id": 0, "end_id": 1, "text": "一"},
-                {"start_id": 1, "end_id": 2, "text": "二"},
+                {"start_id": 0, "end_id": 0, "text": "一"},
+                {"start_id": 1, "end_id": 1, "text": "二"},
             ], track, 0, 2, 20, "简体中文", validate_language=True,
         )
         self.assertEqual([(item.start_id, item.end_id) for item in records], [(0, 1), (1, 2)])
         with self.assertRaisesRegex(CoverageValidationError, "coverage failed"):
             _validate_records(
-                [{"start_id": 0, "end_id": 1, "text": "一"}],
+                [{"start_id": 0, "end_id": 0, "text": "一"}],
                 track, 0, 2, 20, "简体中文", validate_language=True,
             )
 
@@ -68,8 +68,8 @@ class JointTranslationTests(unittest.TestCase):
         )
         records = _validate_records(
             [
-                {"start_id": 0, "end_id": 1, "text": "甲"},
-                {"start_id": 1, "end_id": 3, "text": "乙"},
+                {"start_id": 0, "end_id": 0, "text": "甲"},
+                {"start_id": 1, "end_id": 2, "text": "乙"},
             ],
             track,
             2,
@@ -88,7 +88,7 @@ class JointTranslationTests(unittest.TestCase):
             "A", "A", (LocalUnit("A", 0, (0,), 0, 1, "一", "A", "speech"),)
         )
         records = _validate_records(
-            [{"start_id": "0", "end_id": "1", "text": "一"}],
+            [{"start_id": "0", "end_id": "0", "text": "一"}],
             track,
             0,
             1,
@@ -110,11 +110,11 @@ class JointTranslationTests(unittest.TestCase):
         with self.assertRaises(CoverageValidationError) as raised:
             _validate_records(
                 [
-                    {"start_id": 0, "end_id": 1, "text": "零"},
-                    {"start_id": 1, "end_id": 2, "text": "一"},
-                    {"start_id": 3, "end_id": 4, "text": "三"},
-                    {"start_id": 4, "end_id": 5, "text": "四"},
-                    {"start_id": 5, "end_id": 6, "text": "五"},
+                    {"start_id": 0, "end_id": 0, "text": "零"},
+                    {"start_id": 1, "end_id": 1, "text": "一"},
+                    {"start_id": 3, "end_id": 3, "text": "三"},
+                    {"start_id": 4, "end_id": 4, "text": "四"},
+                    {"start_id": 5, "end_id": 5, "text": "五"},
                 ],
                 track,
                 0,
@@ -145,14 +145,14 @@ class JointTranslationTests(unittest.TestCase):
             targets.append(target)
             if len(targets) == 1:
                 cues = [
-                    {"start_id": 0, "end_id": 1, "text": "零"},
-                    {"start_id": 1, "end_id": 2, "text": "一"},
-                    {"start_id": 3, "end_id": 4, "text": "三"},
-                    {"start_id": 4, "end_id": 5, "text": "四"},
-                    {"start_id": 5, "end_id": 6, "text": "五"},
+                    {"start_id": 0, "end_id": 0, "text": "零"},
+                    {"start_id": 1, "end_id": 1, "text": "一"},
+                    {"start_id": 3, "end_id": 3, "text": "三"},
+                    {"start_id": 4, "end_id": 4, "text": "四"},
+                    {"start_id": 5, "end_id": 5, "text": "五"},
                 ]
             else:
-                cues = [{"start_id": 0, "end_id": 3, "text": "补丁"}]
+                cues = [{"start_id": 0, "end_id": 2, "text": "补丁"}]
             return _response(json.dumps({"cues": cues,}, ensure_ascii=False))
 
         records = _request_resilient(
@@ -224,7 +224,7 @@ class JointTranslationTests(unittest.TestCase):
                 if part and part.split(">", 1)[0].isdigit()
             ]
             speaker = target.splitlines()[0][1:-1]
-            content = {"cues": [{"start_id": min(ids), "end_id": max(ids) + 1, "text": f"{speaker}字幕"}]}
+            content = {"cues": [{"start_id": min(ids), "end_id": max(ids), "text": f"{speaker}字幕"}]}
             return _response(json.dumps(content, ensure_ascii=False))
 
         with tempfile.TemporaryDirectory() as temp:
@@ -237,7 +237,7 @@ class JointTranslationTests(unittest.TestCase):
                 )
             self.assertEqual(mocked.call_count, 2)
             self.assertTrue(audit.is_file())
-            self.assertEqual(json.loads(cache.read_text(encoding="utf-8"))["version"], 4)
+            self.assertEqual(json.loads(cache.read_text(encoding="utf-8"))["version"], 5)
 
             cached = OpenAICompatibleTranslator(LLMConfig(max_concurrency=2), "secret")
             with patch.object(cached, "_request") as cached_request:
@@ -259,14 +259,27 @@ class JointTranslationTests(unittest.TestCase):
             invalid = _response(
                 '{"cues":[{"start_id":1,"end_id":2,"text":"错误范围"}]}'
             )
-            with patch.object(
-                translator, "_request", return_value=invalid
-            ), self.assertRaises(CoverageValidationError):
-                translator.plan_and_translate(
+            with (
+                patch.object(translator, "_request", return_value=invalid),
+                patch.object(
+                    translator.local_translator, "translate", return_value="本地译文"
+                ) as local_translate,
+                self.assertLogs(
+                    "subtitle_pipeline.joint_translation", "WARNING"
+                ) as captured,
+            ):
+                result = translator.plan_and_translate(
                     [Cue(0, 1, "原文", "A")],
                     SegmentationConfig(),
                     max_line_units=20,
                 )
+
+            local_translate.assert_called_once_with("原文")
+            self.assertEqual(result.translated_cues[0].text, "本地译文")
+            self.assertIn(
+                "reason=single_unit_CoverageValidationError",
+                "\n".join(captured.output),
+            )
 
             entries = [
                 json.loads(line)
@@ -275,7 +288,7 @@ class JointTranslationTests(unittest.TestCase):
             self.assertEqual(len(entries), 2)
             self.assertEqual(entries[0]["error_type"], "CoverageValidationError")
             self.assertEqual(entries[0]["expected_start"], 0)
-            self.assertEqual(entries[0]["expected_end"], 1)
+            self.assertEqual(entries[0]["expected_end"], 0)
             self.assertEqual(entries[0]["received_ranges"], [[1, 2]])
             self.assertIn("错误范围", entries[0]["response_content"])
             self.assertEqual(entries[0]["response"], invalid)
@@ -323,7 +336,7 @@ class JointTranslationTests(unittest.TestCase):
         self.assertNotIn("目标", context)
 
     def test_joint_parser_accepts_object_array_and_ndjson(self):
-        records = [{"start_id": 0, "end_id": 1, "text": "甲"}]
+        records = [{"start_id": 0, "end_id": 0, "text": "甲"}]
         self.assertEqual(_parse_joint_records(json.dumps({"cues": records})), records)
         self.assertEqual(_parse_joint_records(json.dumps(records)), records)
         self.assertEqual(_parse_joint_records(json.dumps(records[0])), records)
@@ -344,7 +357,7 @@ class JointTranslationTests(unittest.TestCase):
             ]
             if len(ids) > 1:
                 return _response('{"cues":[]}')
-            return _response(json.dumps({"cues": [{"start_id": ids[0], "end_id": ids[0] + 1, "text": "好"}]}, ensure_ascii=False))
+            return _response(json.dumps({"cues": [{"start_id": ids[0], "end_id": ids[0], "text": "好"}]}, ensure_ascii=False))
 
         with patch.object(translator, "_request", side_effect=request):
             result = translator.plan_and_translate(cues, SegmentationConfig(), max_line_units=20)
@@ -372,7 +385,7 @@ class JointTranslationTests(unittest.TestCase):
 
         response = _response(
             json.dumps(
-                {"cues": [{"start_id": 0, "end_id": 1, "text": "姓名ミヤコです"}]},
+                {"cues": [{"start_id": 0, "end_id": 0, "text": "姓名ミヤコです"}]},
                 ensure_ascii=False,
             )
         )
@@ -412,7 +425,7 @@ class JointTranslationTests(unittest.TestCase):
             "subtitle_pipeline.joint_translation", "WARNING"
         ) as captured:
             records = _validate_records(
-                [{"start_id": 0, "end_id": 1, "text": "  "}],
+                [{"start_id": 0, "end_id": 0, "text": "  "}],
                 track,
                 0,
                 1,
@@ -433,7 +446,7 @@ class JointTranslationTests(unittest.TestCase):
         )
         with self.assertLogs("subtitle_pipeline.joint_translation", "WARNING"):
             records = _validate_records(
-                [{"start_id": 0, "end_id": 1, "text": "很长的中文字幕"}],
+                [{"start_id": 0, "end_id": 0, "text": "很长的中文字幕"}],
                 track,
                 0,
                 1,
@@ -491,7 +504,7 @@ class JointTranslationTests(unittest.TestCase):
 
     def test_config_change_invalidates_joint_cache(self):
         translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
-        response = _response('{"cues":[{"start_id":0,"end_id":1,"text":"中文"}]}')
+        response = _response('{"cues":[{"start_id":0,"end_id":0,"text":"中文"}]}')
         with tempfile.TemporaryDirectory() as temp:
             cache = Path(temp) / "cache.json"
             with patch.object(translator, "_request", return_value=response):

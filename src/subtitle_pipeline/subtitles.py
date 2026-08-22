@@ -17,6 +17,9 @@ class Cue:
     boundary_hint: str | None = None
     pos: str | None = None
     source_text: str | None = None
+    speaker_assignment: str | None = None
+    speaker_fallback: str | None = None
+    speaker_fallback_distance: float | None = None
 
 
 _TIMING_RE = re.compile(
@@ -196,6 +199,24 @@ def trim_overlapping_cues(cues: list[Cue]) -> list[Cue]:
             else replace(current, end=min(current.end, following.start))
         )
     return trimmed
+
+
+def filter_long_cue_pairs(
+    source: list[Cue], translated: list[Cue], *, maximum_seconds: float
+) -> tuple[list[Cue], list[Cue], list[Cue]]:
+    """Drop overlong source/translation pairs without desynchronizing the tracks."""
+    if len(source) != len(translated):
+        raise ValueError("source and translated subtitle cue counts differ")
+    kept_source: list[Cue] = []
+    kept_translated: list[Cue] = []
+    dropped: list[Cue] = []
+    for source_cue, translated_cue in zip(source, translated):
+        if source_cue.end - source_cue.start > maximum_seconds:
+            dropped.append(source_cue)
+            continue
+        kept_source.append(source_cue)
+        kept_translated.append(translated_cue)
+    return kept_source, kept_translated, dropped
 
 
 def _ends_sentence(text: str) -> bool:

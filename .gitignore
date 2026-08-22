@@ -11,3 +11,4 @@ cookies.json
 /download.log
 checkpoints/
 /result
+.direnv/

@@ -22,7 +22,7 @@ from .prompt_templates import (
 from .subtitles import Cue, text_display_width
 from .telemetry import stage_metrics
 
-_CACHE_VERSION = 4
+_CACHE_VERSION = 5
 _CONTENT_ATTEMPTS = 2
 _PROMPT_NAME = "joint-segment-translate.md"
 _KANA_FRAGMENT_RE = re.compile(r"[\u3040-\u30ff]+")
@@ -148,7 +148,7 @@ def run_joint_translation(
                 [
                     {
                         "start_id": record.start_id - base_id,
-                        "end_id": record.end_id - base_id,
+                        "end_id": record.end_id - base_id - 1,
                         "text": record.text,
                     }
                     for record in cached
@@ -316,12 +316,30 @@ def _request_resilient(
         failure: Exception = exc
     except Exception as exc:  # noqa: BLE001 - classify transport and validation failures
         failure = exc
-    if (
-        is_nontransient(failure)
-        or retry_delay(failure, 1) is not None
-        or end - start <= 1
-    ):
+    if is_nontransient(failure) or retry_delay(failure, 1) is not None:
         raise failure
+    if end - start <= 1:
+        unit = track.units[start]
+        replacements = _reference_replacements(translation_context)
+        _log_translation_downgrade(
+            f"single_unit_{type(failure).__name__}",
+            track.key,
+            unit.local_id,
+            unit.local_id + 1,
+            unit.text,
+            replacements,
+        )
+        translated = _machine_translate_with_protected_terms(
+            unit.text, replacements, local_translate, force=True
+        )
+        return [
+            JointRecord(
+                track.key,
+                unit.local_id,
+                unit.local_id + 1,
+                translated,
+            )
+        ]
     split = _best_split(track.units, start, end)
     logger.warning(
         "shrinking failed joint window %s:%d-%d at %d",
@@ -610,11 +628,15 @@ def _validate_records(
         if set(value) != {"start_id", "end_id", "text"}:
             raise RuntimeError(f"joint cue {position} has unexpected fields")
         start_id = _coerce_integer_id(value["start_id"], position, "start_id")
-        end_id = _coerce_integer_id(value["end_id"], position, "end_id")
+        inclusive_end_id = _coerce_integer_id(
+            value["end_id"], position, "end_id"
+        )
         text = value["text"]
         if not isinstance(text, str):
             raise TypeError(f"joint cue {position} text is not a string")
-        relative.append(_RelativeRecord(start_id, end_id, text.strip()))
+        relative.append(
+            _RelativeRecord(start_id, inclusive_end_id + 1, text.strip())
+        )
 
     expected = 0
     for record in relative:
@@ -823,18 +845,19 @@ def _coverage_error(
         )
         for record in [*prefix[:-1], *suffix[1:]]
     ]
+    received_ranges = [(item.start_id, item.end_id - 1) for item in records]
     return CoverageValidationError(
-        f"joint response coverage failed: expected=[0,{final}) "
-        f"next={expected} received={[(item.start_id, item.end_id) for item in records][:12]} "
+        f"joint response coverage failed: expected=[0,{final - 1}] inclusive "
+        f"next={expected} received={received_ranges[:12]} "
         f"count={len(records)}; patching relative range "
         f"[{patch_start},{patch_end})",
         start + patch_start,
         start + patch_end,
         preserved,
         expected_start=0,
-        expected_end=final,
+        expected_end=final - 1,
         expected_next=expected,
-        received_ranges=[(item.start_id, item.end_id) for item in records],
+        received_ranges=received_ranges,
     )
 
 

@@ -48,12 +48,12 @@ def upload_to_bilibili(
     source = config.source or source_url
     upload_description = _prepare_description(
         description,
-        suffix=config.description_suffix,
+        prefix=config.description_prefix,
         max_chars=config.description_max_chars,
     )
     logger.info(
         "Bilibili description: %d -> %d characters, %d UTF-16 units",
-        len(description + config.description_suffix),
+        len(config.description_prefix + description),
         len(upload_description),
         _utf16_units(upload_description),
     )
@@ -251,22 +251,22 @@ def _truncate_description_body(
     return candidate.rstrip()
 
 
-def _prepare_description(description: str, *, suffix: str, max_chars: int) -> str:
+def _prepare_description(description: str, *, prefix: str, max_chars: int) -> str:
     body = description.replace("\r\n", "\n").replace("\r", "\n").strip()
-    clean_suffix = suffix.replace("\r\n", "\n").replace("\r", "\n").strip()
-    clean_suffix = _bounded_prefix(
-        clean_suffix,
+    clean_prefix = prefix.replace("\r\n", "\n").replace("\r", "\n").strip()
+    clean_prefix = _bounded_prefix(
+        clean_prefix,
         max_chars=max_chars,
         max_utf16_units=max_chars,
     ).rstrip()
 
-    separator = "\n\n" if body and clean_suffix else ""
-    reserved_chars = len(separator) + len(clean_suffix)
-    reserved_units = _utf16_units(separator + clean_suffix)
+    separator = "\n\n" if body and clean_prefix else ""
+    reserved_chars = len(clean_prefix) + len(separator)
+    reserved_units = _utf16_units(clean_prefix + separator)
     body = _truncate_description_body(
         body,
         max_chars=max(0, max_chars - reserved_chars),
         max_utf16_units=max(0, max_chars - reserved_units),
     )
-    separator = "\n\n" if body and clean_suffix else ""
-    return body + separator + clean_suffix
+    separator = "\n\n" if body and clean_prefix else ""
+    return clean_prefix + separator + body

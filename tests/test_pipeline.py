@@ -1,13 +1,15 @@
 import json
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from subtitle_pipeline.config import AppConfig, UploadConfig
+from subtitle_pipeline.config import AppConfig, LLMConfig, UploadConfig
 from subtitle_pipeline.media import DownloadResult
 from subtitle_pipeline.pipeline import (
     _canonicalize_catalog_tags,
+    _deepseek_task_delay,
     _japanese_single_word_list,
     _merge_tags,
     _subtitle_evidence,
@@ -21,6 +23,31 @@ from subtitle_pipeline.translate import CueTranslationResult
 
 
 class PipelineTests(unittest.TestCase):
+    def test_deepseek_task_delay_uses_blocked_utc_windows(self):
+        config = LLMConfig(base_url="https://api.deepseek.com")
+
+        def delay(hour: int, minute: int = 0, second: int = 0) -> float:
+            return _deepseek_task_delay(
+                config,
+                datetime(2026, 8, 22, hour, minute, second, tzinfo=UTC),
+            )
+
+        self.assertEqual(delay(0, 59, 59), 0)
+        self.assertEqual(delay(1), 3 * 60 * 60)
+        self.assertEqual(delay(3, 59, 59), 1)
+        self.assertEqual(delay(4), 0)
+        self.assertEqual(delay(5, 59, 59), 0)
+        self.assertEqual(delay(6), 4 * 60 * 60)
+        self.assertEqual(delay(9, 59, 59), 1)
+        self.assertEqual(delay(10), 0)
+        self.assertEqual(
+            _deepseek_task_delay(
+                LLMConfig(base_url="https://api.openai.com/v1"),
+                datetime(2026, 8, 22, 1, tzinfo=UTC),
+            ),
+            0,
+        )
+
     def test_bang_dream_glossary_models_miyako_as_character(self):
         context = _translation_context(
             {

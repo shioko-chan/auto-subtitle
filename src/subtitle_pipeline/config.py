@@ -70,10 +70,10 @@ class AudioAnalysisConfig:
     device: str = "cuda:0"
     singing_window_seconds: float = 5.0
     singing_stride_seconds: float = 2.5
-    singing_threshold: float = 0.05
+    singing_threshold: float = 0.015
     singing_music_threshold: float = 0.05
     singing_speech_takeover_threshold: float = 0.5
-    singing_vocal_threshold: float = 0.5
+    singing_vocal_threshold: float = 0.15
     singing_speech_bgm_coverage: float = 0.35
     singing_ambiguous_min_seconds: float = 15.0
     singing_merge_gap_seconds: float = 1.5
@@ -181,7 +181,7 @@ class UploadConfig:
     tag_catalog_file: str | None = None
     source: str = ""
     title_prefix: str = ""
-    description_suffix: str = ""
+    description_prefix: str = ""
     description_max_chars: int = 1800
     line: str | None = None
     limit: int = 3

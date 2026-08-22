@@ -122,11 +122,13 @@ max_concurrency = 16
 LLM HTTPS 请求会在系统 CA 基础上补充 `certifi` CA bundle，兼容 uv 独立 Python、
 NixOS、macOS 和 Windows，同时保留 `SSL_CERT_FILE` 等自定义 CA 配置。
 
-字幕使用单阶段联合 JSON 请求。Forced Aligner 单元先由 SudachiPy SplitMode.A 补充词性、
-活用型和活用形，再依据静音、当前块时长、终止形、句末表达、新话语起始和助词连接状态
-打分，贪心合并为可供模型选择的本地单元。每个 speaker 建立独立时间轨，因此不同人物的
-字幕可以重叠显示；同轨间隔达到 2 秒时建立硬 episode 边界。评分与形态信息写入
-`local-segmentation.json`。
+字幕使用单阶段联合 JSON 请求。Forced Aligner 单元首先按 ordinary diarization 的真实
+时间交集归属 speaker；未归属片段依次经过同 speaker 桥接、Sudachi + GiNZA 句法回填和
+0.5 秒最近 speaker 兜底，距离仍过大时删除并审计。随后由 SudachiPy SplitMode.A 补充
+词性、活用型和活用形，再依据静音、当前块时长、终止形、句末表达、新话语起始和助词连接
+状态打分，贪心合并为可供模型选择的本地单元。每个 speaker 建立独立时间轨，因此不同人物
+的字幕可以重叠显示；同轨间隔达到 2 秒时建立硬 episode 边界。逐词人物归属、评分与形态
+信息写入 `local-segmentation.json`。
 
 每个 LLM 请求只处理一条 speaker 轨，模型同时选择左闭右开的本地单元范围并翻译，例如
 `{"start_id":0,"end_id":2,"text":"中文字幕"}`。每个窗口都从 0 重新编号，范围必须连续、
@@ -261,7 +263,7 @@ uv run --extra asr subtitle-pipeline --config config.toml run 'https://www.youtu
 默认 `copyright = 2` 表示转载，来源自动使用 YouTube URL；若 `source` 非空则使用配置值。
 上传使用 `biliup --user-cookie ... upload`，不会把 Cookie 内容放到命令行。
 B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服务端计数差异留出余量。
-超长正文优先在段落或整行边界缩短，并为 `description_suffix` 预留空间；可通过
+超长正文优先在段落或整行边界缩短，并为 `description_prefix` 预留空间；可通过
 `upload.description_max_chars` 调整上限。
 
 更新任务列表为六个官方 YouTube 频道最近 14 天的公开直播录播（需要 Chromium

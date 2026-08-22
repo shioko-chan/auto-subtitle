@@ -15,17 +15,27 @@ def public_http_url(url: str) -> bool:
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return False
     try:
+        literal = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        return public_address(literal)
+    try:
         addresses = socket.getaddrinfo(parsed.hostname, parsed.port or 443)
     except socket.gaierror:
         return False
     return all(
-        not (
-            address.is_private
-            or address.is_loopback
-            or address.is_link_local
-            or address.is_reserved
-        )
+        public_address(address) or address in ipaddress.ip_network("198.18.0.0/15")
         for address in (ipaddress.ip_address(item[4][0]) for item in addresses)
+    )
+
+
+def public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return not (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
     )
 
 
@@ -49,7 +59,7 @@ def search(query: str, limit: int) -> dict[str, object]:
 
     results: list[dict[str, object]] = []
     errors: list[str] = []
-    for backend in ("duckduckgo", "brave", "yahoo"):
+    for backend in ("startpage", "yahoo", "duckduckgo", "brave"):
         try:
             batch = DDGS().text(query, backend=backend, max_results=limit)
         except Exception as exc:

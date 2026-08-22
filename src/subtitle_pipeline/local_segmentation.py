@@ -58,6 +58,7 @@ _DISCOURSE_STARTERS = frozenset(
 )
 _UNKNOWN_BRIDGE_MAX_GAP_SECONDS = 0.5
 _UNKNOWN_GRAMMAR_MAX_GAP_SECONDS = 0.75
+_UNKNOWN_NEAREST_MAX_DISTANCE_SECONDS = 0.5
 
 
 @dataclass(frozen=True)
@@ -106,12 +107,13 @@ class SpeakerTrack:
 class SudachiAnalyzer:
     def __init__(self) -> None:
         self._tokenizer = dictionary.Dictionary().create()
+        self._dependency_nlp = None
 
     @property
     def versions(self) -> dict[str, str]:
         return {
             name: _package_version(name)
-            for name in ("SudachiPy", "SudachiDict-core")
+            for name in ("SudachiPy", "SudachiDict-core", "ginza", "ja-ginza", "spacy")
         }
 
     def analyze(self, text: str) -> list[Morphology]:
@@ -137,6 +139,24 @@ class SudachiAnalyzer:
             cursor = end
         return result
 
+    def dependency_boundary_strengths(
+        self, left: str, middle: str, right: str
+    ) -> tuple[int, int]:
+        if self._dependency_nlp is None:
+            import spacy
+
+            # GiNZA 5.2's optional compound splitter has an invalid null setting
+            # under current spaCy. Dependency and bunsetsu parsing do not need it.
+            self._dependency_nlp = spacy.load(
+                "ja_ginza", exclude=["compound_splitter"]
+            )
+        text = left + middle + right
+        document = self._dependency_nlp(text)
+        return (
+            _dependency_boundary_strength(document, len(left)),
+            _dependency_boundary_strength(document, len(left) + len(middle)),
+        )
+
 
 def build_speaker_tracks(
     cues: list[Cue],
@@ -147,8 +167,12 @@ def build_speaker_tracks(
 ) -> tuple[list[SpeakerTrack], dict[str, str]]:
     analyzer = analyzer or SudachiAnalyzer()
     cues, speaker_reattributions = _reattribute_unknown_speakers(cues, analyzer)
+    cues, final_assignments = _resolve_remaining_unknown_speakers(cues)
+    speaker_reattributions.extend(final_assignments)
     track_indices: dict[str, list[int]] = {}
     for index, cue in enumerate(cues):
+        if cue.kind == "speech" and cue.speaker_assignment == "discarded":
+            continue
         track_indices.setdefault(_track_key(cue.speaker), []).append(index)
 
     audits: list[dict[str, object]] = []
@@ -173,6 +197,20 @@ def build_speaker_tracks(
             "sudachi": versions,
             "config": asdict(config),
             "speaker_reattributions": speaker_reattributions,
+            "speaker_assignments": [
+                {
+                    "source_index": index,
+                    "start": cue.start,
+                    "end": cue.end,
+                    "text": cue.text,
+                    "speaker": cue.speaker,
+                    "reason": cue.speaker_assignment,
+                    "fallback_speaker": cue.speaker_fallback,
+                    "fallback_distance_seconds": cue.speaker_fallback_distance,
+                }
+                for index, cue in enumerate(cues)
+                if cue.kind == "speech"
+            ],
             "episodes": audits,
             "tracks": [
                 {
@@ -229,7 +267,14 @@ def _reattribute_unknown_speakers(
             ),
             None,
         )
-        replacement, reason, left_score, right_score = _unknown_run_candidate(
+        (
+            replacement,
+            reason,
+            left_score,
+            right_score,
+            left_dependency,
+            right_dependency,
+        ) = _unknown_run_candidate(
             resolved,
             start,
             end,
@@ -247,7 +292,9 @@ def _reattribute_unknown_speakers(
         ):
             for position in range(start, end):
                 resolved[position] = replace(
-                    resolved[position], speaker=replacement
+                    resolved[position],
+                    speaker=replacement,
+                    speaker_assignment=reason,
                 )
             audit.append(
                 {
@@ -256,6 +303,8 @@ def _reattribute_unknown_speakers(
                     "reason": reason,
                     "left_boundary_score": left_score,
                     "right_boundary_score": right_score,
+                    "left_dependency_strength": left_dependency,
+                    "right_dependency_strength": right_dependency,
                 }
             )
         index = end
@@ -269,7 +318,7 @@ def _unknown_run_candidate(
     previous: Cue | None,
     following: Cue | None,
     analyzer: SudachiAnalyzer,
-) -> tuple[str | None, str | None, int | None, int | None]:
+) -> tuple[str | None, str | None, int | None, int | None, int | None, int | None]:
     first = cues[start]
     last = cues[end - 1]
     left_gap = float("inf") if previous is None else max(0.0, first.start - previous.end)
@@ -280,6 +329,8 @@ def _unknown_run_candidate(
     right_score = (
         None if following is None else _syntactic_boundary_score(last, following, analyzer)
     )
+    left_dependency: int | None = None
+    right_dependency: int | None = None
 
     if (
         previous is not None
@@ -292,17 +343,128 @@ def _unknown_run_candidate(
             and min(left_score or 0, right_score or 0) < 0
         )
         if close or grammatical:
-            return previous.speaker, "same_speaker_bridge", left_score, right_score
+            return (
+                previous.speaker,
+                "same_speaker_bridge",
+                left_score,
+                right_score,
+                None,
+                None,
+            )
+
+    if (
+        previous is not None
+        and following is not None
+        and previous.speaker != following.speaker
+    ):
+        middle = "".join(cue.text for cue in cues[start:end])
+        left_dependency, right_dependency = analyzer.dependency_boundary_strengths(
+            previous.text, middle, following.text
+        )
 
     if previous is not None and left_gap <= _UNKNOWN_BRIDGE_MAX_GAP_SECONDS:
         competing_score = right_score if right_score is not None else 2
-        if left_score is not None and left_score < 0 and competing_score - left_score >= 2:
-            return previous.speaker, "grammar_left", left_score, right_score
+        if (
+            left_score is not None
+            and left_score < 0
+            and competing_score - left_score >= 2
+            and left_dependency is not None
+            and right_dependency is not None
+            and left_dependency > right_dependency
+        ):
+            return (
+                previous.speaker,
+                "grammar_left",
+                left_score,
+                right_score,
+                left_dependency,
+                right_dependency,
+            )
     if following is not None and right_gap <= _UNKNOWN_BRIDGE_MAX_GAP_SECONDS:
         competing_score = left_score if left_score is not None else 2
-        if right_score is not None and right_score < 0 and competing_score - right_score >= 2:
-            return following.speaker, "grammar_right", left_score, right_score
-    return None, None, left_score, right_score
+        if (
+            right_score is not None
+            and right_score < 0
+            and competing_score - right_score >= 2
+            and left_dependency is not None
+            and right_dependency is not None
+            and right_dependency > left_dependency
+        ):
+            return (
+                following.speaker,
+                "grammar_right",
+                left_score,
+                right_score,
+                left_dependency,
+                right_dependency,
+            )
+    return None, None, left_score, right_score, left_dependency, right_dependency
+
+
+def _resolve_remaining_unknown_speakers(
+    cues: list[Cue],
+) -> tuple[list[Cue], list[dict[str, object]]]:
+    resolved = list(cues)
+    audit: list[dict[str, object]] = []
+    for index, cue in enumerate(resolved):
+        if cue.speaker is not None or cue.kind != "speech":
+            continue
+        distance = cue.speaker_fallback_distance
+        if (
+            cue.speaker_fallback is not None
+            and distance is not None
+            and distance <= _UNKNOWN_NEAREST_MAX_DISTANCE_SECONDS
+        ):
+            resolved[index] = replace(
+                cue,
+                speaker=cue.speaker_fallback,
+                speaker_assignment="nearest_fallback",
+            )
+            audit.append(
+                {
+                    "source_indices": [index],
+                    "speaker": cue.speaker_fallback,
+                    "reason": "nearest_fallback",
+                    "distance_seconds": round(distance, 6),
+                }
+            )
+            continue
+        resolved[index] = replace(cue, speaker_assignment="discarded")
+        audit.append(
+            {
+                "source_indices": [index],
+                "speaker": None,
+                "reason": "discarded",
+                "distance_seconds": (
+                    round(distance, 6) if distance is not None else None
+                ),
+                "start": cue.start,
+                "end": cue.end,
+                "text": cue.text,
+            }
+        )
+    return resolved, audit
+
+
+def _dependency_boundary_strength(document: object, boundary: int) -> int:
+    import ginza
+
+    if boundary <= 0 or boundary >= len(document.text):
+        return 0
+    for span in ginza.bunsetu_spans(document):
+        if span.start_char < boundary < span.end_char:
+            return 3
+    strength = 0
+    for token in document:
+        if token.head is token:
+            continue
+        token_position = token.idx + len(token.text) / 2
+        head_position = token.head.idx + len(token.head.text) / 2
+        if min(token_position, head_position) < boundary < max(
+            token_position, head_position
+        ):
+            strength = max(strength, 2 if abs(token.i - token.head.i) <= 1 else 1)
+    return strength
 
 
 def _syntactic_boundary_score(

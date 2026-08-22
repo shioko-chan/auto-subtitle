@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from subtitle_pipeline.config import SongIdentificationConfig
 from subtitle_pipeline.song_identification import (
+    _public_http_url,
     _run_song_agent,
     aggregate_ocr_observations,
     apply_lyric_corrections,
@@ -12,6 +13,16 @@ from subtitle_pipeline.subtitles import Cue
 
 
 class SongIdentificationTests(unittest.TestCase):
+    @patch("subtitle_pipeline.song_identification.socket.getaddrinfo")
+    def test_public_url_accepts_proxy_fake_ip_for_domain_only(self, getaddrinfo):
+        getaddrinfo.return_value = [
+            (2, 1, 6, "", ("198.18.2.126", 443)),
+        ]
+
+        self.assertTrue(_public_http_url("https://utaten.com/lyric/example/"))
+        self.assertFalse(_public_http_url("https://198.18.2.126/private"))
+        self.assertFalse(_public_http_url("https://127.0.0.1/private"))
+
     def test_groups_singing_phrases_without_absorbing_speech(self):
         cues = [
             Cue(0, 2, "intro", "a", "speech"),
@@ -61,7 +72,8 @@ class SongIdentificationTests(unittest.TestCase):
         reports = [
             {
                 "confidence": "medium",
-                "episode": {"cue_ids": [1, 2]},
+                # SongEpisode.cue_ids is a tuple until the report is serialized.
+                "episode": {"cue_ids": (1, 2)},
                 "alignments": [
                     {
                         "asr_cue_ids": [1, 2],
