@@ -58,7 +58,7 @@ ffmpeg 截取 → Qwen ASR → Forced Aligner → 写缓存
 
 **其余阶段**
 
-- 音频分析约 6 分钟，包含 pyannote、AST、MossFormer2 和声纹匹配，属于合理但仍可优化的 GPU 阶段。
+- 音频分析约 6 分钟，包含 pyannote、AST 和声纹匹配，属于合理但仍可优化的 GPU 阶段。
 - x264 `medium` 压制约为 `9.7x` 实时速度，表现正常。
 - 下载和上传在当前网络下都不构成瓶颈。
 - 有歌曲的视频还会增加 Demucs、OCR、搜索和歌词核验时间，但一般仍不及大量 LLM 重试。

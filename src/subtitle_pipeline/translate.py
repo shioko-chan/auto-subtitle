@@ -5,11 +5,12 @@ import logging
 import math
 import random
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -56,9 +57,17 @@ class CueTranslationResult:
 
 
 class OpenAICompatibleTranslator:
-    def __init__(self, config: LLMConfig, api_key: str):
+    def __init__(
+        self,
+        config: LLMConfig,
+        api_key: str,
+        *,
+        audit_path: Path | None = None,
+    ):
         self.config = config
         self.api_key = api_key
+        self.audit_path = audit_path
+        self._audit_lock = threading.Lock()
         self.ssl_context = _create_ssl_context()
         self.local_translator = LocalJapaneseTranslator(
             config.local_translation_model,
@@ -118,7 +127,7 @@ class OpenAICompatibleTranslator:
             finish_reason=_finish_reason,
             retry_delay=_transient_retry_delay,
             is_nontransient=_is_nontransient_http_error,
-            log_invalid_response=_log_invalid_response,
+            log_invalid_response=self._log_invalid_response,
             local_translate=self.local_translator.translate,
         )
         return CueTranslationResult(result.source_cues, result.translated_cues)
@@ -182,6 +191,7 @@ class OpenAICompatibleTranslator:
         last_error: Exception | None = None
         for attempt in range(1, self.config.max_retries + 1):
             content: object = None
+            response: object = None
             try:
                 response = self._request(body)
                 content = response["choices"][0]["message"]["content"]
@@ -230,7 +240,7 @@ class OpenAICompatibleTranslator:
                 TranslationError,
             ) as exc:
                 last_error = exc
-                _log_invalid_response("metadata", exc, content)
+                self._log_invalid_response("metadata", exc, content, body, response)
                 if _is_nontransient_http_error(exc):
                     raise
                 if attempt < self.config.max_retries:
@@ -257,6 +267,42 @@ class OpenAICompatibleTranslator:
             "metadata translation failed after "
             f"{self.config.max_retries} attempts: {last_error}"
         )
+
+    def _log_invalid_response(
+        self,
+        kind: str,
+        error: Exception,
+        content: object,
+        request_body: dict[str, object] | None = None,
+        response: object = None,
+    ) -> None:
+        _log_invalid_response(kind, error, content)
+        if self.audit_path is None:
+            return
+        entry = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "event": "invalid_llm_response",
+            "kind": kind,
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "request": request_body,
+            "response": response,
+            "response_content": content,
+        }
+        for name in (
+            "patch_start",
+            "patch_end",
+            "expected_start",
+            "expected_end",
+            "expected_next",
+            "received_ranges",
+        ):
+            if hasattr(error, name):
+                entry[name] = getattr(error, name)
+        with self._audit_lock:
+            self.audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.audit_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False, default=repr) + "\n")
 
     def _request(self, body: dict[str, object]) -> dict[str, object]:
         url, request_body = _prepare_api_request(self.config, body)
@@ -500,8 +546,8 @@ def _parse_retry_after(
     except (TypeError, ValueError, OverflowError):
         return None
     if retry_at.tzinfo is None:
-        retry_at = retry_at.replace(tzinfo=timezone.utc)
-    current = now or datetime.now(timezone.utc)
+        retry_at = retry_at.replace(tzinfo=UTC)
+    current = now or datetime.now(UTC)
     return float(max(0, math.ceil((retry_at - current).total_seconds())))
 
 

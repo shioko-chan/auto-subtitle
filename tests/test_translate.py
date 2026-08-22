@@ -171,7 +171,7 @@ class JointTranslationTests(unittest.TestCase):
             _finish_reason,
             lambda _error, _attempt: None,
             lambda _error: False,
-            lambda _kind, _error, _content: None,
+            lambda _kind, _error, _content, _request, _response: None,
             lambda text: text,
         )
         self.assertEqual(len(targets), 2)
@@ -249,6 +249,37 @@ class JointTranslationTests(unittest.TestCase):
         self.assertEqual(result, repeated)
         self.assertEqual([cue.speaker for cue in result.source_cues], ["A", "B"])
         self.assertGreater(result.source_cues[0].end, result.source_cues[1].start)
+
+    def test_coverage_failures_write_complete_llm_audit_records(self):
+        with tempfile.TemporaryDirectory() as temp:
+            audit = Path(temp) / "llm-audit.jsonl"
+            translator = OpenAICompatibleTranslator(
+                LLMConfig(), "secret", audit_path=audit
+            )
+            invalid = _response(
+                '{"cues":[{"start_id":1,"end_id":2,"text":"错误范围"}]}'
+            )
+            with patch.object(
+                translator, "_request", return_value=invalid
+            ), self.assertRaises(CoverageValidationError):
+                translator.plan_and_translate(
+                    [Cue(0, 1, "原文", "A")],
+                    SegmentationConfig(),
+                    max_line_units=20,
+                )
+
+            entries = [
+                json.loads(line)
+                for line in audit.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(entries), 2)
+            self.assertEqual(entries[0]["error_type"], "CoverageValidationError")
+            self.assertEqual(entries[0]["expected_start"], 0)
+            self.assertEqual(entries[0]["expected_end"], 1)
+            self.assertEqual(entries[0]["received_ranges"], [[1, 2]])
+            self.assertIn("错误范围", entries[0]["response_content"])
+            self.assertEqual(entries[0]["response"], invalid)
+            self.assertIn("TARGET:", entries[0]["request"]["messages"][1]["content"])
 
     def test_singing_and_conditioned_speech_are_atomic_windows(self):
         units = (

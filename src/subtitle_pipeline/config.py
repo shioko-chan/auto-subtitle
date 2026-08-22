@@ -63,14 +63,9 @@ class AudioAnalysisConfig:
     moss_max_window_seconds: float = 540.0
     moss_window_search_seconds: float = 60.0
     moss_max_new_tokens: int = 8192
-    # Retained for compatibility with older configuration files. MossFormer2
-    # does not use a pyannote embedding model internally.
-    overlap_embedding_model: str = "pyannote/wespeaker-voxceleb-resnet34-LM"
     speaker_embedding_backend: str = "eres2netv2"
     speaker_embedding_model: str = "iic/speech_eres2netv2_sv_zh-cn_16k-common"
     speaker_embedding_worker_project: str = "tools/speaker_embedding"
-    overlap_separation_model: str = "MossFormer2_SS_16K"
-    overlap_separation_worker_project: str = "tools/mossformer2"
     singing_model: str = "MIT/ast-finetuned-audioset-10-10-0.4593"
     device: str = "cuda:0"
     singing_window_seconds: float = 5.0
@@ -89,9 +84,8 @@ class AudioAnalysisConfig:
     singing_asr_window_seconds: float = 12.0
     singing_asr_overlap_seconds: float = 2.0
     speaker_profiles_dir: str = "work/speaker-profiles-eres2netv2"
-    speaker_match_threshold: float = 0.40
-    speaker_overlap_match_threshold: float = 0.24
-    speaker_match_margin: float = 0.03
+    speaker_match_threshold: float = 0.42
+    speaker_match_margin: float = 0.025
     speaker_identity_trim_ratio: float = 0.15
     speaker_identity_max_weight_seconds: float = 10.0
     speaker_identity_edge_trim_seconds: float = 0.15
@@ -448,10 +442,6 @@ def load_config(path: Path) -> AppConfig:
     if not 0 <= analysis.speaker_match_threshold <= 2:
         raise ConfigError(
             "audio_analysis.speaker_match_threshold must be between 0 and 2"
-        )
-    if not 0 <= analysis.speaker_overlap_match_threshold <= 2:
-        raise ConfigError(
-            "audio_analysis.speaker_overlap_match_threshold must be between 0 and 2"
         )
     if not 0 <= analysis.speaker_match_margin <= 2:
         raise ConfigError("audio_analysis.speaker_match_margin must be between 0 and 2")

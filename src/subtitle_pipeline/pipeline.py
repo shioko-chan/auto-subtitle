@@ -124,7 +124,11 @@ def _run_pipeline_stages(
             if isinstance(item, dict) and isinstance(item.get("name"), str)
         ]
         logging.info("using translation glossary: %s", ", ".join(names))
-    translator = OpenAICompatibleTranslator(config.llm, llm_api_key(config.llm))
+    translator = OpenAICompatibleTranslator(
+        config.llm,
+        llm_api_key(config.llm),
+        audit_path=job_dir / "llm-audit.jsonl",
+    )
     with stage_metrics("pipeline.song_identification"):
         if config.song_identification.enabled:
             song_result = identify_and_align_songs(

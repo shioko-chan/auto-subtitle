@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 from .audio_analysis import AudioRegion
-from .audio_buffer import AudioBufferPool, is_shared_audio_uri
 from .config import AudioAnalysisConfig
 
 logger = logging.getLogger(__name__)
@@ -82,7 +81,6 @@ def identify_speakers(
     *,
     known_character: str | None = None,
     excluded_regions: list[AudioRegion] | None = None,
-    audio_pool: AudioBufferPool | None = None,
 ) -> list[AudioRegion]:
     """Enroll clean solo audio and map anonymous clusters to member prototypes."""
     import numpy as np
@@ -103,9 +101,7 @@ def identify_speakers(
     ]
     if not candidates:
         return regions
-    snippets = _candidate_snippets(
-        waveform, sample_rate, candidates, audio_pool=audio_pool
-    )
+    snippets = _candidate_snippets(waveform, sample_rate, candidates)
     embeddings = _extract_embeddings(snippets, config)
     by_label: dict[str, list[tuple[Any, float]]] = {}
     for region, embedding in zip(candidates, embeddings):
@@ -162,11 +158,7 @@ def identify_speakers(
                 trim_ratio=config.speaker_identity_trim_ratio,
                 maximum_weight=config.speaker_identity_max_weight_seconds,
             )
-            threshold = (
-                config.speaker_overlap_match_threshold
-                if label.startswith("OVERLAP_")
-                else config.speaker_match_threshold
-            )
+            threshold = config.speaker_match_threshold
             if _profile_match_is_confident(
                 distances,
                 threshold=threshold,
@@ -219,39 +211,17 @@ def _candidate_snippets(
     waveform: Any,
     sample_rate: int,
     candidates: list[AudioRegion],
-    *,
-    audio_pool: AudioBufferPool | None = None,
 ) -> list[tuple[Any, int]]:
-    import soundfile as sf
-    import torch
-
-    snippets: list[tuple[Any, int]] = []
-    separated_waveforms: dict[str, tuple[Any, int]] = {}
-    for region in candidates:
-        source_waveform, source_rate = waveform, sample_rate
-        if region.source_path:
-            if region.source_path not in separated_waveforms:
-                if is_shared_audio_uri(region.source_path):
-                    if audio_pool is None:
-                        raise RuntimeError("shared speaker track has no audio pool")
-                    buffer = audio_pool.resolve(region.source_path)
-                    separated_waveforms[region.source_path] = (
-                        torch.from_numpy(buffer.samples).unsqueeze(0),
-                        buffer.sample_rate,
-                    )
-                else:
-                    data, loaded_rate = sf.read(
-                        region.source_path, always_2d=True, dtype="float32"
-                    )
-                    separated_waveforms[region.source_path] = (
-                        torch.from_numpy(data.T.copy()),
-                        int(loaded_rate),
-                    )
-            source_waveform, source_rate = separated_waveforms[region.source_path]
-        start = round((region.start - region.source_offset) * source_rate)
-        end = round((region.end - region.source_offset) * source_rate)
-        snippets.append((source_waveform[:, start:end], source_rate))
-    return snippets
+    return [
+        (
+            waveform[
+                :,
+                round(region.start * sample_rate) : round(region.end * sample_rate),
+            ],
+            sample_rate,
+        )
+        for region in candidates
+    ]
 
 
 def _extract_embeddings(
@@ -356,30 +326,11 @@ def _extract_eres2netv2_embeddings(
 
 def _can_embed_region(region: AudioRegion) -> bool:
     duration = region.end - region.start
-    maximum = 30.0 if region.overlap and region.source_path else 15.0
-    return 2.0 <= duration <= maximum and (
-        not region.overlap or bool(region.source_path)
-    )
+    return 2.0 <= duration <= 15.0 and not region.overlap
 
 
 def _identity_candidates(regions: list[AudioRegion]) -> list[AudioRegion]:
-    candidates = [region for region in regions if _can_embed_region(region)]
-    represented = {region.speaker for region in candidates}
-    separated: dict[tuple[str | None, str, float], list[AudioRegion]] = {}
-    for region in regions:
-        if region.overlap and region.source_path:
-            key = (region.speaker, region.source_path, region.source_offset)
-            separated.setdefault(key, []).append(region)
-
-    for (speaker, _source_path, _source_offset), fragments in separated.items():
-        if speaker in represented:
-            continue
-        start = min(fragment.start for fragment in fragments)
-        end = max(fragment.end for fragment in fragments)
-        voiced = sum(fragment.end - fragment.start for fragment in fragments)
-        if voiced >= 1.0 and 1.0 <= end - start <= 30.0:
-            candidates.append(replace(fragments[0], start=start, end=end))
-    return candidates
+    return [region for region in regions if _can_embed_region(region)]
 
 
 def _is_moss_speaker(value: str | None) -> bool:

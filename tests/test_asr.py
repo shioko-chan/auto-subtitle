@@ -272,7 +272,7 @@ class QwenASRTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "cache.json"
             path.write_text(
-                '{"version":5,"signature":{"speakers":["A","B"]},'
+                '{"version":6,"signature":{"speakers":["A","B"]},'
                 '"chunks":{"0":{"text":"x","cues":[]}}}',
                 encoding="utf-8",
             )
@@ -515,7 +515,7 @@ class QwenASRTests(unittest.TestCase):
             _speaker_for_aligned_cue(
                 20.0,
                 21.0,
-                [AudioRegion(20.64, 21.0, "speech", "A")],
+                [AudioRegion(20.69, 21.0, "speech", "A")],
             ),
             "A",
         )
@@ -523,7 +523,7 @@ class QwenASRTests(unittest.TestCase):
             _speaker_for_aligned_cue(
                 20.0,
                 21.0,
-                [AudioRegion(20.76, 21.0, "speech", "A")],
+                [AudioRegion(20.81, 21.0, "speech", "A")],
             )
         )
         self.assertEqual(

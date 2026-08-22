@@ -25,6 +25,29 @@ class FakeAnalyzer:
         return []
 
 
+class ParticleAnalyzer(FakeAnalyzer):
+    def analyze(self, text):
+        if text == "私は猫です":
+            return [
+                Morphology("私", 0, 1, ("代名詞",), "*", "*"),
+                Morphology("は", 1, 2, ("助詞", "係助詞"), "*", "*"),
+                Morphology("猫", 2, 3, ("名詞",), "*", "*"),
+                Morphology("です", 3, 5, ("助動詞",), "助動詞", "終止形-一般"),
+            ]
+        if text == "私は":
+            return [
+                Morphology("私", 0, 1, ("代名詞",), "*", "*"),
+                Morphology("は", 1, 2, ("助詞", "係助詞"), "*", "*"),
+            ]
+        if text == "は猫です":
+            return [
+                Morphology("は", 0, 1, ("助詞", "係助詞"), "*", "*"),
+                Morphology("猫", 1, 2, ("名詞",), "*", "*"),
+                Morphology("です", 2, 4, ("助動詞",), "助動詞", "終止形-一般"),
+            ]
+        return []
+
+
 class LocalSegmentationTests(unittest.TestCase):
     def test_four_gap_bands_score_one_through_four(self):
         for gap, expected in [(0.12, 1), (0.25, 2), (0.4, 3), (0.6, 4)]:
@@ -72,6 +95,43 @@ class LocalSegmentationTests(unittest.TestCase):
         self.assertEqual(set(values), {"A", "B", "unknown"})
         self.assertEqual(len(values["unknown"].units), 2)
         self.assertEqual(len(values["A"].units), 1)
+
+    def test_unknown_between_same_speaker_is_bridged_before_segmentation(self):
+        cues = [
+            Cue(0, 0.4, "私", "A"),
+            Cue(0.4, 0.7, "は"),
+            Cue(0.7, 1.2, "猫です", "A"),
+        ]
+        tracks, _ = build_speaker_tracks(
+            cues, SegmentationConfig(), analyzer=ParticleAnalyzer()
+        )
+        self.assertEqual([track.key for track in tracks], ["A"])
+        self.assertEqual(tracks[0].units[0].source_indices, (0, 1, 2))
+
+    def test_unknown_is_not_bridged_across_competing_speaker_activity(self):
+        cues = [
+            Cue(0, 0.4, "私", "A"),
+            Cue(0.4, 0.7, "は"),
+            Cue(0.45, 0.65, "插话", "B"),
+            Cue(0.7, 1.2, "猫です", "A"),
+        ]
+        tracks, _ = build_speaker_tracks(
+            cues, SegmentationConfig(), analyzer=ParticleAnalyzer()
+        )
+        self.assertIn("unknown", {track.key for track in tracks})
+
+    def test_unknown_between_different_speakers_follows_stronger_grammar(self):
+        cues = [
+            Cue(0, 0.4, "私", "A"),
+            Cue(0.4, 0.7, "は"),
+            Cue(0.7, 1.2, "猫です", "B"),
+        ]
+        tracks, _ = build_speaker_tracks(
+            cues, SegmentationConfig(), analyzer=ParticleAnalyzer()
+        )
+        values = {track.key: track for track in tracks}
+        self.assertNotIn("unknown", values)
+        self.assertIn(1, values["A"].units[0].source_indices)
 
     def test_atomic_kinds_remain_single_units_and_audit_is_written(self):
         cues = [Cue(0, 1, "歌", "A", "singing"), Cue(1, 2, "重叠", "A", "conditioned_speech")]

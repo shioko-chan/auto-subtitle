@@ -3,6 +3,16 @@
 set -uo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ -z "${IN_NIX_SHELL:-}" ]]; then
+    if ! command -v nix >/dev/null 2>&1; then
+        printf 'Required command not found: nix\n' >&2
+        exit 1
+    fi
+    printf 'Entering the subtitle-pipeline Nix development shell...\n'
+    exec nix develop "$ROOT_DIR#default" --command bash "${BASH_SOURCE[0]}" "$@"
+fi
+
 CONFIG_PATH="${1:-$ROOT_DIR/config.toml}"
 WORK_DIR="$ROOT_DIR/work"
 STATUS_PATH="$WORK_DIR/yumemita-2026-08-10-status.log"
@@ -62,7 +72,7 @@ if ! biliup --user-cookie cookies.json list >/dev/null; then
     exit 1
 fi
 
-# Public archived streams published from 2026-07-27 through 2026-08-10.
+# Successful history plus public archived streams published from 2026-08-08 through 2026-08-22.
 # Members-only streams are deliberately excluded.
 RECORDS=(
     "2026-07-27|nonoka|iDX9seQqdbs"
@@ -74,36 +84,55 @@ RECORDS=(
     "2026-07-29|nonoka|r4ugYsVssAE"
     "2026-07-29|ritsu|cu1srt3zd0Y"
     "2026-07-29|yuno|vy4qBWKlGfM"
-    "2026-07-30|group|Al7aJdw-oic"
     "2026-07-30|miyako|TxbV_9g7YZY"
     "2026-07-30|yuno|tiyrmBJWVNY"
+    "2026-07-30|group|Al7aJdw-oic"
     "2026-07-31|ritsu|y-xzyetM-FI"
     "2026-08-01|ritsu|rpogVTapfWY"
-    "2026-08-01|miyako|MfUA2snR1nA"
     "2026-08-02|ritsu|_aQBzRWfsU0"
-    "2026-08-02|miyako|OHpuxUkdNUQ"
-    "2026-08-02|miyako|tN9mEXyjKHY"
-    "2026-08-03|ritsu|Sfq4BMb5ync"
-    "2026-08-04|arale|QkDtDVGbY9s"
-    "2026-08-04|ritsu|RoTo0TVCbKA"
-    "2026-08-04|yuno|7dUt5p0ueP4"
-    "2026-08-04|yuno|7M_ePReieMs"
-    "2026-08-05|arale|89V47TNVrO4"
-    "2026-08-05|arale|UCV-0SPr53w"
-    "2026-08-05|arale|kXUrjnbmc4Q"
-    "2026-08-05|ritsu|3oBi7dvEAyU"
-    "2026-08-06|yuno|Ez9KFh8x9QI"
-    "2026-08-07|group|YuT4MawXQxk"
-    "2026-08-07|nonoka|brSArzAwakE"
-    "2026-08-08|arale|8Qtx3gFWmtI"
-    "2026-08-08|nonoka|3EYGzu9v7Fc"
     "2026-08-08|ritsu|tzzU0bmVLXA"
     "2026-08-08|miyako|htt3MrWSjNQ"
-    "2026-08-09|arale|v_3fGOhByw4"
-    "2026-08-09|nonoka|2nf1sFpZCYs"
+    "2026-08-09|arale|8Qtx3gFWmtI"
+    "2026-08-09|yuno|jPCGHnY_jOQ"
     "2026-08-09|ritsu|Ba62K5k56zA"
     "2026-08-09|miyako|AwTrSRxs9jo"
-    "2026-08-09|yuno|jPCGHnY_jOQ"
+    "2026-08-10|arale|v_3fGOhByw4"
+    "2026-08-10|miyako|_oZxIYFOcZE"
+    "2026-08-10|ritsu|Y7e056lLCoc"
+    "2026-08-11|arale|yQL3oWk2bII"
+    "2026-08-11|yuno|9LdQLQgD_Lg"
+    "2026-08-12|nonoka|7b_yD_PbnDM"
+    "2026-08-12|ritsu|0GFgZ1DU5n0"
+    "2026-08-12|yuno|FdGQCelgYkQ"
+    "2026-08-12|ritsu|_bh0IurOZTg"
+    "2026-08-13|yuno|c3VJqghTTjw"
+    "2026-08-13|nonoka|uxmT5-WGyCU"
+    "2026-08-13|arale|f6H4FR855DE"
+    "2026-08-13|ritsu|-veVsMnB6Ew"
+    "2026-08-14|group|pTRWGwnLW74"
+    "2026-08-14|ritsu|7iS-f0uPhcw"
+    "2026-08-15|nonoka|qdNLBOiO2PU"
+    "2026-08-15|nonoka|cgJJlsQm_v0"
+    "2026-08-15|ritsu|hH7yAG5l1ms"
+    "2026-08-15|miyako|ZHIDocbGd7g"
+    "2026-08-16|arale|op8M9xPpNNM"
+    "2026-08-16|nonoka|OzZAd4X2Vmo"
+    "2026-08-16|miyako|MHxJm6DDZGY"
+    "2026-08-17|arale|MuK86x4s_x0"
+    "2026-08-17|miyako|qsd-1arFzLs"
+    "2026-08-18|yuno|4yH9F6coc_o"
+    "2026-08-18|yuno|pfwAKQQXwu4"
+    "2026-08-19|yuno|BK8p8J28G6w"
+    "2026-08-19|ritsu|fuiTW78dby0"
+    "2026-08-19|yuno|d0uqb1ntAng"
+    "2026-08-20|arale|EmGZ08TBFOg"
+    "2026-08-20|ritsu|YO2noyg1Hps"
+    "2026-08-20|arale|HhZIXb2YEfk"
+    "2026-08-20|miyako|7e7uClmC-Ps"
+    "2026-08-20|nonoka|p-R2Mluzdtc"
+    "2026-08-21|group|VRYwuzsIoV8"
+    "2026-08-21|group|8cch4m8t8ME"
+    "2026-08-22|group|lo8ogUEvtaA"
 )
 
 total="${#RECORDS[@]}"

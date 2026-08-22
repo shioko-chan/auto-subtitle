@@ -56,20 +56,10 @@ class ConfigTests(unittest.TestCase):
                 "pyannote/speaker-diarization-community-1",
             )
             self.assertEqual(
-                config.audio_analysis.overlap_separation_model,
-                "MossFormer2_SS_16K",
-            )
-            self.assertEqual(
-                config.audio_analysis.overlap_separation_worker_project,
-                "tools/mossformer2",
-            )
-            self.assertEqual(
                 config.audio_analysis.speaker_enrollment_samples_per_video, 40
             )
-            self.assertEqual(
-                config.audio_analysis.speaker_overlap_match_threshold, 0.24
-            )
-            self.assertEqual(config.audio_analysis.speaker_match_margin, 0.03)
+            self.assertEqual(config.audio_analysis.speaker_match_threshold, 0.42)
+            self.assertEqual(config.audio_analysis.speaker_match_margin, 0.025)
             self.assertEqual(config.audio_analysis.speaker_identity_trim_ratio, 0.15)
             self.assertEqual(
                 config.audio_analysis.speaker_identity_max_weight_seconds, 10.0

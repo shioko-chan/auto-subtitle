@@ -209,9 +209,8 @@ aligner 与句级歌声 ASR，时间轴坍缩或循环输出时采用歌声结�
 作业只用 ffmpeg 解码一次完整的 16 kHz 单声道音频，并由 `AudioBufferPool` 在共享 CPU
 内存中提供给 pyannote、Qwen、DiCoW 和 ERes2NetV2。Qwen 与 DiCoW 直接接收 NumPy
 切片或共享内存描述符，正常运行不再
-创建 `asr-chunks`、`asr-analysis-chunks` 或分离声源 WAV。MossFormer2 音轨仅在
-`audio_analysis.debug_audio_artifacts = true` 时落盘。Demucs 只按需解码候选歌曲区间的
-高质量立体声音频。各阶段日志包含耗时和可用时的峰值显存；pyannote 与原音 AST 可通过
+创建 `asr-chunks` 或 `asr-analysis-chunks`。Demucs 只按需解码候选歌曲区间的高质量
+立体声音频。各阶段日志包含耗时和可用时的峰值显存；pyannote 与原音 AST 可通过
 `initial_analysis_concurrency = 2` 并行。Qwen 完成后会先释放显存再启动 DiCoW。
 
 人物身份使用独立 uv worker 中的 ERes2NetV2 embedding 和余弦距离匹配。成员个人频道
@@ -223,7 +222,7 @@ aligner 与句级歌声 ASR，时间轴坍缩或循环输出时采用歌声结�
 先按该标签 embedding 的 medoid 删除最远 15%，再按片段时长加权，单段权重最多计 10 秒。
 重叠片段不参与投票，但会继承该匿名标签的身份。不同匿名标签独立匹配，允许都映射为同一
 成员；匹配仍要求第一候选相对第二候选保持足够距离，证据不足时保留匿名标签。
-MOSS 和 MossFormer2 使用独立 uv 环境，避免模型依赖影响 Qwen ASR。
+MOSS 和 ERes2NetV2 使用独立 uv 环境，避免模型依赖影响 Qwen ASR。
 共享内存、按需高质量立体声和受控并行的实现说明见
 [音频管线内存与并行优化](docs/audio-pipeline-optimization.md)。
 
@@ -265,11 +264,25 @@ B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服�
 超长正文优先在段落或整行边界缩短，并为 `description_suffix` 预留空间；可通过
 `upload.description_max_chars` 调整上限。
 
-批量处理 2026-07-27 至 2026-08-10 的梦限大MewType公开直播录播：
+更新任务列表为六个官方 YouTube 频道最近 14 天的公开直播录播（需要 Chromium
+已登录 YouTube，会员限定和未开播视频会被排除）：
+
+```bash
+uv run python scripts/update-recent-yumemita-tasks.py
+```
+
+可先加 `--dry-run` 预览；通过 `--days`、`--browser` 调整时间范围和浏览器。
+脚本保留 `work/yumemita-2026-08-10-uploaded.txt` 中的成功投稿历史，并原子更新下面
+批处理脚本的 `RECORDS` 队列。
+
+批量处理队列中的梦限大MewType公开直播录播：
 
 ```bash
 ./scripts/upload-recent-yumemita.sh
 ```
+
+脚本会自动进入项目的 `nix develop .#default` 环境，因此从普通终端直接运行即可；
+PyTorch、CUDA 和 `libstdc++` 等运行库会由开发环境提供。
 
 精简的完成状态写入 `work/yumemita-2026-08-10-status.log`，其中只包含每条
 录播的 `RUN`、`OK`、`FAIL`、`SKIP` 和批处理停止状态。需要在当前条目完成后

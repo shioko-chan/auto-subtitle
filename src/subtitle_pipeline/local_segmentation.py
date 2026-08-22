@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -56,6 +56,8 @@ _DISCOURSE_STARTERS = frozenset(
         "まあ",
     }
 )
+_UNKNOWN_BRIDGE_MAX_GAP_SECONDS = 0.5
+_UNKNOWN_GRAMMAR_MAX_GAP_SECONDS = 0.75
 
 
 @dataclass(frozen=True)
@@ -144,6 +146,7 @@ def build_speaker_tracks(
     audit_path: Path | None = None,
 ) -> tuple[list[SpeakerTrack], dict[str, str]]:
     analyzer = analyzer or SudachiAnalyzer()
+    cues, speaker_reattributions = _reattribute_unknown_speakers(cues, analyzer)
     track_indices: dict[str, list[int]] = {}
     for index, cue in enumerate(cues):
         track_indices.setdefault(_track_key(cue.speaker), []).append(index)
@@ -169,6 +172,7 @@ def build_speaker_tracks(
             "version": 1,
             "sudachi": versions,
             "config": asdict(config),
+            "speaker_reattributions": speaker_reattributions,
             "episodes": audits,
             "tracks": [
                 {
@@ -186,6 +190,158 @@ def build_speaker_tracks(
         )
         temporary.replace(audit_path)
     return tracks, versions
+
+
+def _reattribute_unknown_speakers(
+    cues: list[Cue], analyzer: SudachiAnalyzer
+) -> tuple[list[Cue], list[dict[str, object]]]:
+    """Bridge short unknown runs when timing and Japanese syntax support one speaker."""
+    resolved = list(cues)
+    audit: list[dict[str, object]] = []
+    index = 0
+    while index < len(resolved):
+        if resolved[index].speaker is not None or resolved[index].kind != "speech":
+            index += 1
+            continue
+        start = index
+        while (
+            index + 1 < len(resolved)
+            and resolved[index + 1].speaker is None
+            and resolved[index + 1].kind == "speech"
+        ):
+            index += 1
+        end = index + 1
+        previous = next(
+            (
+                resolved[position]
+                for position in range(start - 1, -1, -1)
+                if resolved[position].speaker is not None
+                and resolved[position].kind == "speech"
+            ),
+            None,
+        )
+        following = next(
+            (
+                resolved[position]
+                for position in range(end, len(resolved))
+                if resolved[position].speaker is not None
+                and resolved[position].kind == "speech"
+            ),
+            None,
+        )
+        replacement, reason, left_score, right_score = _unknown_run_candidate(
+            resolved,
+            start,
+            end,
+            previous,
+            following,
+            analyzer,
+        )
+        if replacement is not None and not _has_competing_activity(
+            resolved,
+            resolved[start].start,
+            resolved[end - 1].end,
+            replacement,
+            start,
+            end,
+        ):
+            for position in range(start, end):
+                resolved[position] = replace(
+                    resolved[position], speaker=replacement
+                )
+            audit.append(
+                {
+                    "source_indices": list(range(start, end)),
+                    "speaker": replacement,
+                    "reason": reason,
+                    "left_boundary_score": left_score,
+                    "right_boundary_score": right_score,
+                }
+            )
+        index = end
+    return resolved, audit
+
+
+def _unknown_run_candidate(
+    cues: list[Cue],
+    start: int,
+    end: int,
+    previous: Cue | None,
+    following: Cue | None,
+    analyzer: SudachiAnalyzer,
+) -> tuple[str | None, str | None, int | None, int | None]:
+    first = cues[start]
+    last = cues[end - 1]
+    left_gap = float("inf") if previous is None else max(0.0, first.start - previous.end)
+    right_gap = float("inf") if following is None else max(0.0, following.start - last.end)
+    left_score = (
+        None if previous is None else _syntactic_boundary_score(previous, first, analyzer)
+    )
+    right_score = (
+        None if following is None else _syntactic_boundary_score(last, following, analyzer)
+    )
+
+    if (
+        previous is not None
+        and following is not None
+        and previous.speaker == following.speaker
+    ):
+        close = max(left_gap, right_gap) <= _UNKNOWN_BRIDGE_MAX_GAP_SECONDS
+        grammatical = (
+            max(left_gap, right_gap) <= _UNKNOWN_GRAMMAR_MAX_GAP_SECONDS
+            and min(left_score or 0, right_score or 0) < 0
+        )
+        if close or grammatical:
+            return previous.speaker, "same_speaker_bridge", left_score, right_score
+
+    if previous is not None and left_gap <= _UNKNOWN_BRIDGE_MAX_GAP_SECONDS:
+        competing_score = right_score if right_score is not None else 2
+        if left_score is not None and left_score < 0 and competing_score - left_score >= 2:
+            return previous.speaker, "grammar_left", left_score, right_score
+    if following is not None and right_gap <= _UNKNOWN_BRIDGE_MAX_GAP_SECONDS:
+        competing_score = left_score if left_score is not None else 2
+        if right_score is not None and right_score < 0 and competing_score - right_score >= 2:
+            return following.speaker, "grammar_right", left_score, right_score
+    return None, None, left_score, right_score
+
+
+def _syntactic_boundary_score(
+    left: Cue, right: Cue, analyzer: SudachiAnalyzer
+) -> int:
+    morphology = analyzer.analyze(left.text + right.text)
+    left_morpheme, right_morpheme, inside = _morphemes_at_boundary(
+        morphology, len(left.text)
+    )
+    score = 0
+    if _is_terminal_predicate(left_morpheme):
+        score += 2
+    if _is_sentence_ending(left.text, left_morpheme):
+        score += 1
+    if _is_new_utterance(right.text, right_morpheme):
+        score += 1
+    if _is_dangling(left_morpheme):
+        score -= 2
+    if inside or _is_strong_connection(right_morpheme):
+        score -= 3
+    return score
+
+
+def _has_competing_activity(
+    cues: list[Cue],
+    start: float,
+    end: float,
+    speaker: str,
+    run_start: int,
+    run_end: int,
+) -> bool:
+    return any(
+        position < run_start or position >= run_end
+        for position, cue in enumerate(cues)
+        if cue.speaker is not None
+        and cue.speaker != speaker
+        and cue.end > start
+        and cue.start < end
+    )
 
 
 def _track_key(speaker: str | None) -> str:

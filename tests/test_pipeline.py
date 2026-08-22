@@ -252,8 +252,8 @@ class PipelineTests(unittest.TestCase):
             )
 
             class FakeTranslator:
-                def __init__(self, config, api_key):
-                    pass
+                def __init__(self, config, api_key, *, audit_path=None):
+                    FakeTranslator.audit_path = audit_path
 
                 def plan_and_translate(self, cues, config, **context):
                     FakeTranslator.joint_context = context
@@ -335,6 +335,7 @@ class PipelineTests(unittest.TestCase):
                 FakeTranslator.joint_context["audit_path"].name,
                 "local-segmentation.json",
             )
+            self.assertEqual(FakeTranslator.audit_path.name, "llm-audit.jsonl")
             upload.assert_not_called()
 
 

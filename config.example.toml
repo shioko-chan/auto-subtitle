@@ -62,13 +62,9 @@ moss_window_search_seconds = 60.0
 # An eight-minute transcript should fit comfortably; this cap prevents a
 # malformed generation from decoding tens of thousands of tokens.
 moss_max_new_tokens = 8192
-# Kept only for compatibility with older configs; MossFormer2 does not use it.
-overlap_embedding_model = "pyannote/wespeaker-voxceleb-resnet34-LM"
 speaker_embedding_backend = "eres2netv2"
 speaker_embedding_model = "iic/speech_eres2netv2_sv_zh-cn_16k-common"
 speaker_embedding_worker_project = "tools/speaker_embedding"
-overlap_separation_model = "MossFormer2_SS_16K"
-overlap_separation_worker_project = "tools/mossformer2"
 singing_model = "MIT/ast-finetuned-audioset-10-10-0.4593"
 device = "cuda:0"
 singing_window_seconds = 5.0
@@ -97,7 +93,6 @@ singing_asr_window_seconds = 12.0
 singing_asr_overlap_seconds = 2.0
 speaker_profiles_dir = "work/speaker-profiles-eres2netv2"
 speaker_match_threshold = 0.40
-speaker_overlap_match_threshold = 0.24
 speaker_match_margin = 0.03
 # Resolve every MOSS anonymous speaker independently. Discard the farthest 15%
 # of segment evidence, then weight retained evidence by up to 10 seconds each.

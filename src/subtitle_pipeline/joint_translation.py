@@ -67,10 +67,19 @@ class CoverageValidationError(RuntimeError):
         patch_start: int,
         patch_end: int,
         preserved: list[JointRecord],
+        *,
+        expected_start: int,
+        expected_end: int,
+        expected_next: int,
+        received_ranges: list[tuple[int, int]],
     ):
         self.patch_start = patch_start
         self.patch_end = patch_end
         self.preserved = preserved
+        self.expected_start = expected_start
+        self.expected_end = expected_end
+        self.expected_next = expected_next
+        self.received_ranges = received_ranges
         super().__init__(message)
 
 
@@ -95,7 +104,9 @@ def run_joint_translation(
     finish_reason: Callable[[object], str | None],
     retry_delay: Callable[[Exception, int], float | None],
     is_nontransient: Callable[[Exception], bool],
-    log_invalid_response: Callable[[str, Exception, object], None],
+    log_invalid_response: Callable[
+        [str, Exception, object, dict[str, object] | None, object], None
+    ],
     local_translate: Callable[[str], str],
 ) -> JointResult:
     ranges = [
@@ -240,7 +251,9 @@ def _request_resilient(
     finish_reason: Callable[[object], str | None],
     retry_delay: Callable[[Exception, int], float | None],
     is_nontransient: Callable[[Exception], bool],
-    log_invalid_response: Callable[[str, Exception, object], None],
+    log_invalid_response: Callable[
+        [str, Exception, object, dict[str, object] | None, object], None
+    ],
     local_translate: Callable[[str], str],
     coverage_patch_attempted: bool = False,
 ) -> list[JointRecord]:
@@ -348,7 +361,9 @@ def _request_window(
     finish_reason: Callable[[object], str | None],
     retry_delay: Callable[[Exception, int], float | None],
     is_nontransient: Callable[[Exception], bool],
-    log_invalid_response: Callable[[str, Exception, object], None],
+    log_invalid_response: Callable[
+        [str, Exception, object, dict[str, object] | None, object], None
+    ],
     local_translate: Callable[[str], str],
 ) -> list[JointRecord]:
     prompt_error: Exception | None = None
@@ -381,6 +396,7 @@ def _request_window(
         if llm.json_mode:
             body["response_format"] = {"type": "json_object"}
         content: object = None
+        response: object = None
         try:
             response = request(body)
             content = response["choices"][0]["message"]["content"]
@@ -410,7 +426,12 @@ def _request_window(
                 len(records),
             )
             return records
-        except (CoverageValidationError, LocalFallbackError):
+        except CoverageValidationError as exc:
+            log_invalid_response(
+                "joint segmentation and translation", exc, content, body, response
+            )
+            raise
+        except LocalFallbackError:
             raise
         except (
             KeyError,
@@ -421,7 +442,9 @@ def _request_window(
             TimeoutError,
             RuntimeError,
         ) as exc:
-            log_invalid_response("joint segmentation and translation", exc, content)
+            log_invalid_response(
+                "joint segmentation and translation", exc, content, body, response
+            )
             if is_nontransient(exc):
                 raise
             delay = retry_delay(exc, transient_attempts + 1)
@@ -801,11 +824,17 @@ def _coverage_error(
         for record in [*prefix[:-1], *suffix[1:]]
     ]
     return CoverageValidationError(
-        f"joint response coverage failed near {expected}; "
-        f"patching relative range [{patch_start},{patch_end})",
+        f"joint response coverage failed: expected=[0,{final}) "
+        f"next={expected} received={[(item.start_id, item.end_id) for item in records][:12]} "
+        f"count={len(records)}; patching relative range "
+        f"[{patch_start},{patch_end})",
         start + patch_start,
         start + patch_end,
         preserved,
+        expected_start=0,
+        expected_end=final,
+        expected_next=expected,
+        received_ranges=[(item.start_id, item.end_id) for item in records],
     )
 
 

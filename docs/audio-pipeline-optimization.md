@@ -124,7 +124,7 @@ peak VRAM, and fallback count before changing concurrency defaults.
 6. Decode source-quality stereo only for song candidate ranges before Demucs.
 7. Stage timing and peak allocated VRAM are logged. `initial_analysis_concurrency=2`
    can overlap MOSS/pyannote and raw AST after a machine-specific memory check; the example
-   remains at `1`. Demucs, MossFormer2, ERes2NetV2 and Qwen remain stage-serialized.
+   remains at `1`. Demucs, ERes2NetV2 and Qwen remain stage-serialized.
 8. Community-1 ordinary diarization is the sole speaker timeline. Clean identity
    candidates are derived by subtracting all multi-speaker intersections per speaker.
 9. Identity matching aggregates all clean evidence for one global anonymous label,
@@ -139,7 +139,7 @@ peak VRAM, and fallback count before changing concurrency defaults.
   preserving the existing timestamp restoration path. A real-video equivalence and
   wall-time benchmark remains required before changing production defaults broadly.
 - Worker restart and a killed main process do not leave unbounded shared memory.
-- MossFormer2 and ERes2NetV2 load once per job rather than once per request.
+- ERes2NetV2 loads once per job rather than once per request.
 - Parallel initial analysis is opt-in and should remain enabled only where measured
   wall time improves without OOM or quality regression.
 - Demucs receives source-quality stereo song ranges rather than the 16 kHz mono

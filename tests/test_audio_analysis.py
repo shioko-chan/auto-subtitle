@@ -16,22 +16,14 @@ from subtitle_pipeline.audio_analysis import (
     _exclude_timeline_regions,
     _extract_audio,
     _mark_overlaps,
-    _maximum_concurrent_speakers,
     _merge_regions,
-    _overlap_spans,
     _run_initial_audio_analysis,
-    _run_mossformer2_worker,
-    _run_overlap_separation,
-    _separated_source_is_usable,
     _singing_evidence_score,
     _singing_regions_from_scores,
-    _subtract_regions,
 )
-from subtitle_pipeline.audio_buffer import AudioBufferPool
 from subtitle_pipeline.config import AudioAnalysisConfig
 from subtitle_pipeline.speakers import (
     _aggregate_profile_distances,
-    _can_embed_region,
     _evenly_spaced,
     _extract_eres2netv2_embeddings,
     _identity_candidates,
@@ -133,6 +125,15 @@ class AudioAnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(candidates[-1].end, 21.8)
         self.assertTrue(all(item.end - item.start <= 10.0 for item in candidates))
 
+    def test_identity_candidates_use_only_nonoverlap_speech(self):
+        regions = [
+            AudioRegion(0, 3, "speech", "A"),
+            AudioRegion(3, 6, "speech", "A", overlap=True),
+            AudioRegion(6, 7, "speech", "A"),
+        ]
+
+        self.assertEqual(_identity_candidates(regions), [regions[0]])
+
     def test_moss_identity_distance_trims_outlier_before_duration_weighting(self):
         evidence = [(np.asarray([1.0, 0.0], dtype=np.float32), 1.0) for _ in range(9)]
         evidence.append((np.asarray([0.0, 1.0], dtype=np.float32), 10.0))
@@ -199,41 +200,6 @@ class AudioAnalysisTests(unittest.TestCase):
             ["MOSS_W000_S01", "MOSS_W000_S02", "MOSS_W000_S01"],
         )
 
-    def test_mossformer_worker_uses_shared_memory_descriptors(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            video = root / "source.mp4"
-            video.write_bytes(b"video")
-            pool = AudioBufferPool(video, root, 1.0)
-            source = pool.add(np.ones(16000, dtype=np.float32), 16000)
-            response = SimpleNamespace(
-                returncode=0,
-                stdout=json.dumps({"items": [{"id": 0}]}),
-                stderr="",
-            )
-            with (
-                patch.object(pool, "main", return_value=source),
-                patch(
-                    "subtitle_pipeline.audio_analysis.subprocess.run",
-                    return_value=response,
-                ) as invoke,
-            ):
-                outputs = _run_mossformer2_worker(
-                    np.zeros((1, 16000), dtype=np.float32),
-                    16000,
-                    [(0, 0.0, 1.0)],
-                    AudioAnalysisConfig(),
-                    root / "debug",
-                    audio_pool=pool,
-                )
-            payload = json.loads(invoke.call_args.kwargs["input"])
-            self.assertIn("audio", payload)
-            self.assertNotIn("input_path", payload["items"][0])
-            self.assertEqual(len(payload["items"][0]["outputs"]), 2)
-            self.assertEqual(len(outputs[0]), 2)
-            self.assertFalse((root / "debug").exists())
-            pool.close()
-
     def test_eres2net_worker_uses_one_shared_audio_batch(self):
         import torch
 
@@ -255,28 +221,6 @@ class AudioAnalysisTests(unittest.TestCase):
             payload["items"], [{"id": 0, "start_sample": 0, "end_sample": 32000}]
         )
         self.assertEqual(embeddings, [[0.1, 0.2]])
-
-    def test_counts_distinct_simultaneous_speakers(self):
-        regions = [
-            AudioRegion(0, 5, "speech", "A"),
-            AudioRegion(1, 4, "speech", "B"),
-            AudioRegion(2, 3, "speech", "C"),
-            AudioRegion(2.5, 6, "speech", "A"),
-        ]
-
-        self.assertEqual(_maximum_concurrent_speakers(regions, 0, 6), 3)
-        self.assertEqual(_maximum_concurrent_speakers(regions, 3, 6), 2)
-
-    def test_rejects_silent_and_tiny_separated_speaker_sources(self):
-        segment = type("Segment", (), {"start": 0.1, "end": 0.4})()
-        self.assertFalse(_separated_source_is_usable(np.zeros(8000), [segment], 16000))
-        tiny = type("Segment", (), {"start": 0.1, "end": 0.108})()
-        self.assertFalse(
-            _separated_source_is_usable(np.full(8000, 0.01), [tiny], 16000)
-        )
-        self.assertTrue(
-            _separated_source_is_usable(np.full(8000, 0.01), [segment], 16000)
-        )
 
     def test_audio_is_reextracted_when_analysis_cache_is_invalid(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -585,143 +529,6 @@ class AudioAnalysisTests(unittest.TestCase):
         )
         self.assertEqual(singing, [AudioRegion(0, 20, "singing", confidence=0.8)])
         self.assertEqual(ambiguous, [])
-
-    def test_limits_separation_to_padded_overlap_region(self):
-        regions = [
-            AudioRegion(0, 10, "speech", "A"),
-            AudioRegion(4, 6, "speech", "B"),
-            AudioRegion(12, 14, "speech", "A"),
-        ]
-        self.assertEqual(_overlap_spans(regions, 20), [(3.25, 6.75)])
-        self.assertEqual(
-            _subtract_regions(regions[0], [(3.25, 6.75)]),
-            [
-                AudioRegion(0, 3.25, "speech", "A"),
-                AudioRegion(6.75, 10, "speech", "A"),
-            ],
-        )
-
-    def test_three_speaker_overlap_skips_two_source_separator(self):
-        regions = _mark_overlaps(
-            [
-                AudioRegion(1, 4, "speech", "A"),
-                AudioRegion(1.5, 3.5, "speech", "B"),
-                AudioRegion(2, 3, "speech", "C"),
-            ]
-        )
-        with patch(
-            "subtitle_pipeline.audio_analysis._run_mossformer2_worker"
-        ) as worker:
-            result = _run_overlap_separation(
-                np.zeros((1, 80000), dtype=np.float32),
-                16000,
-                regions,
-                AudioAnalysisConfig(),
-                Path("unused"),
-            )
-
-        worker.assert_not_called()
-        self.assertEqual(result, regions)
-
-    def test_mossformer_replaces_overlap_only_when_both_tracks_are_usable(self):
-        import soundfile as sf
-
-        regions = _mark_overlaps(
-            [
-                AudioRegion(0, 5, "speech", "A"),
-                AudioRegion(2, 4, "speech", "B"),
-            ]
-        )
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            paths = [root / "source-0.wav", root / "source-1.wav"]
-            for path in paths:
-                sf.write(path, np.full(56000, 0.01, dtype=np.float32), 16000)
-            with patch(
-                "subtitle_pipeline.audio_analysis._run_mossformer2_worker",
-                return_value={0: paths},
-            ):
-                result = _run_overlap_separation(
-                    np.zeros((1, 80000), dtype=np.float32),
-                    16000,
-                    regions,
-                    AudioAnalysisConfig(),
-                    root,
-                )
-
-        separated = [region for region in result if region.source_path]
-        self.assertEqual(len(separated), 2)
-        self.assertTrue(all(region.overlap for region in separated))
-        self.assertEqual(
-            {region.speaker for region in separated},
-            {"OVERLAP_00000_SOURCE_0", "OVERLAP_00000_SOURCE_1"},
-        )
-
-    def test_mossformer_empty_track_falls_back_to_original_regions(self):
-        import soundfile as sf
-
-        regions = _mark_overlaps(
-            [
-                AudioRegion(0, 5, "speech", "A"),
-                AudioRegion(2, 4, "speech", "B"),
-            ]
-        )
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            voiced = root / "voiced.wav"
-            silent = root / "silent.wav"
-            sf.write(voiced, np.full(56000, 0.01, dtype=np.float32), 16000)
-            sf.write(silent, np.zeros(56000, dtype=np.float32), 16000)
-            with patch(
-                "subtitle_pipeline.audio_analysis._run_mossformer2_worker",
-                return_value={0: [voiced, silent]},
-            ):
-                result = _run_overlap_separation(
-                    np.zeros((1, 80000), dtype=np.float32),
-                    16000,
-                    regions,
-                    AudioAnalysisConfig(),
-                    root,
-                )
-
-        self.assertEqual(result, regions)
-
-    def test_separated_overlap_track_can_be_embedded_but_raw_overlap_cannot(self):
-        self.assertTrue(
-            _can_embed_region(
-                AudioRegion(0, 20, "speech", "A", overlap=True, source_path="a.wav")
-            )
-        )
-        self.assertFalse(
-            _can_embed_region(AudioRegion(0, 10, "speech", "A", overlap=True))
-        )
-
-    def test_short_overlap_fragments_are_aggregated_for_identity(self):
-        regions = [
-            AudioRegion(
-                10.0,
-                10.6,
-                "speech",
-                "OVERLAP_A",
-                overlap=True,
-                source_path="a.wav",
-                source_offset=10.0,
-            ),
-            AudioRegion(
-                10.8,
-                11.4,
-                "speech",
-                "OVERLAP_A",
-                overlap=True,
-                source_path="a.wav",
-                source_offset=10.0,
-            ),
-        ]
-
-        candidates = _identity_candidates(regions)
-
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual((candidates[0].start, candidates[0].end), (10.0, 11.4))
 
     def test_channel_metadata_identifies_solo_member(self):
         self.assertEqual(
