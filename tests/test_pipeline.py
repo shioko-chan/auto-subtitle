@@ -8,6 +8,7 @@ from subtitle_pipeline.config import AppConfig, UploadConfig
 from subtitle_pipeline.media import DownloadResult
 from subtitle_pipeline.pipeline import (
     _canonicalize_catalog_tags,
+    _japanese_single_word_list,
     _merge_tags,
     _subtitle_evidence,
     _translation_context,
@@ -101,6 +102,30 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(context["characters"][-1]["id"], "example")
         self.assertEqual(context["terms"], {})
+
+    def test_japanese_single_words_include_names_nicknames_and_terms(self):
+        context = {
+            "characters": [
+                {
+                    "canonical": "宫永野乃花",
+                    "source_name": "宮永 ののか",
+                    "aliases": ["Miyanaga Nonoka", "みやなが ののか"],
+                    "short_names": [
+                        {"source": "ののちゃん", "target": "野乃酱"},
+                        {"source": "律", "target": "律"},
+                    ],
+                }
+            ],
+            "terms": {
+                "長い歌曲タイトル": "长歌曲标题",
+                "BanG Dream!": "BanG Dream!",
+            },
+        }
+
+        self.assertEqual(
+            _japanese_single_word_list(context),
+            ["ののちゃん", "みやながののか", "宮永ののか", "長い歌曲タイトル"],
+        )
 
     def test_translation_context_strips_character_rendering_metadata(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -287,7 +312,7 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("pipeline.download", performance["summary"])
             self.assertIn("pipeline.audio_and_asr", performance["summary"])
             self.assertIn(
-                "pipeline.subtitle_planning_and_translation", performance["summary"]
+                "pipeline.joint_segmentation_translation", performance["summary"]
             )
             self.assertIn("pipeline.metadata_translation", performance["summary"])
             self.assertIn("pipeline.render", performance["summary"])
@@ -298,16 +323,17 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("内容摘要", metadata)
             self.assertIn("音乐企划", metadata)
             asr.assert_called_once()
+            self.assertEqual(asr.call_args.args[5], [])
             self.assertEqual(
                 FakeTranslator.joint_context["hard_max_line_units"], 26
             )
             self.assertEqual(
-                FakeTranslator.joint_context["plan_cache_path"].name,
-                "cue-plan-cache.json",
+                FakeTranslator.joint_context["cache_path"].name,
+                "cue-joint-cache.json",
             )
             self.assertEqual(
-                FakeTranslator.joint_context["cache_path"].name,
-                "cue-translation-cache.json",
+                FakeTranslator.joint_context["audit_path"].name,
+                "local-segmentation.json",
             )
             upload.assert_not_called()
 

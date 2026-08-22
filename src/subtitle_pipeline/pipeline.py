@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from importlib import resources
@@ -26,6 +27,7 @@ from .translate import OpenAICompatibleTranslator
 from .upload import upload_to_bilibili
 
 _BUILTIN_GLOSSARY_FILES = ("glossaries/bang-dream.json",)
+_JAPANESE_SCRIPT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,16 @@ def _run_pipeline_stages(
     with stage_metrics("pipeline.download"):
         downloaded = download_youtube(url, job_dir, config.download)
 
+    translation_context = _translation_context(
+        downloaded.metadata, config.llm.glossary_files
+    )
+    japanese_single_word_list = _japanese_single_word_list(translation_context)
+    if japanese_single_word_list:
+        logging.info(
+            "using %d Japanese glossary names as forced-aligner single words",
+            len(japanese_single_word_list),
+        )
+
     with stage_metrics("pipeline.audio_and_asr"):
         source_subtitle = transcribe_with_qwen(
             downloaded.video,
@@ -80,6 +92,7 @@ def _run_pipeline_stages(
             config.asr,
             config.audio_analysis,
             downloaded.metadata,
+            japanese_single_word_list,
         )
 
     sidecar = source_subtitle.with_suffix(".cues.json")
@@ -99,9 +112,6 @@ def _run_pipeline_stages(
     source_title = str(downloaded.metadata.get("title") or "YouTube video")
     source_description = str(downloaded.metadata.get("description") or "")
     youtube_context = _youtube_metadata_context(downloaded.metadata)
-    translation_context = _translation_context(
-        downloaded.metadata, config.llm.glossary_files
-    )
     if asr_evidence:
         translation_context = {
             **translation_context,
@@ -139,18 +149,18 @@ def _run_pipeline_stages(
             len(song_result.reports),
         )
     layout = subtitle_layout(downloaded.video, config.render)
-    with stage_metrics("pipeline.subtitle_planning_and_translation"):
+    with stage_metrics("pipeline.joint_segmentation_translation"):
         joint = translator.plan_and_translate(
             cues,
             config.segmentation,
             translation_context=translation_context,
             max_line_units=layout.max_line_units,
             hard_max_line_units=layout.frame_line_units * 2,
-            plan_cache_path=job_dir / "cue-plan-cache.json",
-            cache_path=job_dir / "cue-translation-cache.json",
+            cache_path=job_dir / "cue-joint-cache.json",
+            audit_path=job_dir / "local-segmentation.json",
         )
     logging.info(
-        "cue planning and ASR-aware fixed translation: "
+        "joint cue segmentation and ASR-aware translation: "
         "%d aligned cues -> %d subtitle cues",
         original_cue_count,
         len(joint.source_cues),
@@ -427,6 +437,39 @@ def _translation_character(character: dict[str, object]) -> dict[str, object]:
     """Keep rendering/training metadata out of the LLM reference payload."""
     allowed = ("id", "canonical", "source_name", "aliases", "short_names")
     return {key: character[key] for key in allowed if key in character}
+
+
+def _japanese_single_word_list(context: dict[str, object]) -> list[str]:
+    values: set[str] = set()
+    characters = context.get("characters", [])
+    if not isinstance(characters, list):
+        return []
+
+    def add(value: object) -> None:
+        if not isinstance(value, str):
+            return
+        normalized = "".join(value.split())
+        if len(normalized) > 1 and _JAPANESE_SCRIPT_RE.search(normalized):
+            values.add(normalized)
+
+    for character in characters:
+        if not isinstance(character, dict):
+            continue
+        add(character.get("source_name"))
+        aliases = character.get("aliases", [])
+        if isinstance(aliases, list):
+            for alias in aliases:
+                add(alias)
+        short_names = character.get("short_names", [])
+        if isinstance(short_names, list):
+            for short_name in short_names:
+                if isinstance(short_name, dict):
+                    add(short_name.get("source"))
+    terms = context.get("terms", {})
+    if isinstance(terms, dict):
+        for source in terms:
+            add(source)
+    return sorted(values)
 
 
 def _validate_translation_glossary(

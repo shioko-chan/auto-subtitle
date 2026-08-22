@@ -19,8 +19,8 @@ from .config import ASRConfig, AudioAnalysisConfig
 from .subtitles import Cue, write_srt
 from .telemetry import stage_metrics
 
-_CACHE_VERSION = 4
-_CUE_SIDECAR_VERSION = 3
+_CACHE_VERSION = 5
+_CUE_SIDECAR_VERSION = 4
 _MIN_RETRY_CHUNK_SECONDS = 15.0
 _MIN_REPETITION_SPAN_CHARACTERS = 160
 _REPETITION_RE = re.compile(r"(.{12,200}?)\1{3,}", re.DOTALL)
@@ -41,7 +41,9 @@ def transcribe_with_qwen(
     config: ASRConfig,
     analysis_config: AudioAnalysisConfig | None = None,
     metadata: dict[str, object] | None = None,
+    japanese_single_word_list: list[str] | None = None,
 ) -> Path:
+    japanese_single_word_list = sorted(set(japanese_single_word_list or []))
     duration = _media_duration(video)
     with AudioBufferPool(video, destination.parent, duration) as audio_pool:
         if analysis_config is not None and analysis_config.enabled:
@@ -62,6 +64,7 @@ def transcribe_with_qwen(
                         analysis_config,
                         analysis,
                         audio_pool,
+                        japanese_single_word_list,
                     )
             except _StaleRuntimeAudio:
                 logging.info(
@@ -85,10 +88,16 @@ def transcribe_with_qwen(
                         analysis_config,
                         analysis,
                         audio_pool,
+                        japanese_single_word_list,
                     )
         with stage_metrics("asr.transcription_total", config.device):
             return _transcribe_unanalyzed(
-                video, destination, config, duration, audio_pool
+                video,
+                destination,
+                config,
+                duration,
+                audio_pool,
+                japanese_single_word_list,
             )
 
 
@@ -98,10 +107,13 @@ def _transcribe_unanalyzed(
     config: ASRConfig,
     duration: float,
     audio_pool: AudioBufferPool,
+    japanese_single_word_list: list[str] | None = None,
 ) -> Path:
     chunk_count = max(1, math.ceil(duration / config.chunk_seconds))
     cache_path = destination.parent / "asr-cache.json"
-    signature = _cache_signature(video, duration, config)
+    signature = _cache_signature(
+        video, duration, config, japanese_single_word_list
+    )
     cache = _load_cache(cache_path, signature)
     cached_chunks = cache["chunks"]
     assert isinstance(cached_chunks, dict)
@@ -129,7 +141,7 @@ def _transcribe_unanalyzed(
             len(missing),
             chunk_count,
         )
-        model = _load_qwen_model(config)
+        model = _load_qwen_model(config, japanese_single_word_list)
     else:
         logging.info("Qwen3-ASR cache complete: %d chunks", chunk_count)
 
@@ -192,6 +204,7 @@ def _transcribe_analyzed(
     analysis_config: AudioAnalysisConfig,
     analysis: AudioAnalysis,
     audio_pool: AudioBufferPool,
+    japanese_single_word_list: list[str] | None = None,
 ) -> Path:
     speech_windows = _speech_asr_windows(analysis, config)
     routed_regions = [
@@ -203,7 +216,9 @@ def _transcribe_analyzed(
     duration = _media_duration(video)
     cache_path = destination.parent / "asr-analysis-cache.json"
     signature = {
-        **_cache_signature(video, duration, config),
+        **_cache_signature(
+            video, duration, config, japanese_single_word_list
+        ),
         "analysis_version": 8,
         "analysis_config": asdict(analysis_config),
         "regions": [_analysis_region_signature(region) for region in regions],
@@ -234,7 +249,9 @@ def _transcribe_analyzed(
         for index in missing
     ):
         raise _StaleRuntimeAudio("missing ephemeral source audio")
-    model = _load_qwen_model(config) if missing else None
+    model = (
+        _load_qwen_model(config, japanese_single_word_list) if missing else None
+    )
     speaker_timeline = _speaker_assignment_timeline(analysis)
     speech_missing = [index for index in missing if regions[index].kind == "speech"]
     for batch_start in range(0, len(speech_missing), config.max_inference_batch_size):
@@ -1415,7 +1432,10 @@ def _repetition_hallucination(text: str) -> tuple[str, int] | None:
     return None
 
 
-def _load_qwen_model(config: ASRConfig) -> Any:
+def _load_qwen_model(
+    config: ASRConfig,
+    japanese_single_word_list: list[str] | None = None,
+) -> Any:
     try:
         import torch
         from qwen_asr import Qwen3ASRModel
@@ -1448,6 +1468,7 @@ def _load_qwen_model(config: ASRConfig) -> Any:
             "dtype": dtype,
             "device_map": config.device,
             "attn_implementation": "sdpa",
+            "japanese_single_word_list": japanese_single_word_list or [],
         },
     )
 
@@ -1497,6 +1518,11 @@ def _result_to_cues(
                         owned_start,
                         min(keep_end, max(owned_start + 0.08, owned_end)),
                         fragment.strip(),
+                        pos=(
+                            str(item.pos)
+                            if getattr(item, "pos", None) is not None
+                            else None
+                        ),
                     )
                 )
     return cues
@@ -1553,13 +1579,17 @@ def _extract_audio_chunk(
 
 
 def _cache_signature(
-    video: Path, duration: float, config: ASRConfig
+    video: Path,
+    duration: float,
+    config: ASRConfig,
+    japanese_single_word_list: list[str] | None = None,
 ) -> dict[str, object]:
     return {
         "video_name": video.name,
         "video_size": video.stat().st_size,
         "duration": round(duration, 3),
         "config": asdict(config),
+        "japanese_single_word_list": sorted(set(japanese_single_word_list or [])),
     }
 
 
@@ -1614,6 +1644,7 @@ def _decode_cached_cues(
                     str(value["boundary_hint"])
                     if value.get("boundary_hint")
                     else None,
+                    str(value["pos"]) if value.get("pos") else None,
                 )
             )
     except (KeyError, TypeError, ValueError) as exc:

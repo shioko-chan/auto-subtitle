@@ -203,12 +203,14 @@ class SubtitleRenderTests(unittest.TestCase):
 
         self.assertEqual(result, [RenderCue(0, 2, "一二三四五六\n七八九十甲乙")])
 
-    def test_rejects_cue_exceeding_two_lines(self):
-        with self.assertRaisesRegex(ValueError, "exceeds two lines"):
-            _layout_subtitle_cues(
-                [Cue(0, 1, "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子")],
+    def test_logs_and_keeps_cue_exceeding_two_lines(self):
+        text = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子"
+        with self.assertLogs(level="WARNING"):
+            result = _layout_subtitle_cues(
+                [Cue(0, 1, text)],
                 max_line_units=10,
             )
+        self.assertEqual(result, [RenderCue(0, 1, text)])
 
     def test_ass_uses_video_resolution_and_global_one_pixel_margins(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -235,6 +237,71 @@ class SubtitleRenderTests(unittest.TestCase):
         self.assertNotIn(r"\fs", content)
         self.assertIn("单行字幕", content)
         self.assertIn("Default,,0,0,0,,单行字幕", content)
+
+    def test_ass_renders_japanese_below_chinese_at_eighty_percent_size(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "subtitle.ass"
+            _write_ass(
+                [Cue(1, 2, "早上好", source_text="おはようございます")],
+                path,
+                width=1920,
+                height=1080,
+                font_name="Noto Sans CJK SC",
+                font_size=71,
+                margin_vertical=54,
+                outline=5,
+            )
+            content = path.read_text(encoding="utf-8")
+
+        self.assertIn("Style: Japanese,Noto Sans CJK SC,57,", content)
+        self.assertIn(
+            "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,122,,早上好",
+            content,
+        )
+        self.assertIn(
+            "Dialogue: 0,0:00:01.00,0:00:02.00,Japanese,,0,0,0,,"
+            "おはようございます",
+            content,
+        )
+
+    def test_ass_japanese_uses_matching_character_outline_style(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "subtitle.ass"
+            styles = {
+                "fuji_miyako": CharacterStyle(
+                    "fuji_miyako", "藤都子", "#FFFFFF", "#BC91FF"
+                )
+            }
+            _write_ass(
+                [
+                    Cue(
+                        1,
+                        2,
+                        "都子",
+                        "fuji_miyako",
+                        source_text="ミヤコ",
+                    )
+                ],
+                path,
+                width=1080,
+                height=1920,
+                font_name="Noto Sans CJK SC",
+                font_size=48,
+                margin_vertical=96,
+                outline=2,
+                character_styles=styles,
+            )
+            content = path.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "Style: Speaker_fuji_miyako_Japanese,Noto Sans CJK SC,38,"
+            "&H00FFFFFF,&H000000FF,&H00FF91BC,",
+            content,
+        )
+        self.assertIn(
+            "Speaker_fuji_miyako_Japanese,fuji_miyako,0,0,0,,ミヤコ",
+            content,
+        )
 
     def test_ass_uses_character_color_and_separate_overlap_lanes(self):
         with tempfile.TemporaryDirectory() as temp:

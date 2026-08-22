@@ -12,6 +12,7 @@ from subtitle_pipeline.asr import (
     _analysis_region_signature,
     _analysis_regions,
     _asr_generation_token_limit,
+    _cache_signature,
     _load_cache,
     _record_timeline_is_healthy,
     _remove_text_overlap,
@@ -44,6 +45,49 @@ class QwenASRTests(unittest.TestCase):
 
         self.assertEqual([cue.boundary_hint for cue in hinted], [None, "weak", None])
         self.assertEqual([cue.boundary_hint for cue in mismatched], [None, None, None])
+
+    def test_forced_aligner_pos_is_preserved_on_aligned_units(self):
+        result = SimpleNamespace(
+            text="配信です",
+            time_stamps=SimpleNamespace(
+                items=[
+                    SimpleNamespace(
+                        text="配信", start_time=0.0, end_time=0.5, pos="名詞"
+                    ),
+                    SimpleNamespace(
+                        text="です", start_time=0.5, end_time=0.8, pos="助動詞"
+                    ),
+                ]
+            ),
+        )
+
+        cues = _result_to_cues(
+            result,
+            offset=0.0,
+            keep_start=0.0,
+            keep_end=1.0,
+            final_chunk=True,
+        )
+
+        self.assertEqual([cue.pos for cue in cues], ["名詞", "助動詞"])
+
+    def test_single_word_list_participates_in_asr_cache_signature(self):
+        with tempfile.TemporaryDirectory() as temp:
+            video = Path(temp) / "source.mp4"
+            video.write_bytes(b"video")
+            config = ASRConfig()
+
+            first = _cache_signature(video, 1.0, config, ["藤都子"])
+            reordered = _cache_signature(
+                video, 1.0, config, ["藤都子", "宮永ののか", "藤都子"]
+            )
+            changed = _cache_signature(video, 1.0, config, ["宮永ののか"])
+
+        self.assertEqual(first["japanese_single_word_list"], ["藤都子"])
+        self.assertEqual(
+            reordered["japanese_single_word_list"], ["宮永ののか", "藤都子"]
+        )
+        self.assertNotEqual(first, changed)
 
     def test_speech_batch_transcribes_four_windows_in_one_model_call(self):
         calls = []
@@ -228,7 +272,7 @@ class QwenASRTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "cache.json"
             path.write_text(
-                '{"version":4,"signature":{"speakers":["A","B"]},'
+                '{"version":5,"signature":{"speakers":["A","B"]},'
                 '"chunks":{"0":{"text":"x","cues":[]}}}',
                 encoding="utf-8",
             )

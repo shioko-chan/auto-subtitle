@@ -6,6 +6,7 @@ import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+
 @dataclass(frozen=True)
 class Cue:
     start: float
@@ -14,6 +15,8 @@ class Cue:
     speaker: str | None = None
     kind: str = "speech"
     boundary_hint: str | None = None
+    pos: str | None = None
+    source_text: str | None = None
 
 
 _TIMING_RE = re.compile(

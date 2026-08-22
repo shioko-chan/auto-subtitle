@@ -87,8 +87,15 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.audio_analysis.singing_min_phrase_seconds, 30.0)
             self.assertFalse(config.song_identification.enabled)
             self.assertEqual(config.song_identification.device, "gpu:0")
-            self.assertEqual(config.segmentation.model_window_cues, 600)
+            self.assertEqual(config.segmentation.boundary_score_threshold, 3)
+            self.assertEqual(config.segmentation.local_unit_max_seconds, 6.0)
+            self.assertEqual(config.segmentation.model_window_units, 160)
+            self.assertEqual(config.segmentation.model_window_chars, 8000)
             self.assertEqual(config.llm.max_concurrency, 16)
+            self.assertEqual(
+                config.llm.local_translation_model, "facebook/m2m100_418M"
+            )
+            self.assertEqual(config.llm.local_translation_device, "cpu")
             self.assertEqual(config.render.font_size_ratio, 0.066)
             self.assertEqual(config.render.portrait_font_size_ratio, 0.077)
             self.assertEqual(config.render.max_font_size, 144)
@@ -127,6 +134,15 @@ class ConfigTests(unittest.TestCase):
             path = Path(temp) / "config.toml"
             path.write_text("[llm]\nmax_concurrency = 0\n", encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, "max_concurrency"):
+                load_config(path)
+
+    def test_rejects_empty_local_translation_model(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(
+                '[llm]\nlocal_translation_model = ""\n', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ConfigError, "local_translation_model"):
                 load_config(path)
 
     def test_rejects_invalid_song_ocr_interval(self):

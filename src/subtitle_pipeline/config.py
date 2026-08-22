@@ -123,7 +123,14 @@ class SongIdentificationConfig:
 
 @dataclass(frozen=True)
 class SegmentationConfig:
-    model_window_cues: int = 600
+    boundary_score_threshold: int = 3
+    local_unit_min_fallback_seconds: float = 2.0
+    local_unit_max_seconds: float = 6.0
+    speaker_episode_gap_seconds: float = 2.0
+    model_window_units: int = 160
+    model_window_chars: int = 8000
+    dialogue_context_seconds: float = 5.0
+    dialogue_context_max_chars: int = 4000
 
 
 @dataclass(frozen=True)
@@ -138,6 +145,8 @@ class LLMConfig:
     max_retries: int = 5
     max_concurrency: int = 16
     max_tokens: int = 16384
+    local_translation_model: str = "facebook/m2m100_418M"
+    local_translation_device: str = "cpu"
     json_mode: bool = True
     thinking: str | None = None
     reasoning_effort: str | None = None
@@ -245,6 +254,10 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("llm.max_concurrency must be at least 1")
     if config.llm.max_tokens < 1:
         raise ConfigError("llm.max_tokens must be at least 1")
+    if not config.llm.local_translation_model.strip():
+        raise ConfigError("llm.local_translation_model cannot be empty")
+    if not config.llm.local_translation_device.strip():
+        raise ConfigError("llm.local_translation_device cannot be empty")
     if config.llm.api_style not in {"chat_completions", "responses"}:
         raise ConfigError(
             "llm.api_style must be 'chat_completions' or 'responses'"
@@ -491,8 +504,33 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("song identification search limits must be at least 1")
     if songs.max_page_chars < 1000:
         raise ConfigError("song_identification.max_page_chars must be at least 1000")
-    if config.segmentation.model_window_cues < 1:
-        raise ConfigError("segmentation.model_window_cues must be at least 1")
+    segmentation = config.segmentation
+    if segmentation.boundary_score_threshold < 0:
+        raise ConfigError("segmentation.boundary_score_threshold cannot be negative")
+    if segmentation.local_unit_min_fallback_seconds <= 0:
+        raise ConfigError(
+            "segmentation.local_unit_min_fallback_seconds must be positive"
+        )
+    if (
+        segmentation.local_unit_max_seconds
+        < segmentation.local_unit_min_fallback_seconds
+    ):
+        raise ConfigError(
+            "segmentation.local_unit_max_seconds must be at least "
+            "local_unit_min_fallback_seconds"
+        )
+    if segmentation.speaker_episode_gap_seconds <= 0:
+        raise ConfigError("segmentation.speaker_episode_gap_seconds must be positive")
+    if segmentation.model_window_units < 1:
+        raise ConfigError("segmentation.model_window_units must be at least 1")
+    if segmentation.model_window_chars < 1:
+        raise ConfigError("segmentation.model_window_chars must be at least 1")
+    if segmentation.dialogue_context_seconds < 0:
+        raise ConfigError("segmentation.dialogue_context_seconds cannot be negative")
+    if segmentation.dialogue_context_max_chars < 1:
+        raise ConfigError(
+            "segmentation.dialogue_context_max_chars must be at least 1"
+        )
     if config.render.font_size_ratio <= 0:
         raise ConfigError("render.font_size_ratio must be positive")
     if config.render.portrait_font_size_ratio <= 0:

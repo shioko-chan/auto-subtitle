@@ -1422,8 +1422,8 @@ def _overlap_intersections(regions: list[AudioRegion]) -> list[AudioRegion]:
         for right in ordered[index + 1 :]:
             if right.start >= left.end:
                 break
-            left_label = left.anonymous_speaker or left.speaker
-            right_label = right.anonymous_speaker or right.speaker
+            left_label = left.speaker or left.anonymous_speaker
+            right_label = right.speaker or right.anonymous_speaker
             if not left_label or not right_label or left_label == right_label:
                 continue
             start = max(left.start, right.start)

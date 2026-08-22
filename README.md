@@ -16,8 +16,8 @@ YouTube URL
   → yt-dlp 下载视频和元数据
   → Qwen3-ASR-1.7B 分块转写音轨
   → Qwen3-ForcedAligner-0.6B 生成词级时间戳
-  → LLM 决定 cue 边界
-  → 固定边界翻译为中文字幕，同时处理可能的 ASR 误听
+  → Sudachi 形态分析和本地评分生成候选单元
+  → LLM 单阶段决定 cue 范围并翻译，同时处理可能的 ASR 误听
   → 本地按 ID 恢复时间轴并校验完整覆盖和整帧宽度
   → 用同一 LLM 翻译投稿标题和简介，并生成 B 站标签
   → 输出 SRT/ASS，由稀疏 libass/CUDA/NVENC 或 ffmpeg CPU 后端烧录硬字幕
@@ -122,40 +122,44 @@ max_concurrency = 16
 LLM HTTPS 请求会在系统 CA 基础上补充 `certifi` CA bundle，兼容 uv 独立 Python、
 NixOS、macOS 和 Windows，同时保留 `SSL_CERT_FILE` 等自定义 CA 配置。
 
-字幕使用两阶段 JSON 请求。Cue Planner 先把 forced aligner 单元组成视觉友好的语义 cue，
-只返回 `start_id` 和 `end_id`；程序按范围恢复原始日文，固定边界翻译阶段再按 `cue_id`
-返回简体中文 `text`。翻译模型会被明确告知日文来自 ASR，可能存在误听，并结合术语、
-视频上下文和相邻 cue 还原意图，但不得改变 ID 范围。解析器也容忍 Planner 偶尔返回 NDJSON、裸数组
-或连续 JSON 对象，再统一执行相同校验。程序根据 ID 恢复时间轴，并严格校验范围连续、
-有序、无遗漏、无重复。助词、专名和术语完整性由模型结合上下文判断，不由本地规则禁止
-特定边界。时长、字符数、停顿和窗口边缘都不会成为硬边界；停顿只作为语义判断证据。
+字幕使用单阶段联合 JSON 请求。Forced Aligner 单元先由 SudachiPy SplitMode.A 补充词性、
+活用型和活用形，再依据静音、当前块时长、终止形、句末表达、新话语起始和助词连接状态
+打分，贪心合并为可供模型选择的本地单元。每个 speaker 建立独立时间轨，因此不同人物的
+字幕可以重叠显示；同轨间隔达到 2 秒时建立硬 episode 边界。评分与形态信息写入
+`local-segmentation.json`。
 
-forced aligner 单元会划分为互不重叠的固定窗口，并以 `llm.max_concurrency` 为上限并行
-规划日文 cue。每个多单元窗口至少必须生成两条 cue；只生成一条时视为内容校验失败，立即
-重试同一范围而不缩窗。所有窗口完成后，程序把每个相邻窗口的末条与首条 cue 组成独立
-边界任务，再按提示词预算将多个互不重叠的任务合并请求 LLM 重规划。每个 boundary_id
-独立校验并立即缓存；缺失或非法结果只重试尚未完成的边界。边界修复完成前所有窗口结果
-均为暂定状态，不允许渲染或上传。
+每个 LLM 请求只处理一条 speaker 轨，模型同时选择左闭右开的本地单元范围并翻译，例如
+`{"start_id":0,"end_id":2,"text":"中文字幕"}`。每个窗口都从 0 重新编号，范围必须连续、
+无遗漏、无重复；单单元 cue 合法。响应通过校验后映射回 speaker 轨的全局单元 ID，缓存与
+最终字幕仍使用全局 ID。日文由本地按范围恢复，模型只返回中文。请求附带目标前后 5 秒的只读
+对话上下文、视频信息和术语表，并明确 ASR 可能误听。歌声与 DiCoW `conditioned_speech`
+保持不可拆分的原子单元，但使用相同响应契约。
 
-`cue-plan-cache.json` 保存已完成的暂定窗口、边界修复和最终连续 ID 计划；
-`cue-translation-cache.json` 保存固定 cue 的中文翻译。每个并发请求成功后立即原子写入
-对应缓存；中断重跑时只补缺失规划窗口、缺失边界或未完成翻译的 `cue_id`。
+进入 DiCoW 前，pyannote 匿名标签会先通过 ERes2NetV2 映射为人物；映射到同一人物的
+多个匿名标签合并为一条人物活动掩码，再判断真正的多人重叠。无法确认人物的匿名标签
+仍分别保留，原标签继续写入音频分析缓存供审计。
 
-Planner 的 ID 覆盖、顺序或时间轴不合法时会重跑对应窗口；空译文、目标语言中残留日文
-假名等可定位文本错误不会触发 cue 重规划，而是先以 `pending` 状态缓存。管线把 pending cue
-连同各自原始日文、说话人和已确认相邻字幕合并成定点修复请求，模型只能按 `cue_id` 修改
-译文，不能改变 cue 边界。一次响应中通过校验的翻译会立即
-写回缓存，后续请求只包含尚未修好的 ID；只要仍有 pending cue，就禁止渲染和上传。
+TARGET 以 160 个本地单元或 8000 源字符为上限，靠近上限时选择末段得分最高的本地边界。
+各窗口按 `llm.max_concurrency` 并行，不再运行 Map 边界 Reduce。`cue-joint-cache.json`
+会在每个窗口成功后立即原子更新；签名包含本地单元、speaker 轨、Sudachi/词典版本、评分
+配置、提示词、模型、REFERENCE 和宽度限制。
+
+JSON 等结构错误立即重试一次，再失败便递归缩窗。可无损转换为整数的字符串 ID 会先归一化。
+范围遗漏、重复或乱序时，程序保留最长可信前后缀，并从已经确认的 cue 边界取错误区及前后
+各一条作局部联合补丁，不重发整个窗口。空译文记录轨道、范围和源文后使用本地
+`facebook/m2m100_418M` 日中机翻；残留日文先保护 REFERENCE 中的姓名、昵称和术语，再对
+未保护部分执行同一机翻。模型按需在 CPU 加载。超宽译文只记录实际宽度和限制并继续，
+不再触发 LLM 重试。
 网络错误和超时使用带随机抖动的指数退避；HTTP 5xx 也采用相同策略，但耗尽重试后直接
 终止而不缩小窗口。HTTP 429 优先遵守服务端的 `Retry-After` 响应头，并在规定等待时间
 之后增加少量随机抖动；缺失该响应头时才使用带抖动的指数退避，同样在耗尽后直接终止而
 不缩窗。其他 HTTP 状态视为非暂时性错误，首次遇到便直接终止。本地输出校验失败会立即
 重试。
 
-Planner 输入使用紧凑的 `<speaker>`、`<id>text` 和显著停顿标记，绝对时间只在本地保存。固定规则、
-术语表和视频信息位于请求前缀，窗口数据随后，重试错误放在末尾，以提高 DeepSeek
+联合输入使用紧凑的 `<speaker>` 与 `<id>text`，绝对时间只在本地保存。固定规则、
+术语表和视频信息位于请求前缀，只读对话上下文与窗口数据随后，重试错误放在末尾，以提高 DeepSeek
 上下文缓存命中。日志会记录 `prompt_cache_hit_tokens`、`prompt_cache_miss_tokens`、
-命中率及输出 token；同起始时间单元只发送紧凑的 ID 范围，不枚举所有合法终点。
+命中率及输出 token。
 
 提示词中的建议字数按当前画幅扣除左右安全边距后计算。译文超过一行但不超过整帧宽度
 两倍时，本地保留同一 cue 并自动平衡为两行；超过两倍才拒绝响应。ASS 左右边距统一为
@@ -296,11 +300,18 @@ B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服�
 - `audio_analysis.initial_analysis_concurrency`：`1` 为顺序执行 diarization 与原音 AST；
   在显存和实测耗时允许时可设为 `2`。
 - `audio_analysis.debug_audio_artifacts`：仅调试时持久化分离音轨，默认 `false`。
-- `segmentation.model_window_cues`：每个并行联合请求的目标 forced aligner 单元数，默认
-  `600`；为避免末窗只有一个单元，实际边界可能向相邻窗口调整。
+- `segmentation.boundary_score_threshold`：本地候选边界的贪心切分阈值，默认 `3`。
+- `segmentation.local_unit_max_seconds`：本地单元最长目标，默认 `6` 秒；超过时从 2 秒后的
+  候选中选择最高分边界。
+- `segmentation.model_window_units` / `model_window_chars`：联合请求的本地单元和源字符上限，
+  默认 `160` / `8000`。
+- `segmentation.dialogue_context_seconds` / `dialogue_context_max_chars`：只读对话上下文范围与
+  字符上限，默认 `5` 秒 / `4000` 字符。
 - `llm.max_tokens`：单次 LLM 响应的输出 token 上限，DeepSeek V4 建议设为 `16384`。
 - `llm.max_retries`：同一窗口、边界或定点修复请求的重试次数，建议设为 `5`。
 - `llm.max_concurrency`：窗口和边界 LLM 请求的最大并发数，默认 `16`。
+- `llm.local_translation_model` / `local_translation_device`：空译文和残留日文使用的本地
+  后备机翻模型及设备，默认 `facebook/m2m100_418M` / `cpu`，首次使用时按需加载。
 - `llm.thinking`：DeepSeek V4 的严格 JSON 翻译应设为 `"disabled"`；其他服务不支持该参数时省略。
 - `llm.translate_metadata`：是否翻译 YouTube 标题和简介。
 - `llm.metadata_description_max_chars`：发送给 LLM 的源简介字符上限。

@@ -28,8 +28,22 @@ class ConditionedASRTests(unittest.TestCase):
 
         self.assertEqual(len(result), 2)
         self.assertEqual((result[0].start, result[0].end), (1.5, 5.0))
-        self.assertEqual(result[0].speakers, ("S0", "S1"))
+        self.assertEqual(result[0].speakers, ("A", "B"))
         self.assertEqual((result[1].start, result[1].end), (8.5, 11.0))
+
+    def test_anonymous_labels_resolved_to_same_person_do_not_overlap(self):
+        diarization = [
+            AudioRegion(0, 4, "speech", "A", anonymous_speaker="S0"),
+            AudioRegion(2, 5, "speech", "A", anonymous_speaker="S1"),
+        ]
+
+        result = _conditioned_windows(
+            diarization,
+            10,
+            AudioAnalysisConfig(overlap_context_seconds=1.0),
+        )
+
+        self.assertEqual(result, [])
 
     def test_explicit_long_overlap_threshold_filters_shorter_overlap(self):
         diarization = [

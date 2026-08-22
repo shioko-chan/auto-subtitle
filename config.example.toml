@@ -131,9 +131,14 @@ max_search_results = 5
 max_page_chars = 12000
 
 [segmentation]
-# Target number of forced-aligner units in each independent parallel request.
-# Ranges may be rebalanced so no multi-window job ends with a one-unit window.
-model_window_cues = 600
+boundary_score_threshold = 3
+local_unit_min_fallback_seconds = 2.0
+local_unit_max_seconds = 6.0
+speaker_episode_gap_seconds = 2.0
+model_window_units = 160
+model_window_chars = 8000
+dialogue_context_seconds = 5.0
+dialogue_context_max_chars = 4000
 
 [llm]
 base_url = "https://api.deepseek.com"
@@ -146,6 +151,9 @@ timeout_seconds = 120
 max_retries = 5
 max_concurrency = 16
 max_tokens = 16384
+# Loaded lazily only when an LLM cue is empty or still contains Japanese kana.
+local_translation_model = "facebook/m2m100_418M"
+local_translation_device = "cpu"
 # Joint subtitles and metadata use json_object.
 # Set false if an OpenAI-compatible provider rejects response_format=json_object.
 json_mode = true

@@ -48,6 +48,7 @@ class RenderCue:
     text: str
     speaker: str | None = None
     kind: str = "speech"
+    source_text: str | None = None
 
 
 def download_youtube(url: str, directory: Path, config: DownloadConfig) -> DownloadResult:
@@ -378,8 +379,15 @@ def _layout_subtitle_cues(
             display = _strip_render_terminal_punctuation(segment)
             width = text_display_width(display)
             if width > hard_limit * 2 + 1e-9:
-                raise ValueError(f"semantic segment for cue {index} exceeds two lines")
-            if width > hard_limit + 1e-9:
+                logging.warning(
+                    "rendering overwide cue without rejection cue=%d "
+                    "width=%.3f two_line_limit=%.3f text=%r",
+                    index,
+                    width,
+                    hard_limit * 2,
+                    display,
+                )
+            elif width > hard_limit + 1e-9:
                 display = _wrap_two_lines(display, hard_limit)
             display_segments.append(display)
             widths.append(width)
@@ -390,7 +398,16 @@ def _layout_subtitle_cues(
                 end = cue.end
             else:
                 end = elapsed + (cue.end - cue.start) * units / total_width
-            rendered.append(RenderCue(elapsed, end, segment, cue.speaker, cue.kind))
+            rendered.append(
+                RenderCue(
+                    elapsed,
+                    end,
+                    segment,
+                    cue.speaker,
+                    cue.kind,
+                    cue.source_text,
+                )
+            )
             elapsed = end
     return rendered
 
@@ -462,11 +479,24 @@ def _write_ass(
         f"{outline},0,2,1,1,"
         f"{margin_vertical},1"
     )
-    styles = [default_style]
+    source_font_size = max(1, round(font_size * 0.8))
+    source_default_style = (
+        f"Style: Japanese,{safe_font_name},{source_font_size},&H00FFFFFF,&H000000FF,"
+        "&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,"
+        f"{outline},0,2,1,1,"
+        f"{margin_vertical},1"
+    )
+    styles = [default_style, source_default_style]
     for character_id, character in sorted((character_styles or {}).items()):
         styles.append(
             f"Style: {_ass_style_name(character_id)},{safe_font_name},{font_size},"
             f"{_ass_color(character.primary_color)},&H000000FF,"
+            f"{_ass_color(character.outline_color)},&H00000000,0,0,0,0,"
+            f"100,100,0,0,1,{outline},0,2,1,1,{margin_vertical},1"
+        )
+        styles.append(
+            f"Style: {_ass_source_style_name(character_id)},{safe_font_name},"
+            f"{source_font_size},{_ass_color(character.primary_color)},&H000000FF,"
             f"{_ass_color(character.outline_color)},&H00000000,0,0,0,0,"
             f"100,100,0,0,1,{outline},0,2,1,1,{margin_vertical},1"
         )
@@ -505,11 +535,28 @@ def _write_ass(
             if speaker is not None and speaker in (character_styles or {})
             else "Default"
         )
+        source_style_name = (
+            _ass_source_style_name(speaker)
+            if speaker is not None and speaker in (character_styles or {})
+            else "Japanese"
+        )
         event_text = _escape_ass_text(cue.text)
+        source_text = (getattr(cue, "source_text", None) or "").strip()
+        escaped_source_text = _escape_ass_text(source_text)
         is_singing = getattr(cue, "kind", "speech") == "singing"
         if is_singing:
             event_text = r"{\u1}" + event_text
-        event_margin = 0 if lane == 0 else margin_vertical + lane * round(font_size * 1.25)
+        if source_text:
+            source_lines = max(1, len(source_text.splitlines()))
+            source_height = round(source_font_size * 1.2 * source_lines)
+            lane_height = round((font_size + source_font_size) * 1.25)
+            source_margin = 0 if lane == 0 else margin_vertical + lane * lane_height
+            event_margin = (source_margin or margin_vertical) + source_height
+        else:
+            source_margin = 0
+            event_margin = (
+                0 if lane == 0 else margin_vertical + lane * round(font_size * 1.25)
+            )
         start = _ass_timestamp(cue.start)
         end = _ass_timestamp(cue.end)
         events.append(
@@ -518,6 +565,13 @@ def _write_ass(
             f"{style_name},{speaker or ''},0,0,{event_margin},,"
             f"{event_text}"
         )
+        if source_text:
+            events.append(
+                "Dialogue: 0,"
+                f"{start},{end},"
+                f"{source_style_name},{speaker or ''},0,0,{source_margin},,"
+                f"{escaped_source_text}"
+            )
         if is_singing:
             effective_margin = event_margin or margin_vertical
             decoration_y = round(
@@ -567,6 +621,10 @@ def _ass_color(value: str) -> str:
 
 def _ass_style_name(value: str) -> str:
     return "Speaker_" + re.sub(r"[^A-Za-z0-9_]", "_", value)
+
+
+def _ass_source_style_name(value: str) -> str:
+    return _ass_style_name(value) + "_Japanese"
 
 
 def _ass_timestamp(value: float) -> str:

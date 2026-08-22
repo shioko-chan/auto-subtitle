@@ -56,13 +56,13 @@ flowchart TD
     AB --> AC
 
     AC --> AD{源单元类型}
-    AD -->|普通讲话| AE[日文 Cue Planner Map + Reduce<br/>并行规划并修复窗口边界]
-    AD -->|DiCoW 重叠讲话| AY[保留 DiCoW 段级边界]
-    AD -->|歌唱| AX[保留歌曲路径的句级边界]
-    AE --> AF[固定边界中文翻译<br/>同时处理可能的 ASR 误听]
+    AD -->|普通讲话| AE[Sudachi 形态分析 + 本地边界评分<br/>按 speaker 建立独立时间轨]
+    AD -->|DiCoW 重叠讲话| AY[保留不可拆分的 DiCoW 原子单元]
+    AD -->|歌唱| AX[保留不可拆分的歌唱原子单元]
+    AE --> AF[单阶段 LLM 划句 + 翻译<br/>左闭右开范围]
     AY --> AF
     AX --> AF
-    AF --> AG[定点修复假名残留等<br/>完整性与宽度校验]
+    AF --> AG[同轨局部联合修复<br/>完整性与宽度校验]
 
     AG --> AH[source.semantic.srt<br/>translated.zh-CN.srt]
     AH --> AI[翻译标题、简介并生成标签]
@@ -165,12 +165,14 @@ ordinary diarization 中真实同时讲话达到 `0.5` 秒时，管线把重叠�
 30 秒。
 
 DiCoW 输出按 speaker 分路的**段级**日文文本与时间，不经过 Qwen Forced Aligner。
-这些段落标记为 `conditioned_speech`，其句级边界直接固定，不进入 Cue Planner：
+这些段落标记为 `conditioned_speech`，并作为联合翻译中的不可拆分原子单元：
 
+- 在建立 DiCoW 窗口前，先将 ERes2NetV2 映射到同一人物的多个 pyannote 匿名标签合并为
+  一条人物活动掩码；重叠判断和条件转写使用人物 ID，原匿名标签仅保留作审计。
 - DiCoW 正常时，用其分路结果替换相应 speaker 的局部 Qwen 基线。
 - DiCoW 遗漏某个活跃 speaker 时，保留该 speaker 的 Qwen 基线。
 - DiCoW 出现强重复循环时，丢弃异常结果并保留 Qwen 基线。
-- 正常 DiCoW 段直接进入固定边界翻译，翻译模型结合术语和相邻 cue 处理可能的误听，
+- 正常 DiCoW 段直接进入联合翻译，翻译模型结合术语和相邻 cue 处理可能的误听，
   但不能合并或拆分 DiCoW 时间段。
 
 当前 DiCoW worker 尚未启用 token timestamp，因此不能把其文本描述为词级对齐结果。
@@ -202,74 +204,63 @@ LLM 综合以下证据判断歌名：
 匹配歌词，但只有 LLM 判断搜索歌词与实际 ASR 内容吻合时才校正歌词。单首识别失败只
 保留原 ASR 并记录警告，不阻塞其他内容。
 
-## 5. LLM Cue 规划与固定边界翻译
+## 5. 本地分段与联合翻译
 
-Planner 输入不再暴露词素 ID。本地先根据 Qwen 原始标点、相邻词素静音和 speaker 切换
-生成候选短句，再按时间顺序压缩为 `<speaker>` 与带 `｜` 候选分隔符的连续文本。原始标点
-只有在 ASR 文本与 aligner 文本的局部序列可靠匹配时才投影为边界提示，不会重新写入词素
-文本。LLM 只能移动、保留或删除 `｜`，不能改写日文；本地保存字符位置到 aligner 词素的
-映射，并把结果恢复为 ID 范围。边界落在词素内部时向词素末尾取整，使整个词素归入前句。
+普通讲话先按 speaker 建立独立时间轨。`unknown` 使用自己的轨，但已知人物活动会切断
+unknown episode；同一 speaker 的相邻发言间隔达到 2 秒也会建立硬边界。这样 A 可以跨过
+B 的短插话继续组成一句，同时不同人物最终可以拥有相互重叠的字幕时间。
 
-绝对时间只保存在本地，LLM 不能生成或修改时间戳。主处理拆成两个独立阶段：第一阶段只
-调整日文字幕边界；第二阶段翻译已经确认的日文 cue，并在翻译时处理可能的 ASR 误听。
-翻译阶段不能改变边界。首次翻译每批最多 200 条 cue 且紧凑输入不超过 8000 字符，各批
-并发请求；定点修复只重发未通过校验的 cue。
+每个 episode 使用 SudachiPy `SplitMode.A` 分析连续日文，补充词性、活用型和活用形。
+相邻 Forced Aligner 单元的候选边界累计评分：静音 120/250/400/600 ms 分别贡献
+1/2/3/4 分；当前块达到 2 秒加 1，达到 4 秒再加 2；终止形或命令形谓语加 2，终助词、
+句末表达和新话语起始各提供额外证据；悬空助词、非终止活用和词素内部强连接扣分。
+总分达到 3 时贪心切分。若 6 秒仍没有切点，则从当前块 2 秒之后选择最高分边界，分数
+相同取最靠后的一个。Qwen 标点不参与评分。
 
-运行时提示词位于 `src/subtitle_pipeline/prompts/`：
+`local-segmentation.json` 保存每个候选的总分、命中因素、两侧 Sudachi 形态、Nagisa POS
+和最终本地单元范围。Sudachi 或核心词典不可用时直接终止，不静默退化。
 
-- `cue-planner.md`：并行 Map 的日文 cue 规划；
-- `cue-boundary-repair.md`：相邻 Map 窗口的人工边界修复；
-- `fixed-translation.md`：固定边界后的中文翻译、ASR 误听处理与定点修复。
+LLM 使用单阶段划句与翻译。每个请求只覆盖一条 speaker 轨，TARGET 采用紧凑格式：
 
-只有各文档 `SYSTEM_PROMPT`、`USER_PROMPT` 标记之间的内容会发给 LLM；动态数据使用
-`{{PLACEHOLDER}}`。加载器严格检查占位符，模板实际内容的哈希也属于缓存签名，修改后
-重跑不会误用旧提示词产生的规划或翻译缓存。
+```text
+DIALOGUE_CONTEXT:
+<speaker_b>只读的邻近发言
 
-### 日文 Cue Planner Map
+TARGET:
+<speaker_a>
+<0>本地日文单元
+<1>下一个本地日文单元
+```
 
-- 本地以 `。！？：`、至少 500 ms 静音和 speaker 切换作为强候选，以 `、` 和
-  250–500 ms 静音作为弱候选。显示宽度不参与本地候选生成，由 LLM 负责按预算调整。
-- Map 窗口只在候选短句边界结束，并把相邻短句打包到约 600 个源单元；不会为了恰好达到
-  600 而从候选短句内部硬切。
-- 最多 16 个窗口并行请求。
-- 仅连续讲话区间进入 Planner；`singing` cue 保留歌曲路径给出的句级边界，直接进入固定
-  边界翻译。Planner 窗口和 Reduce 都不会跨越歌曲边缘。
-- LLM 根据语义和 speaker 证据规划自然、可读的日文字幕。日文 cue 的显示预算为中文单行预算的
-  `1.25` 倍；本地只在日文 cue 超过该目标的 `1.25` 倍（即中文单行预算的 `1.5625`
-  倍）时拒绝。中文翻译与最终渲染仍使用原单行及硬上限，不随日文规划放宽。
-- Planner 不接收视频上下文、人物或术语 REFERENCE；这些信息只在固定边界翻译阶段使用。
-- LLM 只返回 `segmented_text`；删除其中全部 `｜` 后必须与输入逐字一致，否则立即拒绝。
-- 程序将分隔符字符位置映射回 aligner 单元，再恢复 `start_id`、`end_id` 和原始日文。
-- 内容校验失败立即重试一次，随后递归缩小窗口；HTTP 429/5xx 不缩窗。
+Context 按真实时间排列，覆盖目标前后各 5 秒且最多 4000 字符；超限时优先保留最近内容。
+TARGET 最多 160 个本地单元或 8000 个源字符，触及上限时在末段选择评分最高的边界作为
+硬窗口边缘，不再运行 Boundary Reduce。
 
-### 日文 Cue Planner Reduce
+模型同时选择自然 cue 范围并翻译，返回左闭右开的 JSON：
 
-Map 窗口互不重叠，因此窗口边缘只是暂定边界。所有 Map 完成后，每对相邻窗口取左窗
-最后一条和右窗第一条组成一个独立 boundary 任务。程序按提示词预算把多个互不重叠的
-任务合并到同一请求中，只发送一次固定规则；模型按 `boundary_id` 分别返回
-`segmented_text`。Reduce 与 Map 使用同一套文本不变校验和字符到词素映射，也不接收
-REFERENCE。每个边界独立校验并立即缓存，缺失或非法结果只重试未完成项，连续失败时再
-拆小批次。缩窗产生的新内部边界也执行同样的 Reduce，不把计算窗口边缘变成最终字幕边界。
+```json
+{"cues":[{"start_id":0,"end_id":2,"text":"中文字幕"}]}
+```
 
-### 固定边界翻译与定点修复
+每个请求窗口都使用从 0 开始的相对 ID；范围必须连续、无遗漏、无重复地覆盖 TARGET，且
+`end_id = start_id + 1` 合法。校验成功后相对 ID 映射回 speaker 轨全局 ID，缓存和最终字幕
+仍保存全局 ID。日文原文由本地按范围恢复，模型不能回传或修改日文；ASR 纠错只反映在中文译文。`singing` 与
+`conditioned_speech` 各自作为不可拆分、不可跨越的单单元 TARGET，但仍使用同一契约。
 
-最终 cue 按 `cue_id` 组成独立并行批次。翻译请求包含原始 ASR 日文、speaker、相邻 cue、
-视频上下文和术语，并明确说明源文本可能含同音词、人名、漏词或重复等误听。模型结合
-证据还原意图后直接输出中文，只能返回 `cue_id` 与 `text`，不能改变、合并或拆分 ID 范围。
-空译文和日文假名残留等错误先缓存为 `pending`，后续请求只补失败的 `cue_id`；成功 cue
-立即写入缓存。DiCoW 段绕过 Planner，并以自身文本直接进入翻译请求；同时间 Qwen 混合
-文本仅用于本地异常回退和审计，不重复发送给翻译模型。
+JSON 等结构错误立即重试一次，再失败便递归缩窗。整数形式的字符串 ID 会先归一化。范围
+遗漏、重复、乱序或结尾未覆盖时，程序计算最长可信前缀和后缀，从已确认 cue 边界取错误区
+及前后各一条作为局部补丁；补丁成功后覆盖该区，窗口其余结果保持不变。
 
-ID 缺失、重复、越界或时间轴无效只属于 Planner 校验，必须重做相应规划窗口。翻译阶段
-若固定 cue 无法在硬宽度内给出合格中文则停止，不会为了修译文悄悄重规划时间轴。
+空译文不会重试 LLM：程序记录轨道、全局单元范围和源文，再调用按需加载的本地
+`facebook/m2m100_418M` 日中机翻。译文残留日文时，先把 REFERENCE 中的姓名、昵称和术语
+切出保护，再仅机翻未保护部分并拼回。默认在 CPU 推理，避免与 ASR 争用显存。超宽译文
+记录实际宽度、限制和文本后照常进入字幕，不再触发重试。网络超时、HTTP 429 和 5xx 沿用
+Retry-After 或带 jitter 的指数退避，耗尽后直接终止且不缩窗；HTTP 400、401、403 等
+非暂时错误立即终止。
 
-译文建议宽度按画幅、标准字号和安全边距计算。超过建议宽度但仍能放进整帧时允许保持
-一行；超过整帧一行宽度但不超过两倍时，渲染阶段平衡成两行；超过整帧两倍宽度则拒绝。
-任何 pending、ID 覆盖或时间轴错误都会阻止渲染与上传。
-
-网络超时、连接错误、HTTP 429 和 5xx 使用带 jitter 的退避；429 优先遵守
-`Retry-After`。HTTP 400、401、403 等非暂时性错误立即终止。本地内容校验失败不等待
-退避。
+运行时唯一字幕提示词为 `src/subtitle_pipeline/prompts/joint-segment-translate.md`。模板哈希、
+本地单元、评分配置、Sudachi/词典版本、本地机翻模型、LLM、REFERENCE 和显示宽度都进入
+缓存签名。
 
 ## 6. 字幕、元数据与渲染
 
@@ -305,8 +296,8 @@ ID 缺失、重复、越界或时间轴无效只属于 Planner 校验，必须�
 | `conditioned-asr-cache.json` | DiCoW 重叠分路结果 | 全部重叠窗口签名 |
 | `song-ocr-cache.json` | 每首歌的 OCR 候选 | 歌曲集合签名 |
 | `song-identification-cache.json` | 歌名、来源与歌词对齐报告 | 歌曲集合签名 |
-| `cue-plan-cache.json` | 日文 Map、边界 Reduce 与最终 ID 计划 | 单窗、单边界 |
-| `cue-translation-cache.json` | 固定边界中文结果与 pending 状态 | 单 cue ID |
+| `local-segmentation.json` | 本地边界评分、Sudachi 形态与 speaker 轨 | 整个源时间轴 |
+| `cue-joint-cache.json` | 联合划句翻译窗口与最终结果 | 单 speaker 窗口 |
 | `manifest.json` | 最终产物与上传完成状态 | 整个作业 |
 
 缓存签名包含相关模型、配置、源时间轴和提示词版本。签名变化时不会误用旧结果；成功结果
@@ -334,6 +325,7 @@ ID 缺失、重复、越界或时间轴无效只属于 Planner 校验，必须�
 - Qwen ASR 与 Forced Aligner：`src/subtitle_pipeline/asr.py`
 - DiCoW 重叠修复：`src/subtitle_pipeline/conditioned_asr.py`
 - 歌名识别：`src/subtitle_pipeline/song_identification.py`
-- Cue 规划与固定边界翻译：`src/subtitle_pipeline/translate.py`
+- 本地候选分段：`src/subtitle_pipeline/local_segmentation.py`
+- 联合划句与翻译：`src/subtitle_pipeline/joint_translation.py`
 - ASS 与视频渲染：`src/subtitle_pipeline/media.py`
 - Bilibili 投稿：`src/subtitle_pipeline/upload.py`

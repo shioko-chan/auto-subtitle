@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "certifi>=2025.1.31",
+    "SudachiDict-core>=20250515",
+    "SudachiPy>=0.6.10",
     "yt-dlp[default,curl-cffi]>=2025.1.15",
 ]
 
@@ -18,8 +20,10 @@ asr = [
     "demucs>=4,<5",
     "librosa>=0.11,<1",
     "pyannote-audio>=4,<5",
-    "qwen-asr>=0.0.6,<0.1",
+    "qwen-asr @ git+https://github.com/shioko-chan/Qwen3-ASR.git@013c382687fc7a5b862f851e10ecb6611977b340",
     "speechbrain>=1,<2",
+    "sentencepiece>=0.2,<1",
+    "transformers>=4.57,<5",
 ]
 
 [project.scripts]
@@ -27,6 +31,9 @@ subtitle-pipeline = "subtitle_pipeline.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/subtitle_pipeline"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

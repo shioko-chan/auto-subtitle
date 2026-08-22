@@ -14,7 +14,7 @@ from .subtitles import Cue
 
 logger = logging.getLogger(__name__)
 
-_CACHE_VERSION = 3
+_CACHE_VERSION = 4
 _MAX_WINDOW_SECONDS = 30.0
 _CONDITIONED_CUE_KIND = "conditioned_speech"
 
@@ -214,7 +214,7 @@ def _expand_overlap(
             min(end, region.end),
             "speech",
             region.speaker,
-            anonymous_speaker=region.anonymous_speaker or region.speaker,
+            anonymous_speaker=region.anonymous_speaker,
         )
         for region in diarization
         if region.end > start and region.start < end and region.speaker
@@ -222,9 +222,9 @@ def _expand_overlap(
     speakers = tuple(
         sorted(
             {
-                region.anonymous_speaker or region.speaker
+                _condition_label(region)
                 for region in turns
-                if region.anonymous_speaker or region.speaker
+                if _condition_label(region)
             }
         )
     )
@@ -299,7 +299,7 @@ def _window_payload(window: ConditionedWindow) -> dict[str, object]:
             {
                 "start": region.start,
                 "end": region.end,
-                "speaker": region.anonymous_speaker or region.speaker,
+                "speaker": _condition_label(region),
             }
             for region in window.turns
         ],
@@ -310,7 +310,7 @@ def _decode_cues(value: object, windows: list[ConditionedWindow]) -> list[Cue]:
     if not isinstance(value, list):
         raise TypeError("DiCoW worker returned no cues")
     label_to_character = {
-        region.anonymous_speaker or region.speaker: region.speaker
+        _condition_label(region): region.speaker
         for window in windows
         for region in window.turns
         if region.speaker
@@ -401,12 +401,17 @@ def _replace_windows(
 def _simultaneous_speakers(window: ConditionedWindow, timestamp: float) -> int:
     return len(
         {
-            turn.anonymous_speaker or turn.speaker
+            _condition_label(turn)
             for turn in window.turns
             if turn.start <= timestamp <= turn.end
-            and (turn.anonymous_speaker or turn.speaker)
+            and _condition_label(turn)
         }
     )
+
+
+def _condition_label(region: AudioRegion) -> str | None:
+    """Use resolved identity for DiCoW, retaining anonymous labels for audit."""
+    return region.speaker or region.anonymous_speaker
 
 
 def _load_cache(path: Path, signature: dict[str, object]) -> list[Cue] | None:
