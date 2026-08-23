@@ -279,7 +279,7 @@ class JointTranslationTests(unittest.TestCase):
             self.assertEqual(mocked.call_count, 2)
             self.assertTrue(audit.is_file())
             self.assertEqual(
-                json.loads(cache.read_text(encoding="utf-8"))["version"], 6
+                json.loads(cache.read_text(encoding="utf-8"))["version"], 7
             )
 
             cached = OpenAICompatibleTranslator(LLMConfig(max_concurrency=2), "secret")
@@ -369,6 +369,16 @@ class JointTranslationTests(unittest.TestCase):
         self.assertEqual(
             _window_ranges(units, SegmentationConfig()), [(0, 1), (1, 2), (2, 3)]
         )
+
+    def test_window_never_crosses_same_speaker_episode_gap(self):
+        units = (
+            LocalUnit("A", 0, (0,), 10.0, 10.5, "なんか", "A", "speech"),
+            LocalUnit("A", 1, (1,), 10.8, 11.2, "少し", "A", "speech"),
+            LocalUnit("A", 2, (2,), 1011.0, 1011.5, "嬉しい", "A", "speech"),
+        )
+        config = SegmentationConfig(speaker_episode_gap_seconds=2.0)
+
+        self.assertEqual(_window_ranges(units, config), [(0, 2), (2, 3)])
 
     def test_window_limit_chooses_strongest_recent_boundary(self):
         units = tuple(

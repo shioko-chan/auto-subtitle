@@ -22,7 +22,7 @@ from .prompt_templates import (
 from .subtitles import Cue, TimedTextUnit, text_display_width, timed_text_units
 from .telemetry import stage_metrics
 
-_CACHE_VERSION = 6
+_CACHE_VERSION = 7
 _CONTENT_ATTEMPTS = 2
 _PROMPT_NAME = "joint-segment-translate.md"
 _KANA_FRAGMENT_RE = re.compile(r"[\u3040-\u30ff]+")
@@ -594,6 +594,12 @@ def _window_ranges(
         limit_hit = False
         while end < len(units):
             if end > start and units[end].kind in {"singing", "conditioned_speech"}:
+                break
+            if (
+                end > start
+                and units[end].start - units[end - 1].end
+                >= config.speaker_episode_gap_seconds
+            ):
                 break
             next_chars = characters + len(units[end].text)
             if end > start and (
