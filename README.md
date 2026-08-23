@@ -60,12 +60,12 @@ mask 仅在字幕画面变化时上传，并由 CUDA 直接混合到 NV12 帧后
 失败即停止，设为 `cpu` 可禁用该后端。Turing 显卡不支持 AV1 NVDEC，因此下载默认优先
 VP9/H.264，已缓存的 AV1 视频仍可经 CPU 回退处理。
 
-启用 `[song_identification]` 后，管线只在每次检测到开唱的前后短窗口抽帧，使用
-PaddleOCR 聚合稳定的日英文字，再把 OCR、报幕 ASR、简介歌单和歌唱 ASR 交给
-DeepSeek。模型可通过受限的 `ddgs` 搜索与 `trafilatura` 页面提取工具核验歌名和歌词；
-网页正文只作为不可信证据。PaddleOCR 运行在 `tools/song_ocr` 的独立 uv 环境中，避免
-其 Paddle/CUDA 依赖与 Qwen 的 PyTorch 环境冲突；搜索工具同样运行在
-`tools/song_search` 的独立锁定环境中。首次启用会下载工具环境和 OCR 模型。
+启用 `[song_identification]` 后，管线优先用歌唱 ASR 在本地正式歌词库中做连续字符锚点
+匹配；未命中才由独立 `ddgs` worker 搜索受支持歌词站并解析结构化完整歌词。搜歌与匹配
+不调用 LLM，ASR、call 和未发行歌曲不会写入歌词库。匹配成功后在持久化的 Demucs 人声轨
+上切成不超过 20 秒的窗口，由 pySHIRO 生成音素时间；译词优先复用库内官方或外部翻译，
+缺失时才使用歌词专用 LLM 并写回库中。PaddleOCR、搜索和 pySHIRO 均运行在各自锁定的
+worker 环境中。
 原始 `source.qwen3-asr.srt` 始终保留；核验结果写入
 `song-identification-cache.json`，修正版写入 `source.lyrics-corrected.srt`。单首识别
 失败会保留原 ASR 并继续，不会阻塞非歌曲内容。
@@ -130,8 +130,8 @@ NixOS、macOS 和 Windows，同时保留 `SSL_CERT_FILE` 等自定义 CA 配置�
 的字幕可以重叠显示；同轨间隔达到 2 秒时建立硬 episode 边界。逐词人物归属、评分与形态
 信息写入 `local-segmentation.json`。
 
-每个 LLM 请求只处理一条 speaker 轨，模型同时选择左闭右开的本地单元范围并翻译，例如
-`{"start_id":0,"end_id":2,"text":"中文字幕"}`。每个窗口都从 0 重新编号，范围必须连续、
+每个 LLM 请求只处理一条 speaker 轨，模型同时选择左闭右闭的本地单元范围并翻译，例如
+`{"start_id":0,"end_id":2,"text":"中文字幕"}` 表示覆盖 0、1、2。每个窗口都从 0 重新编号，范围必须连续、
 无遗漏、无重复；单单元 cue 合法。响应通过校验后映射回 speaker 轨的全局单元 ID，缓存与
 最终字幕仍使用全局 ID。日文由本地按范围恢复，模型只返回中文。请求附带目标前后 5 秒的只读
 对话上下文、视频信息和术语表，并明确 ASR 可能误听。歌声与 DiCoW `conditioned_speech`

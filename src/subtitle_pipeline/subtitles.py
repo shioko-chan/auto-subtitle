@@ -8,6 +8,13 @@ from pathlib import Path
 
 
 @dataclass(frozen=True)
+class TimedTextUnit:
+    text: str
+    start: float
+    end: float
+
+
+@dataclass(frozen=True)
 class Cue:
     start: float
     end: float
@@ -20,6 +27,35 @@ class Cue:
     speaker_assignment: str | None = None
     speaker_fallback: str | None = None
     speaker_fallback_distance: float | None = None
+    preferred_translation: str | None = None
+    source_units: tuple[TimedTextUnit, ...] = ()
+
+
+def timed_text_units(cue: Cue) -> tuple[TimedTextUnit, ...]:
+    values: list[TimedTextUnit] = []
+    for item in cue.source_units:
+        if isinstance(item, TimedTextUnit):
+            value = item
+        elif isinstance(item, dict):
+            value = TimedTextUnit(
+                str(item["text"]), float(item["start"]), float(item["end"])
+            )
+        elif isinstance(item, (list, tuple)) and len(item) == 3:
+            value = TimedTextUnit(str(item[0]), float(item[1]), float(item[2]))
+        else:
+            continue
+        if value.text and value.end >= value.start:
+            values.append(value)
+    return tuple(values)
+
+
+def cue_from_mapping(value: dict[str, object]) -> Cue:
+    payload = dict(value)
+    raw_units = payload.get("source_units", ())
+    if isinstance(raw_units, (list, tuple)):
+        probe = Cue(0, 0, "", source_units=tuple(raw_units))
+        payload["source_units"] = timed_text_units(probe)
+    return Cue(**payload)
 
 
 _TIMING_RE = re.compile(

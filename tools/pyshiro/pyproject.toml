@@ -1,0 +1,7 @@
+[project]
+name = "subtitle-pipeline-pyshiro-worker"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "pyshiro @ git+https://github.com/wavtechyukky/pyshiro.git@49851cd4701d300eaf310b274f7c3b3e594d3824",
+]

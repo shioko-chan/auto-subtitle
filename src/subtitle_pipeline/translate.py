@@ -19,6 +19,7 @@ import certifi
 from .config import LLMConfig, SegmentationConfig
 from .local_segmentation import build_speaker_tracks
 from .local_translation import LocalJapaneseTranslator
+from .prompt_templates import prompt_system, render_user_prompt
 from .subtitles import Cue
 from .telemetry import stage_metrics
 
@@ -131,6 +132,87 @@ class OpenAICompatibleTranslator:
             local_translate=self.local_translator.translate,
         )
         return CueTranslationResult(result.source_cues, result.translated_cues)
+
+    def translate_lyrics(
+        self,
+        title: str,
+        artist: str,
+        lines: list[str],
+        *,
+        translation_context: dict[str, object] | None = None,
+    ) -> tuple[dict[int, str], str]:
+        """Translate canonical lyric lines without changing their correspondence."""
+        if not lines:
+            return {}, "llm"
+        prompt = render_user_prompt(
+            "lyrics-translate.md",
+            SONG_TITLE=title,
+            ARTIST=artist or "(unknown)",
+            REFERENCE_TEXT=json.dumps(translation_context or {}, ensure_ascii=False),
+            LYRICS_TEXT="\n".join(
+                f"<{index}>{line}" for index, line in enumerate(lines)
+            ),
+        )
+        body: dict[str, object] = {
+            "model": self.config.model,
+            "temperature": 0.2,
+            "max_tokens": self.config.max_tokens,
+            "messages": [
+                {"role": "system", "content": prompt_system("lyrics-translate.md")},
+                {"role": "user", "content": prompt},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+        if self.config.thinking:
+            body["thinking"] = {"type": self.config.thinking}
+        last_error: Exception | None = None
+        for attempt in range(1, self.config.max_retries + 1):
+            response: object = None
+            content: object = None
+            try:
+                response = self._request(body)
+                content = response["choices"][0]["message"]["content"]
+                parsed = _parse_json_object(content)
+                values = parsed.get("lines")
+                if not isinstance(values, list):
+                    raise ValueError("lyrics response requires a lines array")
+                translated: dict[int, str] = {}
+                for value in values:
+                    if not isinstance(value, dict):
+                        raise ValueError("lyrics response line is not an object")
+                    line_id = value.get("line_id")
+                    text = value.get("text")
+                    if isinstance(line_id, str) and line_id.isdigit():
+                        line_id = int(line_id)
+                    if not isinstance(line_id, int) or not isinstance(text, str):
+                        raise ValueError("invalid lyrics line_id or text")
+                    translated[line_id] = text.strip()
+                if set(translated) != set(range(len(lines))) or any(
+                    not value for value in translated.values()
+                ):
+                    raise ValueError("lyrics translation did not cover every line")
+                return translated, "llm"
+            except Exception as exc:  # noqa: BLE001 - established API retry policy
+                last_error = exc
+                self._log_invalid_response(
+                    "lyrics_translation", exc, content, body, response
+                )
+                if _is_nontransient_http_error(exc):
+                    raise
+                delay = _transient_retry_delay(exc, attempt)
+                if delay is not None:
+                    time.sleep(delay)
+        logging.warning(
+            "lyrics translation exhausted LLM retries; using local machine translation: %s",
+            last_error,
+        )
+        return (
+            {
+                line_id: self.local_translator.translate(line).strip()
+                for line_id, line in enumerate(lines)
+            },
+            "machine",
+        )
 
     def translate_metadata(
         self,

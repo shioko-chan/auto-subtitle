@@ -16,7 +16,7 @@ from .audio_analysis import AudioAnalysis, AudioRegion, analyze_audio
 from .audio_buffer import AudioBuffer, AudioBufferPool, is_shared_audio_uri
 from .commands import require_command, run
 from .config import ASRConfig, AudioAnalysisConfig
-from .subtitles import Cue, write_srt
+from .subtitles import Cue, cue_from_mapping, write_srt
 from .telemetry import stage_metrics
 
 _CACHE_VERSION = 6
@@ -40,6 +40,13 @@ class _SpeakerAssignment:
     reason: str | None
     fallback_speaker: str | None
     fallback_distance: float | None
+
+
+@dataclass(frozen=True)
+class _SongCutCandidate:
+    time: float
+    kind: str
+    energy: float = 0.0
 
 
 def transcribe_with_qwen(
@@ -108,6 +115,107 @@ def transcribe_with_qwen(
             )
 
 
+def transcribe_speech_ranges(
+    video: Path,
+    ranges: list[tuple[int, float, float]],
+    job_dir: Path,
+    config: ASRConfig,
+    japanese_single_word_list: list[str] | None = None,
+) -> dict[int, list[Cue]]:
+    """Re-transcribe in-song speech candidates from the untouched source mix."""
+    if not ranges:
+        return {}
+    duration = _media_duration(video)
+    model = _load_qwen_model(config, japanese_single_word_list)
+    output: dict[int, list[Cue]] = {}
+    chunk_dir = job_dir / "song-speech-asr"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        for cue_id, start, end in ranges:
+            record = _transcribe_range(
+                model,
+                video,
+                chunk_dir,
+                config,
+                core_start=start,
+                core_end=end,
+                media_duration=duration,
+                final_chunk=end >= duration,
+                label=f"song-speech-{cue_id:06d}",
+                validate_timeline=True,
+                empty_speech_audit_path=job_dir / "asr-empty-speech-audit.jsonl",
+            )
+            values = record.get("cues")
+            if isinstance(values, list):
+                output[cue_id] = [
+                    cue_from_mapping(value)
+                    for value in values
+                    if isinstance(value, dict)
+                ]
+    finally:
+        del model
+        _release_cuda()
+    return output
+
+
+def transcribe_singing_ranges(
+    ranges: list[tuple[int, float, float]],
+    job_dir: Path,
+    config: ASRConfig,
+    japanese_single_word_list: list[str] | None = None,
+) -> dict[int, str]:
+    """Recheck suspected lyric gaps on persisted Demucs vocal stems."""
+    if not ranges:
+        return {}
+    manifest_path = job_dir / "vocal-candidates" / "manifest.json"
+    if not manifest_path.is_file():
+        return {}
+    raw_manifests = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifests = [value for value in raw_manifests if isinstance(value, dict)]
+    model = _load_qwen_model(config, japanese_single_word_list)
+    chunk_dir = job_dir / "song-gap-asr"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    output: dict[int, str] = {}
+    try:
+        for gap_id, start, end in ranges:
+            manifest = next(
+                (
+                    value
+                    for value in manifests
+                    if float(value.get("start", -1)) <= start
+                    and float(value.get("end", -1)) >= end
+                ),
+                None,
+            )
+            if manifest is None:
+                continue
+            source = manifest_path.parent / str(manifest["path"])
+            chunk = chunk_dir / f"gap-{gap_id:04d}.wav"
+            _extract_audio_chunk(
+                source,
+                chunk,
+                start=start - float(manifest["start"]),
+                duration=end - start,
+            )
+            try:
+                results = model.transcribe(
+                    audio=str(chunk),
+                    context="",
+                    language=config.language,
+                    return_time_stamps=False,
+                )
+            finally:
+                chunk.unlink(missing_ok=True)
+            if len(results) == 1:
+                text = str(getattr(results[0], "text", "")).strip()
+                if text and not _repetition_hallucination(text):
+                    output[gap_id] = text
+    finally:
+        del model
+        _release_cuda()
+    return output
+
+
 def _transcribe_unanalyzed(
     video: Path,
     destination: Path,
@@ -118,9 +226,7 @@ def _transcribe_unanalyzed(
 ) -> Path:
     chunk_count = max(1, math.ceil(duration / config.chunk_seconds))
     cache_path = destination.parent / "asr-cache.json"
-    signature = _cache_signature(
-        video, duration, config, japanese_single_word_list
-    )
+    signature = _cache_signature(video, duration, config, japanese_single_word_list)
     cache = _load_cache(cache_path, signature)
     cached_chunks = cache["chunks"]
     assert isinstance(cached_chunks, dict)
@@ -223,10 +329,8 @@ def _transcribe_analyzed(
     duration = _media_duration(video)
     cache_path = destination.parent / "asr-analysis-cache.json"
     signature = {
-        **_cache_signature(
-            video, duration, config, japanese_single_word_list
-        ),
-        "analysis_version": 8,
+        **_cache_signature(video, duration, config, japanese_single_word_list),
+        "analysis_version": 9,
         "analysis_config": asdict(analysis_config),
         "regions": [_analysis_region_signature(region) for region in regions],
     }
@@ -256,9 +360,7 @@ def _transcribe_analyzed(
         for index in missing
     ):
         raise _StaleRuntimeAudio("missing ephemeral source audio")
-    model = (
-        _load_qwen_model(config, japanese_single_word_list) if missing else None
-    )
+    model = _load_qwen_model(config, japanese_single_word_list) if missing else None
     speaker_timeline = _speaker_assignment_timeline(analysis)
     speech_missing = [index for index in missing if regions[index].kind == "speech"]
     for batch_start in range(0, len(speech_missing), config.max_inference_batch_size):
@@ -336,11 +438,8 @@ def _transcribe_analyzed(
                 config,
                 region,
                 label=f"{index:05d}",
-                window_seconds=analysis_config.singing_asr_window_seconds,
-                overlap_seconds=analysis_config.singing_asr_overlap_seconds,
-                audio_buffer=_region_audio_buffer(
-                    region, video, audio_pool
-                ),
+                window_config=analysis_config,
+                audio_buffer=_region_audio_buffer(region, video, audio_pool),
             )
         elif region.kind == "ambiguous":
             record = _transcribe_ambiguous_range(
@@ -350,8 +449,7 @@ def _transcribe_analyzed(
                 config,
                 region,
                 index=index,
-                window_seconds=analysis_config.singing_asr_window_seconds,
-                overlap_seconds=analysis_config.singing_asr_overlap_seconds,
+                window_config=analysis_config,
                 audio_pool=audio_pool,
             )
         cached[str(index)] = record
@@ -423,9 +521,7 @@ def _transcribe_analyzed(
     else:
         evidence = []
     write_srt(cues, destination)
-    _write_cue_sidecar(
-        cues, destination.with_suffix(".cues.json"), evidence=evidence
-    )
+    _write_cue_sidecar(cues, destination.with_suffix(".cues.json"), evidence=evidence)
     return destination
 
 
@@ -440,7 +536,10 @@ def _speech_asr_windows(
         return []
     episodes: list[list[tuple[float, float]]] = []
     for span in spans:
-        if episodes and span[0] - episodes[-1][-1][1] <= config.speech_window_max_gap_seconds:
+        if (
+            episodes
+            and span[0] - episodes[-1][-1][1] <= config.speech_window_max_gap_seconds
+        ):
             episodes[-1].append(span)
         else:
             episodes.append([span])
@@ -496,8 +595,7 @@ def _speech_asr_windows(
                         )
                         if (
                             tail_start is not None
-                            and episode_end - tail_start
-                            >= _MIN_RETRY_CHUNK_SECONDS
+                            and episode_end - tail_start >= _MIN_RETRY_CHUNK_SECONDS
                             and _speech_window_density_ok(
                                 tail_start, episode_end, episode, config
                             )
@@ -509,7 +607,9 @@ def _speech_asr_windows(
                 after_target = [end for end in valid if end - cursor >= target]
                 end = (after_target or valid)[0 if after_target else -1]
             windows.append(AudioRegion(round(cursor, 3), round(end, 3), "speech"))
-            following = next((start for start, _ in episode if start >= end - 1e-6), None)
+            following = next(
+                (start for start, _ in episode if start >= end - 1e-6), None
+            )
             cursor = max(end, following) if following is not None else end
     return windows
 
@@ -568,9 +668,7 @@ def _speech_window_density_ok(
     duration = end - start
     if duration <= 0:
         return False
-    speech = sum(
-        max(0.0, min(end, right) - max(start, left)) for left, right in spans
-    )
+    speech = sum(max(0.0, min(end, right) - max(start, left)) for left, right in spans)
     silence = duration - speech
     return (
         silence <= config.speech_window_max_silence_seconds + 1e-6
@@ -708,9 +806,7 @@ def _analysis_regions(analysis: AudioAnalysis) -> list[AudioRegion]:
             merged[-1] = replace(
                 previous,
                 end=max(previous.end, region.end),
-                overlap_seconds=max(
-                    previous.overlap_seconds, region.overlap_seconds
-                ),
+                overlap_seconds=max(previous.overlap_seconds, region.overlap_seconds),
             )
         else:
             merged.append(region)
@@ -761,8 +857,7 @@ def _transcribe_ambiguous_range(
     region: AudioRegion,
     *,
     index: int,
-    window_seconds: float,
-    overlap_seconds: float,
+    window_config: AudioAnalysisConfig,
     audio_pool: AudioBufferPool | None = None,
 ) -> dict[str, object]:
     speech_record: dict[str, object] | None = None
@@ -796,8 +891,7 @@ def _transcribe_ambiguous_range(
             config,
             region,
             label=f"ambiguous-song-{index:05d}",
-            window_seconds=window_seconds,
-            overlap_seconds=overlap_seconds,
+            window_config=window_config,
             audio_buffer=(
                 _region_audio_buffer(region, video, audio_pool)
                 if audio_pool is not None
@@ -807,9 +901,7 @@ def _transcribe_ambiguous_range(
     except RuntimeError as exc:
         song_error = exc
 
-    if speech_record is not None and _record_timeline_is_healthy(
-        speech_record, region
-    ):
+    if speech_record is not None and _record_timeline_is_healthy(speech_record, region):
         speech_record["ambiguous_route"] = "speech"
         logging.info(
             "ambiguous %.3f-%.3fs selected forced-aligned speech",
@@ -834,9 +926,7 @@ def _transcribe_ambiguous_range(
     )
 
 
-def _record_timeline_is_healthy(
-    record: dict[str, object], region: AudioRegion
-) -> bool:
+def _record_timeline_is_healthy(record: dict[str, object], region: AudioRegion) -> bool:
     if not _valid_cached_record(record):
         return False
     if record.get("skipped_empty") is True:
@@ -861,9 +951,7 @@ def _record_timeline_is_healthy(
         return False
     rounded_starts = [round(start, 3) for start in starts]
     if len(rounded_starts) >= 20:
-        most_common = max(
-            rounded_starts.count(start) for start in set(rounded_starts)
-        )
+        most_common = max(rounded_starts.count(start) for start in set(rounded_starts))
         if most_common / len(rounded_starts) >= 0.8:
             return False
     return True
@@ -903,11 +991,22 @@ def _transcribe_song_range(
     region: AudioRegion,
     *,
     label: str,
-    window_seconds: float,
-    overlap_seconds: float,
+    window_config: AudioAnalysisConfig,
     audio_buffer: AudioBuffer | None = None,
 ) -> dict[str, object]:
-    windows = _song_windows(region.start, region.end, window_seconds, overlap_seconds)
+    candidates = _song_cut_candidates(region, audio_buffer, window_config)
+    window_audit: list[dict[str, object]] = []
+    windows = _song_windows(
+        region.start,
+        region.end,
+        window_config.singing_asr_target_seconds,
+        window_config.singing_asr_overlap_seconds,
+        minimum_seconds=window_config.singing_asr_min_seconds,
+        maximum_seconds=window_config.singing_asr_max_seconds,
+        search_seconds=window_config.singing_asr_search_seconds,
+        candidates=candidates,
+        audit=window_audit,
+    )
     texts: list[str] = []
     for window_index, (start, end) in enumerate(windows):
         chunk_path = (
@@ -924,14 +1023,16 @@ def _transcribe_song_range(
             )
         else:
             if chunk_path is None:
-                raise RuntimeError("song ASR requires an audio buffer or chunk directory")
+                raise RuntimeError(
+                    "song ASR requires an audio buffer or chunk directory"
+                )
             _extract_audio_chunk(video, chunk_path, start=start, duration=end - start)
             audio = str(chunk_path)
         try:
             with stage_metrics("asr.singing_chunk", config.device):
                 results = model.transcribe(
                     audio=audio,
-                    context=config.context,
+                    context="",
                     language=config.language,
                     return_time_stamps=False,
                 )
@@ -951,8 +1052,14 @@ def _transcribe_song_range(
     for index, ((start, end), text) in enumerate(zip(windows, texts)):
         if not text:
             continue
-        owned_start = region.start if index == 0 else (windows[index - 1][1] + start) / 2
-        owned_end = region.end if index == len(windows) - 1 else (end + windows[index + 1][0]) / 2
+        owned_start = (
+            region.start if index == 0 else (windows[index - 1][1] + start) / 2
+        )
+        owned_end = (
+            region.end
+            if index == len(windows) - 1
+            else (end + windows[index + 1][0]) / 2
+        )
         cues.append(Cue(owned_start, owned_end, text, region.speaker, "singing"))
     language = "Japanese"
     return {
@@ -961,24 +1068,164 @@ def _transcribe_song_range(
         "language": language,
         "text": "\n".join(texts).strip(),
         "cues": [asdict(cue) for cue in cues],
+        "singing_windows": window_audit,
     }
 
 
 def _song_windows(
-    start: float, end: float, window_seconds: float, overlap_seconds: float
+    start: float,
+    end: float,
+    target_seconds: float,
+    overlap_seconds: float,
+    *,
+    minimum_seconds: float = 20.0,
+    maximum_seconds: float = 38.0,
+    search_seconds: float = 5.0,
+    candidates: list[_SongCutCandidate] | tuple[_SongCutCandidate, ...] = (),
+    audit: list[dict[str, object]] | None = None,
 ) -> list[tuple[float, float]]:
-    if end - start <= window_seconds:
+    duration = end - start
+    if duration <= maximum_seconds:
+        if audit is not None:
+            audit.append({"start": start, "end": end, "cut_reason": "region_end"})
         return [(start, end)]
-    step = window_seconds - overlap_seconds
     windows: list[tuple[float, float]] = []
     cursor = start
-    while cursor < end:
-        window_end = min(end, cursor + window_seconds)
+    while end - cursor > maximum_seconds:
+        latest = min(cursor + maximum_seconds, end - minimum_seconds + overlap_seconds)
+        earliest = cursor + minimum_seconds
+        if end - cursor <= 2 * maximum_seconds - overlap_seconds:
+            earliest = max(earliest, end - maximum_seconds + overlap_seconds)
+        desired = min(cursor + target_seconds, latest)
+        desired = max(earliest, desired)
+        search_start = max(earliest, desired - search_seconds)
+        search_end = min(latest, desired + search_seconds)
+        options = [
+            candidate
+            for candidate in candidates
+            if search_start <= candidate.time <= search_end
+        ]
+        selected = (
+            min(options, key=lambda item: _song_cut_sort_key(item, desired))
+            if options
+            else None
+        )
+        window_end = selected.time if selected is not None else desired
         windows.append((cursor, window_end))
-        if window_end >= end:
-            break
-        cursor += step
+        if audit is not None:
+            audit.append(
+                {
+                    "start": round(cursor, 3),
+                    "end": round(window_end, 3),
+                    "target": round(desired, 3),
+                    "cut_reason": selected.kind if selected is not None else "hard",
+                }
+            )
+        cursor = window_end - overlap_seconds
+    windows.append((cursor, end))
+    if audit is not None:
+        audit.append(
+            {
+                "start": round(cursor, 3),
+                "end": round(end, 3),
+                "cut_reason": "region_end",
+            }
+        )
     return windows
+
+
+def _song_cut_sort_key(
+    candidate: _SongCutCandidate, target: float
+) -> tuple[int, float, float]:
+    priority = {
+        "non_singing_gap": 0,
+        "vocal_energy_valley": 1,
+        "phrase_boundary": 2,
+    }.get(candidate.kind, 3)
+    distance = abs(candidate.time - target)
+    if candidate.kind == "vocal_energy_valley":
+        return priority, candidate.energy, distance
+    return priority, distance, candidate.energy
+
+
+def _song_cut_candidates(
+    region: AudioRegion,
+    audio_buffer: AudioBuffer | None,
+    config: AudioAnalysisConfig,
+) -> list[_SongCutCandidate]:
+    if audio_buffer is None:
+        return []
+    import numpy as np
+
+    local_start = region.start - region.source_offset
+    local_end = region.end - region.source_offset
+    samples = np.asarray(audio_buffer.slice(local_start, local_end), dtype=np.float32)
+    if not len(samples):
+        return []
+    sample_rate = audio_buffer.sample_rate
+    frame_length = min(max(1, round(0.05 * sample_rate)), len(samples))
+    hop_length = min(max(1, round(0.025 * sample_rate)), frame_length)
+    frame_starts = np.arange(0, len(samples), hop_length)
+    frame_ends = np.minimum(frame_starts + frame_length, len(samples))
+    squared_prefix = np.concatenate(
+        ([0.0], np.cumsum(np.square(samples), dtype=np.float64))
+    )
+    rms = np.sqrt(
+        (squared_prefix[frame_ends] - squared_prefix[frame_starts])
+        / (frame_ends - frame_starts)
+    )
+    peak = max(float(rms.max()), 1e-9)
+    low_energy = rms <= peak * (10 ** (-35 / 20))
+    candidates: list[_SongCutCandidate] = []
+    long_gap_seconds = max(0.8, config.singing_phrase_silence_seconds)
+    run_start: int | None = None
+    low_energy_runs: list[tuple[int, int]] = []
+    for index, is_low in enumerate(low_energy):
+        if is_low and run_start is None:
+            run_start = index
+        elif not is_low and run_start is not None:
+            low_energy_runs.append((run_start, index))
+            run_start = None
+    if run_start is not None:
+        low_energy_runs.append((run_start, len(low_energy)))
+    for first_frame, after_last_frame in low_energy_runs:
+        gap_start = frame_starts[first_frame] / sample_rate
+        last_frame = after_last_frame - 1
+        gap_end = min(
+            len(samples) / sample_rate,
+            (frame_starts[last_frame] + frame_length) / sample_rate,
+        )
+        duration = gap_end - gap_start
+        if duration < config.singing_phrase_silence_seconds:
+            continue
+        kind = "non_singing_gap" if duration >= long_gap_seconds else "phrase_boundary"
+        candidates.append(
+            _SongCutCandidate(
+                region.start + (gap_start + gap_end) / 2,
+                kind,
+                -duration,
+            )
+        )
+
+    if len(rms) >= 3:
+        smooth_width = max(1, round(0.4 * sample_rate / hop_length))
+        kernel = np.ones(smooth_width, dtype=np.float32) / smooth_width
+        smoothed = np.convolve(rms, kernel, mode="same")
+        scale = max(float(smoothed.max()), 1e-9)
+        for index in range(1, len(smoothed) - 1):
+            if (
+                smoothed[index] <= smoothed[index - 1]
+                and smoothed[index] < smoothed[index + 1]
+            ):
+                candidates.append(
+                    _SongCutCandidate(
+                        region.start
+                        + (frame_starts[index] + frame_length / 2) / sample_rate,
+                        "vocal_energy_valley",
+                        float(smoothed[index] / scale),
+                    )
+                )
+    return candidates
 
 
 def _remove_text_overlap(previous: str, current: str) -> str:
@@ -1126,7 +1373,7 @@ def _transcribe_range(
                 "core_start": core_start,
                 "core_end": core_end,
                 "language": right["language"] or left["language"],
-                "text": f'{left["text"]}\n{right["text"]}'.strip(),
+                "text": f"{left['text']}\n{right['text']}".strip(),
                 "cues": [*left["cues"], *right["cues"]],
                 "recovered_from_repetition": True,
             }
@@ -1222,7 +1469,7 @@ def _transcribe_range(
                 "core_start": core_start,
                 "core_end": core_end,
                 "language": right["language"] or left["language"],
-                "text": f'{left["text"]}\n{right["text"]}'.strip(),
+                "text": f"{left['text']}\n{right['text']}".strip(),
                 "cues": [*left["cues"], *right["cues"]],
                 "recovered_from_timeline_failure": True,
             }
@@ -1304,9 +1551,7 @@ def _transcribe_speech_batch(
         )
 
     records: dict[int, dict[str, object]] = {}
-    for position, ((index, region), result) in enumerate(
-        zip(indexed_regions, results)
-    ):
+    for position, ((index, region), result) in enumerate(zip(indexed_regions, results)):
         extract_start, _ = extract_ranges[position]
         text = str(getattr(result, "text", "")).strip()
         try:
@@ -1517,7 +1762,9 @@ def _result_to_cues(
     alignment = getattr(result, "time_stamps", None)
     items = list(getattr(alignment, "items", []) or [])
     if text and not items:
-        raise RuntimeError("Qwen3 forced aligner returned no timestamps for non-empty text")
+        raise RuntimeError(
+            "Qwen3 forced aligner returned no timestamps for non-empty text"
+        )
     cues: list[Cue] = []
     previous_start = -1.0
     for item in items:
@@ -1563,9 +1810,7 @@ def _media_duration(video: Path) -> float:
         str(video.resolve()),
     ]
     try:
-        completed = subprocess.run(
-            command, check=True, capture_output=True, text=True
-        )
+        completed = subprocess.run(command, check=True, capture_output=True, text=True)
         duration = float(completed.stdout.strip())
     except (subprocess.CalledProcessError, ValueError) as exc:
         raise RuntimeError(f"could not determine media duration: {video}") from exc
@@ -1661,9 +1906,7 @@ def _decode_cached_cues(
                     start=float(value["start"]),
                     end=float(value["end"]),
                     text=str(value["text"]),
-                    speaker=(
-                        str(value["speaker"]) if value.get("speaker") else None
-                    ),
+                    speaker=(str(value["speaker"]) if value.get("speaker") else None),
                     kind=str(value.get("kind") or "speech"),
                     boundary_hint=(
                         str(value["boundary_hint"])
@@ -1672,9 +1915,7 @@ def _decode_cached_cues(
                     ),
                     pos=str(value["pos"]) if value.get("pos") else None,
                     source_text=(
-                        str(value["source_text"])
-                        if value.get("source_text")
-                        else None
+                        str(value["source_text"]) if value.get("source_text") else None
                     ),
                     speaker_assignment=(
                         str(value["speaker_assignment"])
@@ -1700,9 +1941,7 @@ def _decode_cached_cues(
     return _add_punctuation_boundary_hints(raw_text, cues) if raw_text else cues
 
 
-def _add_punctuation_boundary_hints(
-    text: str, cues: list[Cue]
-) -> list[Cue]:
+def _add_punctuation_boundary_hints(text: str, cues: list[Cue]) -> list[Cue]:
     """Project trustworthy ASR punctuation onto aligned-unit boundaries."""
     normalized_cues = [
         "".join(

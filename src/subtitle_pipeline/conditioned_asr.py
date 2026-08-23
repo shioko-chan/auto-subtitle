@@ -10,7 +10,7 @@ from pathlib import Path
 from .audio_analysis import AudioRegion, _overlap_intersections
 from .audio_buffer import AudioBuffer
 from .config import AudioAnalysisConfig
-from .subtitles import Cue
+from .subtitles import Cue, cue_from_mapping
 
 logger = logging.getLogger(__name__)
 
@@ -421,7 +421,7 @@ def _load_cache(path: Path, signature: dict[str, object]) -> list[Cue] | None:
         value = json.loads(path.read_text(encoding="utf-8"))
         if value.get("signature") != signature:
             return None
-        return [Cue(**item) for item in value["cues"]]
+        return [cue_from_mapping(item) for item in value["cues"]]
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         logger.warning("ignoring unreadable conditioned ASR cache: %s", path)
         return None

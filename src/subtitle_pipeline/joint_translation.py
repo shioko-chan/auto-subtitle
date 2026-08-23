@@ -19,13 +19,14 @@ from .prompt_templates import (
     prompt_templates_digest,
     render_user_prompt,
 )
-from .subtitles import Cue, text_display_width
+from .subtitles import Cue, TimedTextUnit, text_display_width, timed_text_units
 from .telemetry import stage_metrics
 
-_CACHE_VERSION = 5
+_CACHE_VERSION = 6
 _CONTENT_ATTEMPTS = 2
 _PROMPT_NAME = "joint-segment-translate.md"
 _KANA_FRAGMENT_RE = re.compile(r"[\u3040-\u30ff]+")
+_PUNCTUATION_UNIT_RE = re.compile(r"^[\s、。！？…・,.!?;:「」『』（）()【】]+$")
 _DEPENDENT_PARTICLE_PREFIXES = (
     "を",
     "が",
@@ -39,6 +40,8 @@ _DEPENDENT_PARTICLE_PREFIXES = (
     "の",
 )
 logger = logging.getLogger(__name__)
+
+
 @dataclass(frozen=True)
 class JointRecord:
     track: str
@@ -174,6 +177,16 @@ def run_joint_translation(
 
     def process(track_key: str, start: int, end: int) -> list[JointRecord]:
         track = track_map[track_key]
+        if end == start + 1 and track.units[start].preferred_translation:
+            unit = track.units[start]
+            return [
+                JointRecord(
+                    track.key,
+                    unit.local_id,
+                    unit.local_id + 1,
+                    unit.preferred_translation.strip(),
+                )
+            ]
         return _request_resilient(
             track,
             start,
@@ -282,8 +295,7 @@ def _request_resilient(
     except CoverageValidationError as exc:
         if not coverage_patch_attempted:
             logger.warning(
-                "patching invalid joint coverage track=%s original=%d-%d "
-                "patch=%d-%d",
+                "patching invalid joint coverage track=%s original=%d-%d patch=%d-%d",
                 track.key,
                 start,
                 end,
@@ -349,16 +361,42 @@ def _request_resilient(
         split,
     )
     left = _request_resilient(
-        track, start, split, all_units, segmentation, llm, request,
-        translation_context, maximum_units, validation_maximum_units,
-        honorific_rules, parse_content, finish_reason, retry_delay,
-        is_nontransient, log_invalid_response, local_translate,
+        track,
+        start,
+        split,
+        all_units,
+        segmentation,
+        llm,
+        request,
+        translation_context,
+        maximum_units,
+        validation_maximum_units,
+        honorific_rules,
+        parse_content,
+        finish_reason,
+        retry_delay,
+        is_nontransient,
+        log_invalid_response,
+        local_translate,
     )
     right = _request_resilient(
-        track, split, end, all_units, segmentation, llm, request,
-        translation_context, maximum_units, validation_maximum_units,
-        honorific_rules, parse_content, finish_reason, retry_delay,
-        is_nontransient, log_invalid_response, local_translate,
+        track,
+        split,
+        end,
+        all_units,
+        segmentation,
+        llm,
+        request,
+        translation_context,
+        maximum_units,
+        validation_maximum_units,
+        honorific_rules,
+        parse_content,
+        finish_reason,
+        retry_delay,
+        is_nontransient,
+        log_invalid_response,
+        local_translate,
     )
     return [*left, *right]
 
@@ -429,9 +467,7 @@ def _request_window(
                 validation_maximum_units,
                 llm.target_language,
                 validate_language=False,
-                reference_replacements=_reference_replacements(
-                    translation_context
-                ),
+                reference_replacements=_reference_replacements(translation_context),
                 local_translate=local_translate,
             )
             logger.info(
@@ -497,7 +533,11 @@ def _prompt(
     )
     target = f"<{track.key}>\n{target}"
     context = _dialogue_context(all_units, selected, config)
-    retry = "" if previous_error is None else f"\n\nPREVIOUS_RESPONSE_ERROR: {previous_error}"
+    retry = (
+        ""
+        if previous_error is None
+        else f"\n\nPREVIOUS_RESPONSE_ERROR: {previous_error}"
+    )
     return render_user_prompt(
         _PROMPT_NAME,
         TARGET_LANGUAGE=target_language,
@@ -628,15 +668,11 @@ def _validate_records(
         if set(value) != {"start_id", "end_id", "text"}:
             raise RuntimeError(f"joint cue {position} has unexpected fields")
         start_id = _coerce_integer_id(value["start_id"], position, "start_id")
-        inclusive_end_id = _coerce_integer_id(
-            value["end_id"], position, "end_id"
-        )
+        inclusive_end_id = _coerce_integer_id(value["end_id"], position, "end_id")
         text = value["text"]
         if not isinstance(text, str):
             raise TypeError(f"joint cue {position} text is not a string")
-        relative.append(
-            _RelativeRecord(start_id, inclusive_end_id + 1, text.strip())
-        )
+        relative.append(_RelativeRecord(start_id, inclusive_end_id + 1, text.strip()))
 
     expected = 0
     for record in relative:
@@ -813,10 +849,7 @@ def _coverage_error(
     suffix: list[_RelativeRecord] = []
     cursor = final
     for record in reversed(records):
-        if (
-            record.end_id != cursor
-            or not 0 <= record.start_id < record.end_id <= final
-        ):
+        if record.end_id != cursor or not 0 <= record.start_id < record.end_id <= final:
             break
         suffix.insert(0, record)
         cursor = record.start_id
@@ -895,12 +928,14 @@ def _records_to_result(
         speaker = track_map[record.track].speaker
         kinds = {cue.kind for cue in source_values}
         kind = next(iter(kinds)) if len(kinds) == 1 else "speech"
+        source_units = _source_timed_units(source_values)
         source_cue = Cue(
             start,
             end,
             "".join(cue.text for cue in source_values),
             speaker,
             kind,
+            source_units=source_units,
         )
         pairs.append(
             (
@@ -915,6 +950,25 @@ def _records_to_result(
     )
 
 
+def _source_timed_units(source: list[Cue]) -> tuple[TimedTextUnit, ...]:
+    values: list[TimedTextUnit] = []
+    for cue in source:
+        aligned = timed_text_units(cue) or (
+            TimedTextUnit(cue.text, cue.start, cue.end),
+        )
+        for unit in aligned:
+            if _PUNCTUATION_UNIT_RE.fullmatch(unit.text) and values:
+                previous = values[-1]
+                values[-1] = TimedTextUnit(
+                    previous.text + unit.text,
+                    previous.start,
+                    max(previous.end, unit.end),
+                )
+            else:
+                values.append(unit)
+    return tuple(values)
+
+
 def _signature(
     tracks: list[SpeakerTrack],
     segmentation: SegmentationConfig,
@@ -927,7 +981,11 @@ def _signature(
     payload = {
         "version": _CACHE_VERSION,
         "tracks": [
-            {"key": track.key, "speaker": track.speaker, "units": [asdict(unit) for unit in track.units]}
+            {
+                "key": track.key,
+                "speaker": track.speaker,
+                "units": [asdict(unit) for unit in track.units],
+            }
             for track in tracks
         ],
         "segmentation": asdict(segmentation),
@@ -958,7 +1016,10 @@ def _load_cache(
         return {}, None
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-        if value.get("version") != _CACHE_VERSION or value.get("signature") != signature:
+        if (
+            value.get("version") != _CACHE_VERSION
+            or value.get("signature") != signature
+        ):
             logger.info("joint subtitle cache signature changed; starting fresh")
             return {}, None
         windows = {
@@ -966,9 +1027,20 @@ def _load_cache(
             for key, items in value.get("windows", {}).items()
         }
         final_value = value.get("final")
-        final = None if final_value is None else [_decode_record(item) for item in final_value]
+        final = (
+            None
+            if final_value is None
+            else [_decode_record(item) for item in final_value]
+        )
         return windows, final
-    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError, OSError) as exc:
+    except (
+        AttributeError,
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        OSError,
+    ) as exc:
         logger.warning("ignoring unreadable joint subtitle cache %s: %s", path, exc)
         return {}, None
 
@@ -984,7 +1056,9 @@ def _write_cache(
     payload = {
         "version": _CACHE_VERSION,
         "signature": signature,
-        "windows": {key: [asdict(item) for item in values] for key, values in windows.items()},
+        "windows": {
+            key: [asdict(item) for item in values] for key, values in windows.items()
+        },
         "final": None if final is None else [asdict(item) for item in final],
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -998,7 +1072,10 @@ def _decode_record(value: object) -> JointRecord:
     if not isinstance(value, dict):
         raise TypeError("cached joint record is not an object")
     return JointRecord(
-        str(value["track"]), int(value["start_id"]), int(value["end_id"]), str(value["text"])
+        str(value["track"]),
+        int(value["start_id"]),
+        int(value["end_id"]),
+        str(value["text"]),
     )
 
 
@@ -1068,9 +1145,7 @@ def _machine_translate_with_protected_terms(
     return "".join(pieces)
 
 
-def _machine_translate(
-    text: str, local_translate: Callable[[str], str] | None
-) -> str:
+def _machine_translate(text: str, local_translate: Callable[[str], str] | None) -> str:
     if not text.strip():
         return text
     if local_translate is None:

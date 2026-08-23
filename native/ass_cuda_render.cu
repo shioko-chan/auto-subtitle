@@ -47,7 +47,9 @@ static void check_cuda(cudaError_t result, const char *operation) {
 __global__ static void blend_luma(
     uint8_t *plane, int pitch, int frame_width, int frame_height,
     const uint8_t *mask, int mask_stride, int width, int height,
-    int dst_x, int dst_y, float opacity, float subtitle_y
+    int dst_x, int dst_y, float opacity, float subtitle_y,
+    bool gradient, float gradient_left_y, float gradient_middle_y,
+    float gradient_right_y, int gradient_start_x, int gradient_end_x
 ) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -58,6 +60,20 @@ __global__ static void blend_luma(
     if (frame_x < 0 || frame_y < 0 || frame_x >= frame_width || frame_y >= frame_height)
         return;
     float alpha = (mask[y * mask_stride + x] / 255.0f) * opacity;
+    if (gradient && gradient_end_x > gradient_start_x) {
+        float mix = static_cast<float>(frame_x - gradient_start_x) /
+                    static_cast<float>(gradient_end_x - gradient_start_x);
+        mix = fminf(1.0f, fmaxf(0.0f, mix));
+        if (mix < 0.5f) {
+            float local_mix = mix * 2.0f;
+            subtitle_y = gradient_left_y * (1.0f - local_mix) +
+                         gradient_middle_y * local_mix;
+        } else {
+            float local_mix = (mix - 0.5f) * 2.0f;
+            subtitle_y = gradient_middle_y * (1.0f - local_mix) +
+                         gradient_right_y * local_mix;
+        }
+    }
     uint8_t *pixel = plane + frame_y * pitch + frame_x;
     *pixel = static_cast<uint8_t>(lrintf(*pixel * (1.0f - alpha) + subtitle_y * alpha));
 }
@@ -65,7 +81,11 @@ __global__ static void blend_luma(
 __global__ static void blend_chroma(
     uint8_t *plane, int pitch, int frame_width, int frame_height,
     const uint8_t *mask, int mask_stride, int width, int height,
-    int dst_x, int dst_y, float opacity, float subtitle_u, float subtitle_v
+    int dst_x, int dst_y, float opacity, float subtitle_u, float subtitle_v,
+    bool gradient, float gradient_left_u, float gradient_left_v,
+    float gradient_middle_u, float gradient_middle_v,
+    float gradient_right_u, float gradient_right_v,
+    int gradient_start_x, int gradient_end_x
 ) {
     int chroma_x = blockIdx.x * blockDim.x + threadIdx.x;
     int chroma_y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -87,6 +107,25 @@ __global__ static void blend_chroma(
         }
     }
     float alpha = coverage * 0.25f * opacity;
+    if (gradient && gradient_end_x > gradient_start_x) {
+        float frame_center_x = global_cx * 2.0f + 0.5f;
+        float mix = (frame_center_x - gradient_start_x) /
+                    static_cast<float>(gradient_end_x - gradient_start_x);
+        mix = fminf(1.0f, fmaxf(0.0f, mix));
+        if (mix < 0.5f) {
+            float local_mix = mix * 2.0f;
+            subtitle_u = gradient_left_u * (1.0f - local_mix) +
+                         gradient_middle_u * local_mix;
+            subtitle_v = gradient_left_v * (1.0f - local_mix) +
+                         gradient_middle_v * local_mix;
+        } else {
+            float local_mix = (mix - 0.5f) * 2.0f;
+            subtitle_u = gradient_middle_u * (1.0f - local_mix) +
+                         gradient_right_u * local_mix;
+            subtitle_v = gradient_middle_v * (1.0f - local_mix) +
+                         gradient_right_v * local_mix;
+        }
+    }
     uint8_t *pixel = plane + global_cy * pitch + global_cx * 2;
     pixel[0] = static_cast<uint8_t>(lrintf(pixel[0] * (1.0f - alpha) + subtitle_u * alpha));
     pixel[1] = static_cast<uint8_t>(lrintf(pixel[1] * (1.0f - alpha) + subtitle_v * alpha));
@@ -98,7 +137,12 @@ struct Renderer {
     ASS_Track *track = nullptr;
     struct DeviceImage {
         int width, height, stride, dst_x, dst_y;
+        int gradient_start_x, gradient_end_x;
         float opacity, y, u, v;
+        float gradient_left_y, gradient_left_u, gradient_left_v;
+        float gradient_middle_y, gradient_middle_u, gradient_middle_v;
+        float gradient_right_y, gradient_right_u, gradient_right_v;
+        bool gradient;
         uint8_t *mask;
     };
     std::vector<DeviceImage> images;
@@ -157,13 +201,35 @@ static void render_ass(Renderer &state, AVFrame *frame, int64_t time_ms) {
             cached.stride = image->stride;
             cached.dst_x = image->dst_x;
             cached.dst_y = image->dst_y;
+            cached.gradient_start_x = image->dst_x;
+            cached.gradient_end_x = image->dst_x + image->w - 1;
             int red = (image->color >> 24) & 0xff;
             int green = (image->color >> 16) & 0xff;
             int blue = (image->color >> 8) & 0xff;
-            cached.opacity = (255 - (image->color & 0xff)) / 255.0f;
+            int transparency = image->color & 0xff;
+            cached.gradient = transparency == 1;
+            cached.opacity = (255 - transparency) / 255.0f;
             rgb_to_yuv(
                 red, green, blue, bt709, full_range,
                 cached.y, cached.u, cached.v
+            );
+            rgb_to_yuv(
+                0xf9, 0xa8, 0xd4, bt709, full_range,
+                cached.gradient_left_y,
+                cached.gradient_left_u,
+                cached.gradient_left_v
+            );
+            rgb_to_yuv(
+                0xc4, 0xb5, 0xfd, bt709, full_range,
+                cached.gradient_middle_y,
+                cached.gradient_middle_u,
+                cached.gradient_middle_v
+            );
+            rgb_to_yuv(
+                0x93, 0xc5, 0xfd, bt709, full_range,
+                cached.gradient_right_y,
+                cached.gradient_right_u,
+                cached.gradient_right_v
             );
             size_t required =
                 static_cast<size_t>(image->stride) * (image->h - 1) + image->w;
@@ -177,6 +243,25 @@ static void render_ass(Renderer &state, AVFrame *frame, int64_t time_ms) {
             );
             state.images.push_back(cached);
         }
+        for (Renderer::DeviceImage &image : state.images) {
+            if (!image.gradient)
+                continue;
+            for (const Renderer::DeviceImage &other : state.images) {
+                int overlap_top = image.dst_y > other.dst_y
+                    ? image.dst_y : other.dst_y;
+                int image_bottom = image.dst_y + image.height;
+                int other_bottom = other.dst_y + other.height;
+                int overlap_bottom = image_bottom < other_bottom
+                    ? image_bottom : other_bottom;
+                if (overlap_top >= overlap_bottom)
+                    continue;
+                if (other.dst_x < image.gradient_start_x)
+                    image.gradient_start_x = other.dst_x;
+                int other_right = other.dst_x + other.width - 1;
+                if (other_right > image.gradient_end_x)
+                    image.gradient_end_x = other_right;
+            }
+        }
     }
 
     dim3 threads(16, 16);
@@ -185,7 +270,10 @@ static void render_ass(Renderer &state, AVFrame *frame, int64_t time_ms) {
         blend_luma<<<luma_blocks, threads>>>(
             frame->data[0], frame->linesize[0], frame->width, frame->height,
             image.mask, image.stride, image.width, image.height,
-            image.dst_x, image.dst_y, image.opacity, image.y
+            image.dst_x, image.dst_y, image.opacity, image.y,
+            image.gradient,
+            image.gradient_left_y, image.gradient_middle_y, image.gradient_right_y,
+            image.gradient_start_x, image.gradient_end_x
         );
         int chroma_width = (image.width + 2) / 2 + 1;
         int chroma_height = (image.height + 2) / 2 + 1;
@@ -193,7 +281,12 @@ static void render_ass(Renderer &state, AVFrame *frame, int64_t time_ms) {
         blend_chroma<<<chroma_blocks, threads>>>(
             frame->data[1], frame->linesize[1], frame->width, frame->height,
             image.mask, image.stride, image.width, image.height,
-            image.dst_x, image.dst_y, image.opacity, image.u, image.v
+            image.dst_x, image.dst_y, image.opacity, image.u, image.v,
+            image.gradient,
+            image.gradient_left_u, image.gradient_left_v,
+            image.gradient_middle_u, image.gradient_middle_v,
+            image.gradient_right_u, image.gradient_right_v,
+            image.gradient_start_x, image.gradient_end_x
         );
         check_cuda(cudaGetLastError(), "launch subtitle blend");
     }

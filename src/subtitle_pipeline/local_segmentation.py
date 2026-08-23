@@ -95,6 +95,7 @@ class LocalUnit:
     kind: str
     boundary_score_after: int | None = None
     source_pos: tuple[str | None, ...] = ()
+    preferred_translation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -147,9 +148,7 @@ class SudachiAnalyzer:
 
             # GiNZA 5.2's optional compound splitter has an invalid null setting
             # under current spaCy. Dependency and bunsetsu parsing do not need it.
-            self._dependency_nlp = spacy.load(
-                "ja_ginza", exclude=["compound_splitter"]
-            )
+            self._dependency_nlp = spacy.load("ja_ginza", exclude=["compound_splitter"])
         text = left + middle + right
         document = self._dependency_nlp(text)
         return (
@@ -321,13 +320,21 @@ def _unknown_run_candidate(
 ) -> tuple[str | None, str | None, int | None, int | None, int | None, int | None]:
     first = cues[start]
     last = cues[end - 1]
-    left_gap = float("inf") if previous is None else max(0.0, first.start - previous.end)
-    right_gap = float("inf") if following is None else max(0.0, following.start - last.end)
+    left_gap = (
+        float("inf") if previous is None else max(0.0, first.start - previous.end)
+    )
+    right_gap = (
+        float("inf") if following is None else max(0.0, following.start - last.end)
+    )
     left_score = (
-        None if previous is None else _syntactic_boundary_score(previous, first, analyzer)
+        None
+        if previous is None
+        else _syntactic_boundary_score(previous, first, analyzer)
     )
     right_score = (
-        None if following is None else _syntactic_boundary_score(last, following, analyzer)
+        None
+        if following is None
+        else _syntactic_boundary_score(last, following, analyzer)
     )
     left_dependency: int | None = None
     right_dependency: int | None = None
@@ -460,16 +467,16 @@ def _dependency_boundary_strength(document: object, boundary: int) -> int:
             continue
         token_position = token.idx + len(token.text) / 2
         head_position = token.head.idx + len(token.head.text) / 2
-        if min(token_position, head_position) < boundary < max(
-            token_position, head_position
+        if (
+            min(token_position, head_position)
+            < boundary
+            < max(token_position, head_position)
         ):
             strength = max(strength, 2 if abs(token.i - token.head.i) <= 1 else 1)
     return strength
 
 
-def _syntactic_boundary_score(
-    left: Cue, right: Cue, analyzer: SudachiAnalyzer
-) -> int:
+def _syntactic_boundary_score(left: Cue, right: Cue, analyzer: SudachiAnalyzer) -> int:
     morphology = analyzer.analyze(left.text + right.text)
     left_morpheme, right_morpheme, inside = _morphemes_at_boundary(
         morphology, len(left.text)
@@ -518,7 +525,9 @@ def _track_episodes(
     previous: int | None = None
     for index in indices:
         cue = cues[index]
-        split = previous is not None and cue.start - cues[previous].end >= hard_gap_seconds
+        split = (
+            previous is not None and cue.start - cues[previous].end >= hard_gap_seconds
+        )
         if previous is not None and cue.speaker is None:
             split = split or any(
                 other.speaker is not None
@@ -527,7 +536,11 @@ def _track_episodes(
                 for other in cues
             )
         if previous is not None:
-            split = split or cues[previous].kind in _ATOMIC_KINDS or cue.kind in _ATOMIC_KINDS
+            split = (
+                split
+                or cues[previous].kind in _ATOMIC_KINDS
+                or cue.kind in _ATOMIC_KINDS
+            )
         if split and current:
             episodes.append(current)
             current = []
@@ -601,7 +614,17 @@ def _score_boundary(
     score = 0
     factors: list[str] = []
 
-    gap_score = 4 if gap_ms >= 600 else 3 if gap_ms >= 400 else 2 if gap_ms >= 250 else 1 if gap_ms >= 120 else 0
+    gap_score = (
+        4
+        if gap_ms >= 600
+        else 3
+        if gap_ms >= 400
+        else 2
+        if gap_ms >= 250
+        else 1
+        if gap_ms >= 120
+        else 0
+    )
     if gap_score:
         score += gap_score
         factors.append(f"gap:{gap_score:+d}")
@@ -667,9 +690,9 @@ def _is_terminal_predicate(value: Morphology | None) -> bool:
 
 
 def _is_sentence_ending(text: str, value: Morphology | None) -> bool:
-    return (value is not None and len(value.pos) > 1 and value.pos[1] == "終助詞") or any(
-        text.endswith(ending) for ending in _SENTENCE_ENDINGS
-    )
+    return (
+        value is not None and len(value.pos) > 1 and value.pos[1] == "終助詞"
+    ) or any(text.endswith(ending) for ending in _SENTENCE_ENDINGS)
 
 
 def _is_new_utterance(text: str, value: Morphology | None) -> bool:
@@ -681,10 +704,18 @@ def _is_new_utterance(text: str, value: Morphology | None) -> bool:
 def _is_dangling(value: Morphology | None) -> bool:
     if value is None or not value.pos:
         return False
-    if value.pos[0] == "助詞" and len(value.pos) > 1 and value.pos[1] in _DANGLING_PARTICLE_TYPES:
+    if (
+        value.pos[0] == "助詞"
+        and len(value.pos) > 1
+        and value.pos[1] in _DANGLING_PARTICLE_TYPES
+    ):
         return True
-    return value.pos[0] in _TERMINAL_POS and value.conjugation_form not in {"*", ""} and not (
-        "終止形" in value.conjugation_form or "命令形" in value.conjugation_form
+    return (
+        value.pos[0] in _TERMINAL_POS
+        and value.conjugation_form not in {"*", ""}
+        and not (
+            "終止形" in value.conjugation_form or "命令形" in value.conjugation_form
+        )
     )
 
 
@@ -787,6 +818,9 @@ def _make_unit(
         kind=first.kind if len(kinds) == 1 else "speech",
         boundary_score_after=score_after,
         source_pos=tuple(cues[index].pos for index in indices),
+        preferred_translation=(
+            first.preferred_translation if len(indices) == 1 else None
+        ),
     )
 
 
@@ -794,4 +828,6 @@ def _package_version(name: str) -> str:
     try:
         return version(name)
     except PackageNotFoundError as exc:
-        raise RuntimeError(f"required segmentation dependency is missing: {name}") from exc
+        raise RuntimeError(
+            f"required segmentation dependency is missing: {name}"
+        ) from exc

@@ -81,7 +81,10 @@ class AudioAnalysisConfig:
     singing_release_seconds: float = 35.0
     singing_phrase_silence_seconds: float = 0.45
     singing_min_phrase_seconds: float = 30.0
-    singing_asr_window_seconds: float = 12.0
+    singing_asr_target_seconds: float = 30.0
+    singing_asr_min_seconds: float = 20.0
+    singing_asr_max_seconds: float = 38.0
+    singing_asr_search_seconds: float = 5.0
     singing_asr_overlap_seconds: float = 2.0
     speaker_profiles_dir: str = "work/speaker-profiles-eres2netv2"
     speaker_match_threshold: float = 0.42
@@ -110,9 +113,19 @@ class SongIdentificationConfig:
     song_gap_seconds: float = 35.0
     minimum_ocr_score: float = 0.45
     minimum_persistent_frames: int = 2
-    max_tool_calls: int = 6
     max_search_results: int = 5
-    max_page_chars: int = 12000
+    lyrics_library_path: str = "work/lyrics/library.sqlite3"
+    match_anchor_threshold: float = 0.48
+    match_minimum_anchors: int = 3
+    match_minimum_score: float = 0.48
+    match_minimum_margin: float = 0.05
+    pyshiro_worker_project: str = "tools/pyshiro"
+    pyshiro_max_window_seconds: float = 20.0
+    lyric_gap_recheck_seconds: float = 20.0
+    lyric_gap_asr_threshold: float = 0.48
+    lyric_gap_vocal_active_ratio: float = 0.08
+    pyshiro_likelihood_floor: float = -30.0
+    pyshiro_likelihood_margin: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -430,14 +443,32 @@ def load_config(path: Path) -> AppConfig:
         )
     if analysis.singing_min_phrase_seconds <= 0:
         raise ConfigError("audio_analysis.singing_min_phrase_seconds must be positive")
-    if analysis.singing_asr_window_seconds <= 0:
-        raise ConfigError("audio_analysis.singing_asr_window_seconds must be positive")
+    if analysis.singing_asr_min_seconds <= 0:
+        raise ConfigError("audio_analysis.singing_asr_min_seconds must be positive")
     if not (
-        0 <= analysis.singing_asr_overlap_seconds < analysis.singing_asr_window_seconds
+        analysis.singing_asr_min_seconds
+        <= analysis.singing_asr_target_seconds
+        <= analysis.singing_asr_max_seconds
     ):
         raise ConfigError(
+            "audio_analysis singing ASR target must be between min and max"
+        )
+    if analysis.singing_asr_search_seconds < 0:
+        raise ConfigError(
+            "audio_analysis.singing_asr_search_seconds cannot be negative"
+        )
+    if not (0 <= analysis.singing_asr_overlap_seconds < analysis.singing_asr_min_seconds):
+        raise ConfigError(
             "audio_analysis.singing_asr_overlap_seconds must be non-negative and "
-            "smaller than singing_asr_window_seconds"
+            "smaller than singing_asr_min_seconds"
+        )
+    if analysis.singing_asr_max_seconds < (
+        2 * analysis.singing_asr_min_seconds
+        - analysis.singing_asr_overlap_seconds
+    ):
+        raise ConfigError(
+            "audio_analysis.singing_asr_max_seconds must meet the minimum "
+            "two-window span"
         )
     if not 0 <= analysis.speaker_match_threshold <= 2:
         raise ConfigError(
@@ -490,10 +521,24 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError(
             "song_identification.minimum_persistent_frames must be at least 1"
         )
-    if songs.max_tool_calls < 1 or songs.max_search_results < 1:
+    if songs.max_search_results < 1:
         raise ConfigError("song identification search limits must be at least 1")
-    if songs.max_page_chars < 1000:
-        raise ConfigError("song_identification.max_page_chars must be at least 1000")
+    if not 0 <= songs.match_anchor_threshold <= 1:
+        raise ConfigError("song_identification.match_anchor_threshold must be between 0 and 1")
+    if songs.match_minimum_anchors < 2:
+        raise ConfigError("song_identification.match_minimum_anchors must be at least 2")
+    if not 0 <= songs.match_minimum_score <= 1 or songs.match_minimum_margin < 0:
+        raise ConfigError("song identification match score settings are invalid")
+    if songs.pyshiro_max_window_seconds <= 0 or songs.pyshiro_max_window_seconds > 20:
+        raise ConfigError("song_identification.pyshiro_max_window_seconds must be in (0, 20]")
+    if not 0 < songs.lyric_gap_recheck_seconds <= 20:
+        raise ConfigError("song_identification.lyric_gap_recheck_seconds must be in (0, 20]")
+    if not 0 <= songs.lyric_gap_asr_threshold <= 1:
+        raise ConfigError("song_identification.lyric_gap_asr_threshold must be between 0 and 1")
+    if not 0 <= songs.lyric_gap_vocal_active_ratio <= 1:
+        raise ConfigError("song_identification.lyric_gap_vocal_active_ratio must be between 0 and 1")
+    if songs.pyshiro_likelihood_margin < 0:
+        raise ConfigError("song_identification.pyshiro_likelihood_margin cannot be negative")
     segmentation = config.segmentation
     if segmentation.boundary_score_threshold < 0:
         raise ConfigError("segmentation.boundary_score_threshold cannot be negative")

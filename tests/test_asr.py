@@ -19,6 +19,8 @@ from subtitle_pipeline.asr import (
     _repetition_hallucination,
     _result_to_cues,
     _song_windows,
+    _song_cut_candidates,
+    _SongCutCandidate,
     _speaker_assignment_for_aligned_cue,
     _speaker_assignment_timeline,
     _speaker_for_aligned_cue,
@@ -27,6 +29,7 @@ from subtitle_pipeline.asr import (
     _transcribe_ambiguous_range,
     _transcribe_analyzed,
     _transcribe_range,
+    _transcribe_song_range,
     _transcribe_speech_batch,
     _valid_cached_record,
     read_cue_sidecar,
@@ -731,8 +734,7 @@ class QwenASRTests(unittest.TestCase):
                 ASRConfig(),
                 AudioRegion(10, 20, "ambiguous", "A"),
                 index=0,
-                window_seconds=12,
-                overlap_seconds=2,
+                window_config=AudioAnalysisConfig(),
             )
         self.assertEqual(result["ambiguous_route"], "speech")
         speech_route.assert_called_once()
@@ -765,8 +767,7 @@ class QwenASRTests(unittest.TestCase):
                 ASRConfig(),
                 AudioRegion(10, 20, "ambiguous", "A"),
                 index=0,
-                window_seconds=12,
-                overlap_seconds=2,
+                window_config=AudioAnalysisConfig(),
             )
         self.assertEqual(result["ambiguous_route"], "singing")
 
@@ -794,11 +795,111 @@ class QwenASRTests(unittest.TestCase):
             [(8.0, 10, "前")],
         )
 
-    def test_singing_windows_overlap_without_extending_past_region(self):
+    def test_singing_windows_target_thirty_seconds_and_balance_tail(self):
         self.assertEqual(
-            _song_windows(5, 29, 12, 2),
-            [(5, 17), (15, 27), (25, 29)],
+            _song_windows(0, 45, 30, 2),
+            [(0, 27), (25, 45)],
         )
+        self.assertEqual(
+            _song_windows(5, 68, 30, 2),
+            [(5, 35), (33, 68)],
+        )
+
+    def test_singing_windows_treat_thirty_five_to_thirty_eight_as_normal(self):
+        audit = []
+
+        windows = _song_windows(0, 36, 30, 2, audit=audit)
+
+        self.assertEqual(windows, [(0, 36)])
+        self.assertEqual(audit[0]["cut_reason"], "region_end")
+
+    def test_singing_windows_allow_a_thirty_seven_second_tail(self):
+        windows = _song_windows(
+            0,
+            70,
+            30,
+            2,
+            candidates=[
+                _SongCutCandidate(35, "non_singing_gap", -1.0),
+                _SongCutCandidate(30, "vocal_energy_valley", 0.1),
+            ],
+        )
+
+        self.assertEqual(windows, [(0, 35), (33, 70)])
+
+    def test_singing_windows_prefer_cut_evidence_lexicographically(self):
+        audit = []
+        windows = _song_windows(
+            0,
+            62,
+            30,
+            2,
+            candidates=[
+                _SongCutCandidate(30, "vocal_energy_valley", 0.01),
+                _SongCutCandidate(28, "phrase_boundary"),
+                _SongCutCandidate(29, "non_singing_gap", -1.2),
+            ],
+            audit=audit,
+        )
+
+        self.assertEqual(windows, [(0, 29), (27, 62)])
+        self.assertEqual(audit[0]["cut_reason"], "non_singing_gap")
+
+    def test_singing_windows_use_energy_valley_before_phrase_boundary(self):
+        windows = _song_windows(
+            0,
+            60,
+            30,
+            2,
+            candidates=[
+                _SongCutCandidate(27, "vocal_energy_valley", 0.05),
+                _SongCutCandidate(30, "vocal_energy_valley", 0.20),
+                _SongCutCandidate(29, "phrase_boundary"),
+            ],
+        )
+
+        self.assertEqual(windows, [(0, 27), (25, 60)])
+
+    def test_singing_cut_candidates_detect_long_vocal_gap(self):
+        samples = np.ones(60000, dtype=np.float32)
+        samples[29000:31000] = 0
+        audio = SimpleNamespace(
+            sample_rate=1000,
+            slice=lambda start, end: samples[round(start * 1000) : round(end * 1000)],
+        )
+
+        candidates = _song_cut_candidates(
+            AudioRegion(0, 60, "singing"),
+            audio,
+            AudioAnalysisConfig(singing_phrase_silence_seconds=0.45),
+        )
+
+        gaps = [item for item in candidates if item.kind == "non_singing_gap"]
+        self.assertTrue(gaps)
+        self.assertAlmostEqual(gaps[0].time, 30, delta=0.2)
+
+    def test_singing_asr_does_not_receive_general_stream_context(self):
+        model = SimpleNamespace()
+        model.transcribe = Mock(
+            return_value=[SimpleNamespace(text="聞こえた歌詞", language="Japanese")]
+        )
+        audio = SimpleNamespace(
+            sample_rate=16000,
+            slice=lambda *_args, **_kwargs: np.zeros(16000, dtype=np.float32),
+        )
+
+        _transcribe_song_range(
+            model,
+            Path("source.mp4"),
+            None,
+            ASRConfig(context="配信名や人物名を含む一般コンテキスト"),
+            AudioRegion(0, 1, "singing"),
+            label="song",
+            window_config=AudioAnalysisConfig(),
+            audio_buffer=audio,
+        )
+
+        self.assertEqual(model.transcribe.call_args.kwargs["context"], "")
 
     def test_removes_repeated_text_from_overlapping_song_window(self):
         self.assertEqual(

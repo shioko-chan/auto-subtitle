@@ -75,8 +75,17 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.audio_analysis.singing_smoothing_windows, 3)
             self.assertEqual(config.audio_analysis.singing_release_seconds, 35.0)
             self.assertEqual(config.audio_analysis.singing_min_phrase_seconds, 30.0)
+            self.assertEqual(config.audio_analysis.singing_asr_target_seconds, 30.0)
+            self.assertEqual(config.audio_analysis.singing_asr_min_seconds, 20.0)
+            self.assertEqual(config.audio_analysis.singing_asr_max_seconds, 38.0)
+            self.assertEqual(config.audio_analysis.singing_asr_search_seconds, 5.0)
             self.assertFalse(config.song_identification.enabled)
             self.assertEqual(config.song_identification.device, "gpu:0")
+            self.assertEqual(config.song_identification.lyric_gap_recheck_seconds, 20.0)
+            self.assertEqual(config.song_identification.lyric_gap_asr_threshold, 0.48)
+            self.assertEqual(
+                config.song_identification.lyric_gap_vocal_active_ratio, 0.08
+            )
             self.assertEqual(config.segmentation.boundary_score_threshold, 3)
             self.assertEqual(config.segmentation.local_unit_max_seconds, 6.0)
             self.assertEqual(config.segmentation.model_window_units, 160)

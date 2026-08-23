@@ -11,7 +11,13 @@ from pathlib import Path
 from .commands import CommandError, require_command, run
 from .config import DownloadConfig, RenderConfig
 from .speakers import CharacterStyle
-from .subtitles import Cue, read_subtitles, text_display_width
+from .subtitles import (
+    Cue,
+    TimedTextUnit,
+    read_subtitles,
+    text_display_width,
+    timed_text_units,
+)
 from .telemetry import stage_metrics
 
 _RENDER_TERMINAL_PLAIN_PUNCTUATION_RE = re.compile(
@@ -21,6 +27,7 @@ _RENDER_TERMINAL_ASCII_PERIOD_RE = re.compile(
     r'''(?<!\.)\.(?=["'”’」』）)\]]*$)'''
 )
 _WRAP_PUNCTUATION = frozenset("，、；：。！？!?…—,;:")
+_SINGING_GRADIENT_MARKER = "#F9A8D4"
 
 
 @dataclass(frozen=True)
@@ -49,6 +56,7 @@ class RenderCue:
     speaker: str | None = None
     kind: str = "speech"
     source_text: str | None = None
+    source_units: tuple[TimedTextUnit, ...] = ()
 
 
 def download_youtube(url: str, directory: Path, config: DownloadConfig) -> DownloadResult:
@@ -398,6 +406,17 @@ def _layout_subtitle_cues(
                 end = cue.end
             else:
                 end = elapsed + (cue.end - cue.start) * units / total_width
+            timed_units = timed_text_units(cue)
+            segment_source_units = tuple(
+                unit
+                for unit in timed_units
+                if elapsed <= (unit.start + unit.end) / 2 < end
+            )
+            segment_source_text = (
+                "".join(unit.text for unit in segment_source_units)
+                if segment_source_units
+                else cue.source_text
+            )
             rendered.append(
                 RenderCue(
                     elapsed,
@@ -405,7 +424,8 @@ def _layout_subtitle_cues(
                     segment,
                     cue.speaker,
                     cue.kind,
-                    cue.source_text,
+                    segment_source_text,
+                    segment_source_units,
                 )
             )
             elapsed = end
@@ -530,22 +550,66 @@ def _write_ass(
         lane = next(index for index in range(len(occupied) + 1) if index not in occupied)
         active.append((cue.end, lane))
         speaker = getattr(cue, "speaker", None)
+        is_singing = getattr(cue, "kind", "speech") == "singing"
         style_name = (
             _ass_style_name(speaker)
-            if speaker is not None and speaker in (character_styles or {})
+            if not is_singing
+            and speaker is not None
+            and speaker in (character_styles or {})
             else "Default"
         )
         source_style_name = (
             _ass_source_style_name(speaker)
-            if speaker is not None and speaker in (character_styles or {})
+            if not is_singing
+            and speaker is not None
+            and speaker in (character_styles or {})
             else "Japanese"
         )
         event_text = _escape_ass_text(cue.text)
         source_text = (getattr(cue, "source_text", None) or "").strip()
-        escaped_source_text = _escape_ass_text(source_text)
-        is_singing = getattr(cue, "kind", "speech") == "singing"
+        source_units = timed_text_units(cue)
+        source_outline_color = (
+            (character_styles or {})[speaker].outline_color
+            if not is_singing
+            and speaker is not None
+            and speaker in (character_styles or {})
+            else "#000000"
+        )
+        escaped_source_text = (
+            _karaoke_text(
+                source_units,
+                cue.start,
+                cue.end,
+                highlight_color=source_outline_color,
+            )
+            if source_units and not is_singing
+            else _escape_ass_text(source_text)
+        )
         if is_singing:
-            event_text = r"{\u1}" + event_text
+            escaped_source_text = (
+                _karaoke_text(
+                    source_units,
+                    cue.start,
+                    cue.end,
+                    outline_color=_SINGING_GRADIENT_MARKER,
+                    highlight_color=_SINGING_GRADIENT_MARKER,
+                    prefix="♪ ",
+                    suffix=" ♫",
+                )
+                if source_units
+                else (
+                    rf"{{\1c&HFFFFFF&"
+                    rf"\3c{_ass_override_color(_SINGING_GRADIENT_MARKER)}"
+                    rf"\3a&H01&}}"
+                    + _decorate_singing_text(escaped_source_text)
+                )
+            )
+            event_text = (
+                rf"{{\1c&HFFFFFF&"
+                rf"\3c{_ass_override_color(_SINGING_GRADIENT_MARKER)}"
+                rf"\3a&H01&}}"
+                + _decorate_singing_text(event_text)
+            )
         if source_text:
             source_lines = max(1, len(source_text.splitlines()))
             source_height = round(source_font_size * 1.2 * source_lines)
@@ -572,38 +636,6 @@ def _write_ass(
                 f"{source_style_name},{speaker or ''},0,0,{source_margin},,"
                 f"{escaped_source_text}"
             )
-        if is_singing:
-            effective_margin = event_margin or margin_vertical
-            decoration_y = round(
-                height
-                - effective_margin
-                - font_size * max(1, len(cue.text.splitlines())) / 2
-            )
-            widest_line_units = max(
-                text_display_width(line) for line in cue.text.splitlines()
-            )
-            half_text_width = widest_line_units * font_size / 2
-            decoration_gap = max(1, round(font_size * 0.35))
-            decoration_size = max(1, round(font_size * 0.72))
-            edge_padding = outline + decoration_size
-            left_x = max(
-                edge_padding,
-                round(width / 2 - half_text_width - decoration_gap),
-            )
-            right_x = min(
-                width - edge_padding,
-                round(width / 2 + half_text_width + decoration_gap),
-            )
-            events.extend(
-                [
-                    "Dialogue: 1,"
-                    f"{start},{end},{style_name},{speaker or ''},0,0,0,,"
-                    rf"{{\an6\pos({left_x},{decoration_y})\fs{decoration_size}}}♪",
-                    "Dialogue: 1,"
-                    f"{start},{end},{style_name},{speaker or ''},0,0,0,,"
-                    rf"{{\an4\pos({right_x},{decoration_y})\fs{decoration_size}}}♫",
-                ]
-            )
     path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
     if skipped_nonpositive:
         logging.warning(
@@ -617,6 +649,10 @@ def _ass_color(value: str) -> str:
     green = value[3:5]
     blue = value[5:7]
     return f"&H00{blue}{green}{red}"
+
+
+def _ass_override_color(value: str) -> str:
+    return _ass_color(value).replace("&H00", "&H", 1) + "&"
 
 
 def _ass_style_name(value: str) -> str:
@@ -642,3 +678,46 @@ def _escape_ass_text(text: str) -> str:
         .replace("}", r"\}")
         .replace("\n", r"\N")
     )
+
+
+def _decorate_singing_text(text: str) -> str:
+    return f"♪ {text} ♫"
+
+
+def _karaoke_text(
+    units: tuple[TimedTextUnit, ...],
+    cue_start: float,
+    cue_end: float,
+    *,
+    outline_color: str | None = None,
+    highlight_color: str = "#000000",
+    prefix: str = "",
+    suffix: str = "",
+) -> str:
+    ordered = sorted(units, key=lambda unit: (unit.start, unit.end))
+    if not ordered:
+        return ""
+    offsets = [
+        max(0, round((min(cue_end, max(cue_start, unit.start)) - cue_start) * 100))
+        for unit in ordered
+    ]
+    final_offset = max(offsets[-1], round((cue_end - cue_start) * 100))
+    outline_override = (
+        rf"\3c{_ass_override_color(outline_color)}\3a&H01&"
+        if outline_color
+        else ""
+    )
+    neutral = rf"{{\1c&HFFFFFF&\2c&HFFFFFF&{outline_override}}}"
+    karaoke = (
+        rf"{{\1c{_ass_override_color(highlight_color)}"
+        + (r"\1a&H01&" if highlight_color == _SINGING_GRADIENT_MARKER else "")
+        + rf"\2c&HFFFFFF&{outline_override}}}"
+    )
+    values = [neutral + _escape_ass_text(prefix) + karaoke if prefix else karaoke]
+    for index, unit in enumerate(ordered):
+        following = offsets[index + 1] if index + 1 < len(offsets) else final_offset
+        duration = max(0, following - offsets[index])
+        values.append(rf"{{\kf{duration}}}{_escape_ass_text(unit.text)}")
+    if suffix:
+        values.append(neutral + _escape_ass_text(suffix))
+    return "".join(values)

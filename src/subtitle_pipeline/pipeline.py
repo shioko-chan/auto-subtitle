@@ -11,7 +11,13 @@ from importlib import resources
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .asr import read_cue_evidence, read_cue_sidecar, transcribe_with_qwen
+from .asr import (
+    read_cue_evidence,
+    read_cue_sidecar,
+    transcribe_singing_ranges,
+    transcribe_speech_ranges,
+    transcribe_with_qwen,
+)
 from .config import AppConfig, LLMConfig, llm_api_key
 from .media import download_youtube, render_subtitles, subtitle_layout
 from .song_identification import SongIdentificationResult, identify_and_align_songs
@@ -174,7 +180,22 @@ def _run_pipeline_stages(
                 downloaded.metadata,
                 job_dir,
                 config.song_identification,
-                translator.request,
+                translator.translate_lyrics,
+                translation_context,
+                config.llm.model,
+                lambda ranges: transcribe_speech_ranges(
+                    downloaded.video,
+                    ranges,
+                    job_dir,
+                    config.asr,
+                    japanese_single_word_list,
+                ),
+                lambda ranges: transcribe_singing_ranges(
+                    ranges,
+                    job_dir,
+                    config.asr,
+                    japanese_single_word_list,
+                ),
             )
         else:
             song_result = SongIdentificationResult(cues, [])

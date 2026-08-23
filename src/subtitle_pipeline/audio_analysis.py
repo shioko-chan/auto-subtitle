@@ -150,9 +150,8 @@ def analyze_audio(
                     separation_candidates,
                     config.device,
                     audio_pool,
-                    debug_dir=(job_dir / "vocal-candidates")
-                    if config.debug_audio_artifacts
-                    else None,
+                    # Persist candidate stems for later canonical-lyric alignment.
+                    debug_dir=job_dir / "vocal-candidates",
                 )
                 vocal_scores = _score_singing_sources(
                     [
@@ -857,6 +856,23 @@ def _separate_vocal_candidates(
     finally:
         del separator
         _release_cuda()
+    if debug_dir is not None:
+        (debug_dir / "manifest.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "start": candidate.start,
+                        "end": candidate.end,
+                        "path": f"candidate-{index:04d}.vocals.wav",
+                    }
+                    for index, candidate in enumerate(candidates)
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     return outputs
 
 

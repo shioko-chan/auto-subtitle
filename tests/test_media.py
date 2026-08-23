@@ -20,7 +20,7 @@ from subtitle_pipeline.media import (
     render_subtitles,
 )
 from subtitle_pipeline.speakers import CharacterStyle
-from subtitle_pipeline.subtitles import Cue
+from subtitle_pipeline.subtitles import Cue, TimedTextUnit
 
 
 class MediaDownloadTests(unittest.TestCase):
@@ -264,6 +264,35 @@ class SubtitleRenderTests(unittest.TestCase):
             content,
         )
 
+    def test_ass_karaoke_sweeps_outline_color_across_aligner_units(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "subtitle.ass"
+            _write_ass(
+                [
+                    Cue(
+                        1,
+                        2,
+                        "早上好",
+                        source_text="おはよう。",
+                        source_units=(
+                            TimedTextUnit("おはよう。", 1.0, 1.6),
+                        ),
+                    )
+                ],
+                path,
+                width=1920,
+                height=1080,
+                font_name="Noto Sans CJK SC",
+                font_size=71,
+                margin_vertical=54,
+                outline=5,
+            )
+            content = path.read_text(encoding="utf-8")
+
+        self.assertIn(
+            r"{\1c&H000000&\2c&HFFFFFF&}{\kf100}おはよう。", content
+        )
+
     def test_ass_japanese_uses_matching_character_outline_style(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "subtitle.ass"
@@ -280,6 +309,7 @@ class SubtitleRenderTests(unittest.TestCase):
                         "都子",
                         "fuji_miyako",
                         source_text="ミヤコ",
+                        source_units=(TimedTextUnit("ミヤコ", 1.0, 2.0),),
                     )
                 ],
                 path,
@@ -299,7 +329,8 @@ class SubtitleRenderTests(unittest.TestCase):
             content,
         )
         self.assertIn(
-            "Speaker_fuji_miyako_Japanese,fuji_miyako,0,0,0,,ミヤコ",
+            r"Speaker_fuji_miyako_Japanese,fuji_miyako,0,0,0,,"
+            r"{\1c&HFF91BC&\2c&HFFFFFF&}{\kf100}ミヤコ",
             content,
         )
 
@@ -335,7 +366,7 @@ class SubtitleRenderTests(unittest.TestCase):
         self.assertIn("Speaker_fuji_miyako,fuji_miyako,0,0,0,,都子", content)
         self.assertIn("Default,unknown,0,0,156,,默认", content)
 
-    def test_ass_underlines_and_decorates_only_singing_cues(self):
+    def test_ass_decorates_only_singing_cues_without_underlining(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "subtitle.ass"
             styles = {
@@ -360,25 +391,17 @@ class SubtitleRenderTests(unittest.TestCase):
             content = path.read_text(encoding="utf-8")
 
         self.assertIn(
-            r"Speaker_fuji_miyako,fuji_miyako,0,0,0,,{\u1}歌词", content
-        )
-        self.assertIn(
-            r"Dialogue: 1,0:00:01.00,0:00:02.00,Speaker_fuji_miyako,"
-            r"fuji_miyako,0,0,0,,{\an6\pos(864,990)\fs51}♪",
+            r"Default,fuji_miyako,0,0,0,,"
+            r"{\1c&HFFFFFF&\3c&HD4A8F9&\3a&H01&}♪ 歌词 ♫",
             content,
         )
-        self.assertIn(
-            r"Dialogue: 1,0:00:01.00,0:00:02.00,Speaker_fuji_miyako,"
-            r"fuji_miyako,0,0,0,,{\an4\pos(1056,990)\fs51}♫",
-            content,
-        )
+        self.assertNotIn(r"\pos(", content)
         self.assertIn("Speaker_fuji_miyako,fuji_miyako,0,0,0,,讲话", content)
-        self.assertNotIn(r"{\u1}讲话", content)
+        self.assertNotIn(r"{\u1}", content)
         self.assertEqual(content.count("♪"), 1)
         self.assertEqual(content.count("♫"), 1)
-        self.assertNotIn(r"{\u1}歌词 ♪", content)
 
-    def test_singing_decorations_center_on_multiline_lyrics_without_changing_text(self):
+    def test_singing_decorations_are_inline_with_multiline_lyrics(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "subtitle.ass"
             _write_ass(
@@ -393,9 +416,49 @@ class SubtitleRenderTests(unittest.TestCase):
             )
             content = path.read_text(encoding="utf-8")
 
-        self.assertIn(r",,{\u1}第一行歌词\N第二行", content)
-        self.assertIn(r"{\an6\pos(403,1776)\fs35}♪", content)
-        self.assertIn(r"{\an4\pos(677,1776)\fs35}♫", content)
+        self.assertIn(
+            r",,{\1c&HFFFFFF&\3c&HD4A8F9&\3a&H01&}♪ 第一行歌词\N第二行 ♫",
+            content,
+        )
+        self.assertNotIn(r"\pos(", content)
+
+    def test_singing_japanese_sweeps_gradient_foreground_with_gradient_outline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "subtitle.ass"
+            _write_ass(
+                [
+                    Cue(
+                        1,
+                        3,
+                        "歌词",
+                        kind="singing",
+                        source_text="歌うよ",
+                        source_units=(
+                            TimedTextUnit("歌う", 1.0, 2.0),
+                            TimedTextUnit("よ", 2.0, 3.0),
+                        ),
+                    )
+                ],
+                path,
+                width=1920,
+                height=1080,
+                font_name="Noto Sans CJK SC",
+                font_size=71,
+                margin_vertical=54,
+                outline=5,
+            )
+            content = path.read_text(encoding="utf-8")
+
+        self.assertIn(
+            r"Dialogue: 0,0:00:01.00,0:00:03.00,Japanese,,0,0,0,,"
+            r"{\1c&HFFFFFF&\2c&HFFFFFF&\3c&HD4A8F9&\3a&H01&}♪ "
+            r"{\1c&HD4A8F9&\1a&H01&\2c&HFFFFFF&\3c&HD4A8F9&\3a&H01&}"
+            r"{\kf100}歌う{\kf100}よ"
+            r"{\1c&HFFFFFF&\2c&HFFFFFF&\3c&HD4A8F9&\3a&H01&} ♫",
+            content,
+        )
+        self.assertEqual(content.count("Dialogue: 0,"), 2)
+        self.assertNotIn("Dialogue: 1,", content)
 
     def test_ass_skips_non_positive_duration_cues(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -92,6 +92,23 @@ def _check(config: AppConfig) -> int:
 
             analysis = config.audio_analysis
             workers: list[tuple[str, Path]] = []
+            if config.song_identification.enabled:
+                workers.extend(
+                    [
+                        (
+                            "song search worker",
+                            Path(config.song_identification.search_worker_project)
+                            .resolve()
+                            .joinpath("worker.py"),
+                        ),
+                        (
+                            "pySHIRO worker",
+                            Path(config.song_identification.pyshiro_worker_project)
+                            .resolve()
+                            .joinpath("worker.py"),
+                        ),
+                    ]
+                )
             if analysis.diarization_backend == "moss":
                 workers.append(
                     (
