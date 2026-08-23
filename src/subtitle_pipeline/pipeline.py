@@ -14,7 +14,6 @@ from urllib.parse import urlsplit
 from .asr import (
     read_cue_evidence,
     read_cue_sidecar,
-    transcribe_singing_ranges,
     transcribe_speech_ranges,
     transcribe_with_qwen,
 )
@@ -185,12 +184,6 @@ def _run_pipeline_stages(
                 config.llm.model,
                 lambda ranges: transcribe_speech_ranges(
                     downloaded.video,
-                    ranges,
-                    job_dir,
-                    config.asr,
-                    japanese_single_word_list,
-                ),
-                lambda ranges: transcribe_singing_ranges(
                     ranges,
                     job_dir,
                     config.asr,

@@ -125,6 +125,7 @@ class OpenAICompatibleTranslator:
             sudachi_versions=sudachi_versions,
             honorific_rules=_HONORIFIC_TRANSLATION_RULES,
             parse_content=_parse_joint_records,
+            parse_batch_content=_parse_joint_windows,
             finish_reason=_finish_reason,
             retry_delay=_transient_retry_delay,
             is_nontransient=_is_nontransient_http_error,
@@ -678,6 +679,14 @@ def _parse_joint_records(content: object) -> list[object]:
     if isinstance(parsed, list):
         return parsed
     raise ValueError("joint cue response must be an object or array")
+
+
+def _parse_joint_windows(content: object) -> list[object]:
+    parsed = _parse_json_object(content)
+    windows = parsed.get("windows")
+    if not isinstance(windows, list):
+        raise TypeError("batched joint response must contain a windows array")
+    return windows
 
 
 def _parse_json_sequence(value: str) -> list[object]:

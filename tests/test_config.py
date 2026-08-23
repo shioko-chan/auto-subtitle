@@ -31,8 +31,20 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.upload.description_max_chars, 1800)
             self.assertEqual(config.asr.model, "Qwen/Qwen3-ASR-1.7B")
             self.assertEqual(config.asr.aligner_model, "Qwen/Qwen3-ForcedAligner-0.6B")
+            self.assertEqual(
+                config.asr.singing_model, "HeartMuLa/HeartTranscriptor-oss"
+            )
+            self.assertEqual(config.asr.singing_max_new_tokens, 256)
+            self.assertEqual(config.asr.singing_num_beams, 2)
+            self.assertEqual(config.song_identification.lyric_neighbor_max_lines, 12)
+            self.assertEqual(
+                config.song_identification.lyric_neighbor_min_coverage, 0.45
+            )
+            self.assertEqual(
+                config.song_identification.lyric_neighbor_max_unit_seconds, 2.0
+            )
             self.assertEqual(config.asr.dtype, "float16")
-            self.assertEqual(config.asr.language, "Japanese")
+            self.assertIsNone(config.asr.language)
             self.assertTrue(config.audio_analysis.enabled)
             self.assertFalse(config.audio_analysis.debug_audio_artifacts)
             self.assertEqual(config.audio_analysis.initial_analysis_concurrency, 1)
@@ -75,14 +87,13 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.audio_analysis.singing_smoothing_windows, 3)
             self.assertEqual(config.audio_analysis.singing_release_seconds, 35.0)
             self.assertEqual(config.audio_analysis.singing_min_phrase_seconds, 30.0)
-            self.assertEqual(config.audio_analysis.singing_asr_target_seconds, 30.0)
-            self.assertEqual(config.audio_analysis.singing_asr_min_seconds, 20.0)
-            self.assertEqual(config.audio_analysis.singing_asr_max_seconds, 38.0)
-            self.assertEqual(config.audio_analysis.singing_asr_search_seconds, 5.0)
+            self.assertEqual(config.audio_analysis.singing_asr_target_seconds, 10.0)
+            self.assertEqual(config.audio_analysis.singing_asr_min_seconds, 6.0)
+            self.assertEqual(config.audio_analysis.singing_asr_max_seconds, 15.0)
+            self.assertEqual(config.audio_analysis.singing_asr_search_seconds, 4.0)
             self.assertFalse(config.song_identification.enabled)
             self.assertEqual(config.song_identification.device, "gpu:0")
             self.assertEqual(config.song_identification.lyric_gap_recheck_seconds, 20.0)
-            self.assertEqual(config.song_identification.lyric_gap_asr_threshold, 0.48)
             self.assertEqual(
                 config.song_identification.lyric_gap_vocal_active_ratio, 0.08
             )
@@ -90,6 +101,8 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.segmentation.local_unit_max_seconds, 6.0)
             self.assertEqual(config.segmentation.model_window_units, 160)
             self.assertEqual(config.segmentation.model_window_chars, 8000)
+            self.assertEqual(config.segmentation.request_batch_windows, 32)
+            self.assertEqual(config.segmentation.request_batch_chars, 8000)
             self.assertEqual(config.llm.max_concurrency, 16)
             self.assertEqual(
                 config.llm.local_translation_model, "facebook/m2m100_418M"
@@ -183,6 +196,15 @@ class ConfigTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ConfigError, "180 seconds"):
                 load_config(path)
+
+    def test_asr_language_defaults_to_automatic_detection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text("", encoding="utf-8")
+
+            config = load_config(path)
+
+            self.assertIsNone(config.asr.language)
 
     def test_api_key_comes_from_named_environment_variable_when_pass_is_disabled(self):
         with tempfile.TemporaryDirectory() as temp:

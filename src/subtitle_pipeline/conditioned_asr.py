@@ -60,7 +60,14 @@ def repair_long_overlaps(
     repaired = _load_cache(cache_path, signature)
     if repaired is None:
         repaired = [
-            Cue(cue.start, cue.end, cue.text, cue.speaker, _CONDITIONED_CUE_KIND)
+            Cue(
+                cue.start,
+                cue.end,
+                cue.text,
+                cue.speaker,
+                _CONDITIONED_CUE_KIND,
+                language="Japanese",
+            )
             for cue in _run_dicow(audio, windows, config)
         ]
         _write_cache(cache_path, signature, repaired)
@@ -339,6 +346,7 @@ def _decode_cues(value: object, windows: list[ConditionedWindow]) -> list[Cue]:
                 text,
                 label_to_character.get(label, label),
                 _CONDITIONED_CUE_KIND,
+                language="Japanese",
             )
         )
     if not cues:

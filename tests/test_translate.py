@@ -251,7 +251,30 @@ class JointTranslationTests(unittest.TestCase):
         ]
 
         def request(body):
-            target = body["messages"][1]["content"].split("TARGET:\n", 1)[1]
+            prompt = body["messages"][1]["content"]
+            if "WINDOWS:\n" in prompt:
+                return _response(
+                    json.dumps(
+                        {
+                            "windows": [
+                                {
+                                    "window_id": 0,
+                                    "cues": [
+                                        {"start_id": 0, "end_id": 0, "text": "A字幕"}
+                                    ],
+                                },
+                                {
+                                    "window_id": 1,
+                                    "cues": [
+                                        {"start_id": 0, "end_id": 0, "text": "B字幕"}
+                                    ],
+                                },
+                            ]
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            target = prompt.split("TARGET:\n", 1)[1]
             ids = [
                 int(part.split(">", 1)[0])
                 for part in target.split("<")
@@ -276,10 +299,10 @@ class JointTranslationTests(unittest.TestCase):
                     cache_path=cache,
                     audit_path=audit,
                 )
-            self.assertEqual(mocked.call_count, 2)
+            self.assertEqual(mocked.call_count, 1)
             self.assertTrue(audit.is_file())
             self.assertEqual(
-                json.loads(cache.read_text(encoding="utf-8"))["version"], 7
+                json.loads(cache.read_text(encoding="utf-8"))["version"], 8
             )
 
             cached = OpenAICompatibleTranslator(LLMConfig(max_concurrency=2), "secret")
@@ -295,6 +318,107 @@ class JointTranslationTests(unittest.TestCase):
         self.assertEqual(result, repeated)
         self.assertEqual([cue.speaker for cue in result.source_cues], ["A", "B"])
         self.assertGreater(result.source_cues[0].end, result.source_cues[1].start)
+
+    def test_distant_same_speaker_episodes_share_request_but_not_cue(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(max_concurrency=2), "secret")
+        cues = [
+            Cue(0.0, 0.5, "なんか", "A"),
+            Cue(1000.0, 1000.5, "嬉しい", "A"),
+        ]
+
+        def request(body):
+            prompt = body["messages"][1]["content"]
+            self.assertEqual(prompt.count('<WINDOW id="'), 2)
+            return _response(
+                json.dumps(
+                    {
+                        "windows": [
+                            {
+                                "window_id": 0,
+                                "cues": [
+                                    {"start_id": 0, "end_id": 0, "text": "总觉得"}
+                                ],
+                            },
+                            {
+                                "window_id": 1,
+                                "cues": [
+                                    {"start_id": 0, "end_id": 0, "text": "很开心"}
+                                ],
+                            },
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        with patch.object(translator, "_request", side_effect=request) as mocked:
+            result = translator.plan_and_translate(
+                cues,
+                SegmentationConfig(),
+                max_line_units=20,
+            )
+
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(
+            [cue.text for cue in result.translated_cues], ["总觉得", "很开心"]
+        )
+        self.assertEqual(
+            [(cue.start, cue.end) for cue in result.translated_cues],
+            [(0.0, 0.5), (1000.0, 1000.5)],
+        )
+
+    def test_missing_batch_window_retries_only_that_window(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(max_concurrency=2), "secret")
+        cues = [
+            Cue(0.0, 0.5, "なんか", "A"),
+            Cue(1000.0, 1000.5, "嬉しい", "A"),
+        ]
+
+        def request(body):
+            prompt = body["messages"][1]["content"]
+            if "WINDOWS:\n" in prompt:
+                return _response(
+                    json.dumps(
+                        {
+                            "windows": [
+                                {
+                                    "window_id": 0,
+                                    "cues": [
+                                        {
+                                            "start_id": 0,
+                                            "end_id": 0,
+                                            "text": "总觉得",
+                                        }
+                                    ],
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            self.assertIn("<0>嬉しい", prompt)
+            return _response(
+                json.dumps(
+                    {
+                        "cues": [
+                            {"start_id": 0, "end_id": 0, "text": "很开心"}
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        with patch.object(translator, "_request", side_effect=request) as mocked:
+            result = translator.plan_and_translate(
+                cues,
+                SegmentationConfig(),
+                max_line_units=20,
+            )
+
+        self.assertEqual(mocked.call_count, 2)
+        self.assertEqual(
+            [cue.text for cue in result.translated_cues], ["总觉得", "很开心"]
+        )
 
     def test_verified_lyric_translation_bypasses_general_llm(self):
         translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
@@ -340,7 +464,9 @@ class JointTranslationTests(unittest.TestCase):
                     max_line_units=20,
                 )
 
-            local_translate.assert_called_once_with("原文")
+            local_translate.assert_called_once_with(
+                "原文", source_language="Japanese"
+            )
             self.assertEqual(result.translated_cues[0].text, "本地译文")
             self.assertIn(
                 "reason=single_unit_CoverageValidationError",
@@ -417,7 +543,10 @@ class JointTranslationTests(unittest.TestCase):
             LocalUnit("C", 0, (3,), 30, 31, "太远", "C", "speech"),
         ]
         context = _dialogue_context(values, selected, SegmentationConfig())
-        self.assertEqual(context, "<B>之前\n<B>之后")
+        self.assertEqual(
+            context,
+            "<B language=Japanese>之前\n<B language=Japanese>之后",
+        )
         self.assertNotIn("目标", context)
 
     def test_joint_parser_accepts_object_array_and_ndjson(self):
@@ -505,7 +634,7 @@ class JointTranslationTests(unittest.TestCase):
                 max_line_units=20,
             )
         request.assert_called_once()
-        local_translate.assert_called_once_with("です")
+        local_translate.assert_called_once_with("です", source_language="Japanese")
         self.assertIn("reason=residual_japanese", "\n".join(captured.output))
         self.assertIn("protected_terms=1", "\n".join(captured.output))
         self.assertEqual(result.translated_cues[0].text, "姓名都子是")

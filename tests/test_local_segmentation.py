@@ -191,6 +191,35 @@ class LocalSegmentationTests(unittest.TestCase):
         values = SudachiAnalyzer().analyze("行きました")
         self.assertTrue(any(item.conjugation_form != "*" for item in values))
 
+    def test_english_units_preserve_spaces_and_use_punctuation_boundary(self):
+        analyzer = SudachiAnalyzer()
+        cues = [
+            Cue(0, 0.5, "Hello.", "A", language="English"),
+            Cue(0.5, 1.0, "But", "A", language="English"),
+            Cue(1.0, 1.5, "wait", "A", language="English"),
+        ]
+
+        tracks, _versions = build_speaker_tracks(
+            cues,
+            SegmentationConfig(boundary_score_threshold=3),
+            analyzer=analyzer,
+        )
+
+        self.assertEqual([unit.text for unit in tracks[0].units], ["Hello.", "But wait"])
+        self.assertTrue(all(unit.language == "English" for unit in tracks[0].units))
+
+    def test_mixed_analysis_uses_sudachi_only_for_japanese_spans(self):
+        values = SudachiAnalyzer().analyze_source(
+            "今日は Ready set です", "mixed"
+        )
+
+        self.assertTrue(any(value.language == "Japanese" for value in values))
+        self.assertTrue(any(value.language == "English" for value in values))
+        self.assertEqual(
+            "".join(value.surface for value in values).replace(" ", ""),
+            "今日はReadysetです",
+        )
+
     def test_real_ginza_prefers_boundary_inside_bunsetsu(self):
         left, right = SudachiAnalyzer().dependency_boundary_strengths(
             "私", "は", "猫です"

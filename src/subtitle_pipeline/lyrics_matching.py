@@ -5,11 +5,18 @@ import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
+import alkana
 from sudachipy import dictionary, tokenizer
 
 from .lyrics_library import LibrarySong
 
 _SMALL_KANA = frozenset("ぁぃぅぇぉゃゅょゎァィゥェォャュョヮ")
+_ENGLISH_WORD_RE = re.compile(r"[A-Za-z]+(?:['’-][A-Za-z]+)*")
+_ENGLISH_KATAKANA_OVERRIDES = {
+    "newtype": "ニュータイプ",
+}
+_MAX_LYRIC_LINES_PER_ANCHOR = 24
+_MAX_LYRIC_LENGTH_RATIO = 1.75
 
 
 @dataclass(frozen=True)
@@ -18,6 +25,7 @@ class LyricAnchor:
     line_start: int
     line_end: int
     score: float
+    take_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -46,11 +54,17 @@ class JapaneseNormalizer:
         self, text: str, supplied_reading: str | None = None
     ) -> list[tuple[str, str]]:
         normalized = unicodedata.normalize("NFKC", text)
-        if supplied_reading:
+        if supplied_reading and not _ENGLISH_WORD_RE.search(supplied_reading):
             units = self._split_surface_reading(
                 normalized, self._clean_reading(supplied_reading)
             )
             return units if "".join(value[0] for value in units) == text else []
+        if _ENGLISH_WORD_RE.search(normalized):
+            units = self._mixed_language_display_units(normalized)
+            return units if "".join(value[0] for value in units) == text else []
+        return self._japanese_display_units(normalized)
+
+    def _japanese_display_units(self, normalized: str) -> list[tuple[str, str]]:
         units: list[tuple[str, str]] = []
         prefix = ""
         for word in self._tokenizer.tokenize(
@@ -80,9 +94,40 @@ class JapaneseNormalizer:
         if prefix and units:
             previous_text, previous_reading = units[-1]
             units[-1] = (previous_text + prefix, previous_reading)
-        if not units or "".join(value[0] for value in units) != text:
+        if not units or "".join(value[0] for value in units) != normalized:
             return []
         return units
+
+    def _mixed_language_display_units(self, text: str) -> list[tuple[str, str]]:
+        units: list[tuple[str, str]] = []
+        cursor = 0
+        for match in _ENGLISH_WORD_RE.finditer(text):
+            self._append_non_english_units(units, text[cursor : match.start()])
+            reading = _english_katakana(match.group(0))
+            if reading is None:
+                return []
+            prefix = ""
+            if units and not units[-1][1]:
+                prefix, _ = units.pop()
+            units.append((prefix + match.group(0), self._clean_reading(reading)))
+            cursor = match.end()
+        self._append_non_english_units(units, text[cursor:])
+        return units
+
+    def _append_non_english_units(
+        self, units: list[tuple[str, str]], text: str
+    ) -> None:
+        if not text:
+            return
+        values = self._japanese_display_units(text)
+        if values:
+            units.extend(values)
+        elif units:
+            previous_text, previous_reading = units[-1]
+            units[-1] = (previous_text + text, previous_reading)
+        else:
+            # A leading separator is displayed with the first pronounced unit.
+            units.append((text, ""))
 
     def _split_surface_reading(
         self, surface: str, reading: str
@@ -134,6 +179,41 @@ class JapaneseNormalizer:
             chr(ord(char) - 0x60) if "ァ" <= char <= "ヶ" else char for char in value
         )
         return re.sub(r"[^0-9a-zぁ-ゖー]", "", value)
+
+
+def _english_katakana(word: str) -> str | None:
+    normalized = word.casefold().replace("’", "'")
+    value = _ENGLISH_KATAKANA_OVERRIDES.get(normalized) or alkana.get_kana(
+        normalized
+    )
+    if value:
+        return str(value)
+    expansions = {
+        "aren't": ("are", "not"),
+        "can't": ("can", "not"),
+        "couldn't": ("could", "not"),
+        "didn't": ("did", "not"),
+        "doesn't": ("does", "not"),
+        "don't": ("do", "not"),
+        "i'm": ("i", "am"),
+        "isn't": ("is", "not"),
+        "it's": ("it", "is"),
+        "let's": ("let", "us"),
+        "they're": ("they", "are"),
+        "wasn't": ("was", "not"),
+        "we're": ("we", "are"),
+        "weren't": ("were", "not"),
+        "won't": ("will", "not"),
+        "wouldn't": ("would", "not"),
+        "you're": ("you", "are"),
+    }
+    pieces = expansions.get(normalized)
+    if pieces is None and "-" in normalized:
+        pieces = tuple(part for part in normalized.split("-") if part)
+    if not pieces:
+        return None
+    readings = [alkana.get_kana(piece) for piece in pieces]
+    return "".join(str(item) for item in readings) if all(readings) else None
 
 
 def _is_nonpronounced_word(word: object) -> bool:
@@ -248,7 +328,12 @@ def match_song(
             for line_start in range(len(normalized_lyrics)):
                 combined = ""
                 for line_end in range(
-                    line_start + 1, min(len(normalized_lyrics), line_start + 4) + 1
+                    line_start + 1,
+                    min(
+                        len(normalized_lyrics),
+                        line_start + _MAX_LYRIC_LINES_PER_ANCHOR,
+                    )
+                    + 1,
                 ):
                     combined += normalized_lyrics[line_end - 1]
                     score = SequenceMatcher(
@@ -258,7 +343,11 @@ def match_song(
                         choices.append(
                             LyricAnchor(cue_index, line_start, line_end, score)
                         )
-        anchors = _semiglobal_anchor_path(choices)
+                    if len(combined) > max(
+                        24, len(hypothesis) * _MAX_LYRIC_LENGTH_RATIO
+                    ):
+                        break
+        anchors = _semiglobal_anchor_paths(choices, minimum_anchors)
         if len(anchors) >= minimum_anchors:
             score = sum(anchor.score for anchor in anchors) / len(anchors)
             coverage = min(1.0, len(anchors) / max(1, len(normalized_asr)))
@@ -276,6 +365,36 @@ def match_song(
     ):
         return None
     return candidates[0]
+
+
+def _semiglobal_anchor_paths(
+    choices: list[LyricAnchor], minimum_anchors: int
+) -> list[LyricAnchor]:
+    """Extract independent chronological takes from one singing episode."""
+    remaining = list(choices)
+    paths: list[list[LyricAnchor]] = []
+    minimum_take_anchors = min(2, minimum_anchors)
+    while remaining:
+        path = _semiglobal_anchor_path(remaining)
+        if len(path) < minimum_take_anchors:
+            break
+        paths.append(path)
+        used_cues = {anchor.cue_index for anchor in path}
+        remaining = [
+            anchor for anchor in remaining if anchor.cue_index not in used_cues
+        ]
+    paths.sort(key=lambda path: path[0].cue_index)
+    return [
+        LyricAnchor(
+            anchor.cue_index,
+            anchor.line_start,
+            anchor.line_end,
+            anchor.score,
+            take_index,
+        )
+        for take_index, path in enumerate(paths)
+        for anchor in path
+    ]
 
 
 def _semiglobal_anchor_path(

@@ -3,11 +3,13 @@ from __future__ import annotations
 import logging
 import threading
 
+from .source_language import language_for_text, normalize_source_language
+
 logger = logging.getLogger(__name__)
 
 
 class LocalJapaneseTranslator:
-    """Lazily loaded, process-local Japanese-to-Chinese fallback translator."""
+    """Lazily loaded, process-local source-language-to-Chinese fallback."""
 
     def __init__(self, model_name: str, device: str):
         self.model_name = model_name
@@ -17,7 +19,7 @@ class LocalJapaneseTranslator:
         self._tokenizer = None
         self._model = None
 
-    def translate(self, text: str) -> str:
+    def translate(self, text: str, source_language: str | None = None) -> str:
         source = text.strip()
         if not source:
             return ""
@@ -25,7 +27,9 @@ class LocalJapaneseTranslator:
         import torch
 
         with self._inference_lock, torch.inference_mode():
-            self._tokenizer.src_lang = "ja"
+            self._tokenizer.src_lang = _m2m_source_language(
+                source, source_language
+            )
             encoded = self._tokenizer(source, return_tensors="pt")
             encoded = {key: value.to(self.device) for key, value in encoded.items()}
             generated = self._model.generate(
@@ -60,3 +64,10 @@ class LocalJapaneseTranslator:
             model.eval()
             self._tokenizer = tokenizer
             self._model = model
+
+
+def _m2m_source_language(text: str, source_language: str | None) -> str:
+    language = normalize_source_language(source_language)
+    if language is None or language == "mixed":
+        language = language_for_text(text)
+    return "en" if language == "English" else "ja"

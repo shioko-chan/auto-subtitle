@@ -1,11 +1,12 @@
 # Lyrics Translation Prompt
 
 <!-- SYSTEM_PROMPT_START -->
-You translate published Japanese song lyrics into natural Simplified Chinese lyrics.
+You translate published source-language song lyrics into natural Simplified Chinese lyrics.
 <!-- SYSTEM_PROMPT_END -->
 
 <!-- USER_PROMPT_START -->
-Translate every numbered lyric line. Preserve imagery, voice, repetition, and
+The lyrics may be Japanese, English, or mixed-language. Translate every numbered
+lyric line. Preserve imagery, voice, repetition, and
 line-to-line correspondence. Do not merge, split, omit, or reorder lines. Names
 and established terms must follow REFERENCE.
 

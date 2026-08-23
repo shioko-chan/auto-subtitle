@@ -28,9 +28,13 @@ class DownloadConfig:
 class ASRConfig:
     model: str = "Qwen/Qwen3-ASR-1.7B"
     aligner_model: str = "Qwen/Qwen3-ForcedAligner-0.6B"
+    singing_model: str = "HeartMuLa/HeartTranscriptor-oss"
+    singing_max_new_tokens: int = 256
+    singing_num_beams: int = 2
     device: str = "cuda:0"
     dtype: str = "float16"
-    language: str = "Japanese"
+    # None lets Qwen detect the language independently for each ASR window.
+    language: str | None = None
     context: str = ""
     chunk_seconds: float = 170.0
     chunk_context_seconds: float = 0.5
@@ -81,11 +85,11 @@ class AudioAnalysisConfig:
     singing_release_seconds: float = 35.0
     singing_phrase_silence_seconds: float = 0.45
     singing_min_phrase_seconds: float = 30.0
-    singing_asr_target_seconds: float = 30.0
-    singing_asr_min_seconds: float = 20.0
-    singing_asr_max_seconds: float = 38.0
-    singing_asr_search_seconds: float = 5.0
-    singing_asr_overlap_seconds: float = 2.0
+    singing_asr_target_seconds: float = 10.0
+    singing_asr_min_seconds: float = 6.0
+    singing_asr_max_seconds: float = 15.0
+    singing_asr_search_seconds: float = 4.0
+    singing_asr_overlap_seconds: float = 1.0
     speaker_profiles_dir: str = "work/speaker-profiles-eres2netv2"
     speaker_match_threshold: float = 0.42
     speaker_match_margin: float = 0.025
@@ -122,10 +126,12 @@ class SongIdentificationConfig:
     pyshiro_worker_project: str = "tools/pyshiro"
     pyshiro_max_window_seconds: float = 20.0
     lyric_gap_recheck_seconds: float = 20.0
-    lyric_gap_asr_threshold: float = 0.48
     lyric_gap_vocal_active_ratio: float = 0.08
     pyshiro_likelihood_floor: float = -30.0
     pyshiro_likelihood_margin: float = 2.0
+    lyric_neighbor_max_lines: int = 12
+    lyric_neighbor_min_coverage: float = 0.45
+    lyric_neighbor_max_unit_seconds: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -136,6 +142,8 @@ class SegmentationConfig:
     speaker_episode_gap_seconds: float = 2.0
     model_window_units: int = 160
     model_window_chars: int = 8000
+    request_batch_windows: int = 32
+    request_batch_chars: int = 8000
     dialogue_context_seconds: float = 5.0
     dialogue_context_max_chars: int = 4000
 
@@ -308,6 +316,12 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("asr.model cannot be empty")
     if not config.asr.aligner_model.strip():
         raise ConfigError("asr.aligner_model cannot be empty")
+    if not config.asr.singing_model.strip():
+        raise ConfigError("asr.singing_model cannot be empty")
+    if config.asr.singing_max_new_tokens < 1:
+        raise ConfigError("asr.singing_max_new_tokens must be at least 1")
+    if config.asr.singing_num_beams < 1:
+        raise ConfigError("asr.singing_num_beams must be at least 1")
     if config.asr.dtype not in {"float16", "bfloat16", "float32"}:
         raise ConfigError("asr.dtype must be 'float16', 'bfloat16', or 'float32'")
     if config.asr.chunk_seconds <= 0 or config.asr.chunk_seconds > 175:
@@ -533,12 +547,20 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("song_identification.pyshiro_max_window_seconds must be in (0, 20]")
     if not 0 < songs.lyric_gap_recheck_seconds <= 20:
         raise ConfigError("song_identification.lyric_gap_recheck_seconds must be in (0, 20]")
-    if not 0 <= songs.lyric_gap_asr_threshold <= 1:
-        raise ConfigError("song_identification.lyric_gap_asr_threshold must be between 0 and 1")
     if not 0 <= songs.lyric_gap_vocal_active_ratio <= 1:
         raise ConfigError("song_identification.lyric_gap_vocal_active_ratio must be between 0 and 1")
     if songs.pyshiro_likelihood_margin < 0:
         raise ConfigError("song_identification.pyshiro_likelihood_margin cannot be negative")
+    if songs.lyric_neighbor_max_lines < 1:
+        raise ConfigError("song_identification.lyric_neighbor_max_lines must be at least 1")
+    if not 0 <= songs.lyric_neighbor_min_coverage <= 1:
+        raise ConfigError(
+            "song_identification.lyric_neighbor_min_coverage must be between 0 and 1"
+        )
+    if songs.lyric_neighbor_max_unit_seconds <= 0:
+        raise ConfigError(
+            "song_identification.lyric_neighbor_max_unit_seconds must be positive"
+        )
     segmentation = config.segmentation
     if segmentation.boundary_score_threshold < 0:
         raise ConfigError("segmentation.boundary_score_threshold cannot be negative")
@@ -560,6 +582,10 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("segmentation.model_window_units must be at least 1")
     if segmentation.model_window_chars < 1:
         raise ConfigError("segmentation.model_window_chars must be at least 1")
+    if segmentation.request_batch_windows < 1:
+        raise ConfigError("segmentation.request_batch_windows must be at least 1")
+    if segmentation.request_batch_chars < 1:
+        raise ConfigError("segmentation.request_batch_chars must be at least 1")
     if segmentation.dialogue_context_seconds < 0:
         raise ConfigError("segmentation.dialogue_context_seconds cannot be negative")
     if segmentation.dialogue_context_max_chars < 1:

@@ -14,7 +14,7 @@
 ```text
 YouTube URL
   → yt-dlp 下载视频和元数据
-  → Qwen3-ASR-1.7B 分块转写音轨
+  → Qwen3-ASR-1.7B 分块转写音轨并自动识别语言
   → Qwen3-ForcedAligner-0.6B 生成词级时间戳
   → Sudachi 形态分析和本地评分生成候选单元
   → LLM 单阶段决定 cue 范围并翻译，同时处理可能的 ASR 误听
@@ -63,7 +63,9 @@ VP9/H.264，已缓存的 AV1 视频仍可经 CPU 回退处理。
 启用 `[song_identification]` 后，管线优先用歌唱 ASR 在本地正式歌词库中做连续字符锚点
 匹配；未命中才由独立 `ddgs` worker 搜索受支持歌词站并解析结构化完整歌词。搜歌与匹配
 不调用 LLM，ASR、call 和未发行歌曲不会写入歌词库。匹配成功后在持久化的 Demucs 人声轨
-上切成不超过 20 秒的窗口，由 pySHIRO 生成音素时间；译词优先复用库内官方或外部翻译，
+上切成不超过 20 秒的窗口，由 pySHIRO 生成音素时间。英文歌词保留官方拼写作为显示文本，
+同时用 `alkana` 生成隐藏的日式片假名发音，供 pySHIRO 日语模型近似对齐；无法可靠转读的专名不强制对齐。
+译词优先复用库内官方或外部翻译，
 缺失时才使用歌词专用 LLM 并写回库中。PaddleOCR、搜索和 pySHIRO 均运行在各自锁定的
 worker 环境中。
 原始 `source.qwen3-asr.srt` 始终保留；核验结果写入
@@ -124,16 +126,17 @@ NixOS、macOS 和 Windows，同时保留 `SSL_CERT_FILE` 等自定义 CA 配置�
 
 字幕使用单阶段联合 JSON 请求。Forced Aligner 单元首先按 ordinary diarization 的真实
 时间交集归属 speaker；未归属片段依次经过同 speaker 桥接、Sudachi + GiNZA 句法回填和
-0.5 秒最近 speaker 兜底，距离仍过大时删除并审计。随后由 SudachiPy SplitMode.A 补充
-词性、活用型和活用形，再依据静音、当前块时长、终止形、句末表达、新话语起始和助词连接
-状态打分，贪心合并为可供模型选择的本地单元。每个 speaker 建立独立时间轨，因此不同人物
+0.5 秒最近 speaker 兜底，距离仍过大时删除并审计。随后按 ASR 记录的语言分流：日语使用
+SudachiPy SplitMode.A 与 GiNZA；英语保留词间空格，使用英语标点、停顿和 spaCy English
+tokenizer；混合语言保留原始空格，仅对日语片段运行 Sudachi。语言对应的语法证据与静音、
+当前块时长一起打分，贪心合并为可供模型选择的本地单元。每个 speaker 建立独立时间轨，因此不同人物
 的字幕可以重叠显示；同轨间隔达到 2 秒时建立硬 episode 边界。逐词人物归属、评分与形态
 信息写入 `local-segmentation.json`。
 
 每个 LLM 请求只处理一条 speaker 轨，模型同时选择左闭右闭的本地单元范围并翻译，例如
 `{"start_id":0,"end_id":2,"text":"中文字幕"}` 表示覆盖 0、1、2。每个窗口都从 0 重新编号，范围必须连续、
 无遗漏、无重复；单单元 cue 合法。响应通过校验后映射回 speaker 轨的全局单元 ID，缓存与
-最终字幕仍使用全局 ID。日文由本地按范围恢复，模型只返回中文。请求附带目标前后 5 秒的只读
+最终字幕仍使用全局 ID。源语言文本由本地按范围恢复，模型只返回中文。请求附带目标前后 5 秒的只读
 对话上下文、视频信息和术语表，并明确 ASR 可能误听。歌声与 DiCoW `conditioned_speech`
 保持不可拆分的原子单元，但使用相同响应契约。
 
@@ -149,8 +152,9 @@ TARGET 以 160 个本地单元或 8000 源字符为上限，靠近上限时选�
 JSON 等结构错误立即重试一次，再失败便递归缩窗。可无损转换为整数的字符串 ID 会先归一化。
 范围遗漏、重复或乱序时，程序保留最长可信前后缀，并从已经确认的 cue 边界取错误区及前后
 各一条作局部联合补丁，不重发整个窗口。空译文记录轨道、范围和源文后使用本地
-`facebook/m2m100_418M` 日中机翻；残留日文先保护 REFERENCE 中的姓名、昵称和术语，再对
-未保护部分执行同一机翻。模型按需在 CPU 加载。超宽译文只记录实际宽度和限制并继续，
+`facebook/m2m100_418M` 本地机翻，并按 cue 语言选择 `ja` 或 `en` 源语言；残留日文先保护
+REFERENCE 中的姓名、昵称和术语，再对未保护部分执行机翻。模型按需在 CPU 加载。
+超宽译文只记录实际宽度和限制并继续，
 不再触发 LLM 重试。
 网络错误和超时使用带随机抖动的指数退避；HTTP 5xx 也采用相同策略，但耗尽重试后直接
 终止而不缩小窗口。HTTP 429 优先遵守服务端的 `Retry-After` 响应头，并在规定等待时间
@@ -299,7 +303,7 @@ PyTorch、CUDA 和 `libstdc++` 等运行库会由开发环境提供。
 - `asr.model` / `aligner_model`：分别指定 Qwen3-ASR 和 forced aligner 模型。
 - `asr.device` / `dtype`：这台 RTX 2080 Ti 使用 `cuda:0` 和 `float16`；不要改为
   该显卡不支持的 `bfloat16`。
-- `asr.language`：梦限大MewType直播固定为 `Japanese`，减少语言误判。
+- `asr.language`：默认不设置，由 Qwen 自动识别语言并保存到 cue/对齐单元；特定任务仍可显式强制语言。
 - `asr.context`：提供节目、团体和专名背景，辅助识别罕见词。
 - `asr.chunk_seconds` / `chunk_context_seconds`：控制可恢复分块和切点上下文；总输入
   长度不能超过 180 秒。
@@ -320,13 +324,15 @@ PyTorch、CUDA 和 `libstdc++` 等运行库会由开发环境提供。
   候选中选择最高分边界。
 - `segmentation.model_window_units` / `model_window_chars`：联合请求的本地单元和源字符上限，
   默认 `160` / `8000`。
+- `segmentation.request_batch_windows` / `request_batch_chars`：一次 API 请求最多承载的独立
+  窗口数和窗口块总字符数，默认 `32` / `8000`；窗口仍独立校验且不能跨 episode 合并。
 - `segmentation.dialogue_context_seconds` / `dialogue_context_max_chars`：只读对话上下文范围与
   字符上限，默认 `5` 秒 / `4000` 字符。
 - `llm.max_tokens`：单次 LLM 响应的输出 token 上限，DeepSeek V4 建议设为 `16384`。
 - `llm.max_retries`：同一窗口、边界或定点修复请求的重试次数，建议设为 `5`。
 - `llm.max_concurrency`：窗口和边界 LLM 请求的最大并发数，默认 `16`。
-- `llm.local_translation_model` / `local_translation_device`：空译文和残留日文使用的本地
-  后备机翻模型及设备，默认 `facebook/m2m100_418M` / `cpu`，首次使用时按需加载。
+- `llm.local_translation_model` / `local_translation_device`：空译文和残留源文使用的本地
+  后备机翻模型及设备，默认 `facebook/m2m100_418M` / `cpu`，并按 cue 语言选择 `ja`/`en`。
 - `llm.thinking`：DeepSeek V4 的严格 JSON 翻译应设为 `"disabled"`；其他服务不支持该参数时省略。
 - `llm.translate_metadata`：是否翻译 YouTube 标题和简介。
 - `llm.metadata_description_max_chars`：发送给 LLM 的源简介字符上限。

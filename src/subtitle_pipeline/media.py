@@ -28,6 +28,7 @@ _RENDER_TERMINAL_ASCII_PERIOD_RE = re.compile(
 )
 _WRAP_PUNCTUATION = frozenset("，、；：。！？!?…—,;:")
 _SINGING_GRADIENT_MARKER = "#F9A8D4"
+_KARAOKE_HIGHLIGHT_COLOR = "#AFFF5C"
 
 
 @dataclass(frozen=True)
@@ -568,19 +569,12 @@ def _write_ass(
         event_text = _escape_ass_text(cue.text)
         source_text = (getattr(cue, "source_text", None) or "").strip()
         source_units = timed_text_units(cue)
-        source_outline_color = (
-            (character_styles or {})[speaker].outline_color
-            if not is_singing
-            and speaker is not None
-            and speaker in (character_styles or {})
-            else "#000000"
-        )
         escaped_source_text = (
             _karaoke_text(
                 source_units,
                 cue.start,
                 cue.end,
-                highlight_color=source_outline_color,
+                highlight_color=_KARAOKE_HIGHLIGHT_COLOR,
             )
             if source_units and not is_singing
             else _escape_ass_text(source_text)
@@ -592,7 +586,7 @@ def _write_ass(
                     cue.start,
                     cue.end,
                     outline_color=_SINGING_GRADIENT_MARKER,
-                    highlight_color=_SINGING_GRADIENT_MARKER,
+                    highlight_color=_KARAOKE_HIGHLIGHT_COLOR,
                     prefix="♪ ",
                     suffix=" ♫",
                 )
@@ -690,7 +684,7 @@ def _karaoke_text(
     cue_end: float,
     *,
     outline_color: str | None = None,
-    highlight_color: str = "#000000",
+    highlight_color: str = _KARAOKE_HIGHLIGHT_COLOR,
     prefix: str = "",
     suffix: str = "",
 ) -> str:
@@ -710,7 +704,6 @@ def _karaoke_text(
     neutral = rf"{{\1c&HFFFFFF&\2c&HFFFFFF&{outline_override}}}"
     karaoke = (
         rf"{{\1c{_ass_override_color(highlight_color)}"
-        + (r"\1a&H01&" if highlight_color == _SINGING_GRADIENT_MARKER else "")
         + rf"\2c&HFFFFFF&{outline_override}}}"
     )
     values = [neutral + _escape_ass_text(prefix) + karaoke if prefix else karaoke]

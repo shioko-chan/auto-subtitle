@@ -21,9 +21,10 @@ from .config import SongIdentificationConfig
 from .lyrics_library import LibrarySong, LyricLine, LyricsLibrary
 from .lyrics_matching import JapaneseNormalizer, LyricAnchor, SongMatch, match_song
 from .prompt_templates import prompt_templates_digest
+from .source_language import language_for_text
 from .subtitles import Cue, TimedTextUnit, cue_from_mapping
 
-_CACHE_VERSION = 7
+_CACHE_VERSION = 10
 _PROMPT_VERSION = 3
 
 
@@ -60,10 +61,6 @@ def identify_and_align_songs(
     lyrics_translation_model: str | None = None,
     transcribe_song_speech: Callable[
         [list[tuple[int, float, float]]], dict[int, list[Cue]]
-    ]
-    | None = None,
-    transcribe_song_gaps: Callable[
-        [list[tuple[int, float, float]]], dict[int, str]
     ]
     | None = None,
 ) -> SongIdentificationResult:
@@ -182,7 +179,6 @@ def identify_and_align_songs(
                 singing_ids,
                 match,
                 config,
-                transcribe_song_gaps,
             )
             for cue_id, values in recovered.items():
                 replacements.setdefault(cue_id, []).extend(values)
@@ -205,7 +201,15 @@ def identify_and_align_songs(
                     "song": song.title,
                     "artist": song.artist,
                     "confidence": "high" if match.score >= 0.68 else "medium",
-                    "evidence": [provenance, "continuous_character_anchors"],
+                    "evidence": [
+                        provenance,
+                        "continuous_character_anchors",
+                        *(
+                            ["multiple_nonoverlapping_song_takes"]
+                            if len({anchor.take_index for anchor in match.anchors}) > 1
+                            else []
+                        ),
+                    ],
                     "sources": [song.source_url],
                     "score": round(match.score, 6),
                     "alignments": alignments,
@@ -418,6 +422,7 @@ def _apply_local_match(
                             "end": end,
                             "text": line.text,
                             "kind": "singing",
+                            "language": language_for_text(line.text, "Japanese"),
                             "preferred_translation": line.translation,
                             "source_units": source_units,
                         }
@@ -432,6 +437,7 @@ def _apply_local_match(
                         "start": start,
                         "end": end,
                         "score": round(anchor.score, 6),
+                        "take_index": anchor.take_index,
                     }
                 )
             replacements[cue_id] = replacement
@@ -445,6 +451,7 @@ def _apply_local_match(
                     **asdict(cues[cue_id]),
                     "text": text,
                     "kind": "singing",
+                    "language": language_for_text(text, "Japanese"),
                     "preferred_translation": translation,
                 }
             )
@@ -456,6 +463,7 @@ def _apply_local_match(
                 "match": "lyrics",
                 "corrected_text": text,
                 "score": round(anchor.score, 6),
+                "take_index": anchor.take_index,
             }
         )
     return replacements, alignments
@@ -467,16 +475,12 @@ def _recover_lyric_gaps(
     singing_ids: list[int],
     match: SongMatch,
     config: SongIdentificationConfig,
-    transcribe_song_gaps: Callable[
-        [list[tuple[int, float, float]]], dict[int, str]
-    ]
-    | None,
 ) -> tuple[
     dict[int, list[Cue]],
     list[dict[str, object]],
     list[dict[str, object]],
 ]:
-    if transcribe_song_gaps is None or len(match.anchors) < 2:
+    if len(match.anchors) < 2:
         return {}, [], []
     manifest_path = job_dir / "vocal-candidates" / "manifest.json"
     worker = Path(config.pyshiro_worker_project).resolve() / "worker.py"
@@ -486,10 +490,13 @@ def _recover_lyric_gaps(
     raw_manifests = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifests = [value for value in raw_manifests if isinstance(value, dict)]
     probes: list[dict[str, object]] = []
-    ordered = sorted(match.anchors, key=lambda value: value.cue_index)
+    ordered = sorted(
+        match.anchors, key=lambda value: (value.take_index, value.cue_index)
+    )
     for left, right in pairwise(ordered):
         if (
-            right.cue_index <= left.cue_index
+            right.take_index != left.take_index
+            or right.cue_index <= left.cue_index
             or right.line_start <= left.line_end
             or min(left.score, right.score) < config.match_anchor_threshold
         ):
@@ -528,18 +535,6 @@ def _recover_lyric_gaps(
                 "manifest": manifest,
             }
         )
-    if not probes:
-        return {}, [], []
-    requests = [
-        (int(value["gap_id"]), float(value["start"]), float(value["end"]))
-        for value in probes
-    ]
-    try:
-        rechecks = transcribe_song_gaps(requests)
-    except Exception as exc:
-        logging.warning("singing lyric-gap ASR recheck failed: %s", exc)
-        return {}, [], [{"status": "gap_recheck_failed", "reason": str(exc)}]
-
     normalizer = JapaneseNormalizer()
     output_dir = job_dir / "song-alignment" / match.song.song_id / "gap-recheck"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -553,24 +548,14 @@ def _recover_lyric_gaps(
         assert isinstance(left, LyricAnchor) and isinstance(right, LyricAnchor)
         missing_ids = list(range(left.line_end, right.line_start))
         missing_lines = [match.song.lines[index] for index in missing_ids]
-        asr_text = rechecks.get(gap_id, "")
-        expected = "".join(line.reading or line.text for line in missing_lines)
-        asr_score = SequenceMatcher(
-            None, normalizer(asr_text), normalizer(expected), autojunk=False
-        ).ratio()
         audit: dict[str, object] = {
             "status": "gap_rejected",
             "gap_id": gap_id,
+            "take_index": left.take_index,
             "lyric_line_ids": missing_ids,
             "start": probe["start"],
             "end": probe["end"],
-            "asr_text": asr_text,
-            "asr_score": round(asr_score, 6),
         }
-        if not asr_text or asr_score < config.lyric_gap_asr_threshold:
-            audit["reason"] = "insufficient_short_window_asr_evidence"
-            audits.append(audit)
-            continue
         manifest = probe["manifest"]
         assert isinstance(manifest, dict)
         source = manifest_path.parent / str(manifest["path"])
@@ -665,6 +650,7 @@ def _recover_lyric_gaps(
                     "singing",
                     preferred_translation=line.translation,
                     source_units=units,
+                    language=language_for_text(line.text, "Japanese"),
                 )
             )
             alignments.append(
@@ -675,7 +661,8 @@ def _recover_lyric_gaps(
                     "corrected_text": line.text,
                     "start": start,
                     "end": end,
-                    "score": round(asr_score, 6),
+                    "score": round(aligned_score, 6),
+                    "take_index": left.take_index,
                 }
             )
             previous_end = end
@@ -687,9 +674,298 @@ def _recover_lyric_gaps(
             continue
         replacements.setdefault(int(probe["left_cue_id"]), []).extend(recovered_cues)
         audit["status"] = "gap_recovered"
-        audit["reason"] = "asr_vocal_and_pyshiro_confirmed"
+        audit["reason"] = "vocal_and_pyshiro_confirmed"
         audits.append(audit)
+
+    neighbor_replacements, neighbor_alignments, neighbor_audits = (
+        _recover_take_neighbor_lyrics(
+            cues,
+            singing_ids,
+            match,
+            config,
+            manifests,
+            manifest_path,
+            uv,
+            worker,
+            normalizer,
+            output_dir,
+        )
+    )
+    for cue_id, values in neighbor_replacements.items():
+        replacements.setdefault(cue_id, []).extend(values)
+    alignments.extend(neighbor_alignments)
+    audits.extend(neighbor_audits)
     return replacements, alignments, audits
+
+
+def _recover_take_neighbor_lyrics(
+    cues: list[Cue],
+    singing_ids: list[int],
+    match: SongMatch,
+    config: SongIdentificationConfig,
+    manifests: list[dict[str, object]],
+    manifest_path: Path,
+    uv: str,
+    worker: Path,
+    normalizer: JapaneseNormalizer,
+    output_dir: Path,
+) -> tuple[
+    dict[int, list[Cue]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
+    by_take: dict[int, list[LyricAnchor]] = {}
+    for anchor in match.anchors:
+        by_take.setdefault(anchor.take_index, []).append(anchor)
+    takes = [
+        sorted(values, key=lambda value: value.cue_index)
+        for _take, values in sorted(by_take.items())
+    ]
+    replacements: dict[int, list[Cue]] = {}
+    alignments: list[dict[str, object]] = []
+    audits: list[dict[str, object]] = []
+    for left_take, right_take in pairwise(takes):
+        left = left_take[-1]
+        right = right_take[0]
+        positions = list(range(left.cue_index + 1, right.cue_index))
+        if not positions:
+            continue
+        candidates: list[tuple[int, list[int], str, int]] = []
+        suffix_position = positions[0]
+        suffix_cue = cues[singing_ids[suffix_position]]
+        suffix_ids = _select_suffix_neighbor_lines(
+            match.song,
+            left.line_end,
+            suffix_cue.text,
+            suffix_cue.end - suffix_cue.start,
+            config.lyric_neighbor_max_lines,
+            normalizer,
+        )
+        if suffix_ids:
+            candidates.append(
+                (suffix_position, suffix_ids, "take_suffix", left.take_index)
+            )
+
+        prefix_ids = list(
+            range(0, min(right.line_start, config.lyric_neighbor_max_lines))
+        )
+        if prefix_ids:
+            prefix_position = positions[-1]
+            if prefix_position == suffix_position and suffix_ids:
+                candidates[-1] = (
+                    suffix_position,
+                    [*suffix_ids, *prefix_ids],
+                    "take_suffix_and_prefix",
+                    left.take_index,
+                )
+            else:
+                candidates.append(
+                    (prefix_position, prefix_ids, "take_prefix", right.take_index)
+                )
+
+        for position, line_ids, route, take_index in candidates:
+            cue_id = singing_ids[position]
+            recovered, recovered_alignments, audit = _align_acoustic_neighbor(
+                cues[cue_id],
+                cue_id,
+                line_ids,
+                route,
+                take_index,
+                match,
+                config,
+                manifests,
+                manifest_path,
+                uv,
+                worker,
+                normalizer,
+                output_dir,
+            )
+            audits.append(audit)
+            if not recovered:
+                continue
+            replacements.setdefault(cue_id, []).extend(recovered)
+            alignments.extend(recovered_alignments)
+    return replacements, alignments, audits
+
+
+def _select_suffix_neighbor_lines(
+    song: LibrarySong,
+    line_start: int,
+    asr_text: str,
+    duration: float,
+    maximum_lines: int,
+    normalizer: JapaneseNormalizer,
+) -> list[int]:
+    if line_start >= len(song.lines) or duration <= 0:
+        return []
+    hypothesis = normalizer(asr_text)
+    candidates: list[tuple[float, int, list[int]]] = []
+    for line_end in range(
+        line_start + 1, min(len(song.lines), line_start + maximum_lines) + 1
+    ):
+        lines = song.lines[line_start:line_end]
+        display_units = [
+            normalizer.display_units(line.text, line.reading) for line in lines
+        ]
+        if any(not values for values in display_units):
+            continue
+        expected = normalizer("".join(line.reading or line.text for line in lines))
+        text_score = (
+            SequenceMatcher(None, hypothesis, expected, autojunk=False).ratio()
+            if hypothesis and expected
+            else 0.0
+        )
+        unit_count = sum(len(values) for values in display_units)
+        seconds_per_unit = duration / max(1, unit_count)
+        duration_score = 1.0 / (1.0 + abs(seconds_per_unit - 0.24))
+        score = 0.35 * text_score + 0.65 * duration_score
+        candidates.append((score, line_end, list(range(line_start, line_end))))
+    if not candidates:
+        return []
+    return max(candidates, key=lambda value: value[:2])[2]
+
+
+def _align_acoustic_neighbor(
+    cue: Cue,
+    cue_id: int,
+    line_ids: list[int],
+    route: str,
+    take_index: int,
+    match: SongMatch,
+    config: SongIdentificationConfig,
+    manifests: list[dict[str, object]],
+    manifest_path: Path,
+    uv: str,
+    worker: Path,
+    normalizer: JapaneseNormalizer,
+    output_dir: Path,
+) -> tuple[list[Cue], list[dict[str, object]], dict[str, object]]:
+    audit: dict[str, object] = {
+        "status": "neighbor_rejected",
+        "route": route,
+        "cue_id": cue_id,
+        "take_index": take_index,
+        "lyric_line_ids": line_ids,
+        "start": cue.start,
+        "end": cue.end,
+    }
+    if cue.end <= cue.start or cue.end - cue.start > config.pyshiro_max_window_seconds:
+        audit["reason"] = "duration_outside_pyshiro_limit"
+        return [], [], audit
+    manifest = next(
+        (
+            value
+            for value in manifests
+            if float(value.get("start", -1)) <= cue.start
+            and float(value.get("end", -1)) >= cue.end
+        ),
+        None,
+    )
+    if manifest is None:
+        audit["reason"] = "no_covering_vocal_stem"
+        return [], [], audit
+    source = manifest_path.parent / str(manifest["path"])
+    wav = output_dir / f"neighbor-{take_index:02d}-{route}-{cue_id:04d}.wav"
+    if not _extract_vocal_window(
+        source,
+        wav,
+        cue.start - float(manifest["start"]),
+        cue.end - cue.start,
+    ):
+        audit["reason"] = "vocal_window_extraction_failed"
+        return [], [], audit
+    active_ratio = _vocal_active_ratio(wav)
+    audit["vocal_active_ratio"] = round(active_ratio, 6)
+    if active_ratio < config.lyric_gap_vocal_active_ratio:
+        audit["reason"] = "insufficient_vocal_activity"
+        return [], [], audit
+    lines = [match.song.lines[line_id] for line_id in line_ids]
+    response = _run_pyshiro_lines(uv, worker, wav, lines, normalizer)
+    if response is None:
+        audit["reason"] = "pyshiro_neighbor_failed"
+        return [], [], audit
+    likelihood = float(response.get("likelihood_per_frame", -1e9))
+    audit["likelihood_per_frame"] = likelihood
+    if likelihood < config.pyshiro_likelihood_floor:
+        audit["reason"] = "pyshiro_likelihood_rejected"
+        return [], [], audit
+    ranges = response.get("lines")
+    units_by_line = response.get("units")
+    if (
+        not isinstance(ranges, list)
+        or not isinstance(units_by_line, list)
+        or len(ranges) != len(line_ids)
+        or len(units_by_line) != len(line_ids)
+    ):
+        audit["reason"] = "pyshiro_line_count_mismatch"
+        return [], [], audit
+    recovered: list[Cue] = []
+    alignments: list[dict[str, object]] = []
+    previous_end = cue.start
+    for line_id, line, value, raw_units in zip(
+        line_ids, lines, ranges, units_by_line
+    ):
+        if (
+            not isinstance(value, list)
+            or len(value) != 2
+            or not isinstance(raw_units, list)
+        ):
+            audit["reason"] = "pyshiro_timeline_rejected"
+            return [], [], audit
+        start = cue.start + float(value[0])
+        end = cue.start + float(value[1])
+        units = tuple(
+            TimedTextUnit(
+                str(unit["text"]),
+                cue.start + float(unit["start"]),
+                cue.start + float(unit["end"]),
+            )
+            for unit in raw_units
+            if isinstance(unit, dict)
+        )
+        if start < previous_end - 1e-3 or end <= start or not units:
+            audit["reason"] = "pyshiro_timeline_rejected"
+            return [], [], audit
+        if any(
+            unit.end <= unit.start
+            or unit.end - unit.start > config.lyric_neighbor_max_unit_seconds
+            for unit in units
+        ):
+            audit["reason"] = "pyshiro_unit_duration_rejected"
+            return [], [], audit
+        recovered.append(
+            Cue(
+                start,
+                end,
+                line.text,
+                cue.speaker,
+                "singing",
+                preferred_translation=line.translation,
+                source_units=units,
+                language=language_for_text(line.text, "Japanese"),
+            )
+        )
+        alignments.append(
+            {
+                "asr_cue_ids": [cue_id],
+                "lyric_line_ids": [line_id],
+                "match": "lyrics_acoustic_neighbor",
+                "corrected_text": line.text,
+                "start": start,
+                "end": end,
+                "score": round(likelihood, 6),
+                "take_index": take_index,
+            }
+        )
+        previous_end = end
+    coverage = (recovered[-1].end - recovered[0].start) / (cue.end - cue.start)
+    audit["timeline_coverage"] = round(coverage, 6)
+    if coverage < config.lyric_neighbor_min_coverage:
+        audit["reason"] = "insufficient_timeline_coverage"
+        return [], [], audit
+    audit["status"] = "neighbor_recovered"
+    audit["reason"] = "vocal_and_pyshiro_confirmed_without_asr_gate"
+    return recovered, alignments, audit
 
 
 def _extract_vocal_window(
@@ -812,6 +1088,7 @@ def _align_match_with_pyshiro(
             audits.append(
                 {
                     "cue_id": cue_id,
+                    "take_index": anchor.take_index,
                     "status": "skipped",
                     "reason": "duration_outside_pyshiro_limit",
                     "duration": duration,
@@ -832,6 +1109,7 @@ def _align_match_with_pyshiro(
             audits.append(
                 {
                     "cue_id": cue_id,
+                    "take_index": anchor.take_index,
                     "status": "skipped",
                     "reason": "no_covering_vocal_stem",
                 }
@@ -866,6 +1144,7 @@ def _align_match_with_pyshiro(
             audits.append(
                 {
                     "cue_id": cue_id,
+                    "take_index": anchor.take_index,
                     "status": "failed",
                     "reason": completed.stderr[-300:],
                 }
@@ -880,6 +1159,7 @@ def _align_match_with_pyshiro(
             audits.append(
                 {
                     "cue_id": cue_id,
+                    "take_index": anchor.take_index,
                     "status": "failed",
                     "reason": "lyric_display_units_empty",
                 }
@@ -921,7 +1201,12 @@ def _align_match_with_pyshiro(
         owned_units = response.get("units")
         if not isinstance(ranges, list) or not ranges:
             audits.append(
-                {"cue_id": cue_id, "status": "failed", "reason": "missing_line_ranges"}
+                {
+                    "cue_id": cue_id,
+                    "take_index": anchor.take_index,
+                    "status": "failed",
+                    "reason": "missing_line_ranges",
+                }
             )
             continue
         line_ids = list(range(anchor.line_start, anchor.line_end))
@@ -936,6 +1221,7 @@ def _align_match_with_pyshiro(
             audits.append(
                 {
                     "cue_id": cue_id,
+                    "take_index": anchor.take_index,
                     "status": "failed",
                     "reason": "line_range_count_mismatch",
                 }
@@ -970,6 +1256,7 @@ def _align_match_with_pyshiro(
             audits.append(
                 {
                     "cue_id": cue_id,
+                    "take_index": anchor.take_index,
                     "status": "failed",
                     "reason": "lyric_unit_ranges_invalid",
                 }
@@ -980,10 +1267,18 @@ def _align_match_with_pyshiro(
         audits.append(
             {
                 "cue_id": cue_id,
+                "take_index": anchor.take_index,
                 "status": "aligned",
                 "start": line_ranges[0][1],
                 "end": line_ranges[-1][2],
                 "lyric_line_ids": line_ids,
+                "lyric_languages": [
+                    language_for_text(line.text, "Japanese") for line in lines
+                ],
+                "alignment_readings": [
+                    "".join(reading for _text, reading in units)
+                    for units in display_units
+                ],
                 "line_ranges": [
                     {
                         "lyric_line_id": line_id,
@@ -1133,7 +1428,16 @@ def apply_lyric_corrections(
             continue
         end_id, text = replacement
         first, last = cues[index], cues[end_id]
-        output.append(Cue(first.start, last.end, text, first.speaker, "singing"))
+        output.append(
+            Cue(
+                first.start,
+                last.end,
+                text,
+                first.speaker,
+                "singing",
+                language=language_for_text(text, "Japanese"),
+            )
+        )
         index = end_id + 1
     if replacements:
         logging.info(

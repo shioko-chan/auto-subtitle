@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -14,6 +15,12 @@ from pathlib import Path
 
 from .config import LLMConfig, SegmentationConfig
 from .local_segmentation import LocalUnit, SpeakerTrack
+from .source_language import (
+    combine_source_languages,
+    join_source_fragments,
+    language_for_text,
+    source_separator,
+)
 from .prompt_templates import (
     prompt_system,
     prompt_templates_digest,
@@ -22,9 +29,10 @@ from .prompt_templates import (
 from .subtitles import Cue, TimedTextUnit, text_display_width, timed_text_units
 from .telemetry import stage_metrics
 
-_CACHE_VERSION = 7
+_CACHE_VERSION = 8
 _CONTENT_ATTEMPTS = 2
 _PROMPT_NAME = "joint-segment-translate.md"
+_BATCH_PROMPT_NAME = "joint-segment-translate-batch.md"
 _KANA_FRAGMENT_RE = re.compile(r"[\u3040-\u30ff]+")
 _PUNCTUATION_UNIT_RE = re.compile(r"^[\s、。！？…・,.!?;:「」『』（）()【】]+$")
 _DEPENDENT_PARTICLE_PREFIXES = (
@@ -104,6 +112,7 @@ def run_joint_translation(
     sudachi_versions: dict[str, str],
     honorific_rules: str,
     parse_content: Callable[[object], list[object]],
+    parse_batch_content: Callable[[object], list[object]],
     finish_reason: Callable[[object], str | None],
     retry_delay: Callable[[Exception, int], float | None],
     is_nontransient: Callable[[Exception], bool],
@@ -209,33 +218,62 @@ def run_joint_translation(
 
     missing = [item for item in ranges if _range_key(*item) not in windows]
     if missing:
+        groups = _batch_range_groups(
+            missing, track_map, all_units, segmentation
+        )
         logger.info(
             "jointly segmenting and translating %d/%d speaker-track windows "
-            "with concurrency=%d",
+            "in %d API request group(s) with concurrency=%d",
             len(missing),
             len(ranges),
+            len(groups),
             llm.max_concurrency,
         )
         errors: list[Exception] = []
         with (
             stage_metrics("llm.joint_segment_translate"),
             ThreadPoolExecutor(
-                max_workers=min(llm.max_concurrency, len(missing)),
+                max_workers=min(llm.max_concurrency, len(groups)),
                 thread_name_prefix="joint-subtitle",
             ) as executor,
         ):
-            futures: dict[Future[list[JointRecord]], tuple[str, int, int]] = {
-                executor.submit(process, *item): item for item in missing
+            futures: dict[
+                Future[dict[str, list[JointRecord]]],
+                list[tuple[str, int, int]],
+            ] = {
+                executor.submit(
+                    _process_range_group,
+                    group,
+                    process,
+                    track_map,
+                    all_units,
+                    segmentation,
+                    llm,
+                    request,
+                    translation_context,
+                    maximum_units,
+                    validation_maximum_units,
+                    honorific_rules,
+                    parse_batch_content,
+                    finish_reason,
+                    retry_delay,
+                    is_nontransient,
+                    log_invalid_response,
+                    local_translate,
+                ): group
+                for group in groups
             }
             for future in as_completed(futures):
-                item = futures[future]
+                group = futures[future]
                 try:
-                    records = future.result()
+                    completed = future.result()
                 except Exception as exc:  # noqa: BLE001 - report sibling failures too
                     errors.append(exc)
-                    logger.error("joint subtitle window %s failed: %s", item, exc)
+                    logger.error(
+                        "joint subtitle request group %s failed: %s", group, exc
+                    )
                 else:
-                    windows[_range_key(*item)] = records
+                    windows.update(completed)
                     write_cache()
         if errors:
             raise errors[0]
@@ -246,6 +284,247 @@ def run_joint_translation(
     )
     _write_cache(cache_path, signature, windows, records)
     return _records_to_result(source_cues, tracks, records)
+
+
+def _batch_range_groups(
+    ranges: list[tuple[str, int, int]],
+    track_map: dict[str, SpeakerTrack],
+    all_units: list[LocalUnit],
+    config: SegmentationConfig,
+) -> list[list[tuple[str, int, int]]]:
+    groups: list[list[tuple[str, int, int]]] = []
+    current: list[tuple[str, int, int]] = []
+    characters = 0
+    for item in ranges:
+        track_key, start, end = item
+        block = _batch_window_block(
+            0, track_map[track_key], start, end, all_units, config
+        )
+        block_chars = len(block)
+        if current and (
+            len(current) >= config.request_batch_windows
+            or characters + block_chars > config.request_batch_chars
+        ):
+            groups.append(current)
+            current = []
+            characters = 0
+        current.append(item)
+        characters += block_chars
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _process_range_group(
+    group: list[tuple[str, int, int]],
+    process: Callable[[str, int, int], list[JointRecord]],
+    track_map: dict[str, SpeakerTrack],
+    all_units: list[LocalUnit],
+    segmentation: SegmentationConfig,
+    llm: LLMConfig,
+    request: Callable[[dict[str, object]], dict[str, object]],
+    translation_context: dict[str, object],
+    maximum_units: float,
+    validation_maximum_units: float,
+    honorific_rules: str,
+    parse_batch_content: Callable[[object], list[object]],
+    finish_reason: Callable[[object], str | None],
+    retry_delay: Callable[[Exception, int], float | None],
+    is_nontransient: Callable[[Exception], bool],
+    log_invalid_response: Callable[
+        [str, Exception, object, dict[str, object] | None, object], None
+    ],
+    local_translate: Callable[[str], str],
+) -> dict[str, list[JointRecord]]:
+    completed: dict[str, list[JointRecord]] = {}
+    requestable: list[tuple[str, int, int]] = []
+    for item in group:
+        track_key, start, end = item
+        unit = track_map[track_key].units[start]
+        if end == start + 1 and unit.preferred_translation:
+            completed[_range_key(*item)] = process(*item)
+        else:
+            requestable.append(item)
+
+    if len(requestable) > 1:
+        completed.update(
+            _request_batch_windows(
+                requestable,
+                track_map,
+                all_units,
+                segmentation,
+                llm,
+                request,
+                translation_context,
+                maximum_units,
+                validation_maximum_units,
+                honorific_rules,
+                parse_batch_content,
+                finish_reason,
+                retry_delay,
+                is_nontransient,
+                log_invalid_response,
+                local_translate,
+            )
+        )
+
+    for item in requestable:
+        key = _range_key(*item)
+        if key not in completed:
+            completed[key] = process(*item)
+    return completed
+
+
+def _request_batch_windows(
+    ranges: list[tuple[str, int, int]],
+    track_map: dict[str, SpeakerTrack],
+    all_units: list[LocalUnit],
+    segmentation: SegmentationConfig,
+    llm: LLMConfig,
+    request: Callable[[dict[str, object]], dict[str, object]],
+    translation_context: dict[str, object],
+    maximum_units: float,
+    validation_maximum_units: float,
+    honorific_rules: str,
+    parse_batch_content: Callable[[object], list[object]],
+    finish_reason: Callable[[object], str | None],
+    retry_delay: Callable[[Exception, int], float | None],
+    is_nontransient: Callable[[Exception], bool],
+    log_invalid_response: Callable[
+        [str, Exception, object, dict[str, object] | None, object], None
+    ],
+    local_translate: Callable[[str], str],
+) -> dict[str, list[JointRecord]]:
+    content_attempts = 0
+    transient_attempts = 0
+    previous_error: Exception | None = None
+    while True:
+        prompt = _batch_prompt(
+            ranges,
+            track_map,
+            all_units,
+            segmentation,
+            translation_context,
+            maximum_units,
+            llm.target_language,
+            honorific_rules,
+            previous_error,
+        )
+        body: dict[str, object] = {
+            "model": llm.model,
+            "temperature": 0.1,
+            "max_tokens": llm.max_tokens,
+            "messages": [
+                {"role": "system", "content": prompt_system(_BATCH_PROMPT_NAME)},
+                {"role": "user", "content": prompt},
+            ],
+        }
+        if llm.thinking:
+            body["thinking"] = {"type": llm.thinking}
+        if llm.json_mode:
+            body["response_format"] = {"type": "json_object"}
+        content: object = None
+        response: object = None
+        try:
+            response = request(body)
+            content = response["choices"][0]["message"]["content"]
+            reason = finish_reason(response)
+            if reason not in (None, "stop"):
+                raise RuntimeError(f"finish_reason={reason}")
+            values = parse_batch_content(content)
+        except (
+            KeyError,
+            IndexError,
+            TypeError,
+            ValueError,
+            urllib.error.URLError,
+            TimeoutError,
+            RuntimeError,
+        ) as exc:
+            log_invalid_response(
+                "batched joint segmentation and translation",
+                exc,
+                content,
+                body,
+                response,
+            )
+            if is_nontransient(exc):
+                raise
+            delay = retry_delay(exc, transient_attempts + 1)
+            if delay is not None:
+                transient_attempts += 1
+                if transient_attempts >= llm.max_retries:
+                    raise
+                time.sleep(delay)
+                continue
+            content_attempts += 1
+            previous_error = exc
+            if content_attempts < min(_CONTENT_ATTEMPTS, llm.max_retries):
+                continue
+            return {}
+
+        expected = {window_id: item for window_id, item in enumerate(ranges)}
+        completed: dict[str, list[JointRecord]] = {}
+        seen: set[int] = set()
+        for position, value in enumerate(values):
+            try:
+                if not isinstance(value, dict) or set(value) != {"window_id", "cues"}:
+                    raise RuntimeError(f"batch window {position} has unexpected fields")
+                window_id = _coerce_integer_id(
+                    value["window_id"], position, "window_id"
+                )
+                if window_id not in expected or window_id in seen:
+                    raise RuntimeError(f"invalid or duplicate window_id={window_id}")
+                cues = value["cues"]
+                if not isinstance(cues, list):
+                    raise TypeError(f"batch window {window_id} cues is not a list")
+                track_key, start, end = expected[window_id]
+                records = _validate_records(
+                    cues,
+                    track_map[track_key],
+                    start,
+                    end,
+                    validation_maximum_units,
+                    llm.target_language,
+                    validate_language=False,
+                    reference_replacements=_reference_replacements(
+                        translation_context
+                    ),
+                    local_translate=local_translate,
+                )
+            except (RuntimeError, TypeError) as exc:
+                log_invalid_response(
+                    "batched joint translation window",
+                    exc,
+                    content,
+                    body,
+                    response,
+                )
+                continue
+            seen.add(window_id)
+            completed[_range_key(track_key, start, end)] = records
+
+        for window_id, item in expected.items():
+            if _range_key(*item) in completed:
+                continue
+            exc = RuntimeError(
+                f"batch response omitted or invalid window_id={window_id}"
+            )
+            log_invalid_response(
+                "batched joint translation window",
+                exc,
+                content,
+                body,
+                response,
+            )
+
+        logger.info(
+            "batched joint subtitle response windows=%d/%d fallback=%d",
+            len(completed),
+            len(ranges),
+            len(ranges) - len(completed),
+        )
+        return completed
 
 
 def _request_resilient(
@@ -342,7 +621,11 @@ def _request_resilient(
             replacements,
         )
         translated = _machine_translate_with_protected_terms(
-            unit.text, replacements, local_translate, force=True
+            unit.text,
+            replacements,
+            local_translate,
+            force=True,
+            source_language=unit.language,
         )
         return [
             JointRecord(
@@ -527,6 +810,7 @@ def _prompt(
     previous_error: Exception | None,
 ) -> str:
     selected = track.units[start:end]
+    source_language = _window_source_language(selected)
     target = "\n".join(
         f"<{request_id}>{_escape(unit.text)}"
         for request_id, unit in enumerate(selected)
@@ -544,9 +828,72 @@ def _prompt(
         HONORIFIC_TRANSLATION_RULES=honorific_rules,
         REFERENCE_TEXT=_reference_text(translation_context),
         MAXIMUM_UNITS=f"{maximum_units:.3f}",
+        SOURCE_LANGUAGE=source_language,
         DIALOGUE_CONTEXT=context or "(none)",
         TARGET_TEXT=target,
         RETRY_SECTION=retry,
+    )
+
+
+def _batch_prompt(
+    ranges: list[tuple[str, int, int]],
+    track_map: dict[str, SpeakerTrack],
+    all_units: list[LocalUnit],
+    config: SegmentationConfig,
+    translation_context: dict[str, object],
+    maximum_units: float,
+    target_language: str,
+    honorific_rules: str,
+    previous_error: Exception | None,
+) -> str:
+    windows = "\n\n".join(
+        _batch_window_block(
+            window_id,
+            track_map[track_key],
+            start,
+            end,
+            all_units,
+            config,
+        )
+        for window_id, (track_key, start, end) in enumerate(ranges)
+    )
+    retry = (
+        ""
+        if previous_error is None
+        else f"\n\nPREVIOUS_RESPONSE_ERROR: {previous_error}"
+    )
+    return render_user_prompt(
+        _BATCH_PROMPT_NAME,
+        TARGET_LANGUAGE=target_language,
+        HONORIFIC_TRANSLATION_RULES=honorific_rules,
+        REFERENCE_TEXT=_reference_text(translation_context),
+        MAXIMUM_UNITS=f"{maximum_units:.3f}",
+        WINDOWS_TEXT=windows,
+        RETRY_SECTION=retry,
+    )
+
+
+def _batch_window_block(
+    window_id: int,
+    track: SpeakerTrack,
+    start: int,
+    end: int,
+    all_units: list[LocalUnit],
+    config: SegmentationConfig,
+) -> str:
+    selected = track.units[start:end]
+    source_language = _window_source_language(selected)
+    target = "\n".join(
+        f"<{request_id}>{_escape(unit.text)}"
+        for request_id, unit in enumerate(selected)
+    )
+    context = _dialogue_context(all_units, selected, config) or "(none)"
+    return (
+        f'<WINDOW id="{window_id}">\n'
+        f"SOURCE_LANGUAGE: {source_language}\n"
+        f"DIALOGUE_CONTEXT:\n{context}\n"
+        f"TARGET:\n<{track.key}>\n{target}\n"
+        "</WINDOW>"
     )
 
 
@@ -570,13 +917,30 @@ def _dialogue_context(
     kept: list[LocalUnit] = []
     used = 0
     for unit in candidates:
-        line = f"<{unit.track}>{_escape(unit.text)}"
+        unit_language = language_for_text(unit.text, unit.language) or "unknown"
+        line = (
+            f"<{unit.track} language={unit_language}>"
+            f"{_escape(unit.text)}"
+        )
         if used + len(line) + 1 > config.dialogue_context_max_chars:
             continue
         kept.append(unit)
         used += len(line) + 1
     kept.sort(key=lambda unit: (unit.start, unit.end, unit.track))
-    return "\n".join(f"<{unit.track}>{_escape(unit.text)}" for unit in kept)
+    return "\n".join(
+        f"<{unit.track} language={language_for_text(unit.text, unit.language) or 'unknown'}>"
+        f"{_escape(unit.text)}"
+        for unit in kept
+    )
+
+
+def _window_source_language(units: tuple[LocalUnit, ...]) -> str:
+    return (
+        combine_source_languages(
+            language_for_text(unit.text, unit.language) for unit in units
+        )
+        or "unknown"
+    )
 
 
 def _window_ranges(
@@ -748,12 +1112,13 @@ def _finalize_relative_record(
     reference_replacements: tuple[tuple[str, str], ...],
     local_translate: Callable[[str], str] | None,
 ) -> JointRecord:
-    source = "".join(
-        unit.text
-        for unit in track.units[
-            window_start + record.start_id : window_start + record.end_id
-        ]
+    selected_units = track.units[
+        window_start + record.start_id : window_start + record.end_id
+    ]
+    source = join_source_fragments(
+        (unit.text, unit.language) for unit in selected_units
     )
+    source_language = combine_source_languages(unit.language for unit in selected_units)
     global_start = track.units[window_start + record.start_id].local_id
     global_end = track.units[window_start + record.end_id - 1].local_id + 1
     text = record.text
@@ -767,7 +1132,11 @@ def _finalize_relative_record(
             reference_replacements,
         )
         text = _machine_translate_with_protected_terms(
-            source, reference_replacements, local_translate, force=True
+            source,
+            reference_replacements,
+            local_translate,
+            force=True,
+            source_language=source_language,
         )
     elif _KANA_FRAGMENT_RE.search(text):
         _log_translation_downgrade(
@@ -779,7 +1148,7 @@ def _finalize_relative_record(
             reference_replacements,
         )
         text = normalize_residual_japanese(
-            text, reference_replacements, local_translate
+            text, reference_replacements, local_translate, source_language
         )
     width = text_display_width(text)
     if width > maximum_units:
@@ -935,13 +1304,19 @@ def _records_to_result(
         kinds = {cue.kind for cue in source_values}
         kind = next(iter(kinds)) if len(kinds) == 1 else "speech"
         source_units = _source_timed_units(source_values)
+        source_language = combine_source_languages(
+            language_for_text(cue.text, cue.language) for cue in source_values
+        )
         source_cue = Cue(
             start,
             end,
-            "".join(cue.text for cue in source_values),
+            join_source_fragments(
+                (cue.text, cue.language) for cue in source_values
+            ),
             speaker,
             kind,
             source_units=source_units,
+            language=source_language,
         )
         pairs.append(
             (
@@ -971,7 +1346,15 @@ def _source_timed_units(source: list[Cue]) -> tuple[TimedTextUnit, ...]:
                     max(previous.end, unit.end),
                 )
             else:
-                values.append(unit)
+                text = unit.text
+                if values:
+                    text = source_separator(
+                        values[-1].text,
+                        text,
+                        language_for_text(values[-1].text),
+                        language_for_text(text, cue.language),
+                    ) + text
+                values.append(TimedTextUnit(text, unit.start, unit.end))
     return tuple(values)
 
 
@@ -1110,12 +1493,17 @@ def normalize_residual_japanese(
     text: str,
     replacements: tuple[tuple[str, str], ...],
     local_translate: Callable[[str], str] | None = None,
+    source_language: str | None = None,
 ) -> str:
     """Protect known references and machine-translate remaining Japanese text."""
     if not _KANA_FRAGMENT_RE.search(text):
         return text
     return _machine_translate_with_protected_terms(
-        text, replacements, local_translate, force=False
+        text,
+        replacements,
+        local_translate,
+        force=False,
+        source_language=source_language,
     )
 
 
@@ -1125,9 +1513,10 @@ def _machine_translate_with_protected_terms(
     local_translate: Callable[[str], str] | None,
     *,
     force: bool,
+    source_language: str | None = None,
 ) -> str:
     if not replacements:
-        return _machine_translate(text, local_translate)
+        return _machine_translate(text, local_translate, source_language)
 
     targets = dict(replacements)
     pattern = re.compile("|".join(re.escape(source) for source, _ in replacements))
@@ -1136,7 +1525,7 @@ def _machine_translate_with_protected_terms(
     for match in pattern.finditer(text):
         unprotected = text[offset : match.start()]
         pieces.append(
-            _machine_translate(unprotected, local_translate)
+            _machine_translate(unprotected, local_translate, source_language)
             if force or _KANA_FRAGMENT_RE.search(unprotected)
             else unprotected
         )
@@ -1144,20 +1533,26 @@ def _machine_translate_with_protected_terms(
         offset = match.end()
     remainder = text[offset:]
     pieces.append(
-        _machine_translate(remainder, local_translate)
+        _machine_translate(remainder, local_translate, source_language)
         if force or _KANA_FRAGMENT_RE.search(remainder)
         else remainder
     )
     return "".join(pieces)
 
 
-def _machine_translate(text: str, local_translate: Callable[[str], str] | None) -> str:
+def _machine_translate(
+    text: str,
+    local_translate: Callable[[str], str] | None,
+    source_language: str | None = None,
+) -> str:
     if not text.strip():
         return text
     if local_translate is None:
         raise LocalFallbackError("local machine translator is not configured")
     try:
-        translated = local_translate(text).strip()
+        translated = _invoke_local_translate(
+            local_translate, text, source_language
+        ).strip()
     except Exception as exc:
         raise LocalFallbackError(
             f"local machine translation failed for {text!r}: {exc}"
@@ -1167,6 +1562,23 @@ def _machine_translate(text: str, local_translate: Callable[[str], str] | None) 
             f"local machine translation returned empty text for {text!r}"
         )
     return translated
+
+
+def _invoke_local_translate(
+    local_translate: Callable[..., str], text: str, source_language: str | None
+) -> str:
+    try:
+        parameters = inspect.signature(local_translate).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    accepts_language = any(
+        parameter.kind in {parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD}
+        or parameter.name == "source_language"
+        for parameter in parameters
+    )
+    if accepts_language:
+        return local_translate(text, source_language=source_language)
+    return local_translate(text)
 
 
 def _reference_replacements(

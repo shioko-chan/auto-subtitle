@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from subtitle_pipeline.asr import (
+    _HeartTranscriptorAdapter,
     _add_punctuation_boundary_hints,
     _analysis_region_signature,
     _analysis_regions,
@@ -41,6 +42,34 @@ from subtitle_pipeline.subtitles import Cue
 
 
 class QwenASRTests(unittest.TestCase):
+    def test_heart_transcriptor_adapter_accepts_buffer_audio(self):
+        transcriber = Mock(return_value={"text": "聞こえた歌詞"})
+        model = _HeartTranscriptorAdapter(
+            transcriber,
+            max_new_tokens=123,
+            num_beams=3,
+        )
+
+        result = model.transcribe(
+            audio=(np.zeros(1600, dtype=np.float32), 16000),
+            context="ignored",
+            language=None,
+            return_time_stamps=False,
+        )
+
+        self.assertEqual(result[0].text, "聞こえた歌詞")
+        self.assertEqual(result[0].language, "Japanese")
+        source = transcriber.call_args.args[0]
+        self.assertEqual(source["sampling_rate"], 16000)
+        self.assertEqual(source["raw"].shape, (1600,))
+        self.assertEqual(
+            transcriber.call_args.kwargs["generate_kwargs"]["max_new_tokens"],
+            123,
+        )
+        self.assertEqual(
+            transcriber.call_args.kwargs["generate_kwargs"]["num_beams"], 3
+        )
+
     def test_asr_punctuation_becomes_boundary_metadata_only_when_text_matches(self):
         cues = [Cue(0, 1, "まもなく"), Cue(1, 2, "開演"), Cue(2, 3, "です")]
 
@@ -53,6 +82,7 @@ class QwenASRTests(unittest.TestCase):
     def test_forced_aligner_pos_is_preserved_on_aligned_units(self):
         result = SimpleNamespace(
             text="配信です",
+            language="Japanese",
             time_stamps=SimpleNamespace(
                 items=[
                     SimpleNamespace(
@@ -74,6 +104,29 @@ class QwenASRTests(unittest.TestCase):
         )
 
         self.assertEqual([cue.pos for cue in cues], ["名詞", "助動詞"])
+        self.assertEqual([cue.language for cue in cues], ["Japanese", "Japanese"])
+
+    def test_forced_aligner_language_is_recorded_per_source_unit(self):
+        result = SimpleNamespace(
+            text="Ready set",
+            language="English",
+            time_stamps=SimpleNamespace(
+                items=[
+                    SimpleNamespace(text="Ready", start_time=0.0, end_time=0.4),
+                    SimpleNamespace(text="set", start_time=0.4, end_time=0.8),
+                ]
+            ),
+        )
+
+        cues = _result_to_cues(
+            result,
+            offset=0.0,
+            keep_start=0.0,
+            keep_end=1.0,
+            final_chunk=True,
+        )
+
+        self.assertEqual([cue.language for cue in cues], ["English", "English"])
 
     def test_single_word_list_participates_in_asr_cache_signature(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -276,7 +329,7 @@ class QwenASRTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "cache.json"
             path.write_text(
-                '{"version":6,"signature":{"speakers":["A","B"]},'
+                '{"version":10,"signature":{"speakers":["A","B"]},'
                 '"chunks":{"0":{"text":"x","cues":[]}}}',
                 encoding="utf-8",
             )
@@ -295,6 +348,19 @@ class QwenASRTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "invalid cue sidecar"):
                 read_cue_sidecar(path)
+
+    def test_cue_sidecar_preserves_detected_language(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "source.cues.json"
+            path.write_text(
+                '{"version":7,"cues":[{"start":0,"end":1,'
+                '"text":"Ready","language":"English"}]}',
+                encoding="utf-8",
+            )
+
+            cues = read_cue_sidecar(path)
+
+        self.assertEqual(cues[0].language, "English")
 
     def test_shared_audio_names_do_not_invalidate_asr_cache_signature(self):
         left = _analysis_region_signature(
@@ -892,7 +958,10 @@ class QwenASRTests(unittest.TestCase):
             model,
             Path("source.mp4"),
             None,
-            ASRConfig(context="配信名や人物名を含む一般コンテキスト"),
+            ASRConfig(
+                context="配信名や人物名を含む一般コンテキスト",
+                language="Japanese",
+            ),
             AudioRegion(0, 1, "singing"),
             label="song",
             window_config=AudioAnalysisConfig(),
@@ -900,6 +969,51 @@ class QwenASRTests(unittest.TestCase):
         )
 
         self.assertEqual(model.transcribe.call_args.kwargs["context"], "")
+        self.assertIsNone(model.transcribe.call_args.kwargs["language"])
+
+    def test_singing_asr_retries_repetition_with_shorter_windows(self):
+        repeated = "同じ長い歌詞を繰り返してしまう" * 12
+        model = SimpleNamespace()
+        model.transcribe = Mock(
+            side_effect=[
+                [SimpleNamespace(text=repeated, language="Japanese")],
+                [SimpleNamespace(text="前半の歌詞", language="Japanese")],
+                [SimpleNamespace(text="ready set and find out", language="English")],
+            ]
+        )
+        audio = SimpleNamespace(
+            sample_rate=16000,
+            slice=lambda *_args, **_kwargs: np.zeros(320000, dtype=np.float32),
+        )
+
+        record = _transcribe_song_range(
+            model,
+            Path("source.mp4"),
+            None,
+            ASRConfig(),
+            AudioRegion(0, 20, "singing"),
+            label="song",
+            window_config=AudioAnalysisConfig(
+                singing_asr_target_seconds=30,
+                singing_asr_min_seconds=20,
+                singing_asr_max_seconds=38,
+                singing_asr_overlap_seconds=2,
+            ),
+            audio_buffer=audio,
+        )
+
+        self.assertEqual(model.transcribe.call_count, 3)
+        self.assertEqual(record["language"], "mixed")
+        self.assertEqual(
+            [(item["start"], item["end"]) for item in record["cues"]],
+            [(0, 10), (10, 20)],
+        )
+        self.assertTrue(
+            any(
+                item.get("cut_reason") == "repetition_retry"
+                for item in record["singing_windows"]
+            )
+        )
 
     def test_removes_repeated_text_from_overlapping_song_window(self):
         self.assertEqual(

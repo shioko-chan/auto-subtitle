@@ -9,7 +9,10 @@ from subtitle_pipeline.prompt_templates import (
 
 class PromptTemplateTests(unittest.TestCase):
     def test_runtime_prompt_documents_have_system_and_user_sections(self):
-        for name in ("joint-segment-translate.md",):
+        for name in (
+            "joint-segment-translate.md",
+            "joint-segment-translate-batch.md",
+        ):
             with self.subTest(name=name):
                 template = load_prompt_template(name)
                 self.assertTrue(template.system)
@@ -26,6 +29,7 @@ class PromptTemplateTests(unittest.TestCase):
                 HONORIFIC_TRANSLATION_RULES="rules",
                 REFERENCE_TEXT="<terms>\nsource=>target",
                 MAXIMUM_UNITS="20.000",
+                SOURCE_LANGUAGE="English",
                 DIALOGUE_CONTEXT="(none)",
                 TARGET_TEXT="<unknown>\n<0>source",
                 RETRY_SECTION="",

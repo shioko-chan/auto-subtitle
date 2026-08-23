@@ -10,18 +10,21 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 from .audio_analysis import AudioAnalysis, AudioRegion, analyze_audio
 from .audio_buffer import AudioBuffer, AudioBufferPool, is_shared_audio_uri
 from .commands import require_command, run
 from .config import ASRConfig, AudioAnalysisConfig
+from .source_language import language_for_text, normalize_source_language
 from .subtitles import Cue, cue_from_mapping, write_srt
 from .telemetry import stage_metrics
 
-_CACHE_VERSION = 6
-_CUE_SIDECAR_VERSION = 6
+_CACHE_VERSION = 10
+_CUE_SIDECAR_VERSION = 7
 _MIN_RETRY_CHUNK_SECONDS = 15.0
+_MIN_SONG_RETRY_CHUNK_SECONDS = 8.0
 _MIN_REPETITION_SPAN_CHARACTERS = 160
 _REPETITION_RE = re.compile(r"(.{12,200}?)\1{3,}", re.DOTALL)
 _MIN_ASR_GENERATION_TOKENS = 128
@@ -158,64 +161,6 @@ def transcribe_speech_ranges(
     return output
 
 
-def transcribe_singing_ranges(
-    ranges: list[tuple[int, float, float]],
-    job_dir: Path,
-    config: ASRConfig,
-    japanese_single_word_list: list[str] | None = None,
-) -> dict[int, str]:
-    """Recheck suspected lyric gaps on persisted Demucs vocal stems."""
-    if not ranges:
-        return {}
-    manifest_path = job_dir / "vocal-candidates" / "manifest.json"
-    if not manifest_path.is_file():
-        return {}
-    raw_manifests = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifests = [value for value in raw_manifests if isinstance(value, dict)]
-    model = _load_qwen_model(config, japanese_single_word_list)
-    chunk_dir = job_dir / "song-gap-asr"
-    chunk_dir.mkdir(parents=True, exist_ok=True)
-    output: dict[int, str] = {}
-    try:
-        for gap_id, start, end in ranges:
-            manifest = next(
-                (
-                    value
-                    for value in manifests
-                    if float(value.get("start", -1)) <= start
-                    and float(value.get("end", -1)) >= end
-                ),
-                None,
-            )
-            if manifest is None:
-                continue
-            source = manifest_path.parent / str(manifest["path"])
-            chunk = chunk_dir / f"gap-{gap_id:04d}.wav"
-            _extract_audio_chunk(
-                source,
-                chunk,
-                start=start - float(manifest["start"]),
-                duration=end - start,
-            )
-            try:
-                results = model.transcribe(
-                    audio=str(chunk),
-                    context="",
-                    language=config.language,
-                    return_time_stamps=False,
-                )
-            finally:
-                chunk.unlink(missing_ok=True)
-            if len(results) == 1:
-                text = str(getattr(results[0], "text", "")).strip()
-                if text and not _repetition_hallucination(text):
-                    output[gap_id] = text
-    finally:
-        del model
-        _release_cuda()
-    return output
-
-
 def _transcribe_unanalyzed(
     video: Path,
     destination: Path,
@@ -330,7 +275,7 @@ def _transcribe_analyzed(
     cache_path = destination.parent / "asr-analysis-cache.json"
     signature = {
         **_cache_signature(video, duration, config, japanese_single_word_list),
-        "analysis_version": 9,
+        "analysis_version": 10,
         "analysis_config": asdict(analysis_config),
         "regions": [_analysis_region_signature(region) for region in regions],
     }
@@ -360,7 +305,14 @@ def _transcribe_analyzed(
         for index in missing
     ):
         raise _StaleRuntimeAudio("missing ephemeral source audio")
-    model = _load_qwen_model(config, japanese_single_word_list) if missing else None
+    qwen_missing = [
+        index for index in missing if regions[index].kind != "singing"
+    ]
+    model = (
+        _load_qwen_model(config, japanese_single_word_list)
+        if qwen_missing
+        else None
+    )
     speaker_timeline = _speaker_assignment_timeline(analysis)
     speech_missing = [index for index in missing if regions[index].kind == "speech"]
     for batch_start in range(0, len(speech_missing), config.max_inference_batch_size):
@@ -425,23 +377,12 @@ def _transcribe_analyzed(
                 len(record["cues"]),
             )
 
-    for index in missing:
+    for index in qwen_missing:
         region = regions[index]
         if region.kind == "speech":
             continue
         assert model is not None
-        if region.kind == "singing":
-            record = _transcribe_song_range(
-                model,
-                Path(region.source_path) if region.source_path else video,
-                None,
-                config,
-                region,
-                label=f"{index:05d}",
-                window_config=analysis_config,
-                audio_buffer=_region_audio_buffer(region, video, audio_pool),
-            )
-        elif region.kind == "ambiguous":
+        if region.kind == "ambiguous":
             record = _transcribe_ambiguous_range(
                 model,
                 video,
@@ -466,6 +407,42 @@ def _transcribe_analyzed(
     if model is not None:
         del model
         _release_cuda()
+
+    singing_missing = [
+        index for index in missing if regions[index].kind == "singing"
+    ]
+    singing_model = (
+        _load_heart_transcriptor(config) if singing_missing else None
+    )
+    try:
+        for index in singing_missing:
+            region = regions[index]
+            assert singing_model is not None
+            record = _transcribe_song_range(
+                singing_model,
+                Path(region.source_path) if region.source_path else video,
+                None,
+                config,
+                region,
+                label=f"{index:05d}",
+                window_config=analysis_config,
+                audio_buffer=_region_audio_buffer(region, video, audio_pool),
+            )
+            record["singing_asr_model"] = config.singing_model
+            cached[str(index)] = record
+            _write_cache(cache_path, cache)
+            logging.info(
+                "cached HeartTranscriptor region %d/%d speaker=%s cues=%d",
+                index + 1,
+                len(regions),
+                region.speaker or "unknown",
+                len(record["cues"]),
+            )
+    finally:
+        if singing_model is not None:
+            singing_model.close()
+            del singing_model
+            _release_cuda()
 
     cues: list[Cue] = []
     for index in range(len(regions)):
@@ -1008,9 +985,15 @@ def _transcribe_song_range(
         audit=window_audit,
     )
     texts: list[str] = []
-    for window_index, (start, end) in enumerate(windows):
+    detected_languages: list[str] = []
+    window_languages: list[str | None] = []
+    resolved_windows: list[tuple[float, float]] = []
+
+    def transcribe_window(
+        start: float, end: float, window_label: str
+    ) -> list[tuple[float, float, str, str]]:
         chunk_path = (
-            chunk_dir / f"song-{label}-{window_index}.wav"
+            chunk_dir / f"song-{window_label}.wav"
             if chunk_dir is not None
             else None
         )
@@ -1033,35 +1016,92 @@ def _transcribe_song_range(
                 results = model.transcribe(
                     audio=audio,
                     context="",
-                    language=config.language,
+                    language=None,
                     return_time_stamps=False,
                 )
+            if len(results) != 1:
+                raise RuntimeError(f"Qwen3-ASR returned {len(results)} song results")
+            text = str(getattr(results[0], "text", "")).strip()
+            detected_language = str(getattr(results[0], "language", "")).strip()
         finally:
             if chunk_path is not None:
                 chunk_path.unlink(missing_ok=True)
-        if len(results) != 1:
-            raise RuntimeError(f"Qwen3-ASR returned {len(results)} song results")
-        text = str(getattr(results[0], "text", "")).strip()
-        if _repetition_hallucination(text):
-            raise RuntimeError(
-                f"Qwen3-ASR repetition loop in singing phrase {start:.3f}-{end:.3f}s"
+        repetition = _repetition_hallucination(text)
+        if repetition is not None:
+            pattern, repeats = repetition
+            child_duration = (end - start) / 2
+            logging.warning(
+                "Qwen3-ASR repetition loop in singing phrase %.3f-%.3fs: "
+                "pattern=%r repeats=%d; retrying with shorter song windows",
+                start,
+                end,
+                pattern[:80],
+                repeats,
             )
-        texts.append(_remove_text_overlap(texts[-1] if texts else "", text))
+            if child_duration < _MIN_SONG_RETRY_CHUNK_SECONDS:
+                raise RuntimeError(
+                    "Qwen3-ASR repetition loop remains at minimum singing retry "
+                    f"window {start:.3f}-{end:.3f}s"
+                )
+            midpoint = start + child_duration
+            window_audit.append(
+                {
+                    "start": round(start, 3),
+                    "end": round(end, 3),
+                    "cut_reason": "repetition_retry",
+                    "retry_at": round(midpoint, 3),
+                }
+            )
+            return [
+                *transcribe_window(start, midpoint, f"{window_label}-0"),
+                *transcribe_window(midpoint, end, f"{window_label}-1"),
+            ]
+        return [(start, end, text, detected_language)]
+
+    resolved: list[tuple[float, float, str, str]] = []
+    for window_index, (start, end) in enumerate(windows):
+        resolved.extend(transcribe_window(start, end, f"{label}-{window_index}"))
+
+    for start, end, text, detected_language in resolved:
+        if detected_language:
+            detected_languages.append(detected_language)
+        text = _remove_text_overlap(texts[-1] if texts else "", text)
+        texts.append(text)
+        window_languages.append(language_for_text(text, detected_language))
+        resolved_windows.append((start, end))
 
     cues: list[Cue] = []
-    for index, ((start, end), text) in enumerate(zip(windows, texts)):
+    for index, ((start, end), text) in enumerate(zip(resolved_windows, texts)):
         if not text:
             continue
         owned_start = (
-            region.start if index == 0 else (windows[index - 1][1] + start) / 2
+            region.start
+            if index == 0
+            else (resolved_windows[index - 1][1] + start) / 2
         )
         owned_end = (
             region.end
-            if index == len(windows) - 1
-            else (end + windows[index + 1][0]) / 2
+            if index == len(resolved_windows) - 1
+            else (end + resolved_windows[index + 1][0]) / 2
         )
-        cues.append(Cue(owned_start, owned_end, text, region.speaker, "singing"))
-    language = "Japanese"
+        cues.append(
+            Cue(
+                owned_start,
+                owned_end,
+                text,
+                region.speaker,
+                "singing",
+                language=window_languages[index],
+            )
+        )
+    unique_languages = list(dict.fromkeys(detected_languages))
+    language = (
+        unique_languages[0]
+        if len(unique_languages) == 1
+        else "mixed"
+        if unique_languages
+        else ""
+    )
     return {
         "core_start": region.start,
         "core_end": region.end,
@@ -1740,6 +1780,114 @@ def _load_qwen_model(
     )
 
 
+class _HeartTranscriptorAdapter:
+    def __init__(
+        self,
+        pipeline: Any,
+        *,
+        max_new_tokens: int,
+        num_beams: int,
+    ) -> None:
+        self._pipeline = pipeline
+        self._max_new_tokens = max_new_tokens
+        self._num_beams = num_beams
+
+    def transcribe(
+        self,
+        *,
+        audio: object,
+        context: str = "",
+        language: str | None = None,
+        return_time_stamps: bool = False,
+    ) -> list[SimpleNamespace]:
+        import numpy as np
+
+        del context, language, return_time_stamps
+        source: object = audio
+        if isinstance(audio, tuple) and len(audio) == 2:
+            samples, sample_rate = audio
+            source = {
+                "raw": np.asarray(samples, dtype=np.float32),
+                "sampling_rate": int(sample_rate),
+            }
+        result = self._pipeline(
+            source,
+            return_timestamps=False,
+            generate_kwargs={
+                "max_new_tokens": self._max_new_tokens,
+                "num_beams": self._num_beams,
+                "task": "transcribe",
+                "condition_on_prev_tokens": False,
+                "compression_ratio_threshold": 1.8,
+                "temperature": (0.0, 0.1, 0.2, 0.4),
+                "logprob_threshold": -1.0,
+                "no_speech_threshold": 0.4,
+            },
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "HeartTranscriptor returned a non-object transcription result"
+            )
+        text = str(result.get("text") or "").strip()
+        return [
+            SimpleNamespace(
+                text=text,
+                language=language_for_text(text, None) or "",
+            )
+        ]
+
+    def close(self) -> None:
+        self._pipeline = None
+
+
+def _load_heart_transcriptor(config: ASRConfig) -> _HeartTranscriptorAdapter:
+    try:
+        import torch
+        from transformers import (
+            AutoModelForSpeechSeq2Seq,
+            AutoProcessor,
+            pipeline,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "HeartTranscriptor dependencies are not installed; "
+            "run `uv sync --extra asr`"
+        ) from exc
+
+    if config.device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"HeartTranscriptor device is {config.device}, "
+            "but PyTorch cannot access CUDA"
+        )
+    dtype = getattr(torch, config.dtype)
+    logging.info(
+        "loading singing ASR %s on %s (%s)",
+        config.singing_model,
+        config.device,
+        config.dtype,
+    )
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(
+        config.singing_model,
+        dtype=dtype,
+        low_cpu_mem_usage=True,
+        use_safetensors=True,
+    ).to(config.device)
+    processor = AutoProcessor.from_pretrained(config.singing_model)
+    transcriber = pipeline(
+        "automatic-speech-recognition",
+        model=model,
+        tokenizer=processor.tokenizer,
+        feature_extractor=processor.feature_extractor,
+        dtype=dtype,
+        device=config.device,
+    )
+    return _HeartTranscriptorAdapter(
+        transcriber,
+        max_new_tokens=config.singing_max_new_tokens,
+        num_beams=config.singing_num_beams,
+    )
+
+
 def _release_cuda() -> None:
     try:
         import torch
@@ -1760,6 +1908,9 @@ def _result_to_cues(
 ) -> list[Cue]:
     text = str(getattr(result, "text", "")).strip()
     alignment = getattr(result, "time_stamps", None)
+    detected_language = normalize_source_language(
+        str(getattr(result, "language", ""))
+    )
     items = list(getattr(alignment, "items", []) or [])
     if text and not items:
         raise RuntimeError(
@@ -1792,6 +1943,7 @@ def _result_to_cues(
                             if getattr(item, "pos", None) is not None
                             else None
                         ),
+                        language=language_for_text(fragment, detected_language),
                     )
                 )
     return cues
@@ -1931,6 +2083,9 @@ def _decode_cached_cues(
                         float(value["speaker_fallback_distance"])
                         if value.get("speaker_fallback_distance") is not None
                         else None
+                    ),
+                    language=(
+                        str(value["language"]) if value.get("language") else None
                     ),
                 )
             )

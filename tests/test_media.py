@@ -290,7 +290,7 @@ class SubtitleRenderTests(unittest.TestCase):
             content = path.read_text(encoding="utf-8")
 
         self.assertIn(
-            r"{\1c&H000000&\2c&HFFFFFF&}{\kf100}おはよう。", content
+            r"{\1c&H5CFFAF&\2c&HFFFFFF&}{\kf100}おはよう。", content
         )
 
     def test_ass_japanese_uses_matching_character_outline_style(self):
@@ -330,7 +330,7 @@ class SubtitleRenderTests(unittest.TestCase):
         )
         self.assertIn(
             r"Speaker_fuji_miyako_Japanese,fuji_miyako,0,0,0,,"
-            r"{\1c&HFF91BC&\2c&HFFFFFF&}{\kf100}ミヤコ",
+            r"{\1c&H5CFFAF&\2c&HFFFFFF&}{\kf100}ミヤコ",
             content,
         )
 
@@ -452,7 +452,7 @@ class SubtitleRenderTests(unittest.TestCase):
         self.assertIn(
             r"Dialogue: 0,0:00:01.00,0:00:03.00,Japanese,,0,0,0,,"
             r"{\1c&HFFFFFF&\2c&HFFFFFF&\3c&HD4A8F9&\3a&H01&}♪ "
-            r"{\1c&HD4A8F9&\1a&H01&\2c&HFFFFFF&\3c&HD4A8F9&\3a&H01&}"
+            r"{\1c&H5CFFAF&\2c&HFFFFFF&\3c&HD4A8F9&\3a&H01&}"
             r"{\kf100}歌う{\kf100}よ"
             r"{\1c&HFFFFFF&\2c&HFFFFFF&\3c&HD4A8F9&\3a&H01&} ♫",
             content,

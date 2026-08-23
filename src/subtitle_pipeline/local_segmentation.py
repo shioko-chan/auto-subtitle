@@ -5,10 +5,17 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass, replace
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+import re
 
 from sudachipy import dictionary, tokenizer
 
 from .config import SegmentationConfig
+from .source_language import (
+    combine_source_languages,
+    join_source_fragments,
+    language_for_text,
+    source_separator,
+)
 from .subtitles import Cue
 
 _ATOMIC_KINDS = frozenset({"singing", "conditioned_speech"})
@@ -59,6 +66,31 @@ _DISCOURSE_STARTERS = frozenset(
 _UNKNOWN_BRIDGE_MAX_GAP_SECONDS = 0.5
 _UNKNOWN_GRAMMAR_MAX_GAP_SECONDS = 0.75
 _UNKNOWN_NEAREST_MAX_DISTANCE_SECONDS = 0.5
+_JAPANESE_SPAN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]+")
+_ENGLISH_SENTENCE_END_RE = re.compile(r"[.!?]+[\"')\]]*$")
+_ENGLISH_DISCOURSE_STARTERS = frozenset(
+    {"and", "but", "so", "then", "well", "now", "anyway", "however", "next"}
+)
+_ENGLISH_DANGLING_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "because",
+        "but",
+        "for",
+        "from",
+        "if",
+        "in",
+        "of",
+        "or",
+        "the",
+        "to",
+        "with",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -69,6 +101,7 @@ class Morphology:
     pos: tuple[str, ...]
     conjugation_type: str
     conjugation_form: str
+    language: str = "Japanese"
 
 
 @dataclass(frozen=True)
@@ -96,6 +129,7 @@ class LocalUnit:
     boundary_score_after: int | None = None
     source_pos: tuple[str | None, ...] = ()
     preferred_translation: str | None = None
+    language: str | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +143,7 @@ class SudachiAnalyzer:
     def __init__(self) -> None:
         self._tokenizer = dictionary.Dictionary().create()
         self._dependency_nlp = None
+        self._english_nlp = None
 
     @property
     def versions(self) -> dict[str, str]:
@@ -118,12 +153,33 @@ class SudachiAnalyzer:
         }
 
     def analyze(self, text: str) -> list[Morphology]:
+        return self._analyze_japanese(text, 0)
+
+    def analyze_source(self, text: str, language: str | None) -> list[Morphology]:
+        if language == "Japanese" or language is None:
+            return self.analyze(text)
+        if language == "English":
+            return self._analyze_english(text, 0)
+
+        result: list[Morphology] = []
+        cursor = 0
+        for match in _JAPANESE_SPAN_RE.finditer(text):
+            if match.start() > cursor:
+                result.extend(self._analyze_english(text[cursor : match.start()], cursor))
+            result.extend(self._analyze_japanese(match.group(0), match.start()))
+            cursor = match.end()
+        if cursor < len(text):
+            result.extend(self._analyze_english(text[cursor:], cursor))
+        return result
+
+    def _analyze_japanese(self, text: str, offset: int) -> list[Morphology]:
         result: list[Morphology] = []
         cursor = 0
         for value in self._tokenizer.tokenize(text, tokenizer.Tokenizer.SplitMode.A):
             surface = value.surface()
-            start = text.find(surface, cursor)
-            if start < 0:
+            local_start = text.find(surface, cursor)
+            start = offset + local_start
+            if local_start < 0:
                 raise RuntimeError("Sudachi token could not be mapped to source text")
             end = start + len(surface)
             pos = tuple(str(item) for item in value.part_of_speech())
@@ -137,8 +193,27 @@ class SudachiAnalyzer:
                     conjugation_form=pos[5] if len(pos) > 5 else "*",
                 )
             )
-            cursor = end
+            cursor = local_start + len(surface)
         return result
+
+    def _analyze_english(self, text: str, offset: int) -> list[Morphology]:
+        if self._english_nlp is None:
+            import spacy
+
+            self._english_nlp = spacy.blank("en")
+        return [
+            Morphology(
+                token.text,
+                offset + token.idx,
+                offset + token.idx + len(token.text),
+                ("EN_PUNCT" if token.is_punct else "EN_WORD",),
+                "*",
+                "*",
+                "English",
+            )
+            for token in self._english_nlp(text)
+            if not token.is_space
+        ]
 
     def dependency_boundary_strengths(
         self, left: str, middle: str, right: str
@@ -192,7 +267,7 @@ def build_speaker_tracks(
     versions = analyzer.versions
     if audit_path is not None:
         payload = {
-            "version": 1,
+            "version": 2,
             "sudachi": versions,
             "config": asdict(config),
             "speaker_reattributions": speaker_reattributions,
@@ -202,6 +277,7 @@ def build_speaker_tracks(
                     "start": cue.start,
                     "end": cue.end,
                     "text": cue.text,
+                    "language": language_for_text(cue.text, cue.language),
                     "speaker": cue.speaker,
                     "reason": cue.speaker_assignment,
                     "fallback_speaker": cue.speaker_fallback,
@@ -232,7 +308,7 @@ def build_speaker_tracks(
 def _reattribute_unknown_speakers(
     cues: list[Cue], analyzer: SudachiAnalyzer
 ) -> tuple[list[Cue], list[dict[str, object]]]:
-    """Bridge short unknown runs when timing and Japanese syntax support one speaker."""
+    """Bridge short unknown runs when timing and language-aware syntax support it."""
     resolved = list(cues)
     audit: list[dict[str, object]] = []
     index = 0
@@ -359,12 +435,23 @@ def _unknown_run_candidate(
                 None,
             )
 
+    source_language = combine_source_languages(
+        language_for_text(cue.text, cue.language)
+        for cue in (
+            *((previous,) if previous is not None else ()),
+            *cues[start:end],
+            *((following,) if following is not None else ()),
+        )
+    )
     if (
         previous is not None
         and following is not None
         and previous.speaker != following.speaker
+        and source_language == "Japanese"
     ):
-        middle = "".join(cue.text for cue in cues[start:end])
+        middle = join_source_fragments(
+            (cue.text, cue.language) for cue in cues[start:end]
+        )
         left_dependency, right_dependency = analyzer.dependency_boundary_strengths(
             previous.text, middle, following.text
         )
@@ -477,22 +564,62 @@ def _dependency_boundary_strength(document: object, boundary: int) -> int:
 
 
 def _syntactic_boundary_score(left: Cue, right: Cue, analyzer: SudachiAnalyzer) -> int:
-    morphology = analyzer.analyze(left.text + right.text)
-    left_morpheme, right_morpheme, inside = _morphemes_at_boundary(
-        morphology, len(left.text)
+    text, offsets = _joined_cue_text_and_offsets([left, right])
+    language = combine_source_languages(
+        (
+            language_for_text(left.text, left.language),
+            language_for_text(right.text, right.language),
+        )
     )
+    morphology = _analyze_source(analyzer, text, language)
+    score, _factors = _boundary_grammar_evidence(
+        left, right, morphology, offsets[0], language
+    )
+    return score
+
+
+def _boundary_grammar_evidence(
+    left: Cue,
+    right: Cue,
+    morphology: list[Morphology],
+    character_offset: int,
+    language: str | None,
+) -> tuple[int, list[str]]:
     score = 0
+    factors: list[str] = []
+    if language == "English":
+        if _ENGLISH_SENTENCE_END_RE.search(left.text.rstrip()):
+            score += 3
+            factors.append("english_sentence_ending:+3")
+        if _english_first_word(right.text) in _ENGLISH_DISCOURSE_STARTERS:
+            score += 1
+            factors.append("english_new_utterance:+1")
+        if _english_last_word(left.text) in _ENGLISH_DANGLING_WORDS:
+            score -= 2
+            factors.append("english_dangling:-2")
+        return score, factors
+    if language != "Japanese":
+        return score, factors
+
+    left_morpheme, right_morpheme, inside = _morphemes_at_boundary(
+        morphology, character_offset
+    )
     if _is_terminal_predicate(left_morpheme):
         score += 2
+        factors.append("terminal_predicate:+2")
     if _is_sentence_ending(left.text, left_morpheme):
         score += 1
+        factors.append("sentence_ending:+1")
     if _is_new_utterance(right.text, right_morpheme):
         score += 1
+        factors.append("new_utterance:+1")
     if _is_dangling(left_morpheme):
         score -= 2
+        factors.append("dangling:-2")
     if inside or _is_strong_connection(right_morpheme):
         score -= 3
-    return score
+        factors.append("strong_connection:-3")
+    return score, factors
 
 
 def _has_competing_activity(
@@ -563,13 +690,12 @@ def _segment_episode(
         unit = _make_unit(cues, indices, track, id_offset, None)
         return [unit], {"track": track, "source_indices": indices, "boundaries": []}
 
-    text = "".join(cues[index].text for index in indices)
-    morphology = analyzer.analyze(text)
-    cue_offsets: list[int] = []
-    cursor = 0
-    for index in indices:
-        cursor += len(cues[index].text)
-        cue_offsets.append(cursor)
+    episode_cues = [cues[index] for index in indices]
+    text, cue_offsets = _joined_cue_text_and_offsets(episode_cues)
+    language = combine_source_languages(
+        language_for_text(cue.text, cue.language) for cue in episode_cues
+    )
+    morphology = _analyze_source(analyzer, text, language)
 
     cuts, boundaries = _choose_cuts_and_scores(
         cues, indices, cue_offsets, morphology, config
@@ -635,24 +761,21 @@ def _score_boundary(
         score += 2
         factors.append("duration>=4s:+2")
 
-    left_morpheme, right_morpheme, inside = _morphemes_at_boundary(
+    language = combine_source_languages(
+        (
+            language_for_text(left.text, left.language),
+            language_for_text(right.text, right.language),
+        )
+    )
+    grammar_score, grammar_factors = _boundary_grammar_evidence(
+        left, right, morphology, character_offset, language
+    )
+    score += grammar_score
+    factors.extend(grammar_factors)
+
+    left_morpheme, right_morpheme, _inside = _morphemes_at_boundary(
         morphology, character_offset
     )
-    if _is_terminal_predicate(left_morpheme):
-        score += 2
-        factors.append("terminal_predicate:+2")
-    if _is_sentence_ending(left.text, left_morpheme):
-        score += 1
-        factors.append("sentence_ending:+1")
-    if _is_new_utterance(right.text, right_morpheme):
-        score += 1
-        factors.append("new_utterance:+1")
-    if _is_dangling(left_morpheme):
-        score -= 2
-        factors.append("dangling:-2")
-    if inside or _is_strong_connection(right_morpheme):
-        score -= 3
-        factors.append("strong_connection:-3")
 
     return BoundaryScore(
         left_source_index=indices[position],
@@ -664,6 +787,40 @@ def _score_boundary(
         left_morpheme=left_morpheme,
         right_morpheme=right_morpheme,
     )
+
+
+def _analyze_source(
+    analyzer: object, text: str, language: str | None
+) -> list[Morphology]:
+    analyze_source = getattr(analyzer, "analyze_source", None)
+    if callable(analyze_source):
+        return list(analyze_source(text, language))
+    return list(analyzer.analyze(text))
+
+
+def _joined_cue_text_and_offsets(cues: list[Cue]) -> tuple[str, list[int]]:
+    text = ""
+    offsets: list[int] = []
+    previous_language: str | None = None
+    for cue in cues:
+        fragment = cue.text.strip()
+        language = language_for_text(fragment, cue.language)
+        if text and fragment:
+            text += source_separator(text, fragment, previous_language, language)
+        text += fragment
+        offsets.append(len(text))
+        previous_language = combine_source_languages((previous_language, language))
+    return text, offsets
+
+
+def _english_first_word(text: str) -> str:
+    match = re.search(r"[A-Za-z]+(?:'[A-Za-z]+)?", text)
+    return match.group(0).lower() if match else ""
+
+
+def _english_last_word(text: str) -> str:
+    matches = re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text)
+    return matches[-1].lower() if matches else ""
 
 
 def _morphemes_at_boundary(
@@ -813,13 +970,19 @@ def _make_unit(
         source_indices=tuple(indices),
         start=first.start,
         end=last.end,
-        text="".join(cues[index].text for index in indices),
+        text=join_source_fragments(
+            (cues[index].text, cues[index].language) for index in indices
+        ),
         speaker=first.speaker,
         kind=first.kind if len(kinds) == 1 else "speech",
         boundary_score_after=score_after,
         source_pos=tuple(cues[index].pos for index in indices),
         preferred_translation=(
             first.preferred_translation if len(indices) == 1 else None
+        ),
+        language=combine_source_languages(
+            language_for_text(cues[index].text, cues[index].language)
+            for index in indices
         ),
     )
 

@@ -9,6 +9,7 @@ description = "Download YouTube videos, translate/generate subtitles, and upload
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "alkana>=0.0.3",
     "certifi>=2025.1.31",
     "ja-ginza>=5.2,<6",
     "SudachiDict-core>=20250515",

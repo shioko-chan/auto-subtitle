@@ -29,6 +29,7 @@ class Cue:
     speaker_fallback_distance: float | None = None
     preferred_translation: str | None = None
     source_units: tuple[TimedTextUnit, ...] = ()
+    language: str | None = None
 
 
 def timed_text_units(cue: Cue) -> tuple[TimedTextUnit, ...]:
