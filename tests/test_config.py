@@ -126,6 +126,16 @@ class ConfigTests(unittest.TestCase):
             )
             self.assertIn("vcodec^=vp9]", config.download.video_format)
             self.assertIn("vcodec^=vp09", config.download.video_format)
+            self.assertEqual(config.download.concurrent_fragments, 8)
+
+    def test_rejects_invalid_download_fragment_concurrency(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(
+                "[download]\nconcurrent_fragments = 0\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ConfigError, "concurrent_fragments"):
+                load_config(path)
 
     def test_rejects_unknown_render_backend(self):
         with tempfile.TemporaryDirectory() as temp:

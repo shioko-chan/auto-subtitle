@@ -23,13 +23,13 @@ from subtitle_pipeline.translate import CueTranslationResult
 
 
 class PipelineTests(unittest.TestCase):
-    def test_deepseek_task_delay_uses_blocked_utc_windows(self):
+    def test_deepseek_task_delay_uses_beijing_weekday_windows(self):
         config = LLMConfig(base_url="https://api.deepseek.com")
 
         def delay(hour: int, minute: int = 0, second: int = 0) -> float:
             return _deepseek_task_delay(
                 config,
-                datetime(2026, 8, 22, hour, minute, second, tzinfo=UTC),
+                datetime(2026, 8, 24, hour, minute, second, tzinfo=UTC),
             )
 
         self.assertEqual(delay(0, 59, 59), 0)
@@ -40,10 +40,19 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(delay(6), 4 * 60 * 60)
         self.assertEqual(delay(9, 59, 59), 1)
         self.assertEqual(delay(10), 0)
+
+        # Saturday in Beijing is never blocked, even during the same clock hours.
+        self.assertEqual(
+            _deepseek_task_delay(
+                config,
+                datetime(2026, 8, 22, 1, tzinfo=UTC),
+            ),
+            0,
+        )
         self.assertEqual(
             _deepseek_task_delay(
                 LLMConfig(base_url="https://api.openai.com/v1"),
-                datetime(2026, 8, 22, 1, tzinfo=UTC),
+                datetime(2026, 8, 24, 1, tzinfo=UTC),
             ),
             0,
         )

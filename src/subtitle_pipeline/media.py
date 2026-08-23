@@ -69,6 +69,8 @@ def download_youtube(url: str, directory: Path, config: DownloadConfig) -> Downl
     video_command = [
         *common,
         "--write-info-json",
+        "--concurrent-fragments",
+        str(config.concurrent_fragments),
         "--format",
         config.video_format,
         "--merge-output-format",

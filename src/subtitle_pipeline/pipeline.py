@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from .asr import (
     read_cue_evidence,
@@ -35,7 +36,8 @@ from .upload import upload_to_bilibili
 
 _BUILTIN_GLOSSARY_FILES = ("glossaries/bang-dream.json",)
 _JAPANESE_SCRIPT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
-_DEEPSEEK_BLOCKED_UTC_HOURS = ((1, 4), (6, 10))
+_BEIJING_TIME = ZoneInfo("Asia/Shanghai")
+_DEEPSEEK_BLOCKED_BEIJING_HOURS = ((9, 12), (14, 18))
 _MAX_SUBTITLE_DURATION_SECONDS = 30.0
 
 
@@ -80,8 +82,11 @@ def _deepseek_task_delay(config: LLMConfig, now: datetime) -> float:
     normalized = hostname.lower().rstrip(".") if hostname else ""
     if normalized != "deepseek.com" and not normalized.endswith(".deepseek.com"):
         return 0.0
-    current = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
-    for start_hour, end_hour in _DEEPSEEK_BLOCKED_UTC_HOURS:
+    current = now.replace(tzinfo=UTC) if now.tzinfo is None else now
+    current = current.astimezone(_BEIJING_TIME)
+    if current.weekday() >= 5:
+        return 0.0
+    for start_hour, end_hour in _DEEPSEEK_BLOCKED_BEIJING_HOURS:
         if start_hour <= current.hour < end_hour:
             resume_at = current.replace(
                 hour=end_hour,
@@ -99,9 +104,12 @@ def _wait_for_deepseek_task_window(config: LLMConfig) -> None:
     if delay <= 0:
         return
     resume_at = datetime.fromtimestamp(current.timestamp() + delay, UTC)
+    resume_at_beijing = resume_at.astimezone(_BEIJING_TIME)
     logging.info(
-        "DeepSeek blocked window active; pausing task for %.0fs until %s",
+        "DeepSeek Beijing weekday blocked window active; pausing task for %.0fs "
+        "until %s (%s UTC)",
         delay,
+        resume_at_beijing.isoformat(timespec="seconds"),
         resume_at.isoformat(timespec="seconds"),
     )
     time.sleep(delay)

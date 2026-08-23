@@ -18,6 +18,7 @@ class DownloadConfig:
     cookies_from_browser: str | None = None
     cookies_file: str | None = None
     js_runtime: str | None = "auto"
+    concurrent_fragments: int = 8
     video_format: str = (
         "bv*[vcodec^=vp9]+ba/bv*[vcodec^=vp09]+ba/"
         "bv*[vcodec^=avc1]+ba/b"
@@ -263,6 +264,8 @@ def load_config(path: Path) -> AppConfig:
     except TypeError as exc:
         raise ConfigError(f"unknown or missing configuration field: {exc}") from exc
 
+    if not 1 <= config.download.concurrent_fragments <= 32:
+        raise ConfigError("download.concurrent_fragments must be between 1 and 32")
     if config.llm.max_retries < 1:
         raise ConfigError("llm.max_retries must be at least 1")
     if config.llm.max_concurrency < 1:

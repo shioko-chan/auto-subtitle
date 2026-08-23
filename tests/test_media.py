@@ -57,6 +57,8 @@ class MediaDownloadTests(unittest.TestCase):
             self.assertNotIn("--write-auto-subs", video_command)
             self.assertIn("node:/usr/bin/node", video_command)
             self.assertIn(DownloadConfig().video_format, video_command)
+            fragments_index = video_command.index("--concurrent-fragments")
+            self.assertEqual(video_command[fragments_index + 1], "8")
 
     def test_existing_subtitle_is_ignored_by_qwen_pipeline(self):
         with tempfile.TemporaryDirectory() as temp:

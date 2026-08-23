@@ -244,6 +244,7 @@ MOSS 和 ERes2NetV2 使用独立 uv 环境，避免模型依赖影响 Qwen ASR�
 
 年龄限制、地区限制或需要登录的视频，可以在 `[download]` 配置
 `cookies_from_browser = "chrome"`，或配置 Netscape 格式的 `cookies_file`。
+`concurrent_fragments = 8` 会让 yt-dlp 并行下载 DASH/HLS 分片；普通单文件流不受影响。
 
 ## 上传 Bilibili
 

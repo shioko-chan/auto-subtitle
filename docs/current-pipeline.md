@@ -82,7 +82,7 @@ flowchart TD
 
 ## 1. 下载与音频承载
 
-`yt-dlp` 下载视频及 `source.info.json`。当前格式顺序优先 VP9，其次 H.264，原因是
+`yt-dlp` 下载视频及 `source.info.json`，DASH/HLS 默认并行下载 8 个分片。当前格式顺序优先 VP9，其次 H.264，原因是
 RTX 2080 Ti 可以硬解这两种编码，但不能硬解 AV1。已经存在的源视频会直接复用。
 
 进入语音阶段后，ffmpeg 将完整音轨一次性解码成 16 kHz、单声道、`float32` PCM。

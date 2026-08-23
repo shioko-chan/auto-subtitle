@@ -3,6 +3,8 @@ work_dir = "work"
 [download]
 # Prefer formats supported by NVDEC on Turing GPUs; fall back to any combined stream.
 video_format = "bv*[vcodec^=vp9]+ba/bv*[vcodec^=vp09]+ba/bv*[vcodec^=avc1]+ba/b"
+# Download DASH/HLS fragments in parallel. Plain single-file streams ignore this.
+concurrent_fragments = 8
 # Automatically use Deno, Node or QuickJS when available; set "" to disable.
 js_runtime = "auto"
 # cookies_from_browser = "chrome"
