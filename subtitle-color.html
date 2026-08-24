@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Subtitle Color Studio</title>
+    <style>
+      :root {
+        --color-1: #7dd3fc;
+        --color-2: #a78bfa;
+        --color-3: #f0abfc;
+        --panel: rgba(18, 22, 31, 0.88);
+        --border: rgba(255, 255, 255, 0.1);
+        --muted: #8b93a7;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: #090b10;
+        color: #f4f6fb;
+        font-family: Inter, "SF Pro Display", "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      button, input { font: inherit; }
+      button { color: inherit; }
+      .app { width: min(1280px, calc(100% - 40px)); margin: 0 auto; padding: 36px 0 48px; }
+      header { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 24px; }
+      .eyebrow { margin: 0 0 8px; color: #8ca0c7; font-size: 11px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase; }
+      h1 { margin: 0; font-size: clamp(28px, 4vw, 42px); letter-spacing: -0.04em; }
+      .subtitle { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
+      .copy-button, .segmented button, .preset { border: 1px solid var(--border); cursor: pointer; transition: border-color 160ms ease, background 160ms ease, transform 160ms ease; }
+      .copy-button { min-width: 138px; padding: 11px 16px; border-radius: 11px; background: #f3f5f8; color: #10131a; font-size: 13px; font-weight: 700; }
+      .copy-button:hover { background: white; transform: translateY(-1px); }
+      .workspace { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(320px, 0.9fr); gap: 18px; }
+      .card { border: 1px solid var(--border); border-radius: 18px; background: var(--panel); box-shadow: 0 18px 60px rgba(0, 0, 0, 0.24); backdrop-filter: blur(18px); }
+      .preview-card { min-height: 650px; overflow: hidden; }
+      .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+      .toolbar-label { color: #bec4d2; font-size: 12px; font-weight: 650; }
+      .segmented { display: flex; gap: 3px; padding: 3px; border: 1px solid rgba(255, 255, 255, 0.07); border-radius: 10px; background: rgba(0, 0, 0, 0.25); }
+      .segmented button { padding: 6px 11px; border-color: transparent; border-radius: 7px; background: transparent; color: var(--muted); font-size: 12px; }
+      .segmented button[aria-pressed="true"] { background: rgba(255, 255, 255, 0.1); color: white; }
+      .stage { position: relative; min-height: 590px; display: flex; align-items: flex-end; padding: 64px clamp(28px, 6vw, 68px) 74px; overflow: hidden; background-color: #161b24; isolation: isolate; }
+      .stage::before, .stage::after { content: ""; position: absolute; inset: 0; z-index: -2; transition: opacity 200ms ease; }
+      .stage::before {
+        background: linear-gradient(180deg, transparent 35%, rgba(2, 4, 9, 0.9) 100%), radial-gradient(circle at 25% 25%, #65718a 0 9%, transparent 10%), radial-gradient(circle at 74% 30%, #cd876b 0 7%, transparent 8%), linear-gradient(125deg, #29384a, #4c3552 48%, #16252c);
+      }
+      .stage::after { z-index: -1; background-image: radial-gradient(circle at 50% 90%, color-mix(in srgb, var(--color-2) 18%, transparent), transparent 45%); }
+      .stage[data-background="light"]::before { background: linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(34, 39, 50, 0.32)), linear-gradient(130deg, #d9e4ef, #d8c7d2 48%, #a9c6c1); }
+      .stage[data-background="dark"]::before { background: radial-gradient(circle at 80% 18%, #28334d, transparent 32%), linear-gradient(145deg, #101724, #07090e 60%); }
+      .safe-area { position: absolute; inset: 8%; border: 1px dashed rgba(255, 255, 255, 0.12); border-radius: 8px; pointer-events: none; }
+      .safe-area span { position: absolute; top: 8px; right: 10px; color: rgba(255, 255, 255, 0.32); font-size: 9px; letter-spacing: 0.12em; }
+      .lyrics { width: 100%; }
+      .context-line { margin: 0 0 18px; color: rgba(255, 255, 255, 0.34); font-size: clamp(20px, 2.5vw, 30px); font-weight: 650; letter-spacing: 0.02em; }
+      .active-line { position: relative; display: inline-block; margin: 0; color: rgba(255, 255, 255, 0.72); font-size: clamp(30px, 4.8vw, 58px); font-weight: 750; line-height: 1.3; letter-spacing: 0.025em; text-shadow: 0 3px 15px rgba(0, 0, 0, 0.68); }
+      .active-line::after { content: attr(data-text); position: absolute; inset: 0; width: 72%; overflow: hidden; color: transparent; white-space: nowrap; background: linear-gradient(90deg, var(--color-1), var(--color-2), var(--color-3)); background-clip: text; -webkit-background-clip: text; filter: drop-shadow(0 0 8px rgba(255, 255, 255, 0.18)); }
+      .timeline { position: absolute; right: clamp(28px, 6vw, 68px); bottom: 40px; left: clamp(28px, 6vw, 68px); height: 3px; overflow: hidden; border-radius: 99px; background: rgba(255, 255, 255, 0.14); }
+      .timeline::after { content: ""; display: block; width: 72%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--color-1), var(--color-2), var(--color-3)); }
+      .panel { align-self: start; overflow: hidden; }
+      .section { padding: 20px; border-bottom: 1px solid var(--border); }
+      .section:last-child { border-bottom: 0; }
+      .section-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; }
+      .section-heading h2 { margin: 0; font-size: 13px; letter-spacing: 0.01em; }
+      .section-heading span { color: var(--muted); font-size: 11px; }
+      .gradient-track { position: relative; height: 62px; margin-bottom: 18px; border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 12px; background: linear-gradient(90deg, var(--color-1), var(--color-2), var(--color-3)); box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08); }
+      .track-stop { position: absolute; bottom: -7px; width: 14px; height: 14px; border: 2px solid white; border-radius: 50%; background: var(--stop-color); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.48); transform: translateX(-50%); }
+      .track-stop:nth-child(1) { left: 0; transform: translateX(0); }
+      .track-stop:nth-child(2) { left: 50%; }
+      .track-stop:nth-child(3) { left: 100%; transform: translateX(-100%); }
+      .color-list { display: grid; gap: 9px; }
+      .color-row { display: grid; grid-template-columns: 32px 1fr 62px; align-items: center; gap: 10px; min-height: 44px; padding: 6px 8px; border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 10px; background: rgba(0, 0, 0, 0.17); }
+      .swatch { position: relative; width: 30px; height: 30px; overflow: hidden; border: 1px solid rgba(255, 255, 255, 0.18); border-radius: 8px; background: var(--swatch-color); cursor: pointer; }
+      .swatch input { position: absolute; inset: -8px; width: 48px; height: 48px; opacity: 0; cursor: pointer; }
+      .hex-input { width: 100%; border: 0; outline: 0; background: transparent; color: #f4f6fb; font-family: "SFMono-Regular", Consolas, monospace; font-size: 13px; text-transform: uppercase; }
+      .color-row:focus-within { border-color: rgba(151, 171, 255, 0.62); box-shadow: 0 0 0 3px rgba(106, 127, 255, 0.1); }
+      .color-row.invalid { border-color: #ef6673; }
+      .contrast { color: var(--muted); font-size: 10px; text-align: right; }
+      .contrast strong { display: block; margin-bottom: 1px; color: #dce1eb; font-size: 11px; }
+      .presets { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+      .preset { height: 38px; padding: 5px; border-radius: 9px; background: rgba(0, 0, 0, 0.2); }
+      .preset:hover, .preset[aria-pressed="true"] { border-color: rgba(255, 255, 255, 0.36); transform: translateY(-1px); }
+      .preset span { display: block; width: 100%; height: 100%; border-radius: 5px; background: var(--preset); }
+      .field-label { display: block; margin-bottom: 8px; color: var(--muted); font-size: 11px; }
+      .text-input { width: 100%; padding: 10px 11px; border: 1px solid rgba(255, 255, 255, 0.09); border-radius: 9px; outline: 0; background: rgba(0, 0, 0, 0.2); color: white; font-size: 13px; }
+      .text-input:focus { border-color: rgba(151, 171, 255, 0.62); }
+      .hint { display: flex; gap: 8px; margin: 12px 0 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
+      .hint::before { content: "i"; flex: 0 0 auto; width: 16px; height: 16px; border: 1px solid #67738b; border-radius: 50%; color: #aeb8cb; font-size: 10px; font-weight: 700; line-height: 14px; text-align: center; }
+      .toast { position: fixed; right: 22px; bottom: 22px; padding: 10px 14px; border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 10px; background: #232936; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.36); font-size: 12px; opacity: 0; pointer-events: none; transform: translateY(8px); transition: 180ms ease; }
+      .toast.visible { opacity: 1; transform: translateY(0); }
+      @media (max-width: 900px) { .workspace { grid-template-columns: 1fr; } .preview-card { min-height: auto; } .stage { min-height: 500px; } }
+      @media (max-width: 560px) { .app { width: min(100% - 24px, 1280px); padding-top: 22px; } header { align-items: flex-start; flex-direction: column; } .copy-button { width: 100%; } .toolbar { align-items: flex-start; flex-direction: column; } .stage { min-height: 430px; } }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <header>
+        <div>
+          <p class="eyebrow">Design utility</p>
+          <h1>Subtitle Color Studio</h1>
+          <p class="subtitle">在真实明暗场景中校准歌词高亮渐变，确认后复制到项目。</p>
+        </div>
+        <button class="copy-button" id="copyButton" type="button">复制 CSS 渐变</button>
+      </header>
+      <div class="workspace">
+        <section class="card preview-card" aria-label="字幕预览">
+          <div class="toolbar">
+            <span class="toolbar-label">16:9 · 字幕安全区预览</span>
+            <div class="segmented" aria-label="预览背景">
+              <button type="button" data-background="scene" aria-pressed="true">混合</button>
+              <button type="button" data-background="dark" aria-pressed="false">暗色</button>
+              <button type="button" data-background="light" aria-pressed="false">亮色</button>
+            </div>
+          </div>
+          <div class="stage" id="stage" data-background="scene">
+            <div class="safe-area"><span>SAFE AREA</span></div>
+            <div class="lyrics">
+              <p class="context-line">夜色慢慢落在城市中央</p>
+              <p class="active-line" id="previewText" data-text="晚风轻轻吹过这座城市">晚风轻轻吹过这座城市</p>
+            </div>
+            <div class="timeline"></div>
+          </div>
+        </section>
+        <aside class="card panel">
+          <section class="section">
+            <div class="section-heading"><h2>渐变色标</h2><span>HEX · RGB</span></div>
+            <div class="gradient-track" aria-label="当前渐变预览">
+              <i class="track-stop" style="--stop-color: var(--color-1)"></i>
+              <i class="track-stop" style="--stop-color: var(--color-2)"></i>
+              <i class="track-stop" style="--stop-color: var(--color-3)"></i>
+            </div>
+            <div class="color-list" id="colorList">
+              <label class="color-row"><span class="swatch" style="--swatch-color: var(--color-1)"><input type="color" value="#7dd3fc" aria-label="起始颜色" /></span><input class="hex-input" value="#7DD3FC" aria-label="起始颜色 HEX" spellcheck="false" /><span class="contrast"><strong>2.5:1</strong>起始</span></label>
+              <label class="color-row"><span class="swatch" style="--swatch-color: var(--color-2)"><input type="color" value="#a78bfa" aria-label="中间颜色" /></span><input class="hex-input" value="#A78BFA" aria-label="中间颜色 HEX" spellcheck="false" /><span class="contrast"><strong>2.9:1</strong>中间</span></label>
+              <label class="color-row"><span class="swatch" style="--swatch-color: var(--color-3)"><input type="color" value="#f0abfc" aria-label="结束颜色" /></span><input class="hex-input" value="#F0ABFC" aria-label="结束颜色 HEX" spellcheck="false" /><span class="contrast"><strong>1.8:1</strong>结束</span></label>
+            </div>
+          </section>
+          <section class="section">
+            <div class="section-heading"><h2>专业色板</h2><span>一键应用</span></div>
+            <div class="presets" id="presets"></div>
+          </section>
+          <section class="section">
+            <label class="field-label" for="sampleText">预览文案</label>
+            <input class="text-input" id="sampleText" value="晚风轻轻吹过这座城市" maxlength="28" />
+            <p class="hint">对比度数值按深色背景估算。视频画面变化较大，成片仍应保留描边或阴影。</p>
+          </section>
+        </aside>
+      </div>
+    </main>
+    <div class="toast" id="toast" role="status" aria-live="polite">已复制到剪贴板</div>
+    <script>
+      const root = document.documentElement;
+      const rows = [...document.querySelectorAll(".color-row")];
+      const previewText = document.getElementById("previewText");
+      const toast = document.getElementById("toast");
+      const paletteData = [
+        ["#7DD3FC", "#A78BFA", "#F0ABFC"],
+        ["#67E8F9", "#34D399", "#BEF264"],
+        ["#FDE68A", "#FB923C", "#FB7185"],
+        ["#F9A8D4", "#C084FC", "#818CF8"],
+        ["#F8FAFC", "#CBD5E1", "#94A3B8"],
+        ["#AFFF5C", "#FACC15", "#FB7185"],
+      ];
+      function normalizeHex(value) {
+        const trimmed = value.trim();
+        const withHash = trimmed.startsWith("#") ? trimmed : `#${trimmed}`;
+        return /^#[0-9a-f]{6}$/i.test(withHash) ? withHash.toUpperCase() : null;
+      }
+      function contrastRatio(hex) {
+        const channels = hex.slice(1).match(/.{2}/g).map((part) => parseInt(part, 16) / 255).map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+        const luminance = 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+        return ((luminance + 0.05) / 0.062).toFixed(1);
+      }
+      function currentColors() { return rows.map((row) => normalizeHex(row.querySelector(".hex-input").value)); }
+      function setColor(index, hex) {
+        const row = rows[index];
+        row.querySelector(".hex-input").value = hex;
+        row.querySelector('input[type="color"]').value = hex.toLowerCase();
+        row.querySelector(".contrast strong").textContent = `${contrastRatio(hex)}:1`;
+        row.classList.remove("invalid");
+        root.style.setProperty(`--color-${index + 1}`, hex);
+      }
+      function applyPalette(colors) {
+        colors.forEach((color, index) => setColor(index, color));
+        document.querySelectorAll(".preset").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.colors === colors.join(","))));
+      }
+      rows.forEach((row, index) => {
+        const textInput = row.querySelector(".hex-input");
+        const picker = row.querySelector('input[type="color"]');
+        textInput.addEventListener("input", () => {
+          const hex = normalizeHex(textInput.value);
+          row.classList.toggle("invalid", !hex);
+          if (hex) setColor(index, hex);
+        });
+        textInput.addEventListener("blur", () => {
+          const hex = normalizeHex(textInput.value);
+          if (hex) textInput.value = hex;
+        });
+        picker.addEventListener("input", () => setColor(index, picker.value.toUpperCase()));
+      });
+      const presets = document.getElementById("presets");
+      paletteData.forEach((colors, index) => {
+        const button = document.createElement("button");
+        button.className = "preset";
+        button.type = "button";
+        button.dataset.colors = colors.join(",");
+        button.setAttribute("aria-label", `应用色板 ${index + 1}`);
+        button.setAttribute("aria-pressed", String(index === 0));
+        const swatch = document.createElement("span");
+        swatch.style.setProperty("--preset", `linear-gradient(90deg, ${colors.join(", ")})`);
+        button.append(swatch);
+        button.addEventListener("click", () => applyPalette(colors));
+        presets.append(button);
+      });
+      document.querySelectorAll(".segmented [data-background]").forEach((button) => {
+        button.addEventListener("click", () => {
+          document.getElementById("stage").dataset.background = button.dataset.background;
+          document.querySelectorAll(".segmented [data-background]").forEach((item) => item.setAttribute("aria-pressed", String(item === button)));
+        });
+      });
+      document.getElementById("sampleText").addEventListener("input", (event) => {
+        const value = event.target.value || "字幕颜色预览";
+        previewText.textContent = value;
+        previewText.dataset.text = value;
+      });
+      document.getElementById("copyButton").addEventListener("click", async () => {
+        const colors = currentColors();
+        if (colors.some((color) => !color)) return;
+        const css = `linear-gradient(90deg, ${colors.join(", ")})`;
+        try { await navigator.clipboard.writeText(css); toast.textContent = "已复制 CSS 渐变"; }
+        catch { toast.textContent = "浏览器未授权剪贴板"; }
+        toast.classList.add("visible");
+        window.setTimeout(() => toast.classList.remove("visible"), 1800);
+      });
+      applyPalette(paletteData[0]);
+    </script>
+  </body>
+</html>
