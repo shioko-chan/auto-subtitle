@@ -12,6 +12,7 @@ from subtitle_pipeline.song_identification import (
     _apply_local_match,
     _build_lyric_search_queries,
     _load_cache,
+    _parse_worker_json_output,
     _public_http_url,
     _recover_lyric_gaps,
     _signature,
@@ -25,6 +26,12 @@ from subtitle_pipeline.subtitles import Cue, TimedTextUnit
 
 
 class SongIdentificationTests(unittest.TestCase):
+    def test_pyshiro_json_parser_ignores_worker_stdout_noise(self):
+        self.assertEqual(
+            _parse_worker_json_output('loading model...\n{"ok":true,"lines":[]}\n'),
+            {"ok": True, "lines": []},
+        )
+
     def test_song_translation_stage_backfills_without_invalidating_signature(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -103,7 +110,7 @@ class SongIdentificationTests(unittest.TestCase):
         "subtitle_pipeline.song_identification._load_ocr_cache",
         return_value=[[]],
     )
-    def test_unmatched_song_episode_discards_all_internal_text(
+    def test_unmatched_song_episode_preserves_internal_speech(
         self, _ocr_cache, _search
     ):
         with TemporaryDirectory() as directory:
@@ -129,7 +136,8 @@ class SongIdentificationTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            [cue.text for cue in result.corrected_cues], ["outside speech"]
+            [cue.text for cue in result.corrected_cues],
+            ["in-song speech", "outside speech"],
         )
         self.assertEqual(
             result.reports[0]["evidence"],

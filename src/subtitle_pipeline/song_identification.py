@@ -22,7 +22,7 @@ from .lyrics_library import LibrarySong, LyricLine, LyricsLibrary
 from .lyrics_matching import JapaneseNormalizer, LyricAnchor, SongMatch, match_song
 from .prompt_templates import prompt_templates_digest
 from .source_language import language_for_text
-from .subtitles import Cue, TimedTextUnit, cue_from_mapping
+from .subtitles import Cue, TimedTextUnit, cue_from_mapping, text_display_width
 
 _CACHE_VERSION = 10
 _PROMPT_VERSION = 7
@@ -75,13 +75,21 @@ def identify_and_align_songs(
     metadata: dict[str, object],
     job_dir: Path,
     config: SongIdentificationConfig,
+    *,
+    source_maximum_units: float | None = None,
 ) -> SongIdentificationResult:
     episodes = group_singing_episodes(cues, config.song_gap_seconds)
     if not config.enabled or not episodes:
         return SongIdentificationResult(cues, [])
 
     cache_path = job_dir / "song-identification-cache.json"
-    signature = _signature(video, cues, metadata, config)
+    signature = _signature(
+        video,
+        cues,
+        metadata,
+        config,
+        source_maximum_units=source_maximum_units,
+    )
     cached = _load_cache(cache_path, signature, cues)
     if cached is not None:
         return cached
@@ -164,7 +172,7 @@ def identify_and_align_songs(
                         match.score,
                     )
             if match is None:
-                discarded_song_region_cues.update(episode.cue_ids)
+                discarded_song_region_cues.update(singing_ids)
                 reports.append(
                     {
                         "song": None,
@@ -185,7 +193,11 @@ def identify_and_align_songs(
                 job_dir, cues, singing_ids, match, config
             )
             replacements, alignments = _apply_local_match(
-                cues, singing_ids, match, timing
+                cues,
+                singing_ids,
+                match,
+                timing,
+                source_maximum_units=source_maximum_units,
             )
             recovered, recovered_alignments, gap_audit = _recover_lyric_gaps(
                 job_dir,
@@ -201,7 +213,7 @@ def identify_and_align_songs(
             pyshiro_audit.extend(gap_audit)
             lyric_replacements.update(replacements)
             matched_ids = {item["asr_cue_ids"][0] for item in alignments}
-            for cue_id in episode.cue_ids:
+            for cue_id in singing_ids:
                 if cue_id in matched_ids:
                     continue
                 discarded_song_region_cues.add(cue_id)
@@ -309,6 +321,36 @@ def translate_aligned_song_lyrics(
                     if len(lines) != len(line_ids):
                         continue
                     translated = "".join(line.translation or "" for line in lines)
+                    fragment_count = alignment.get("fragment_count")
+                    fragment_index = alignment.get("fragment_index")
+                    if (
+                        translated
+                        and isinstance(fragment_count, int)
+                        and fragment_count > 1
+                        and isinstance(fragment_index, int)
+                    ):
+                        siblings = [
+                            item
+                            for item in alignments
+                            if isinstance(item, dict)
+                            and item.get("lyric_line_ids") == line_ids
+                            and item.get("fragment_count") == fragment_count
+                            and item.get("take_index") == alignment.get("take_index")
+                            and item.get("asr_cue_ids") == alignment.get("asr_cue_ids")
+                        ]
+                        siblings.sort(
+                            key=lambda item: int(item.get("fragment_index", -1))
+                        )
+                        if len(siblings) == fragment_count:
+                            pieces = _split_text_by_weights(
+                                translated,
+                                [
+                                    float(item.get("fragment_weight", 1.0))
+                                    for item in siblings
+                                ],
+                            )
+                            if 0 <= fragment_index < len(pieces):
+                                translated = pieces[fragment_index]
                     if translated:
                         translations[source] = translated
             episode = report.get("episode")
@@ -324,11 +366,46 @@ def translate_aligned_song_lyrics(
                     and cue.start >= start - 1e-3
                     and cue.end <= end + 1e-3
                 ):
-                    corrected[index] = replace(
-                        cue, preferred_translation=translated
-                    )
+                    corrected[index] = replace(cue, preferred_translation=translated)
     finally:
         library.close()
+    return SongIdentificationResult(corrected, result.reports)
+
+
+def split_aligned_song_cues(
+    result: SongIdentificationResult, source_maximum_units: float
+) -> SongIdentificationResult:
+    corrected: list[Cue] = []
+    for cue in result.corrected_cues:
+        if (
+            cue.kind != "singing"
+            or text_display_width(cue.text) <= source_maximum_units
+            or not cue.source_units
+        ):
+            corrected.append(cue)
+            continue
+        fragments = _split_aligned_lyric_line(
+            cue.text,
+            cue.source_units,
+            cue.start,
+            cue.end,
+            source_maximum_units,
+        )
+        translations = _split_text_by_weights(
+            cue.preferred_translation or "",
+            [text_display_width(text) for text, _units in fragments],
+        )
+        for (text, units), translated in zip(fragments, translations):
+            corrected.append(
+                replace(
+                    cue,
+                    start=units[0].start,
+                    end=units[-1].end,
+                    text=text,
+                    preferred_translation=translated or None,
+                    source_units=units,
+                )
+            )
     return SongIdentificationResult(corrected, result.reports)
 
 
@@ -478,9 +555,7 @@ def _asr_lyric_search_fragments(hypotheses: list[str]) -> list[str]:
                     fragment,
                 ):
                     score -= 8
-                candidates[excerpt] = max(
-                    candidates.get(excerpt, float("-inf")), score
-                )
+                candidates[excerpt] = max(candidates.get(excerpt, float("-inf")), score)
     ranked = sorted(candidates.items(), key=lambda item: (-item[1], item[0]))
     return [item[0] for item in ranked]
 
@@ -587,6 +662,68 @@ def _ensure_song_translations(
     return refreshed
 
 
+def _split_aligned_lyric_line(
+    text: str,
+    source_units: tuple[TimedTextUnit, ...],
+    start: float,
+    end: float,
+    maximum_units: float | None,
+) -> list[tuple[str, tuple[TimedTextUnit, ...]]]:
+    if maximum_units is None or text_display_width(text) <= maximum_units:
+        return [(text, source_units)]
+
+    units = source_units
+    if not units or "".join(unit.text for unit in units) != text:
+        units = (TimedTextUnit(text, start, end),)
+
+    characters: list[TimedTextUnit] = []
+    for unit in units:
+        if len(unit.text) <= 1:
+            characters.append(unit)
+            continue
+        duration = max(0.0, unit.end - unit.start)
+        for index, character in enumerate(unit.text):
+            character_start = unit.start + duration * index / len(unit.text)
+            character_end = unit.start + duration * (index + 1) / len(unit.text)
+            characters.append(TimedTextUnit(character, character_start, character_end))
+
+    fragments: list[tuple[str, tuple[TimedTextUnit, ...]]] = []
+    current: list[TimedTextUnit] = []
+    current_width = 0.0
+    for unit in characters:
+        width = text_display_width(unit.text)
+        if current and current_width + width > maximum_units:
+            fragments.append(("".join(item.text for item in current), tuple(current)))
+            current = []
+            current_width = 0.0
+        current.append(unit)
+        current_width += width
+    if current:
+        fragments.append(("".join(item.text for item in current), tuple(current)))
+    return fragments
+
+
+def _split_text_by_weights(text: str, weights: list[float]) -> list[str]:
+    if not weights:
+        return []
+    if len(weights) == 1:
+        return [text]
+    if not text:
+        return ["" for _weight in weights]
+    total = sum(max(0.0, weight) for weight in weights) or float(len(weights))
+    result: list[str] = []
+    start = 0
+    cumulative = 0.0
+    for weight in weights[:-1]:
+        cumulative += max(0.0, weight)
+        target = round(len(text) * cumulative / total)
+        target = min(len(text), max(start, target))
+        result.append(text[start:target])
+        start = target
+    result.append(text[start:])
+    return result
+
+
 def _apply_local_match(
     cues: list[Cue],
     singing_ids: list[int],
@@ -595,6 +732,8 @@ def _apply_local_match(
         int,
         tuple[tuple[int, float, float] | tuple[int, float, float, object], ...],
     ],
+    *,
+    source_maximum_units: float | None = None,
 ) -> tuple[dict[int, list[Cue]], list[dict[str, object]]]:
     replacements: dict[int, list[Cue]] = {}
     alignments: list[dict[str, object]] = []
@@ -612,32 +751,52 @@ def _apply_local_match(
             for line, timing_value in zip(lines, line_timing):
                 line_id, start, end = timing_value[:3]
                 source_units = tuple(timing_value[3]) if len(timing_value) == 4 else ()
-                replacement.append(
-                    Cue(
-                        **{
-                            **asdict(cues[cue_id]),
-                            "start": start,
-                            "end": end,
-                            "text": line.text,
-                            "kind": "singing",
-                            "language": language_for_text(line.text, "Japanese"),
-                            "preferred_translation": line.translation,
-                            "source_units": source_units,
+                fragments = _split_aligned_lyric_line(
+                    line.text,
+                    source_units,
+                    start,
+                    end,
+                    source_maximum_units,
+                )
+                translated_fragments = _split_text_by_weights(
+                    line.translation or "",
+                    [text_display_width(text) for text, _units in fragments],
+                )
+                for fragment_index, ((text, units), translated) in enumerate(
+                    zip(fragments, translated_fragments)
+                ):
+                    fragment_start = units[0].start if units else start
+                    fragment_end = units[-1].end if units else end
+                    replacement.append(
+                        Cue(
+                            **{
+                                **asdict(cues[cue_id]),
+                                "start": fragment_start,
+                                "end": fragment_end,
+                                "text": text,
+                                "kind": "singing",
+                                "language": language_for_text(text, "Japanese"),
+                                "preferred_translation": translated or None,
+                                "source_units": units,
+                            }
+                        )
+                    )
+                    alignments.append(
+                        {
+                            "asr_cue_ids": [cue_id],
+                            "lyric_line_ids": [line_id],
+                            "match": "lyrics",
+                            "corrected_text": text,
+                            "source_line_text": line.text,
+                            "fragment_index": fragment_index,
+                            "fragment_count": len(fragments),
+                            "fragment_weight": text_display_width(text),
+                            "start": fragment_start,
+                            "end": fragment_end,
+                            "score": round(anchor.score, 6),
+                            "take_index": anchor.take_index,
                         }
                     )
-                )
-                alignments.append(
-                    {
-                        "asr_cue_ids": [cue_id],
-                        "lyric_line_ids": [line_id],
-                        "match": "lyrics",
-                        "corrected_text": line.text,
-                        "start": start,
-                        "end": end,
-                        "score": round(anchor.score, 6),
-                        "take_index": anchor.take_index,
-                    }
-                )
             replacements[cue_id] = replacement
             continue
 
@@ -1244,8 +1403,30 @@ def _run_pyshiro_lines(
     )
     if result.returncode:
         return None
-    response = json.loads(result.stdout)
+    response = _parse_worker_json_output(result.stdout)
     return response if response.get("ok") is True else None
+
+
+def _parse_worker_json_output(output: str) -> dict[str, object]:
+    candidates = [output.strip()]
+    candidates.extend(line.strip() for line in reversed(output.splitlines()))
+    candidates.extend(
+        output[position:].strip()
+        for position, character in reversed(list(enumerate(output)))
+        if character == "{"
+    )
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    raise ValueError(
+        f"pySHIRO worker produced no JSON object; stdout_tail={output[-500:]!r}"
+    )
 
 
 def _align_match_with_pyshiro(
@@ -1386,7 +1567,18 @@ def _align_match_with_pyshiro(
                 }
             )
             continue
-        response = json.loads(result.stdout)
+        try:
+            response = _parse_worker_json_output(result.stdout)
+        except ValueError as exc:
+            audits.append(
+                {
+                    "cue_id": cue_id,
+                    "take_index": anchor.take_index,
+                    "status": "failed",
+                    "reason": str(exc),
+                }
+            )
+            continue
         ranges = response.get("lines")
         owned_units = response.get("units")
         if not isinstance(ranges, list) or not ranges:
@@ -1909,6 +2101,8 @@ def _signature(
     cues: list[Cue],
     metadata: dict[str, object],
     config: SongIdentificationConfig,
+    *,
+    source_maximum_units: float | None = None,
 ) -> str:
     stat = video.stat()
     library_path = Path(config.lyrics_library_path).resolve()
@@ -1926,6 +2120,7 @@ def _signature(
         },
         "config": asdict(config),
         "lyrics_library": library_digest,
+        "source_maximum_units": source_maximum_units,
     }
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode()

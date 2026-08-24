@@ -91,7 +91,7 @@ singing_ambiguous_min_seconds = 15.0
 # Smooth isolated AST misses/hits, then keep the song state through short gaps.
 singing_merge_gap_seconds = 1.5
 singing_smoothing_windows = 3
-singing_release_seconds = 35.0
+singing_release_seconds = 15.0
 singing_phrase_silence_seconds = 0.45
 # Coalesce lyric-phrase ASR blocks toward this duration. A short performance can
 # still be confirmed when vocal-stem AST supplies a real singing anchor.

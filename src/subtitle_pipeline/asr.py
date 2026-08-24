@@ -124,6 +124,172 @@ def transcribe_with_qwen(
             )
 
 
+def transcribe_unverified_song_speech(
+    video: Path,
+    job_dir: Path,
+    reports: list[dict[str, object]],
+    existing_cues: list[Cue],
+    config: ASRConfig,
+    japanese_single_word_list: list[str] | None = None,
+) -> list[Cue]:
+    """Recover diarized speech from song episodes that lacked verified lyrics."""
+    analysis_path = job_dir / "audio-analysis.json"
+    if not analysis_path.is_file():
+        logging.warning("song speech fallback skipped: audio analysis cache is missing")
+        return []
+    try:
+        payload = json.loads(analysis_path.read_text(encoding="utf-8"))
+        raw_speech = payload["speech"]
+        if not isinstance(raw_speech, list):
+            raise TypeError
+        speech = [
+            AudioRegion(
+                **{
+                    **value,
+                    "overlap_speakers": tuple(value.get("overlap_speakers") or ()),
+                    "source_path": None,
+                    "source_offset": 0.0,
+                }
+            )
+            for value in raw_speech
+            if isinstance(value, dict)
+        ]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError) as exc:
+        logging.warning("song speech fallback skipped: invalid audio analysis: %s", exc)
+        return []
+
+    fallback_turns = _unverified_song_speech_regions(speech, reports)
+    if not fallback_turns:
+        return []
+    windows = _speech_asr_windows(
+        AudioAnalysis(
+            speech=fallback_turns,
+            singing=[],
+            diarization=fallback_turns,
+        ),
+        config,
+    )
+    if not windows:
+        return []
+
+    duration = _media_duration(video)
+    cache_path = job_dir / "asr-song-speech-fallback-cache.json"
+    signature = {
+        **_cache_signature(video, duration, config, japanese_single_word_list),
+        "fallback_version": 1,
+        "regions": [_analysis_region_signature(region) for region in windows],
+    }
+    cache = _load_cache(cache_path, signature)
+    chunks = cache["chunks"]
+    assert isinstance(chunks, dict)
+    missing = [index for index in range(len(windows)) if str(index) not in chunks]
+
+    if missing:
+        with AudioBufferPool(video, job_dir, duration) as audio_pool:
+            raw_records: dict[int, dict[str, object]] = {}
+            raw_model = _load_qwen_model(
+                config, japanese_single_word_list, with_aligner=False
+            )
+            try:
+                for batch_start in range(
+                    0, len(missing), config.max_inference_batch_size
+                ):
+                    indices = missing[
+                        batch_start : batch_start + config.max_inference_batch_size
+                    ]
+                    raw_records.update(
+                        _transcribe_raw_speech_batch(
+                            raw_model,
+                            config,
+                            [(index, windows[index]) for index in indices],
+                            media_duration=duration,
+                            audio_buffer=audio_pool.main(),
+                        )
+                    )
+            finally:
+                del raw_model
+                _release_cuda()
+
+            records = [{**raw_records[index], "window_id": index} for index in missing]
+            aligner = _load_qwen_aligner(config, japanese_single_word_list)
+            try:
+                aligned = _align_speech_records(
+                    aligner,
+                    records,
+                    windows,
+                    audio_pool.main(),
+                    config,
+                    duration,
+                )
+            finally:
+                del aligner
+                _release_cuda()
+            for index, record in aligned.items():
+                for cue in record["cues"]:
+                    cue["speaker"] = _speaker_for_aligned_cue(
+                        float(cue["start"]), float(cue["end"]), fallback_turns
+                    )
+                    cue["kind"] = "speech"
+                    cue["speaker_assignment"] = "unverified_song_speech_fallback"
+                chunks[str(index)] = record
+                _write_cache(cache_path, cache)
+
+    recovered: list[Cue] = []
+    for index in range(len(windows)):
+        record = chunks.get(str(index))
+        if not isinstance(record, dict) or not isinstance(record.get("cues"), list):
+            continue
+        recovered.extend(
+            _decode_cached_cues(
+                record["cues"], index, raw_text=str(record.get("text") or "")
+            )
+        )
+    recovered = [
+        cue
+        for cue in recovered
+        if not any(
+            existing.kind == "speech" and _cue_overlap_ratio(cue, existing) >= 0.5
+            for existing in existing_cues
+        )
+    ]
+    logging.warning(
+        "song speech fallback recovered %d cues from %d unverified windows",
+        len(recovered),
+        len(windows),
+    )
+    return recovered
+
+
+def _unverified_song_speech_regions(
+    speech: list[AudioRegion], reports: list[dict[str, object]]
+) -> list[AudioRegion]:
+    intervals: list[tuple[float, float]] = []
+    for report in reports:
+        if report.get("song") is not None:
+            continue
+        episode = report.get("episode")
+        if not isinstance(episode, dict):
+            continue
+        try:
+            start = float(episode["start"])
+            end = float(episode["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end > start:
+            intervals.append((start, end))
+    return [
+        replace(region, start=max(region.start, start), end=min(region.end, end))
+        for start, end in intervals
+        for region in speech
+        if min(region.end, end) - max(region.start, start) >= 0.08
+    ]
+
+
+def _cue_overlap_ratio(left: Cue, right: Cue) -> float:
+    overlap = max(0.0, min(left.end, right.end) - max(left.start, right.start))
+    return overlap / max(1e-6, left.end - left.start)
+
+
 def _transcribe_unanalyzed(
     video: Path,
     destination: Path,

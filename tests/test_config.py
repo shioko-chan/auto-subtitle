@@ -85,7 +85,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.audio_analysis.singing_speech_bgm_coverage, 0.35)
             self.assertEqual(config.audio_analysis.singing_ambiguous_min_seconds, 15.0)
             self.assertEqual(config.audio_analysis.singing_smoothing_windows, 3)
-            self.assertEqual(config.audio_analysis.singing_release_seconds, 35.0)
+            self.assertEqual(config.audio_analysis.singing_release_seconds, 15.0)
             self.assertEqual(config.audio_analysis.singing_min_phrase_seconds, 30.0)
             self.assertEqual(config.audio_analysis.singing_asr_target_seconds, 10.0)
             self.assertEqual(config.audio_analysis.singing_asr_min_seconds, 6.0)

@@ -84,7 +84,7 @@ class AudioAnalysisConfig:
     singing_ambiguous_min_seconds: float = 15.0
     singing_merge_gap_seconds: float = 1.5
     singing_smoothing_windows: int = 3
-    singing_release_seconds: float = 35.0
+    singing_release_seconds: float = 15.0
     singing_phrase_silence_seconds: float = 0.45
     singing_min_phrase_seconds: float = 30.0
     singing_asr_target_seconds: float = 10.0

@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from .asr import (
     read_cue_evidence,
     read_cue_sidecar,
+    transcribe_unverified_song_speech,
     transcribe_with_qwen,
 )
 from .asr_correction import correct_asr_windows, entities_from_context
@@ -24,6 +25,7 @@ from .media import download_youtube, render_subtitles, subtitle_layout
 from .song_identification import (
     SongIdentificationResult,
     identify_and_align_songs,
+    split_aligned_song_cues,
     translate_aligned_song_lyrics,
 )
 from .speakers import load_character_styles
@@ -73,9 +75,7 @@ def run_pipeline(
     job_dir = config.work_dir.resolve() / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     logging.info("job directory: %s", job_dir)
-    local_llm_server = LocalLLMServer(
-        config.llm, job_dir / "local-llm-server.log"
-    )
+    local_llm_server = LocalLLMServer(config.llm, job_dir / "local-llm-server.log")
 
     try:
         with (
@@ -217,6 +217,8 @@ def _run_pipeline_stages(
             if isinstance(item, dict) and isinstance(item.get("name"), str)
         ]
         logging.info("using translation glossary: %s", ", ".join(names))
+    layout = subtitle_layout(downloaded.video, config.render)
+    japanese_guidance_units = layout.max_line_units * 1.25
     with stage_metrics("pipeline.song_identification"):
         if config.song_identification.enabled:
             song_result = identify_and_align_songs(
@@ -225,9 +227,32 @@ def _run_pipeline_stages(
                 downloaded.metadata,
                 job_dir,
                 config.song_identification,
+                source_maximum_units=japanese_guidance_units,
             )
         else:
             song_result = SongIdentificationResult(cues, [])
+    if song_result.reports:
+        try:
+            with stage_metrics("pipeline.unverified_song_speech_fallback"):
+                fallback_cues = transcribe_unverified_song_speech(
+                    downloaded.video,
+                    job_dir,
+                    song_result.reports,
+                    song_result.corrected_cues,
+                    config.asr,
+                    japanese_single_word_list,
+                )
+        except Exception as exc:
+            logging.warning("unverified song speech fallback failed: %s", exc)
+            fallback_cues = []
+        if fallback_cues:
+            song_result = SongIdentificationResult(
+                sorted(
+                    [*song_result.corrected_cues, *fallback_cues],
+                    key=lambda cue: (cue.start, cue.end, cue.speaker or ""),
+                ),
+                song_result.reports,
+            )
     if config.llm.local_server_enabled:
         with stage_metrics("pipeline.local_llm_startup"):
             local_llm_server.start()
@@ -242,6 +267,7 @@ def _run_pipeline_stages(
                 translation_context,
                 config.llm.model,
             )
+    song_result = split_aligned_song_cues(song_result, japanese_guidance_units)
     cues = song_result.corrected_cues
     if song_result.reports:
         write_srt(cues, job_dir / "source.lyrics-corrected.srt")
@@ -253,29 +279,50 @@ def _run_pipeline_stages(
             "song identification produced %d episode reports",
             len(song_result.reports),
         )
-    layout = subtitle_layout(downloaded.video, config.render)
-    with stage_metrics("pipeline.joint_segmentation_translation"):
-        joint = translator.plan_and_translate(
-            cues,
-            config.segmentation,
-            translation_context=translation_context,
-            max_line_units=layout.max_line_units,
-            hard_max_line_units=layout.frame_line_units * 2,
-            cache_path=job_dir / "cue-joint-cache.json",
-            audit_path=job_dir / "local-segmentation.json",
-        )
+    if hasattr(translator, "segment_cues") and hasattr(
+        translator, "translate_segmented_cues"
+    ):
+        with stage_metrics("pipeline.llm_cue_segmentation"):
+            segmented = translator.segment_cues(
+                cues,
+                config.segmentation,
+                max_line_units=layout.max_line_units,
+                cache_path=job_dir / "cue-segmentation-cache.json",
+                audit_path=job_dir / "local-segmentation.json",
+            )
+        with stage_metrics("pipeline.llm_cue_translation"):
+            translated = translator.translate_segmented_cues(
+                segmented,
+                config.segmentation,
+                translation_context=translation_context,
+                max_line_units=layout.max_line_units,
+                cache_path=job_dir / "cue-translation-cache.json",
+            )
+    else:  # Compatibility for embedders implementing the former translator API.
+        with stage_metrics("pipeline.joint_segmentation_translation"):
+            joint = translator.plan_and_translate(
+                cues,
+                config.segmentation,
+                translation_context=translation_context,
+                max_line_units=layout.max_line_units,
+                hard_max_line_units=layout.frame_line_units * 2,
+                cache_path=job_dir / "cue-joint-cache.json",
+                audit_path=job_dir / "local-segmentation.json",
+            )
+        segmented = joint.source_cues
+        translated = joint.translated_cues
     logging.info(
-        "joint cue segmentation and ASR-aware translation: "
+        "staged cue segmentation and ASR-aware translation: "
         "%d aligned cues -> %d subtitle cues",
         original_cue_count,
-        len(joint.source_cues),
+        len(segmented),
     )
     overlap_count = sum(
         current.end > following.start
-        for current, following in zip(joint.source_cues, joint.source_cues[1:])
+        for current, following in zip(segmented, segmented[1:])
     )
-    cues = trim_overlapping_cues(joint.source_cues)
-    translated = trim_overlapping_cues(joint.translated_cues)
+    cues = trim_overlapping_cues(segmented)
+    translated = trim_overlapping_cues(translated)
     logging.info("timing overlap cleanup: adjusted %d cues", overlap_count)
     cues, translated, dropped_long_cues = filter_long_cue_pairs(
         cues,
@@ -303,9 +350,7 @@ def _run_pipeline_stages(
     translated_path = job_dir / "translated.zh-CN.srt"
     write_srt(translated, translated_path)
 
-    subtitle_evidence = _subtitle_evidence(
-        cues, config.llm.metadata_subtitle_max_chars
-    )
+    subtitle_evidence = _subtitle_evidence(cues, config.llm.metadata_subtitle_max_chars)
     ip_aliases = _load_optional_json_object(config.llm.ip_aliases_file, "IP aliases")
     tag_catalog = _load_optional_json_object(
         config.upload.tag_catalog_file, "Bilibili tag catalog"
@@ -330,7 +375,9 @@ def _run_pipeline_stages(
     generated_tags, tag_catalog_matches = _canonicalize_catalog_tags(
         generated_tags, tag_catalog
     )
-    upload_tags = _merge_tags(config.upload.tags, generated_tags, config.upload.max_tags)
+    upload_tags = _merge_tags(
+        config.upload.tags, generated_tags, config.upload.max_tags
+    )
     metadata_path = job_dir / "translated.metadata.json"
     metadata_path.write_text(
         json.dumps(
@@ -375,7 +422,9 @@ def _run_pipeline_stages(
             ),
         )
 
-    should_upload = config.upload.enabled if upload_override is None else upload_override
+    should_upload = (
+        config.upload.enabled if upload_override is None else upload_override
+    )
     if should_upload:
         with stage_metrics("pipeline.upload"):
             upload_to_bilibili(
@@ -459,7 +508,9 @@ def _youtube_metadata_context(metadata: dict[str, object]) -> dict[str, object]:
         "album",
         "language",
     )
-    return {key: metadata[key] for key in keys if metadata.get(key) not in (None, "", [])}
+    return {
+        key: metadata[key] for key in keys if metadata.get(key) not in (None, "", [])
+    }
 
 
 def _subtitle_evidence(cues: list[Cue], limit: int) -> str:
@@ -511,7 +562,9 @@ def _translation_context(
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
-            raise ValueError(f"invalid translation glossary file {path}: {exc}") from exc
+            raise ValueError(
+                f"invalid translation glossary file {path}: {exc}"
+            ) from exc
         glossaries.append(_validate_translation_glossary(value, str(path)))
 
     identity = {
@@ -612,9 +665,7 @@ def _japanese_single_word_list(context: dict[str, object]) -> list[str]:
     return sorted(values)
 
 
-def _validate_translation_glossary(
-    value: object, label: str
-) -> dict[str, object]:
+def _validate_translation_glossary(value: object, label: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError(f"translation glossary {label} must be a JSON object")
     if not isinstance(value.get("name"), str) or not value["name"].strip():
@@ -715,9 +766,13 @@ def _canonicalize_catalog_tags(
                 heat = max(0, int(raw_heat))
             raw_aliases = raw.get("aliases", [])
             if isinstance(raw_aliases, list):
-                names.extend(str(value) for value in raw_aliases if isinstance(value, str))
+                names.extend(
+                    str(value) for value in raw_aliases if isinstance(value, str)
+                )
         for name in names:
-            aliases.setdefault(name.strip().casefold(), []).append((heat, canonical.strip()))
+            aliases.setdefault(name.strip().casefold(), []).append(
+                (heat, canonical.strip())
+            )
 
     resolved: list[str] = []
     matches: list[dict[str, object]] = []
@@ -727,7 +782,12 @@ def _canonicalize_catalog_tags(
             heat, canonical = max(candidates, key=lambda value: value[0])
             resolved.append(canonical)
             matches.append(
-                {"candidate": tag, "canonical": canonical, "heat": heat, "existing": True}
+                {
+                    "candidate": tag,
+                    "canonical": canonical,
+                    "heat": heat,
+                    "existing": True,
+                }
             )
         else:
             resolved.append(tag)
@@ -747,7 +807,8 @@ def _write_manifest(result: PipelineResult, url: str, title: str) -> None:
         }
     )
     serializable = {
-        key: str(value) if isinstance(value, Path) else value for key, value in values.items()
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in values.items()
     }
     (result.job_dir / "manifest.json").write_text(
         json.dumps(serializable, ensure_ascii=False, indent=2) + "\n",

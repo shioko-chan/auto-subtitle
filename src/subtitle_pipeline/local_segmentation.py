@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, replace
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-import re
 
 from sudachipy import dictionary, tokenizer
 
@@ -16,7 +16,7 @@ from .source_language import (
     language_for_text,
     source_separator,
 )
-from .subtitles import Cue
+from .subtitles import Cue, text_display_width
 
 _ATOMIC_KINDS = frozenset({"singing", "conditioned_speech"})
 _TERMINAL_POS = frozenset({"動詞", "形容詞", "形状詞", "助動詞"})
@@ -165,7 +165,9 @@ class SudachiAnalyzer:
         cursor = 0
         for match in _JAPANESE_SPAN_RE.finditer(text):
             if match.start() > cursor:
-                result.extend(self._analyze_english(text[cursor : match.start()], cursor))
+                result.extend(
+                    self._analyze_english(text[cursor : match.start()], cursor)
+                )
             result.extend(self._analyze_japanese(match.group(0), match.start()))
             cursor = match.end()
         if cursor < len(text):
@@ -238,6 +240,7 @@ def build_speaker_tracks(
     *,
     analyzer: SudachiAnalyzer | None = None,
     audit_path: Path | None = None,
+    source_maximum_units: float | None = None,
 ) -> tuple[list[SpeakerTrack], dict[str, str]]:
     analyzer = analyzer or SudachiAnalyzer()
     cues, speaker_reattributions = _reattribute_unknown_speakers(cues, analyzer)
@@ -256,7 +259,13 @@ def build_speaker_tracks(
         units: list[LocalUnit] = []
         for episode in episodes:
             episode_units, episode_audit = _segment_episode(
-                cues, episode, key, config, analyzer, len(units)
+                cues,
+                episode,
+                key,
+                config,
+                analyzer,
+                len(units),
+                source_maximum_units,
             )
             units.extend(episode_units)
             audits.append(episode_audit)
@@ -270,6 +279,7 @@ def build_speaker_tracks(
             "version": 2,
             "sudachi": versions,
             "config": asdict(config),
+            "source_maximum_units": source_maximum_units,
             "speaker_reattributions": speaker_reattributions,
             "speaker_assignments": [
                 {
@@ -685,6 +695,7 @@ def _segment_episode(
     config: SegmentationConfig,
     analyzer: SudachiAnalyzer,
     id_offset: int,
+    source_maximum_units: float | None = None,
 ) -> tuple[list[LocalUnit], dict[str, object]]:
     if len(indices) == 1 or cues[indices[0]].kind in _ATOMIC_KINDS:
         unit = _make_unit(cues, indices, track, id_offset, None)
@@ -698,7 +709,12 @@ def _segment_episode(
     morphology = _analyze_source(analyzer, text, language)
 
     cuts, boundaries = _choose_cuts_and_scores(
-        cues, indices, cue_offsets, morphology, config
+        cues,
+        indices,
+        cue_offsets,
+        morphology,
+        config,
+        source_maximum_units=source_maximum_units,
     )
     units: list[LocalUnit] = []
     start = 0
@@ -886,6 +902,7 @@ def _choose_cuts_and_scores(
     cue_offsets: list[int],
     morphology: list[Morphology],
     config: SegmentationConfig,
+    source_maximum_units: float | None = None,
 ) -> tuple[list[int], list[BoundaryScore]]:
     cuts: list[int] = []
     final_scores: dict[int, BoundaryScore] = {}
@@ -901,6 +918,16 @@ def _choose_cuts_and_scores(
             morphology,
         )
         final_scores[position] = boundary
+        if source_maximum_units is not None:
+            projected_text = join_source_fragments(
+                (cues[indices[value]].text, cues[indices[value]].language)
+                for value in range(start, position + 2)
+            )
+            if text_display_width(projected_text) > source_maximum_units:
+                cuts.append(position + 1)
+                start = position + 1
+                position = start
+                continue
         if boundary.score >= config.boundary_score_threshold:
             cuts.append(position + 1)
             start = position + 1

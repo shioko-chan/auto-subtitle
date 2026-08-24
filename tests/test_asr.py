@@ -8,19 +8,19 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from subtitle_pipeline.asr import (
-    _HeartTranscriptorAdapter,
     _add_punctuation_boundary_hints,
     _analysis_region_signature,
     _analysis_regions,
     _asr_generation_token_limit,
     _cache_signature,
+    _HeartTranscriptorAdapter,
     _load_cache,
     _record_timeline_is_healthy,
     _remove_text_overlap,
     _repetition_hallucination,
     _result_to_cues,
-    _song_windows,
     _song_cut_candidates,
+    _song_windows,
     _SongCutCandidate,
     _speaker_assignment_for_aligned_cue,
     _speaker_assignment_timeline,
@@ -32,6 +32,7 @@ from subtitle_pipeline.asr import (
     _transcribe_range,
     _transcribe_song_range,
     _transcribe_speech_batch,
+    _unverified_song_speech_regions,
     _valid_cached_record,
     read_cue_sidecar,
     transcribe_with_qwen,
@@ -42,6 +43,24 @@ from subtitle_pipeline.subtitles import Cue
 
 
 class QwenASRTests(unittest.TestCase):
+    def test_unverified_song_fallback_uses_only_original_speech_intersections(self):
+        speech = [
+            AudioRegion(0, 5, "speech", "A"),
+            AudioRegion(8, 14, "speech", "B"),
+            AudioRegion(20, 25, "speech", "A"),
+        ]
+        reports = [
+            {"song": None, "episode": {"start": 3, "end": 10}},
+            {"song": "verified", "episode": {"start": 20, "end": 25}},
+        ]
+
+        result = _unverified_song_speech_regions(speech, reports)
+
+        self.assertEqual(
+            [(item.start, item.end, item.speaker) for item in result],
+            [(3, 5, "A"), (8, 10, "B")],
+        )
+
     def test_heart_transcriptor_adapter_accepts_buffer_audio(self):
         transcriber = Mock(return_value={"text": "聞こえた歌詞"})
         model = _HeartTranscriptorAdapter(

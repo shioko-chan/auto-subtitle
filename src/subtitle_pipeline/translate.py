@@ -113,6 +113,7 @@ class OpenAICompatibleTranslator:
                 cues,
                 config,
                 audit_path=audit_path,
+                source_maximum_units=max_line_units * 1.25,
             )
         from .joint_translation import run_joint_translation
 
@@ -137,6 +138,73 @@ class OpenAICompatibleTranslator:
             local_translate=self.local_translator.translate,
         )
         return CueTranslationResult(result.source_cues, result.translated_cues)
+
+    def segment_cues(
+        self,
+        cues: list[Cue],
+        config: SegmentationConfig,
+        *,
+        max_line_units: float,
+        cache_path: Path | None = None,
+        audit_path: Path | None = None,
+    ) -> list[Cue]:
+        if not cues:
+            return []
+        source_maximum_units = max_line_units * 1.25
+        with stage_metrics("subtitle.local_segmentation"):
+            tracks, sudachi_versions = build_speaker_tracks(
+                cues,
+                config,
+                audit_path=audit_path,
+                source_maximum_units=source_maximum_units,
+            )
+        from .staged_translation import run_segmentation
+
+        return run_segmentation(
+            tracks=tracks,
+            source_cues=cues,
+            segmentation=config,
+            llm=self.config,
+            request=self._request,
+            source_maximum_units=source_maximum_units,
+            cache_path=cache_path,
+            sudachi_versions=sudachi_versions,
+            parse_content=_parse_joint_records,
+            finish_reason=_finish_reason,
+            retry_delay=_transient_retry_delay,
+            is_nontransient=_is_nontransient_http_error,
+            log_invalid_response=self._log_invalid_response,
+        )
+
+    def translate_segmented_cues(
+        self,
+        cues: list[Cue],
+        config: SegmentationConfig,
+        *,
+        translation_context: dict[str, object] | None = None,
+        max_line_units: float,
+        cache_path: Path | None = None,
+    ) -> list[Cue]:
+        if not cues:
+            return []
+        from .staged_translation import run_fixed_translation
+
+        return run_fixed_translation(
+            source_cues=cues,
+            segmentation=config,
+            llm=self.config,
+            request=self._request,
+            translation_context=translation_context or {},
+            maximum_units=max_line_units,
+            cache_path=cache_path,
+            honorific_rules=_HONORIFIC_TRANSLATION_RULES,
+            parse_content=_parse_joint_records,
+            finish_reason=_finish_reason,
+            retry_delay=_transient_retry_delay,
+            is_nontransient=_is_nontransient_http_error,
+            log_invalid_response=self._log_invalid_response,
+            local_translate=self.local_translator.translate,
+        )
 
     def translate_lyrics(
         self,
@@ -242,9 +310,7 @@ class OpenAICompatibleTranslator:
             ],
             "known_ip_aliases": ip_aliases or {},
             "bilibili_tag_catalog": bilibili_tag_catalog or {},
-            "translation_context": compact_reference_context(
-                translation_context or {}
-            ),
+            "translation_context": compact_reference_context(translation_context or {}),
         }
         prompt = (
             f"Translate this video title and description into {self.config.target_language}. "
