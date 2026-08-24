@@ -80,6 +80,46 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(short_names["Miyako"]["context_only"])
         self.assertNotIn("Miyako", context["terms"])
 
+    def test_builtin_glossaries_only_load_matching_project_scope(self):
+        yumemita = _translation_context(
+            {"title": "夢限大みゅーたいぷ 藤都子"},
+            [],
+        )
+        self.assertIn("夢現妄想世界", yumemita["terms"])
+        self.assertNotIn("汐見蛍", yumemita["terms"])
+        self.assertEqual(
+            [item["name"] for item in yumemita["franchises"]],
+            ["BanG Dream!", "梦限大MewType"],
+        )
+
+        our_notes = _translation_context(
+            {"title": "BanG Dream! Our Notes 汐見蛍"},
+            [],
+        )
+        self.assertIn("汐見蛍", our_notes["terms"])
+        self.assertNotIn("夢現妄想世界", our_notes["terms"])
+        self.assertEqual(
+            [item["name"] for item in our_notes["franchises"]],
+            ["BanG Dream!", "BanG Dream! Our Notes"],
+        )
+
+    def test_translation_glossary_rejects_invalid_sources(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "invalid-sources.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "name": "Invalid sources",
+                        "background": "Source validation",
+                        "match": ["source-video"],
+                        "sources": ["not-a-url"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "sources must be HTTP URLs"):
+                _translation_context({"title": "source-video"}, [str(path)])
+
     def test_translation_glossary_keeps_legacy_terms_format_compatible(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "legacy.json"
@@ -307,6 +347,8 @@ class PipelineTests(unittest.TestCase):
             )
             with patch(
                 "subtitle_pipeline.pipeline.download_youtube", return_value=downloaded
+            ), patch(
+                "subtitle_pipeline.pipeline._wait_for_deepseek_task_window"
             ), patch(
                 "subtitle_pipeline.pipeline.transcribe_with_qwen",
                 return_value=subtitle,

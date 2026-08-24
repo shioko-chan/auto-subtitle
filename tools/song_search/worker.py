@@ -82,8 +82,27 @@ def fetch_lyrics(url: str) -> dict[str, object]:
     opener = urllib.request.build_opener(SafeRedirectHandler())
     with opener.open(request, timeout=15) as response:
         raw = response.read(2_000_000)
-    document = raw.decode("utf-8", errors="replace")
-    values = _parse_utaten(document)
+        charset = response.headers.get_content_charset() or "utf-8"
+    try:
+        document = raw.decode(charset, errors="replace")
+    except LookupError:
+        document = raw.decode("utf-8", errors="replace")
+    hostname = (urlsplit(url).hostname or "").casefold()
+    parsers = []
+    if hostname.endswith("utaten.com"):
+        parsers.append(_parse_utaten)
+    elif hostname.endswith("oricon.co.jp"):
+        parsers.append(_parse_oricon)
+    elif hostname.endswith("awa.fm"):
+        parsers.append(_parse_awa)
+    elif hostname.endswith("uta-net.com"):
+        parsers.append(_parse_utanet)
+    parsers.extend(
+        parser
+        for parser in (_parse_utaten, _parse_oricon, _parse_awa, _parse_utanet)
+        if parser not in parsers
+    )
+    values = next((value for parser in parsers if (value := parser(document))), None)
     if values is None:
         return {"error": "page has no supported structured canonical lyrics"}
     return values
@@ -136,14 +155,121 @@ def _parse_utaten(document: str) -> dict[str, object] | None:
         body,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    body = re.sub(r"<(?:br|p|li)\b[^>]*>", "\n", body, flags=re.I)
-    body = re.sub(r"</(?:p|li)>", "\n", body, flags=re.I)
+    body = re.sub(r"<(?:br|p|li)\b[^>]*>", "\n", body, flags=re.IGNORECASE)
+    body = re.sub(r"</(?:p|li)>", "\n", body, flags=re.IGNORECASE)
     body = re.sub(r"<[^>]+>", "", body)
     lines = [html.unescape(line).strip() for line in body.splitlines()]
     lines = [line for line in lines if line]
     if not title or len(lines) < 3:
         return None
     return {"title": title, "artist": artist, "lines": lines, "readings": []}
+
+
+def _parse_oricon(document: str) -> dict[str, object] | None:
+    title, artist = _json_ld_song_identity(document)
+    match = re.search(
+        r'<div[^>]+class=["\'][^"\']*all-lyrics[^"\']*["\'][^>]*>(.*?)</div>',
+        document,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        return None
+    lines = _html_lyric_lines(match.group(1))
+    if not title or len(lines) < 3:
+        return None
+    return {"title": title, "artist": artist, "lines": lines, "readings": []}
+
+
+def _parse_awa(document: str) -> dict[str, object] | None:
+    title_match = re.search(
+        r"<h1\b[^>]*>(.*?)</h1>", document, re.IGNORECASE | re.DOTALL
+    )
+    artist_match = re.search(
+        r"<span\b[^>]*>\s*Track by\s*</span>\s*<a\b[^>]*>(.*?)</a>",
+        document,
+        re.IGNORECASE | re.DOTALL,
+    )
+    lyrics_match = re.search(
+        r"<h2\b[^>]*>\s*歌詞\s*</h2>\s*<p\b[^>]*>(.*?)</p>",
+        document,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if title_match is None or lyrics_match is None:
+        return None
+    title = _plain_html_text(title_match.group(1))
+    artist = _plain_html_text(artist_match.group(1)) if artist_match else ""
+    lines = _html_lyric_lines(lyrics_match.group(1))
+    if not title or len(lines) < 3:
+        return None
+    return {"title": title, "artist": artist, "lines": lines, "readings": []}
+
+
+def _parse_utanet(document: str) -> dict[str, object] | None:
+    title, artist = _json_ld_song_identity(document)
+    match = re.search(
+        r'<div[^>]+(?:id|class)=["\'][^"\']*kashi_area[^"\']*["\'][^>]*>(.*?)</div>',
+        document,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match is None or "Enable JavaScript and cookies" in document:
+        return None
+    lines = _html_lyric_lines(match.group(1))
+    if not title or len(lines) < 3:
+        return None
+    return {"title": title, "artist": artist, "lines": lines, "readings": []}
+
+
+def _json_ld_song_identity(document: str) -> tuple[str, str]:
+    title = ""
+    artist = ""
+    for raw in re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        document,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        try:
+            value = json.loads(html.unescape(raw))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        objects = value if isinstance(value, list) else [value]
+        for item in objects:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("@type")
+            if item_type in {"MusicGroup", "Person"} and not artist:
+                artist = str(item.get("name") or "").strip()
+                continue
+            if item_type not in {"MusicComposition", "MusicRecording"}:
+                continue
+            title = str(item.get("name") or title).strip()
+            by_artist = item.get("byArtist")
+            if isinstance(by_artist, list):
+                by_artist = next(
+                    (
+                        candidate
+                        for candidate in by_artist
+                        if isinstance(candidate, dict)
+                    ),
+                    None,
+                )
+            if isinstance(by_artist, dict):
+                artist = str(by_artist.get("name") or artist).strip()
+    return title, artist
+
+
+def _plain_html_text(value: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", value)).strip()
+
+
+def _html_lyric_lines(value: str) -> list[str]:
+    body = re.sub(r"<(?:br|p|li)\b[^>]*>", "\n", value, flags=re.IGNORECASE)
+    body = re.sub(r"</(?:p|li)>", "\n", body, flags=re.IGNORECASE)
+    body = re.sub(r"<[^>]+>", "", body)
+    return [
+        line
+        for raw in html.unescape(body).splitlines()
+        if (line := re.sub(r"\s+", " ", raw).strip())
+    ]
 
 
 def main() -> None:

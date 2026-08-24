@@ -20,6 +20,10 @@ from .config import LLMConfig, SegmentationConfig
 from .local_segmentation import build_speaker_tracks
 from .local_translation import LocalJapaneseTranslator
 from .prompt_templates import prompt_system, render_user_prompt
+from .reference_context import (
+    compact_lyrics_reference_context,
+    compact_reference_context,
+)
 from .subtitles import Cue
 from .telemetry import stage_metrics
 
@@ -149,7 +153,10 @@ class OpenAICompatibleTranslator:
             "lyrics-translate.md",
             SONG_TITLE=title,
             ARTIST=artist or "(unknown)",
-            REFERENCE_TEXT=json.dumps(translation_context or {}, ensure_ascii=False),
+            REFERENCE_TEXT=json.dumps(
+                compact_lyrics_reference_context(translation_context or {}),
+                ensure_ascii=False,
+            ),
             LYRICS_TEXT="\n".join(
                 f"<{index}>{line}" for index, line in enumerate(lines)
             ),
@@ -235,7 +242,9 @@ class OpenAICompatibleTranslator:
             ],
             "known_ip_aliases": ip_aliases or {},
             "bilibili_tag_catalog": bilibili_tag_catalog or {},
-            "translation_context": translation_context or {},
+            "translation_context": compact_reference_context(
+                translation_context or {}
+            ),
         }
         prompt = (
             f"Translate this video title and description into {self.config.target_language}. "

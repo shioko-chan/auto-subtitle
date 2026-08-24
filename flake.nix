@@ -3,10 +3,14 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    llama-cpp-src = {
+      url = "github:ggml-org/llama.cpp";
+      flake = false;
+    };
   };
 
   outputs =
-    { nixpkgs, ... }:
+    { nixpkgs, llama-cpp-src, ... }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs {
@@ -14,9 +18,14 @@
         config = {
           allowUnfree = true;
           cudaSupport = true;
+          cudaCapabilities = [ "7.5" ];
         };
       };
       cuda = pkgs.cudaPackages;
+      llamaCpp = pkgs.llama-cpp.overrideAttrs (_: {
+        version = "0";
+        src = llama-cpp-src;
+      });
       assCudaRender = pkgs.stdenv.mkDerivation {
         pname = "ass-cuda-render";
         version = "0.1.0";
@@ -59,6 +68,7 @@
           pkgs.pkg-config
           pkgs.ffmpeg.dev
           pkgs.libass.dev
+          llamaCpp
         ];
 
         CUDA_HOME = "${cuda.cuda_nvcc}";

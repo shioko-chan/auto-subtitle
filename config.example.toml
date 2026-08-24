@@ -156,33 +156,50 @@ boundary_score_threshold = 3
 local_unit_min_fallback_seconds = 2.0
 local_unit_max_seconds = 6.0
 speaker_episode_gap_seconds = 2.0
-model_window_units = 160
-model_window_chars = 8000
-request_batch_windows = 32
-request_batch_chars = 8000
+model_window_units = 80
+model_window_chars = 3000
+request_batch_windows = 8
+request_batch_chars = 3000
 dialogue_context_seconds = 5.0
 dialogue_context_max_chars = 4000
 
 [llm]
-base_url = "https://api.deepseek.com"
+base_url = "http://127.0.0.1:8080/v1"
 api_style = "chat_completions"
-api_key_pass_entry = "api/deepseek"
-api_key_env = "DEEPSEEK_API_KEY"
-model = "deepseek-v4-flash"
+api_key_pass_entry = ""
+api_key_env = "LOCAL_LLM_API_KEY"
+model = "Qwen3.8-27B"
 target_language = "简体中文"
 timeout_seconds = 120
 max_retries = 5
-max_concurrency = 16
-max_tokens = 16384
+max_concurrency = 3
+max_tokens = 8192
+# ASR correction must repeat every source window, so keep these batches smaller
+# than ordinary context capacity even when the output token cap is large.
+asr_correction_batch_windows = 6
+asr_correction_batch_chars = 3000
+# llama.cpp starts after ASR and stops before rendering, so the 22 GB GPU does
+# not need to hold both model families. The first run downloads the 16.5 GB GGUF.
+local_server_enabled = true
+local_server_command = "llama-server"
+local_server_hf_repo = "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M"
+# For a manually downloaded file, remove local_server_hf_repo and use:
+# local_server_model_path = "models/Qwen3.8-27B-UD-Q4_K_M.gguf"
+local_server_host = "127.0.0.1"
+local_server_port = 8080
+local_server_context_size = 16384
+local_server_gpu_layers = 99
+local_server_parallel = 3
+local_server_reasoning = "off"
+local_server_startup_timeout_seconds = 1800
 # Loaded lazily only when an LLM cue is empty or still contains Japanese kana.
 local_translation_model = "facebook/m2m100_418M"
 local_translation_device = "cpu"
 # Joint subtitles and metadata use json_object.
 # Set false if an OpenAI-compatible provider rejects response_format=json_object.
 json_mode = true
-# DeepSeek V4 defaults to thinking mode, which is slow and unreliable for strict JSON.
-# Omit this option for providers that do not implement the DeepSeek thinking parameter.
-thinking = "disabled"
+# DeepSeek example: disable local_server_enabled, restore its URL, credentials
+# and model, then set thinking = "disabled".
 # OpenAI Responses API example:
 # base_url = "https://api.openai.com/v1"
 # api_style = "responses"
@@ -218,7 +235,7 @@ outline_ratio = 0.0045
 crf = 20
 preset = "medium"
 nvenc_preset = "p4"
-nvenc_cq = 23
+nvenc_cq = 20
 
 [upload]
 # Keep false until `biliup login` has produced the cookie file and a dry run succeeds.
@@ -232,8 +249,7 @@ max_tags = 10
 # tag_catalog_file = "bilibili-tags.json"
 source = ""
 title_prefix = "【中字】"
-description_prefix = "翻译：yunoseek，校对：你\n字幕由yunoseek生成，请以原视频为准。\n\n"
-# Keep a margin below Bilibili's nominal limit; truncation preserves the suffix.
+description_prefix = "翻译：Qwen，校对：Qwen，时轴：Qwen\n请以原视频为准：\n{youtube_url}\n─────── ⋆⋅☆⋅⋆ ───────\n\n"
 description_max_chars = 1800
 # line = "kodo"
 limit = 3

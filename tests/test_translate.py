@@ -9,6 +9,7 @@ from subtitle_pipeline.joint_translation import (
     CoverageValidationError,
     _dialogue_context,
     _prompt,
+    _reference_text,
     _reference_replacements,
     _request_resilient,
     _validate_records,
@@ -34,6 +35,22 @@ def _response(content):
 
 
 class JointTranslationTests(unittest.TestCase):
+    def test_reference_text_excludes_large_audit_payloads(self):
+        reference = json.loads(
+            _reference_text(
+                {
+                    "video": {"title": "配信"},
+                    "terms": {"ミヤコ": "都子"},
+                    "identified_songs": [{"alignment": "large"}],
+                    "asr_evidence": [{"text": "large"}],
+                }
+            )
+        )
+        self.assertEqual(
+            reference,
+            {"video": {"title": "配信"}, "terms": {"ミヤコ": "都子"}},
+        )
+
     def test_inclusive_ranges_allow_single_unit_and_require_full_coverage(self):
         track = SpeakerTrack(
             "A",
@@ -751,6 +768,66 @@ class JointTranslationTests(unittest.TestCase):
 
 
 class ApiCompatibilityTests(unittest.TestCase):
+    def test_lyrics_prompt_excludes_runtime_audit_payloads(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        response = _response(
+            json.dumps(
+                {"lines": [{"line_id": 0, "text": "准备好去寻找答案"}]},
+                ensure_ascii=False,
+            )
+        )
+        with patch.object(translator, "_request", return_value=response) as request:
+            translator.translate_lyrics(
+                "Song",
+                "Artist",
+                ["Ready set and find out"],
+                translation_context={
+                    "video": {"description": "large video context"},
+                    "franchises": [
+                        {"name": "夢限大みゅーたいぷ", "background": "large background"}
+                    ],
+                    "terms": {"ミヤコ": "都子"},
+                    "asr_evidence": [{"text": "large ASR audit"}],
+                    "identified_songs": [{"pyshiro": "large alignment audit"}],
+                },
+            )
+
+        prompt = request.call_args.args[0]["messages"][1]["content"]
+        self.assertIn("夢限大みゅーたいぷ", prompt)
+        self.assertIn("ミヤコ", prompt)
+        self.assertNotIn("large background", prompt)
+        self.assertNotIn("large video context", prompt)
+        self.assertNotIn("large ASR audit", prompt)
+        self.assertNotIn("large alignment audit", prompt)
+
+    def test_metadata_prompt_excludes_large_audit_payloads(self):
+        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        response = _response(
+            json.dumps(
+                {
+                    "title": "标题",
+                    "description": "简介",
+                    "content_summary": "摘要",
+                    "tags": ["标签"],
+                },
+                ensure_ascii=False,
+            )
+        )
+        with patch.object(translator, "_request", return_value=response) as request:
+            translator.translate_metadata(
+                "title",
+                "description",
+                translation_context={
+                    "terms": {"ミヤコ": "都子"},
+                    "identified_songs": [{"alignment": "large"}],
+                    "asr_evidence": [{"text": "large"}],
+                },
+            )
+        prompt = request.call_args.args[0]["messages"][1]["content"]
+        self.assertIn("ミヤコ", prompt)
+        self.assertNotIn("identified_songs", prompt)
+        self.assertNotIn("asr_evidence", prompt)
+
     def test_only_transient_http_failures_receive_backoff(self):
         self.assertIsNotNone(_transient_retry_delay(LLMHTTPError(429, "rate"), 1))
         self.assertIsNotNone(_transient_retry_delay(LLMHTTPError(503, "busy"), 1))

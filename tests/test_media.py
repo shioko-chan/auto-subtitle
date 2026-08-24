@@ -266,7 +266,7 @@ class SubtitleRenderTests(unittest.TestCase):
             content,
         )
 
-    def test_ass_karaoke_sweeps_outline_color_across_aligner_units(self):
+    def test_ass_speech_ignores_aligner_units_for_static_japanese(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "subtitle.ass"
             _write_ass(
@@ -291,9 +291,8 @@ class SubtitleRenderTests(unittest.TestCase):
             )
             content = path.read_text(encoding="utf-8")
 
-        self.assertIn(
-            r"{\1c&H5CFFAF&\2c&HFFFFFF&}{\kf100}おはよう。", content
-        )
+        self.assertIn("Japanese,,0,0,0,,おはよう。", content)
+        self.assertNotIn(r"\kf", content)
 
     def test_ass_japanese_uses_matching_character_outline_style(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -332,9 +331,10 @@ class SubtitleRenderTests(unittest.TestCase):
         )
         self.assertIn(
             r"Speaker_fuji_miyako_Japanese,fuji_miyako,0,0,0,,"
-            r"{\1c&H5CFFAF&\2c&HFFFFFF&}{\kf100}ミヤコ",
+            r"ミヤコ",
             content,
         )
+        self.assertNotIn(r"\kf", content)
 
     def test_ass_uses_character_color_and_separate_overlap_lanes(self):
         with tempfile.TemporaryDirectory() as temp:

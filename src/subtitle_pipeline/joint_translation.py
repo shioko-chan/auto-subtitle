@@ -26,6 +26,7 @@ from .prompt_templates import (
     prompt_templates_digest,
     render_user_prompt,
 )
+from .reference_context import compact_reference_context
 from .subtitles import Cue, TimedTextUnit, text_display_width, timed_text_units
 from .telemetry import stage_metrics
 
@@ -1475,7 +1476,7 @@ def _range_key(track: str, start: int, end: int) -> str:
 def _reference_text(context: dict[str, object]) -> str:
     if not context:
         return "(none)"
-    compact = {key: value for key, value in context.items() if key != "asr_evidence"}
+    compact = compact_reference_context(context)
     return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
 
 

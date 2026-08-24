@@ -7,6 +7,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 class ConfigError(ValueError):
@@ -141,10 +142,10 @@ class SegmentationConfig:
     local_unit_min_fallback_seconds: float = 2.0
     local_unit_max_seconds: float = 6.0
     speaker_episode_gap_seconds: float = 2.0
-    model_window_units: int = 160
-    model_window_chars: int = 8000
-    request_batch_windows: int = 32
-    request_batch_chars: int = 8000
+    model_window_units: int = 80
+    model_window_chars: int = 3000
+    request_batch_windows: int = 8
+    request_batch_chars: int = 3000
     dialogue_context_seconds: float = 5.0
     dialogue_context_max_chars: int = 4000
 
@@ -161,6 +162,19 @@ class LLMConfig:
     max_retries: int = 5
     max_concurrency: int = 16
     max_tokens: int = 16384
+    asr_correction_batch_windows: int = 6
+    asr_correction_batch_chars: int = 3000
+    local_server_enabled: bool = False
+    local_server_command: str = "llama-server"
+    local_server_model_path: str | None = None
+    local_server_hf_repo: str | None = None
+    local_server_host: str = "127.0.0.1"
+    local_server_port: int = 8080
+    local_server_context_size: int = 8192
+    local_server_gpu_layers: int = 99
+    local_server_parallel: int = 2
+    local_server_reasoning: str = "off"
+    local_server_startup_timeout_seconds: int = 1800
     local_translation_model: str = "facebook/m2m100_418M"
     local_translation_device: str = "cpu"
     json_mode: bool = True
@@ -189,7 +203,7 @@ class RenderConfig:
     crf: int = 20
     preset: str = "medium"
     nvenc_preset: str = "p4"
-    nvenc_cq: int = 23
+    nvenc_cq: int = 20
 
 
 @dataclass(frozen=True)
@@ -272,6 +286,60 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("llm.max_concurrency must be at least 1")
     if config.llm.max_tokens < 1:
         raise ConfigError("llm.max_tokens must be at least 1")
+    if config.llm.asr_correction_batch_windows < 1:
+        raise ConfigError("llm.asr_correction_batch_windows must be at least 1")
+    if config.llm.asr_correction_batch_chars < 1:
+        raise ConfigError("llm.asr_correction_batch_chars must be at least 1")
+    if config.llm.local_server_enabled:
+        if config.llm.api_style != "chat_completions":
+            raise ConfigError(
+                "llm.local_server_enabled requires api_style='chat_completions'"
+            )
+        if not config.llm.local_server_command.strip():
+            raise ConfigError("llm.local_server_command cannot be empty")
+        model_sources = (
+            bool(
+                config.llm.local_server_model_path
+                and config.llm.local_server_model_path.strip()
+            ),
+            bool(
+                config.llm.local_server_hf_repo
+                and config.llm.local_server_hf_repo.strip()
+            ),
+        )
+        if sum(model_sources) != 1:
+            raise ConfigError(
+                "local LLM server requires exactly one of local_server_model_path "
+                "or local_server_hf_repo"
+            )
+        if config.llm.local_server_host not in {"127.0.0.1", "localhost", "::1"}:
+            raise ConfigError("llm.local_server_host must be a loopback address")
+        if not 1 <= config.llm.local_server_port <= 65535:
+            raise ConfigError("llm.local_server_port must be between 1 and 65535")
+        if config.llm.local_server_context_size < 1:
+            raise ConfigError("llm.local_server_context_size must be at least 1")
+        if config.llm.local_server_gpu_layers < 0:
+            raise ConfigError("llm.local_server_gpu_layers cannot be negative")
+        if config.llm.local_server_parallel < 1:
+            raise ConfigError("llm.local_server_parallel must be at least 1")
+        if config.llm.local_server_reasoning not in {"on", "off", "auto"}:
+            raise ConfigError(
+                "llm.local_server_reasoning must be 'on', 'off', or 'auto'"
+            )
+        if config.llm.local_server_startup_timeout_seconds <= 0:
+            raise ConfigError(
+                "llm.local_server_startup_timeout_seconds must be positive"
+            )
+        endpoint = urlsplit(config.llm.base_url)
+        endpoint_port = endpoint.port or (443 if endpoint.scheme == "https" else 80)
+        if (
+            endpoint.scheme != "http"
+            or endpoint.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or endpoint_port != config.llm.local_server_port
+        ):
+            raise ConfigError(
+                "llm.base_url must point to the configured local HTTP server port"
+            )
     if not config.llm.local_translation_model.strip():
         raise ConfigError("llm.local_translation_model cannot be empty")
     if not config.llm.local_translation_device.strip():
@@ -639,6 +707,8 @@ def load_config(path: Path) -> AppConfig:
 
 
 def llm_api_key(config: LLMConfig) -> str:
+    if config.local_server_enabled:
+        return "local-llama-cpp"
     if config.api_key_pass_entry:
         pass_command = shutil.which("pass")
         if pass_command is None:

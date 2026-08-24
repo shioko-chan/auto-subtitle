@@ -17,171 +17,9 @@
     "アワーノーツ",
     "夢限大みゅーたいぷ",
     "ゆめ∞みた",
-    "ゆめみた",
-    "millsage",
-    "一家Dumb Rock!"
+    "ゆめみた"
   ],
   "background": "BanG Dream! 是以女子乐队为核心的日本跨媒体音乐企划。角色所属乐队、角色姓名、舞台名和声优姓名容易被普通翻译误判；乐队的拉丁字母风格化名称通常保留原文。",
-  "sources": [
-    "https://bang-dream.com/",
-    "https://bang-dream.com/artist/yumemita/",
-    "https://bang-dream.com/discographies/?artist=yumemita",
-    "https://bang-dream.com/events/?artist=yumemita",
-    "https://anime.bang-dream.com/",
-    "https://anime.bang-dream.com/yumemita/",
-    "https://bang-dream-on.bushimo.jp/",
-    "https://bdon.biligames.com/",
-    "https://bandori.fandom.com/wiki/Characters",
-    "https://bandori.fandom.com/wiki/Bands",
-    "https://moegirl.uk/BanG_Dream!",
-    "https://moegirl.uk/BanG_Dream!_Our_Notes"
-  ],
-  "characters": [
-    {
-      "id": "nakamachi_arale",
-      "canonical": "仲町阿拉蕾",
-      "source_name": "仲町あられ",
-      "aliases": [
-        "仲町 あられ",
-        "NAKAMACHI ARALE",
-        "Nakamachi Arale"
-      ],
-      "short_names": [
-        {
-          "source": "あられ",
-          "target": "阿拉蕾",
-          "context_only": true
-        }
-      ]
-    },
-    {
-      "id": "miyanaga_nonoka",
-      "canonical": "宫永野乃花",
-      "source_name": "宮永ののか",
-      "aliases": [
-        "宮永 ののか",
-        "MIYANAGA NONOKA",
-        "Miyanaga Nonoka"
-      ],
-      "short_names": [
-        {
-          "source": "ののか",
-          "target": "野乃花",
-          "context_only": true
-        },
-        {
-          "source": "のの",
-          "target": "野乃",
-          "context_only": true
-        },
-        {
-          "source": "ののちゃん",
-          "target": "野乃酱",
-          "context_only": true
-        }
-      ]
-    },
-    {
-      "id": "minetsuki_ritsu",
-      "canonical": "峰月律",
-      "source_name": "峰月律",
-      "aliases": [
-        "峰月 律",
-        "峯月律",
-        "MINETSUKI RITSU",
-        "Minetsuki Ritsu"
-      ],
-      "short_names": [
-        {
-          "source": "律",
-          "target": "律",
-          "context_only": true
-        }
-      ]
-    },
-    {
-      "id": "clematis",
-      "canonical": "克蕾玛琪丝",
-      "source_name": "クレマチス",
-      "aliases": [
-        "クレマちス",
-        "CLEMATIS",
-        "Clematis"
-      ]
-    },
-    {
-      "id": "fuji_miyako",
-      "canonical": "藤都子",
-      "source_name": "藤都子",
-      "aliases": [
-        "藤 都子",
-        "ふじみやこ",
-        "フジミヤコ",
-        "FUJI MIYAKO",
-        "Fuji Miyako"
-      ],
-      "short_names": [
-        {
-          "source": "みやこ",
-          "target": "都子",
-          "context_only": true
-        },
-        {
-          "source": "ミヤコ",
-          "target": "都子",
-          "context_only": true
-        },
-        {
-          "source": "miyako",
-          "target": "都子",
-          "context_only": true
-        },
-        {
-          "source": "Miyako",
-          "target": "都子",
-          "context_only": true
-        },
-        {
-          "source": "MIYAKO",
-          "target": "都子",
-          "context_only": true
-        },
-        {
-          "source": "都子",
-          "target": "都子",
-          "context_only": true
-        }
-      ]
-    },
-    {
-      "id": "fujimi_yako",
-      "canonical": "富士见夜子",
-      "source_name": "富士みやこ",
-      "aliases": [
-        "富士 みやこ",
-        "富士み やこ",
-        "FUJIMI YAKO",
-        "FujiMi yako"
-      ]
-    },
-    {
-      "id": "sengoku_yuno",
-      "canonical": "千石由乃",
-      "source_name": "千石ユノ",
-      "aliases": [
-        "千石 ユノ",
-        "SENGOKU YUNO",
-        "Sengoku Yuno"
-      ],
-      "short_names": [
-        {
-          "source": "ユノ",
-          "target": "由乃",
-          "context_only": true
-        }
-      ]
-    }
-  ],
   "terms": {
     "BanG Dream!": "BanG Dream!",
     "バンドリ！": "BanG Dream!",
@@ -225,23 +63,6 @@
     "CRYCHIC": "CRYCHIC",
     "クライシック": "CRYCHIC",
     "sumimi": "sumimi",
-    "夢限大みゅーたいぷ": "梦限大MewType",
-    "夢限大みゅーたいぷ（ゆめみた）": "梦限大MewType（YUMEMITA）",
-    "夢限大MewType": "梦限大MewType",
-    "Mugendai Mewtype": "梦限大MewType",
-    "Mugendai MewType": "梦限大MewType",
-    "MUGENDAI MEWTYPE": "梦限大MewType",
-    "ゆめみた": "梦限大MewType",
-    "YUMEMITA": "梦限大MewType",
-    "みゅーたいぷ": "MewType",
-    "夢幻戦隊むーたいぷ": "梦幻战队MewType",
-    "むーたいぷ": "MewType",
-    "夢と現実を飛び越える運命共同体": "跨越梦想与现实的命运共同体",
-    "millsage": "millsage",
-    "ミルサージュ": "millsage",
-    "一家Dumb Rock!": "一家Dumb Rock!",
-    "いっかだんらん": "一家Dumb Rock!",
-    "Ikka Dumb Rock!": "一家Dumb Rock!",
     "CiRCLE": "CiRCLE",
     "戸山香澄": "户山香澄",
     "花園たえ": "花园多惠",
@@ -309,87 +130,6 @@
     "ティモリス": "Timoris",
     "アモーリス": "Amoris",
     "オブリビオニス": "Oblivionis",
-    "ビオラ": "Viola",
-    "ベル": "Bell",
-    "ポポ": "Popo",
-    "fairy book": "妖精花束",
-    "フェアリーブック": "妖精花束",
-    "夢現妄想世界": "夢現妄想世界",
-    "むげんマイワールド": "夢現妄想世界",
-    "ビッグマウス": "ビッグマウス",
-    "限界現実サバイブ天使": "限界現実サバイブ天使",
-    "エンプティパペット": "エンプティパペット",
-    "✞animaるパーティ✞開催中✞": "✞animaるパーティ✞開催中✞",
-    "スタートライン": "スタートライン",
-    "コハク": "コハク",
-    "新人類は仮想世界の夢を見るか？": "新人類は仮想世界の夢を見るか？",
-    "コミュ着火Fire!": "コミュ着火Fire!",
-    "YoU kNOw the overture": "YoU kNOw the overture",
-    "Hi-Vision": "Hi-Vision",
-    "TRASH LIFE": "TRASH LIFE",
-    "テレパシー": "テレパシー",
-    "Dream Voyage": "Dream Voyage",
-    "グラディエント": "グラディエント",
-    "LET'Sあちあちトレーニング！": "LET'Sあちあちトレーニング！",
-    "真夜中遊園地": "真夜中遊園地",
-    "チューニング": "チューニング",
-    "Calling": "Calling",
-    "プログレス サイン": "プログレス サイン",
-    "アイの夢限": "アイの夢限",
-    "どんがらがっしゃん": "どんがらがっしゃん",
-    "みゅーたんとミュータント": "みゅーたんとミュータント",
-    "超惑星Xへの旅": "超惑星Xへの旅",
-    "やわやわNERD 超FreQuency": "やわやわNERD 超FreQuency",
-    "これはぼくたちの生存のあらすじ": "これはぼくたちの生存のあらすじ",
-    "うちゅうのふしぎ": "うちゅうのふしぎ",
-    "等身大あんりみてっど": "等身大あんりみてっど",
-    "Face The Next": "Face The Next",
-    "マジカルフィジカル☆くるる": "マジカルフィジカル☆くるる",
-    "マジるる": "マジカルフィジカル☆くるる",
-    "マジるる！ナイスバルク": "マジるる！ナイスバルク",
-    "神田白八馬アカデミー": "神田白八馬アカデミー",
-    "ROCK'Nりとる☆すたーず！": "ROCK'Nりとる☆すたーず！",
-    "ゆめみたのあゆみ": "ゆめみたのあゆみ",
-    "めたもるふぉーぜ": "めたもるふぉーぜ",
-    "でぃすかばりー☆じゃーにー": "でぃすかばりー☆じゃーにー",
-    "ふりーてぃんぐ もーめんと": "ふりーてぃんぐ もーめんと",
-    "アンロック・ザ・フューチャー": "アンロック・ザ・フューチャー",
-    "えんかうんた～": "えんかうんた～",
-    "ぷれぱれ〜しょん！": "ぷれぱれ〜しょん！",
-    "スーパーポジション": "スーパーポジション",
-    "ゆめ∞みたラジオ": "ゆめ∞みたラジオ",
-    "#ゆめみた": "#ゆめみた",
-    "#むーたいぷ出陣": "#むーたいぷ出陣",
-    "汐見蛍": "汐见萤",
-    "汐見 蛍": "汐见萤",
-    "伊沢なつめ": "伊泽Natsume",
-    "伊沢 なつめ": "伊泽Natsume",
-    "琴平凪": "琴平凪",
-    "琴平 凪": "琴平凪",
-    "浜崎まほろ": "滨崎Mahoro",
-    "浜崎 まほろ": "滨崎Mahoro",
-    "和泉朋花": "和泉朋花",
-    "和泉 朋花": "和泉朋花",
-    "蛍": "萤",
-    "なつめ": "Natsume",
-    "凪": "凪",
-    "まほろ": "Mahoro",
-    "朋花": "朋花",
-    "須賀蕾叶": "须贺蕾叶",
-    "須賀 蕾叶": "须贺蕾叶",
-    "馬橋心玖": "马桥心玖",
-    "馬橋 心玖": "马桥心玖",
-    "矢倉蓬咲": "矢仓蓬咲",
-    "矢倉 蓬咲": "矢仓蓬咲",
-    "梅里ちえり": "梅里Chieri",
-    "梅里 ちえり": "梅里Chieri",
-    "四宮寧月": "四宫宁月",
-    "四宮 寧月": "四宫宁月",
-    "蕾叶": "蕾叶",
-    "心玖": "心玖",
-    "蓬咲": "蓬咲",
-    "ちえり": "Chieri",
-    "寧月": "宁月",
     "愛美": "爱美",
     "大塚紗英": "大冢纱英",
     "西本りみ": "西本里美",
@@ -409,9 +149,15 @@
     "岡田夢以": "冈田梦以",
     "米澤茜": "米泽茜",
     "高尾奏音": "高尾奏音",
-    "佐内瑠奈": "佐内瑠奈",
-    "本渡楓": "本渡枫",
-    "丸岡和佳奈": "丸冈和佳奈",
-    "塚田悠衣": "塚田悠衣"
-  }
+    "佐内瑠奈": "佐内瑠奈"
+  },
+  "sources": [
+    "https://bang-dream.com/",
+    "https://anime.bang-dream.com/",
+    "https://bang-dream-on.bushimo.jp/",
+    "https://bdon.biligames.com/",
+    "https://bandori.fandom.com/wiki/Characters",
+    "https://bandori.fandom.com/wiki/Bands",
+    "https://moegirl.uk/BanG_Dream!"
+  ]
 }

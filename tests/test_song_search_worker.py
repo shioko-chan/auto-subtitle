@@ -33,6 +33,44 @@ class SongSearchWorkerTests(unittest.TestCase):
         self.assertEqual(value["lines"][0], "伝えたくて")
         self.assertEqual(len(value["lines"]), 4)
 
+    def test_parses_oricon_lyrics(self):
+        worker = _worker_module()
+        document = """
+        <script type="application/ld+json">
+        {"@type":"MusicComposition","name":"INSIDE IDENTITY",
+         "composer":{"name":"ZAQ"}}
+        </script>
+        <script type="application/ld+json">
+        {"@type":"MusicGroup","name":"Black Raison d'etre"}
+        </script>
+        <div class="all-lyrics">
+          INSIDE IDENTITY<br>居場所はどこ?<br>
+          誰がなんと言おうと<br>正しさなんてわかんないぜ
+        </div>
+        """
+
+        value = worker._parse_oricon(document)
+
+        self.assertEqual(value["title"], "INSIDE IDENTITY")
+        self.assertEqual(value["artist"], "Black Raison d'etre")
+        self.assertEqual(value["lines"][1], "居場所はどこ?")
+
+    def test_parses_awa_lyrics(self):
+        worker = _worker_module()
+        document = """
+        <h1 class="title">シンデレラ</h1>
+        <span>Track by</span><a href="/artist/id">うらたぬき</a>
+        <h2>歌詞</h2><p class="lyrics">愛とか恋とか全部くだらない
+        がっかりするだけ ダメを知るだけ
+        あたし馬鹿ね ダサい逆走じゃん</p>
+        """
+
+        value = worker._parse_awa(document)
+
+        self.assertEqual(value["title"], "シンデレラ")
+        self.assertEqual(value["artist"], "うらたぬき")
+        self.assertEqual(len(value["lines"]), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

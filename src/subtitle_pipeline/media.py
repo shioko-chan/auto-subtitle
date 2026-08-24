@@ -571,16 +571,7 @@ def _write_ass(
         event_text = _escape_ass_text(cue.text)
         source_text = (getattr(cue, "source_text", None) or "").strip()
         source_units = timed_text_units(cue)
-        escaped_source_text = (
-            _karaoke_text(
-                source_units,
-                cue.start,
-                cue.end,
-                highlight_color=_KARAOKE_HIGHLIGHT_COLOR,
-            )
-            if source_units and not is_singing
-            else _escape_ass_text(source_text)
-        )
+        escaped_source_text = _escape_ass_text(source_text)
         if is_singing:
             escaped_source_text = (
                 _karaoke_text(

@@ -242,6 +242,12 @@ MOSS 和 ERes2NetV2 使用独立 uv 环境，避免模型依赖影响 Qwen ASR�
 `work/<URL哈希>/translated.metadata.json`。先抽查专名、数字、断句和 ASR 可能
 出现的幻觉，再启用上传。
 
+默认 LLM 后端是由流水线按需管理的 llama.cpp，模型为
+`unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M`。首次运行会下载约 16.5 GB；服务在 ASR
+结束后启动，并在视频渲染前停止。服务日志写入
+`work/<URL哈希>/local-llm-server.log`。也可把 GGUF 放入 `models/`，并在 `[llm]`
+中用 `local_server_model_path` 指向它。
+
 年龄限制、地区限制或需要登录的视频，可以在 `[download]` 配置
 `cookies_from_browser = "chrome"`，或配置 Netscape 格式的 `cookies_file`。
 `concurrent_fragments = 8` 会让 yt-dlp 并行下载 DASH/HLS 分片；普通单文件流不受影响。
@@ -269,7 +275,8 @@ uv run --extra asr subtitle-pipeline --config config.toml run 'https://www.youtu
 上传使用 `biliup --user-cookie ... upload`，不会把 Cookie 内容放到命令行。
 B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服务端计数差异留出余量。
 超长正文优先在段落或整行边界缩短，并为 `description_prefix` 预留空间；可通过
-`upload.description_max_chars` 调整上限。
+`upload.description_max_chars` 调整上限。`description_prefix` 中的 `{youtube_url}` 会在
+上传时替换为当前任务的 YouTube URL。
 
 更新任务列表为六个官方 YouTube 频道最近 14 天的公开直播录播（需要 Chromium
 已登录 YouTube，会员限定和未开播视频会被排除）：

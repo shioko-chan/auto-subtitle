@@ -73,6 +73,36 @@ class UploadTests(unittest.TestCase):
             self.assertEqual(description, "Description")
             self.assertEqual(command[-1], str(video))
 
+    def test_expands_youtube_url_in_description_prefix(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cookie = root / "cookies.json"
+            cookie.write_text("{}", encoding="utf-8")
+            source_url = "https://www.youtube.com/watch?v=example"
+            config = UploadConfig(
+                cookie_file=str(cookie),
+                description_prefix="原视频：{youtube_url}\n字幕说明",
+            )
+            with patch(
+                "subtitle_pipeline.upload.require_command", return_value="/bin/biliup"
+            ), patch("subtitle_pipeline.upload._wait_for_upload_cooldown"), patch(
+                "subtitle_pipeline.upload._record_upload_cooldown"
+            ), patch("subtitle_pipeline.upload._run_biliup") as run:
+                upload_to_bilibili(
+                    root / "video.mp4",
+                    title="title",
+                    description="正文",
+                    source_url=source_url,
+                    tags=["中字"],
+                    config=config,
+                )
+            command = run.call_args.args[0]
+            description = command[command.index("--desc") + 1]
+            self.assertEqual(
+                description,
+                f"原视频：{source_url}\n字幕说明\n\n正文",
+            )
+
     def test_retries_rate_limited_complete_upload_with_configured_delays(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

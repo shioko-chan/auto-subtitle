@@ -6,19 +6,20 @@ import math
 import re
 import subprocess
 import unicodedata
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any
 
 from .audio_analysis import AudioAnalysis, AudioRegion, analyze_audio
 from .audio_buffer import AudioBuffer, AudioBufferPool, is_shared_audio_uri
 from .commands import require_command, run
 from .config import ASRConfig, AudioAnalysisConfig
 from .source_language import language_for_text, normalize_source_language
-from .subtitles import Cue, cue_from_mapping, write_srt
+from .subtitles import Cue, write_srt
 from .telemetry import stage_metrics
 
 _CACHE_VERSION = 10
@@ -31,6 +32,8 @@ _MIN_ASR_GENERATION_TOKENS = 128
 _ASR_GENERATION_TOKENS_PER_SECOND = 32
 _ASR_GENERATION_TOKEN_OVERHEAD = 32
 _MIN_SPEAKER_CUE_COVERAGE = 0.30
+
+ASRTextCorrector = Callable[[list[dict[str, object]]], list[dict[str, object]]]
 
 
 class _StaleRuntimeAudio(RuntimeError):
@@ -59,6 +62,7 @@ def transcribe_with_qwen(
     analysis_config: AudioAnalysisConfig | None = None,
     metadata: dict[str, object] | None = None,
     japanese_single_word_list: list[str] | None = None,
+    asr_text_corrector: ASRTextCorrector | None = None,
 ) -> Path:
     japanese_single_word_list = sorted(set(japanese_single_word_list or []))
     duration = _media_duration(video)
@@ -82,6 +86,7 @@ def transcribe_with_qwen(
                         analysis,
                         audio_pool,
                         japanese_single_word_list,
+                        asr_text_corrector,
                     )
             except _StaleRuntimeAudio:
                 logging.info(
@@ -106,6 +111,7 @@ def transcribe_with_qwen(
                         analysis,
                         audio_pool,
                         japanese_single_word_list,
+                        asr_text_corrector,
                     )
         with stage_metrics("asr.transcription_total", config.device):
             return _transcribe_unanalyzed(
@@ -116,49 +122,6 @@ def transcribe_with_qwen(
                 audio_pool,
                 japanese_single_word_list,
             )
-
-
-def transcribe_speech_ranges(
-    video: Path,
-    ranges: list[tuple[int, float, float]],
-    job_dir: Path,
-    config: ASRConfig,
-    japanese_single_word_list: list[str] | None = None,
-) -> dict[int, list[Cue]]:
-    """Re-transcribe in-song speech candidates from the untouched source mix."""
-    if not ranges:
-        return {}
-    duration = _media_duration(video)
-    model = _load_qwen_model(config, japanese_single_word_list)
-    output: dict[int, list[Cue]] = {}
-    chunk_dir = job_dir / "song-speech-asr"
-    chunk_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        for cue_id, start, end in ranges:
-            record = _transcribe_range(
-                model,
-                video,
-                chunk_dir,
-                config,
-                core_start=start,
-                core_end=end,
-                media_duration=duration,
-                final_chunk=end >= duration,
-                label=f"song-speech-{cue_id:06d}",
-                validate_timeline=True,
-                empty_speech_audit_path=job_dir / "asr-empty-speech-audit.jsonl",
-            )
-            values = record.get("cues")
-            if isinstance(values, list):
-                output[cue_id] = [
-                    cue_from_mapping(value)
-                    for value in values
-                    if isinstance(value, dict)
-                ]
-    finally:
-        del model
-        _release_cuda()
-    return output
 
 
 def _transcribe_unanalyzed(
@@ -263,6 +226,7 @@ def _transcribe_analyzed(
     analysis: AudioAnalysis,
     audio_pool: AudioBufferPool,
     japanese_single_word_list: list[str] | None = None,
+    asr_text_corrector: ASRTextCorrector | None = None,
 ) -> Path:
     speech_windows = _speech_asr_windows(analysis, config)
     routed_regions = [
@@ -275,7 +239,7 @@ def _transcribe_analyzed(
     cache_path = destination.parent / "asr-analysis-cache.json"
     signature = {
         **_cache_signature(video, duration, config, japanese_single_word_list),
-        "analysis_version": 10,
+        "analysis_version": 11,
         "analysis_config": asdict(analysis_config),
         "regions": [_analysis_region_signature(region) for region in regions],
     }
@@ -305,61 +269,85 @@ def _transcribe_analyzed(
         for index in missing
     ):
         raise _StaleRuntimeAudio("missing ephemeral source audio")
-    qwen_missing = [
-        index for index in missing if regions[index].kind != "singing"
-    ]
-    model = (
-        _load_qwen_model(config, japanese_single_word_list)
-        if qwen_missing
-        else None
-    )
+    qwen_missing = [index for index in missing if regions[index].kind != "singing"]
     speaker_timeline = _speaker_assignment_timeline(analysis)
     speech_missing = [index for index in missing if regions[index].kind == "speech"]
-    for batch_start in range(0, len(speech_missing), config.max_inference_batch_size):
-        indices = speech_missing[
-            batch_start : batch_start + config.max_inference_batch_size
+    if speech_missing:
+        raw_cache_path = destination.parent / "asr-raw-speech-cache.json"
+        raw_signature = {
+            **_cache_signature(video, duration, config, japanese_single_word_list),
+            "raw_speech_version": 1,
+            "regions": [
+                _analysis_region_signature(regions[index]) for index in speech_missing
+            ],
+        }
+        raw_cache = _load_cache(raw_cache_path, raw_signature)
+        raw_chunks = raw_cache["chunks"]
+        assert isinstance(raw_chunks, dict)
+        raw_uncached = [
+            index for index in speech_missing if str(index) not in raw_chunks
         ]
-        assert model is not None
-        if len(indices) == 1:
-            index = indices[0]
-            region = regions[index]
-            records = {
-                index: _transcribe_range(
-                    model,
-                    video,
-                    None,
+        raw_model = (
+            _load_qwen_model(config, japanese_single_word_list, with_aligner=False)
+            if raw_uncached
+            else None
+        )
+        try:
+            for batch_start in range(
+                0, len(speech_missing), config.max_inference_batch_size
+            ):
+                indices = speech_missing[
+                    batch_start : batch_start + config.max_inference_batch_size
+                ]
+                uncached = [index for index in indices if str(index) not in raw_chunks]
+                if not uncached:
+                    continue
+                assert raw_model is not None
+                records = _transcribe_raw_speech_batch(
+                    raw_model,
                     config,
-                    core_start=region.start,
-                    core_end=region.end,
+                    [(index, regions[index]) for index in uncached],
                     media_duration=duration,
-                    final_chunk=True,
-                    label=f"{index:05d}",
                     audio_buffer=audio_pool.main(),
-                    validate_timeline=True,
-                    completed_ranges=completed_ranges,
-                    completed_range_callback=persist_completed_ranges,
-                    empty_speech_audit_path=(
-                        destination.parent / "asr-empty-speech-audit.jsonl"
-                    ),
                 )
-            }
+                for index, record in records.items():
+                    raw_chunks[str(index)] = record
+                _write_cache(raw_cache_path, raw_cache)
+        finally:
+            if raw_model is not None:
+                del raw_model
+                _release_cuda()
+
+        raw_records = []
+        for index in speech_missing:
+            value = raw_chunks.get(str(index))
+            if not isinstance(value, dict):
+                raise RuntimeError(f"raw ASR cache is missing speech region {index}")
+            raw_records.append({**value, "window_id": index})
+        if asr_text_corrector is not None:
+            with stage_metrics("asr.text_correction"):
+                corrected_records = asr_text_corrector(raw_records)
         else:
-            records = _transcribe_speech_batch(
-                model,
-                video,
+            corrected_records = raw_records
+        if len(corrected_records) != len(raw_records):
+            raise RuntimeError("ASR text corrector changed the speech window count")
+
+        aligner = _load_qwen_aligner(config, japanese_single_word_list)
+        try:
+            aligned_records = _align_speech_records(
+                aligner,
+                corrected_records,
+                regions,
+                audio_pool.main(),
                 config,
-                [(index, regions[index]) for index in indices],
-                media_duration=duration,
-                audio_buffer=audio_pool.main(),
-                completed_ranges=completed_ranges,
-                completed_range_callback=persist_completed_ranges,
-                empty_speech_audit_path=(
-                    destination.parent / "asr-empty-speech-audit.jsonl"
-                ),
+                duration,
             )
-        for index in indices:
+        finally:
+            del aligner
+            _release_cuda()
+        for index in speech_missing:
             region = regions[index]
-            record = records[index]
+            record = aligned_records[index]
             for cue in record["cues"]:
                 cue["speaker"] = _speaker_for_aligned_cue(
                     float(cue["start"]), float(cue["end"]), speaker_timeline
@@ -377,6 +365,14 @@ def _transcribe_analyzed(
                 len(record["cues"]),
             )
 
+    ambiguous_missing = [
+        index for index in qwen_missing if regions[index].kind == "ambiguous"
+    ]
+    model = (
+        _load_qwen_model(config, japanese_single_word_list)
+        if ambiguous_missing
+        else None
+    )
     for index in qwen_missing:
         region = regions[index]
         if region.kind == "speech":
@@ -1650,6 +1646,261 @@ def _transcribe_speech_batch(
     return records
 
 
+def _transcribe_raw_speech_batch(
+    model: Any,
+    config: ASRConfig,
+    indexed_regions: list[tuple[int, AudioRegion]],
+    *,
+    media_duration: float,
+    audio_buffer: AudioBuffer,
+) -> dict[int, dict[str, object]]:
+    audio_inputs: list[object] = []
+    extract_ranges: list[tuple[float, float]] = []
+    token_limits: list[int] = []
+    for _, region in indexed_regions:
+        extract_start = max(0.0, region.start - config.chunk_context_seconds)
+        extract_end = min(media_duration, region.end + config.chunk_context_seconds)
+        extract_ranges.append((extract_start, extract_end))
+        audio_inputs.append(
+            (
+                audio_buffer.slice(extract_start, extract_end, copy=True),
+                audio_buffer.sample_rate,
+            )
+        )
+        token_limits.append(
+            _asr_generation_token_limit(config, extract_end - extract_start)
+        )
+    previous_limit = getattr(model, "max_new_tokens", None)
+    changed = isinstance(previous_limit, int)
+    if changed:
+        model.max_new_tokens = max(token_limits)
+    try:
+        with stage_metrics("asr.raw_speech_batch", config.device):
+            results = model.transcribe(
+                audio=audio_inputs,
+                context=config.context,
+                language=config.language,
+                return_time_stamps=False,
+            )
+    finally:
+        if changed:
+            model.max_new_tokens = previous_limit
+    if len(results) != len(indexed_regions):
+        raise RuntimeError(
+            f"Qwen3-ASR returned {len(results)} raw results for "
+            f"{len(indexed_regions)} speech windows"
+        )
+    records: dict[int, dict[str, object]] = {}
+    for position, ((index, region), result) in enumerate(zip(indexed_regions, results)):
+        text = str(getattr(result, "text", "")).strip()
+        repetition = _repetition_hallucination(text)
+        if repetition is not None:
+            pattern, repeats = repetition
+            logging.warning(
+                "Qwen3-ASR raw speech repetition loop in "
+                "%.3f-%.3fs: pattern=%r repeats=%d; retrying with shorter chunks",
+                region.start,
+                region.end,
+                pattern[:80],
+                repeats,
+            )
+            records[index] = _transcribe_raw_range(
+                model,
+                config,
+                region.start,
+                region.end,
+                media_duration,
+                audio_buffer,
+            )
+            continue
+        records[index] = {
+            "core_start": region.start,
+            "core_end": region.end,
+            "extract_start": extract_ranges[position][0],
+            "extract_end": extract_ranges[position][1],
+            "language": str(getattr(result, "language", "")),
+            "text": text,
+            "generation_token_limit": token_limits[position],
+        }
+    return records
+
+
+def _transcribe_raw_range(
+    model: Any,
+    config: ASRConfig,
+    core_start: float,
+    core_end: float,
+    media_duration: float,
+    audio_buffer: AudioBuffer,
+) -> dict[str, object]:
+    extract_start = max(0.0, core_start - config.chunk_context_seconds)
+    extract_end = min(media_duration, core_end + config.chunk_context_seconds)
+    audio = (
+        audio_buffer.slice(extract_start, extract_end, copy=True),
+        audio_buffer.sample_rate,
+    )
+    token_limit = _asr_generation_token_limit(config, extract_end - extract_start)
+    previous_limit = getattr(model, "max_new_tokens", None)
+    changed = isinstance(previous_limit, int)
+    if changed:
+        model.max_new_tokens = token_limit
+    try:
+        results = model.transcribe(
+            audio=audio,
+            context=config.context,
+            language=config.language,
+            return_time_stamps=False,
+        )
+    finally:
+        if changed:
+            model.max_new_tokens = previous_limit
+    if len(results) != 1:
+        raise RuntimeError("Qwen3-ASR raw retry returned an invalid result count")
+    result = results[0]
+    text = str(getattr(result, "text", "")).strip()
+    repetition = _repetition_hallucination(text)
+    if repetition is not None:
+        duration = core_end - core_start
+        if duration / 2 < _MIN_RETRY_CHUNK_SECONDS:
+            pattern, repeats = repetition
+            raise RuntimeError(
+                "Qwen3-ASR raw speech repetition remains at minimum window "
+                f"{core_start:.3f}-{core_end:.3f}s: "
+                f"pattern={pattern[:80]!r} repeats={repeats}"
+            )
+        midpoint = (core_start + core_end) / 2
+        left = _transcribe_raw_range(
+            model, config, core_start, midpoint, media_duration, audio_buffer
+        )
+        right = _transcribe_raw_range(
+            model, config, midpoint, core_end, media_duration, audio_buffer
+        )
+        return {
+            "core_start": core_start,
+            "core_end": core_end,
+            "extract_start": extract_start,
+            "extract_end": extract_end,
+            "language": right.get("language") or left.get("language") or "",
+            "text": f"{left.get('text', '')}\n{right.get('text', '')}".strip(),
+            "generation_token_limit": token_limit,
+            "recovered_from_repetition": True,
+        }
+    return {
+        "core_start": core_start,
+        "core_end": core_end,
+        "extract_start": extract_start,
+        "extract_end": extract_end,
+        "language": str(getattr(result, "language", "")),
+        "text": text,
+        "generation_token_limit": token_limit,
+    }
+
+
+def _align_speech_records(
+    aligner: Any,
+    corrected_records: list[dict[str, object]],
+    regions: list[AudioRegion],
+    audio_buffer: AudioBuffer,
+    config: ASRConfig,
+    media_duration: float,
+) -> dict[int, dict[str, object]]:
+    output: dict[int, dict[str, object]] = {}
+    for batch_start in range(0, len(corrected_records), config.max_inference_batch_size):
+        batch = corrected_records[
+            batch_start : batch_start + config.max_inference_batch_size
+        ]
+        empty = [record for record in batch if not str(record.get("text") or "").strip()]
+        for record in empty:
+            index = int(record["window_id"])
+            output[index] = {**record, "text": "", "cues": [], "skipped_empty": True}
+        batch = [record for record in batch if str(record.get("text") or "").strip()]
+        if not batch:
+            continue
+        audios: list[object] = []
+        texts: list[str] = []
+        languages: list[str] = []
+        for record in batch:
+            start = max(0.0, float(record["core_start"]) - config.chunk_context_seconds)
+            end = min(
+                media_duration,
+                float(record["core_end"]) + config.chunk_context_seconds,
+            )
+            audios.append(
+                (audio_buffer.slice(start, end, copy=True), audio_buffer.sample_rate)
+            )
+            texts.append(str(record.get("text") or ""))
+            languages.append(str(record.get("language") or "Japanese"))
+        with stage_metrics("asr.corrected_forced_alignment", config.device):
+            alignments = aligner.align(audio=audios, text=texts, language=languages)
+        if len(alignments) != len(batch):
+            raise RuntimeError("Qwen forced aligner result count mismatch")
+        for position, (record, alignment) in enumerate(zip(batch, alignments)):
+            index = int(record["window_id"])
+            region = regions[index]
+            extract_start = max(
+                0.0, float(record["core_start"]) - config.chunk_context_seconds
+            )
+            result = SimpleNamespace(
+                text=str(record.get("text") or ""),
+                language=str(record.get("language") or ""),
+                time_stamps=alignment,
+            )
+            cues = _result_to_cues(
+                result,
+                offset=extract_start,
+                keep_start=region.start,
+                keep_end=region.end,
+                final_chunk=True,
+            )
+            aligned: dict[str, object] = {
+                **record,
+                "cues": [asdict(cue) for cue in cues],
+            }
+            if not cues:
+                aligned["text"] = ""
+                aligned["skipped_empty"] = True
+            elif not _record_timeline_is_healthy(aligned, region):
+                original = str(record.get("original_text") or "").strip()
+                corrected = str(record.get("text") or "").strip()
+                if original and original != corrected:
+                    logging.warning(
+                        "corrected forced alignment invalid in %.3f-%.3fs; "
+                        "falling back to the original ASR text",
+                        region.start,
+                        region.end,
+                    )
+                    fallback_alignment = aligner.align(
+                        audio=audios[position],
+                        text=original,
+                        language=languages[position],
+                    )[0]
+                    fallback_result = SimpleNamespace(
+                        text=original,
+                        language=languages[position],
+                        time_stamps=fallback_alignment,
+                    )
+                    fallback_cues = _result_to_cues(
+                        fallback_result,
+                        offset=extract_start,
+                        keep_start=region.start,
+                        keep_end=region.end,
+                        final_chunk=True,
+                    )
+                    aligned = {
+                        **record,
+                        "text": original,
+                        "correction_method": "alignment_fallback_original",
+                        "cues": [asdict(cue) for cue in fallback_cues],
+                    }
+                if not _record_timeline_is_healthy(aligned, region):
+                    raise RuntimeError(
+                        "forced-alignment timeline invalid after correction fallback in "
+                        f"{region.start:.3f}-{region.end:.3f}s"
+                    )
+            output[index] = aligned
+    return output
+
+
 def _completed_range_key(start: float, end: float, final_chunk: bool) -> str:
     return f"{start:.3f}:{end:.3f}:{int(final_chunk)}"
 
@@ -1742,6 +1993,8 @@ def _repetition_hallucination(text: str) -> tuple[str, int] | None:
 def _load_qwen_model(
     config: ASRConfig,
     japanese_single_word_list: list[str] | None = None,
+    *,
+    with_aligner: bool = True,
 ) -> Any:
     try:
         import torch
@@ -1757,12 +2010,23 @@ def _load_qwen_model(
         )
     dtype = getattr(torch, config.dtype)
     logging.info(
-        "loading %s with aligner %s on %s (%s)",
+        "loading %s%s on %s (%s)",
         config.model,
-        config.aligner_model,
+        f" with aligner {config.aligner_model}" if with_aligner else " without aligner",
         config.device,
         config.dtype,
     )
+    kwargs: dict[str, object] = {}
+    if with_aligner:
+        kwargs = {
+            "forced_aligner": config.aligner_model,
+            "forced_aligner_kwargs": {
+                "dtype": dtype,
+                "device_map": config.device,
+                "attn_implementation": "sdpa",
+                "japanese_single_word_list": japanese_single_word_list or [],
+            },
+        }
     return Qwen3ASRModel.from_pretrained(
         config.model,
         dtype=dtype,
@@ -1770,13 +2034,38 @@ def _load_qwen_model(
         attn_implementation="sdpa",
         max_inference_batch_size=config.max_inference_batch_size,
         max_new_tokens=config.max_new_tokens,
-        forced_aligner=config.aligner_model,
-        forced_aligner_kwargs={
-            "dtype": dtype,
-            "device_map": config.device,
-            "attn_implementation": "sdpa",
-            "japanese_single_word_list": japanese_single_word_list or [],
-        },
+        **kwargs,
+    )
+
+
+def _load_qwen_aligner(
+    config: ASRConfig,
+    japanese_single_word_list: list[str] | None = None,
+) -> Any:
+    try:
+        import torch
+        from qwen_asr import Qwen3ForcedAligner
+    except ImportError as exc:
+        raise RuntimeError(
+            "Qwen3-ASR is not installed; run `uv sync --extra asr`"
+        ) from exc
+    if config.device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"Qwen forced-aligner device is {config.device}, but CUDA is unavailable"
+        )
+    dtype = getattr(torch, config.dtype)
+    logging.info(
+        "loading standalone forced aligner %s on %s (%s)",
+        config.aligner_model,
+        config.device,
+        config.dtype,
+    )
+    return Qwen3ForcedAligner.from_pretrained(
+        config.aligner_model,
+        dtype=dtype,
+        device_map=config.device,
+        attn_implementation="sdpa",
+        japanese_single_word_list=japanese_single_word_list or [],
     )
 
 

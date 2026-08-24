@@ -83,6 +83,20 @@ class LyricsLibrary:
         ).fetchone()
         return self._load_song(row) if row is not None else None
 
+    def canonical_digest(self) -> str:
+        rows = self._database.execute(
+            """SELECT song_id, title, artist, aliases_json, source_url, source_hash
+               FROM songs ORDER BY song_id"""
+        ).fetchall()
+        return hashlib.sha256(
+            json.dumps(
+                [dict(row) for row in rows],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
     def store_canonical_song(
         self,
         *,

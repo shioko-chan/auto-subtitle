@@ -46,14 +46,17 @@ def upload_to_bilibili(
         )
     _wait_for_upload_cooldown(Path(config.throttle_state_file))
     source = config.source or source_url
+    description_prefix = config.description_prefix.replace(
+        "{youtube_url}", source_url
+    )
     upload_description = _prepare_description(
         description,
-        prefix=config.description_prefix,
+        prefix=description_prefix,
         max_chars=config.description_max_chars,
     )
     logger.info(
         "Bilibili description: %d -> %d characters, %d UTF-16 units",
-        len(config.description_prefix + description),
+        len(description_prefix + description),
         len(upload_description),
         _utf16_units(upload_description),
     )

@@ -4,21 +4,181 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from subtitle_pipeline.config import SongIdentificationConfig
-from subtitle_pipeline.lyrics_library import LibrarySong, LyricLine
+from subtitle_pipeline.lyrics_library import LibrarySong, LyricLine, LyricsLibrary
 from subtitle_pipeline.lyrics_matching import LyricAnchor, SongMatch
 from subtitle_pipeline.song_identification import (
+    OCRCandidate,
+    SongIdentificationResult,
     _apply_local_match,
-    _looks_like_clear_speech,
+    _build_lyric_search_queries,
+    _load_cache,
     _public_http_url,
     _recover_lyric_gaps,
+    _signature,
     aggregate_ocr_observations,
     apply_lyric_corrections,
     group_singing_episodes,
+    identify_and_align_songs,
+    translate_aligned_song_lyrics,
 )
 from subtitle_pipeline.subtitles import Cue, TimedTextUnit
 
 
 class SongIdentificationTests(unittest.TestCase):
+    def test_song_translation_stage_backfills_without_invalidating_signature(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            library_path = root / "lyrics.sqlite3"
+            library = LyricsLibrary(library_path)
+            try:
+                song = library.store_canonical_song(
+                    title="曲名",
+                    artist="歌手",
+                    aliases=[],
+                    source_url="https://example.com/lyrics",
+                    lines=[("一行目", None), ("二行目", None), ("三行目", None)],
+                )
+            finally:
+                library.close()
+            config = SongIdentificationConfig(
+                enabled=True, lyrics_library_path=str(library_path)
+            )
+            signature_before = _signature(video, [], {}, config)
+            result = SongIdentificationResult(
+                [
+                    Cue(1, 2, "一行目", "singer", "singing"),
+                    Cue(2, 3, "二行目", "singer", "singing"),
+                ],
+                [
+                    {
+                        "song_id": song.song_id,
+                        "episode": {"start": 1, "end": 3},
+                        "alignments": [
+                            {"corrected_text": "一行目", "lyric_line_ids": [0]},
+                            {"corrected_text": "二行目", "lyric_line_ids": [1]},
+                        ],
+                    }
+                ],
+            )
+
+            translated = translate_aligned_song_lyrics(
+                result,
+                config,
+                lambda *_args, **_kwargs: (
+                    {0: "第一行", 1: "第二行", 2: "第三行"},
+                    "llm",
+                ),
+                lyrics_translation_model="test-model",
+            )
+            signature_after = _signature(video, [], {}, config)
+
+        self.assertEqual(
+            [cue.preferred_translation for cue in translated.corrected_cues],
+            ["第一行", "第二行"],
+        )
+        self.assertEqual(signature_before, signature_after)
+
+    def test_song_cache_accepts_empty_corrected_cues(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "song-cache.json"
+            path.write_text(
+                '{"version":10,"signature":"test","reports":[],'
+                '"corrected_cues":[]}',
+                encoding="utf-8",
+            )
+
+            result = _load_cache(path, "test", [])
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.corrected_cues, [])
+
+    @patch(
+        "subtitle_pipeline.song_identification._search_canonical_lyrics",
+        return_value=([], {"queries": [], "fetches": []}),
+    )
+    @patch(
+        "subtitle_pipeline.song_identification._load_ocr_cache",
+        return_value=[[]],
+    )
+    def test_unmatched_song_episode_discards_all_internal_text(
+        self, _ocr_cache, _search
+    ):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            cues = [
+                Cue(0, 2, "unmatched singing", "singer", "singing"),
+                Cue(2, 3, "in-song speech", "singer", "speech"),
+                Cue(3, 5, "more unmatched singing", "singer", "singing"),
+                Cue(50, 51, "outside speech", "singer", "speech"),
+            ]
+
+            result = identify_and_align_songs(
+                video,
+                cues,
+                {},
+                root,
+                SongIdentificationConfig(
+                    enabled=True,
+                    lyrics_library_path=str(root / "lyrics.sqlite3")
+                ),
+            )
+
+        self.assertEqual(
+            [cue.text for cue in result.corrected_cues], ["outside speech"]
+        )
+        self.assertEqual(
+            result.reports[0]["evidence"],
+            ["no_continuous_canonical_lyric_match"],
+        )
+
+    def test_song_cache_signature_ignores_runtime_metadata(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            config = SongIdentificationConfig(
+                lyrics_library_path=str(root / "lyrics.sqlite3")
+            )
+            cues = [Cue(0, 1, "歌詞", kind="singing")]
+            first = _signature(
+                video,
+                cues,
+                {
+                    "id": "video-id",
+                    "title": "歌枠",
+                    "channel_id": "channel-id",
+                    "epoch": 100,
+                    "requested_downloads": [{"temporary": "value"}],
+                },
+                config,
+            )
+            second = _signature(
+                video,
+                cues,
+                {
+                    "id": "video-id",
+                    "title": "歌枠",
+                    "channel_id": "channel-id",
+                    "epoch": 200,
+                    "requested_downloads": [{"temporary": "changed"}],
+                },
+                config,
+            )
+            changed_title = _signature(
+                video,
+                cues,
+                {"id": "video-id", "title": "別の歌枠"},
+                config,
+            )
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, changed_title)
+
     @patch("subtitle_pipeline.song_identification._run_pyshiro_lines")
     @patch(
         "subtitle_pipeline.song_identification._vocal_active_ratio", return_value=0.5
@@ -211,10 +371,6 @@ class SongIdentificationTests(unittest.TestCase):
             ["neighbor_recovered", "neighbor_recovered"],
         )
 
-    def test_only_clear_sentence_like_unmatched_song_audio_routes_to_speech(self):
-        self.assertTrue(_looks_like_clear_speech("ここから普通に話していきます"))
-        self.assertFalse(_looks_like_clear_speech("オイオイオイオイ"))
-
     @patch("subtitle_pipeline.song_identification.socket.getaddrinfo")
     def test_public_url_accepts_proxy_fake_ip_for_domain_only(self, getaddrinfo):
         getaddrinfo.return_value = [
@@ -252,6 +408,54 @@ class SongIdentificationTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].frames, 2)
         self.assertIn("おじゃま虫", candidates[0].text)
+
+    def test_search_reserves_four_queries_each_for_asr_and_qualified_ocr(self):
+        hypotheses = [f"これは十分に長い歌詞の候補です{index}" for index in range(6)]
+        ocr = [
+            OCRCandidate(f"曲名: テストソングタイトル{index}", 0.95, 3, 0.0, 2.0)
+            for index in range(6)
+        ]
+
+        queries = _build_lyric_search_queries(hypotheses, ocr, [])
+
+        self.assertEqual(
+            [item["source"] for item in queries], ["asr"] * 4 + ["ocr"] * 4
+        )
+        self.assertTrue(all('"' not in item["query"] for item in queries))
+        self.assertTrue(all("site:" not in item["query"] for item in queries))
+
+    def test_search_uses_short_lyric_fragments_instead_of_longest_asr_text(self):
+        queries = _build_lyric_search_queries(
+            [
+                "今日はどのようなテンポで演奏するかちょっとまだわからないですけどね",
+                "愛とか恋とか全部くだらない がっかりするだけ ダメを知るだけ",
+                "誰が何と言おうと 正しさなんてわかんないぜ",
+            ],
+            [],
+            [],
+        )
+
+        phrases = [item["phrase"] for item in queries]
+        self.assertIn("愛とか恋とか全部くだらない", phrases)
+        self.assertIn("正しさなんてわかんないぜ", phrases)
+        self.assertTrue(all(8 <= len(item) <= 20 for item in phrases))
+
+    def test_search_ignores_ocr_ui_noise_and_unstructured_comments(self):
+        ocr = [
+            OCRCandidate("08/11 TUE", 0.99, 5, 0.0, 4.0),
+            OCRCandidate("Date 08/10 MON", 0.99, 5, 0.0, 4.0),
+            OCRCandidate("08/11TUE00:4349", 0.99, 5, 0.0, 4.0),
+            OCRCandidate("08/1@青UE", 0.99, 5, 0.0, 4.0),
+            OCRCandidate("589/10000", 0.99, 5, 0.0, 4.0),
+            OCRCandidate("なるほどね~ん", 0.99, 5, 0.0, 4.0),
+            OCRCandidate("♪ Ready Steady ♪", 0.99, 5, 0.0, 4.0),
+        ]
+
+        queries = _build_lyric_search_queries([], ocr, [])
+
+        self.assertEqual(len(queries), 1)
+        self.assertEqual(queries[0]["source"], "ocr")
+        self.assertEqual(queries[0]["phrase"], "Ready Steady")
 
     def test_episode_includes_cues_between_singing_anchors(self):
         cues = [
@@ -328,7 +532,11 @@ class SongIdentificationTests(unittest.TestCase):
             (),
             "https://example.com/lyrics",
             "hash",
-            (LyricLine(0, "Ready set and find out!", translation="准备好就去找到答案"),),
+            (
+                LyricLine(
+                    0, "Ready set and find out!", translation="准备好就去找到答案"
+                ),
+            ),
         )
         match = SongMatch(song, (LyricAnchor(0, 0, 1, 0.9),), 0.9)
 
@@ -401,6 +609,7 @@ class SongIdentificationTests(unittest.TestCase):
         ]
 
         self.assertEqual(apply_lyric_corrections(cues, reports), cues)
+
 
 if __name__ == "__main__":
     unittest.main()

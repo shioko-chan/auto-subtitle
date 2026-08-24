@@ -15,12 +15,17 @@ from zoneinfo import ZoneInfo
 from .asr import (
     read_cue_evidence,
     read_cue_sidecar,
-    transcribe_speech_ranges,
     transcribe_with_qwen,
 )
+from .asr_correction import correct_asr_windows, entities_from_context
 from .config import AppConfig, LLMConfig, llm_api_key
+from .local_llm_server import LocalLLMServer
 from .media import download_youtube, render_subtitles, subtitle_layout
-from .song_identification import SongIdentificationResult, identify_and_align_songs
+from .song_identification import (
+    SongIdentificationResult,
+    identify_and_align_songs,
+    translate_aligned_song_lyrics,
+)
 from .speakers import load_character_styles
 from .subtitles import (
     Cue,
@@ -34,7 +39,11 @@ from .telemetry import pipeline_metrics, stage_metrics
 from .translate import OpenAICompatibleTranslator
 from .upload import upload_to_bilibili
 
-_BUILTIN_GLOSSARY_FILES = ("glossaries/bang-dream.json",)
+_BUILTIN_GLOSSARY_FILES = (
+    "glossaries/bang-dream.json",
+    "glossaries/yumemita.json",
+    "glossaries/our-notes.json",
+)
 _JAPANESE_SCRIPT_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 _BEIJING_TIME = ZoneInfo("Asia/Shanghai")
 _DEEPSEEK_BLOCKED_BEIJING_HOURS = ((9, 12), (14, 18))
@@ -64,17 +73,24 @@ def run_pipeline(
     job_dir = config.work_dir.resolve() / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     logging.info("job directory: %s", job_dir)
+    local_llm_server = LocalLLMServer(
+        config.llm, job_dir / "local-llm-server.log"
+    )
 
-    with (
-        pipeline_metrics(job_dir / "performance.json"),
-        stage_metrics("pipeline.total"),
-    ):
-        return _run_pipeline_stages(
-            url,
-            config,
-            job_dir,
-            upload_override=upload_override,
-        )
+    try:
+        with (
+            pipeline_metrics(job_dir / "performance.json"),
+            stage_metrics("pipeline.total"),
+        ):
+            return _run_pipeline_stages(
+                url,
+                config,
+                job_dir,
+                upload_override=upload_override,
+                local_llm_server=local_llm_server,
+            )
+    finally:
+        local_llm_server.stop()
 
 
 def _deepseek_task_delay(config: LLMConfig, now: datetime) -> float:
@@ -121,6 +137,7 @@ def _run_pipeline_stages(
     job_dir: Path,
     *,
     upload_override: bool | None,
+    local_llm_server: LocalLLMServer,
 ) -> PipelineResult:
     with stage_metrics("pipeline.download"):
         downloaded = download_youtube(url, job_dir, config.download)
@@ -134,6 +151,31 @@ def _run_pipeline_stages(
             "using %d Japanese glossary names as forced-aligner single words",
             len(japanese_single_word_list),
         )
+    translator = OpenAICompatibleTranslator(
+        config.llm,
+        llm_api_key(config.llm),
+        audit_path=job_dir / "llm-audit.jsonl",
+    )
+    asr_entities = entities_from_context(translation_context)
+
+    def correct_asr_text(records: list[dict[str, object]]) -> list[dict[str, object]]:
+        if config.llm.local_server_enabled:
+            with stage_metrics("pipeline.local_llm_asr_correction_startup"):
+                local_llm_server.start()
+        try:
+            return correct_asr_windows(
+                records,
+                entities=asr_entities,
+                request=translator.request,
+                model=config.llm.model,
+                cache_path=job_dir / "asr-correction-cache.json",
+                audit_path=job_dir / "asr-correction-audit.jsonl",
+                batch_windows=config.llm.asr_correction_batch_windows,
+                batch_chars=config.llm.asr_correction_batch_chars,
+            )
+        finally:
+            if config.llm.local_server_enabled:
+                local_llm_server.stop()
 
     with stage_metrics("pipeline.audio_and_asr"):
         source_subtitle = transcribe_with_qwen(
@@ -143,6 +185,7 @@ def _run_pipeline_stages(
             config.audio_analysis,
             downloaded.metadata,
             japanese_single_word_list,
+            correct_asr_text,
         )
 
     sidecar = source_subtitle.with_suffix(".cues.json")
@@ -174,11 +217,6 @@ def _run_pipeline_stages(
             if isinstance(item, dict) and isinstance(item.get("name"), str)
         ]
         logging.info("using translation glossary: %s", ", ".join(names))
-    translator = OpenAICompatibleTranslator(
-        config.llm,
-        llm_api_key(config.llm),
-        audit_path=job_dir / "llm-audit.jsonl",
-    )
     with stage_metrics("pipeline.song_identification"):
         if config.song_identification.enabled:
             song_result = identify_and_align_songs(
@@ -187,19 +225,23 @@ def _run_pipeline_stages(
                 downloaded.metadata,
                 job_dir,
                 config.song_identification,
-                translator.translate_lyrics,
-                translation_context,
-                config.llm.model,
-                lambda ranges: transcribe_speech_ranges(
-                    downloaded.video,
-                    ranges,
-                    job_dir,
-                    config.asr,
-                    japanese_single_word_list,
-                ),
             )
         else:
             song_result = SongIdentificationResult(cues, [])
+    if config.llm.local_server_enabled:
+        with stage_metrics("pipeline.local_llm_startup"):
+            local_llm_server.start()
+    else:
+        local_llm_server.start()
+    with stage_metrics("pipeline.song_lyrics_translation"):
+        if song_result.reports:
+            song_result = translate_aligned_song_lyrics(
+                song_result,
+                config.song_identification,
+                translator.translate_lyrics,
+                translation_context,
+                config.llm.model,
+            )
     cues = song_result.corrected_cues
     if song_result.reports:
         write_srt(cues, job_dir / "source.lyrics-corrected.srt")
@@ -315,6 +357,11 @@ def _run_pipeline_stages(
         encoding="utf-8",
     )
 
+    if config.llm.local_server_enabled:
+        with stage_metrics("pipeline.local_llm_shutdown"):
+            local_llm_server.stop()
+    else:
+        local_llm_server.stop()
     rendered_path = job_dir / "translated.mp4"
     with stage_metrics("pipeline.render"):
         render_subtitles(
@@ -476,6 +523,7 @@ def _translation_context(
     franchises: list[dict[str, str]] = []
     terms: dict[str, str] = {}
     characters_by_id: dict[str, dict[str, object]] = {}
+    asr_entities_by_surface: dict[str, dict[str, object]] = {}
     for glossary in glossaries:
         matches = glossary["match"]
         assert isinstance(matches, list)
@@ -509,11 +557,19 @@ def _translation_context(
             character_id = character["id"]
             assert isinstance(character_id, str)
             characters_by_id[character_id] = _translation_character(character)
+        glossary_asr_entities = glossary.get("asr_entities", [])
+        assert isinstance(glossary_asr_entities, list)
+        for entity in glossary_asr_entities:
+            assert isinstance(entity, dict)
+            surface = entity["surface"]
+            assert isinstance(surface, str)
+            asr_entities_by_surface[surface] = entity
     return {
         "video": identity,
         "franchises": franchises,
         "characters": list(characters_by_id.values()),
         "terms": terms,
+        "asr_entities": list(asr_entities_by_surface.values()),
     }
 
 
@@ -565,6 +621,12 @@ def _validate_translation_glossary(
         raise ValueError(f"translation glossary {label} requires a name")
     if not isinstance(value.get("background"), str):
         raise ValueError(f"translation glossary {label} requires background text")
+    sources = value.get("sources", [])
+    if not isinstance(sources, list) or not all(
+        isinstance(source, str) and source.startswith(("https://", "http://"))
+        for source in sources
+    ):
+        raise ValueError(f"translation glossary {label} sources must be HTTP URLs")
     matches = value.get("match")
     if not isinstance(matches, list) or not all(
         isinstance(item, str) and item.strip() for item in matches
@@ -619,6 +681,22 @@ def _validate_translation_glossary(
                 raise ValueError(f"{short_label} requires a non-empty target")
             if not isinstance(context_only, bool):
                 raise ValueError(f"{short_label} context_only must be boolean")
+    asr_entities = value.get("asr_entities", [])
+    if not isinstance(asr_entities, list):
+        raise ValueError(f"translation glossary {label} asr_entities must be a list")
+    for position, entity in enumerate(asr_entities):
+        entity_label = f"translation glossary {label} ASR entity {position}"
+        if not isinstance(entity, dict):
+            raise ValueError(f"{entity_label} must be an object")
+        if not isinstance(entity.get("surface"), str) or not entity["surface"].strip():
+            raise ValueError(f"{entity_label} requires a non-empty surface")
+        if not isinstance(entity.get("reading"), str) or not entity["reading"].strip():
+            raise ValueError(f"{entity_label} requires a non-empty reading")
+        aliases = entity.get("aliases", [])
+        if not isinstance(aliases, list) or not all(
+            isinstance(alias, str) and alias.strip() for alias in aliases
+        ):
+            raise ValueError(f"{entity_label} aliases must be non-empty strings")
     return value
 
 

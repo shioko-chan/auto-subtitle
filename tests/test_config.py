@@ -99,11 +99,12 @@ class ConfigTests(unittest.TestCase):
             )
             self.assertEqual(config.segmentation.boundary_score_threshold, 3)
             self.assertEqual(config.segmentation.local_unit_max_seconds, 6.0)
-            self.assertEqual(config.segmentation.model_window_units, 160)
-            self.assertEqual(config.segmentation.model_window_chars, 8000)
-            self.assertEqual(config.segmentation.request_batch_windows, 32)
-            self.assertEqual(config.segmentation.request_batch_chars, 8000)
+            self.assertEqual(config.segmentation.model_window_units, 80)
+            self.assertEqual(config.segmentation.model_window_chars, 3000)
+            self.assertEqual(config.segmentation.request_batch_windows, 8)
+            self.assertEqual(config.segmentation.request_batch_chars, 3000)
             self.assertEqual(config.llm.max_concurrency, 16)
+            self.assertFalse(config.llm.local_server_enabled)
             self.assertEqual(
                 config.llm.local_translation_model, "facebook/m2m100_418M"
             )
@@ -117,7 +118,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.render.outline_ratio, 0.0045)
             self.assertEqual(config.render.backend, "auto")
             self.assertEqual(config.render.nvenc_preset, "p4")
-            self.assertEqual(config.render.nvenc_cq, 23)
+            self.assertEqual(config.render.nvenc_cq, 20)
             self.assertEqual(config.upload.cooldown_min_seconds, 60)
             self.assertEqual(config.upload.cooldown_max_seconds, 120)
             self.assertEqual(
@@ -226,6 +227,30 @@ class ConfigTests(unittest.TestCase):
             config = load_config(path)
             with patch.dict(os.environ, {"TEST_LLM_KEY": "secret"}, clear=True):
                 self.assertEqual(llm_api_key(config.llm), "secret")
+
+    def test_local_server_uses_dummy_api_key_and_validates_endpoint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(
+                "[llm]\n"
+                'base_url = "http://127.0.0.1:8080/v1"\n'
+                "local_server_enabled = true\n"
+                'local_server_hf_repo = "unsloth/model:UD-Q4_K_M"\n',
+                encoding="utf-8",
+            )
+            config = load_config(path)
+
+            self.assertEqual(llm_api_key(config.llm), "local-llama-cpp")
+
+            path.write_text(
+                "[llm]\n"
+                'base_url = "http://127.0.0.1:8081/v1"\n'
+                "local_server_enabled = true\n"
+                'local_server_hf_repo = "unsloth/model:UD-Q4_K_M"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ConfigError, "local HTTP server port"):
+                load_config(path)
 
     def test_loads_openai_responses_configuration(self):
         with tempfile.TemporaryDirectory() as temp:

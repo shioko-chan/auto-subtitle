@@ -426,8 +426,21 @@ class QwenASRTests(unittest.TestCase):
             ) as media_duration, patch(
                 "subtitle_pipeline.asr._load_qwen_model", return_value=object()
             ), patch(
-                "subtitle_pipeline.asr._transcribe_range", return_value=record
-            ) as transcribe:
+                "subtitle_pipeline.asr._transcribe_raw_speech_batch",
+                return_value={
+                    0: {
+                        "core_start": 10.0,
+                        "core_end": 11.0,
+                        "text": "字幕",
+                        "language": "Japanese",
+                    }
+                },
+            ) as transcribe, patch(
+                "subtitle_pipeline.asr._load_qwen_aligner", return_value=object()
+            ), patch(
+                "subtitle_pipeline.asr._align_speech_records",
+                return_value={0: record},
+            ) as align:
                 _transcribe_analyzed(
                     video,
                     destination,
@@ -440,9 +453,9 @@ class QwenASRTests(unittest.TestCase):
             media_duration.assert_called_once_with(video)
             self.assertEqual(transcribe.call_args.kwargs["media_duration"], 30.0)
             self.assertIs(transcribe.call_args.kwargs["audio_buffer"], buffer)
-            self.assertEqual(transcribe.call_args.kwargs["core_start"], 10.0)
-            self.assertEqual(transcribe.call_args.kwargs["core_end"], 11.0)
-            self.assertTrue(transcribe.call_args.kwargs["validate_timeline"])
+            indexed = transcribe.call_args.args[2]
+            self.assertEqual((indexed[0][1].start, indexed[0][1].end), (10.0, 11.0))
+            self.assertIs(align.call_args.args[3], buffer)
 
     def test_speech_windows_merge_nearby_turns_across_speakers(self):
         analysis = AudioAnalysis(
