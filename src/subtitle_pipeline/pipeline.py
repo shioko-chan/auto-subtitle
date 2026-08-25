@@ -15,7 +15,6 @@ from zoneinfo import ZoneInfo
 from .asr import (
     read_cue_evidence,
     read_cue_sidecar,
-    transcribe_unverified_song_speech,
     transcribe_with_qwen,
 )
 from .asr_correction import correct_asr_windows, entities_from_context
@@ -231,28 +230,6 @@ def _run_pipeline_stages(
             )
         else:
             song_result = SongIdentificationResult(cues, [])
-    if song_result.reports:
-        try:
-            with stage_metrics("pipeline.unverified_song_speech_fallback"):
-                fallback_cues = transcribe_unverified_song_speech(
-                    downloaded.video,
-                    job_dir,
-                    song_result.reports,
-                    song_result.corrected_cues,
-                    config.asr,
-                    japanese_single_word_list,
-                )
-        except Exception as exc:
-            logging.warning("unverified song speech fallback failed: %s", exc)
-            fallback_cues = []
-        if fallback_cues:
-            song_result = SongIdentificationResult(
-                sorted(
-                    [*song_result.corrected_cues, *fallback_cues],
-                    key=lambda cue: (cue.start, cue.end, cue.speaker or ""),
-                ),
-                song_result.reports,
-            )
     if config.llm.local_server_enabled:
         with stage_metrics("pipeline.local_llm_startup"):
             local_llm_server.start()
@@ -276,7 +253,7 @@ def _run_pipeline_stages(
             "identified_songs": song_result.reports,
         }
         logging.info(
-            "song identification produced %d episode reports",
+            "song identification produced %d search-group reports",
             len(song_result.reports),
         )
     if hasattr(translator, "segment_cues") and hasattr(

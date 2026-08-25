@@ -10,9 +10,8 @@ import numpy as np
 
 from subtitle_pipeline.audio_analysis import (
     AudioRegion,
-    _arbitrate_singing_regions,
+    _acoustic_phrase_route,
     _clean_speaker_timeline,
-    _coalesce_singing_phrases,
     _exclude_timeline_regions,
     _extract_audio,
     _mark_overlaps,
@@ -40,6 +39,31 @@ from subtitle_pipeline.speakers import (
 
 
 class AudioAnalysisTests(unittest.TestCase):
+    def test_acoustic_phrase_route_covers_full_singing_speech_matrix(self):
+        config = AudioAnalysisConfig(
+            singing_threshold=0.2,
+            singing_vocal_threshold=0.6,
+            singing_speech_takeover_threshold=0.5,
+        )
+        cases = {
+            ("high", "strong"): (0.3, 0.6, 0.7, 0.0, True, True),
+            ("high", "weak"): (0.3, 0.2, 0.7, 0.0, True, False),
+            ("high", "none"): (0.3, 0.0, 0.7, 0.0, True, False),
+            ("medium", "strong"): (0.3, 0.6, 0.2, 0.0, True, True),
+            ("medium", "weak"): (0.3, 0.2, 0.2, 0.0, True, False),
+            ("medium", "none"): (0.3, 0.0, 0.2, 0.0, True, False),
+            ("low", "strong"): (0.1, 0.2, 0.2, 0.1, False, True),
+            ("low", "weak"): (0.1, 0.2, 0.2, 0.0, False, False),
+            ("low", "none"): (0.1, 0.0, 0.2, 0.0, False, False),
+        }
+        for levels, values in cases.items():
+            singing, speech, vocal, overlap, route_alt, route_speech = values
+            with self.subTest(levels=levels):
+                self.assertEqual(
+                    _acoustic_phrase_route(singing, speech, vocal, overlap, config),
+                    (*levels, route_alt, route_speech),
+                )
+
     def test_initial_diarization_and_ast_can_run_concurrently(self):
         barrier = threading.Barrier(2)
 
@@ -272,20 +296,7 @@ class AudioAnalysisTests(unittest.TestCase):
             ],
         )
 
-    def test_singing_hysteresis_bridges_short_ast_miss(self):
-        windows = [
-            AudioRegion(index * 5, index * 5 + 5, "singing", confidence=score)
-            for index, score in enumerate([0.8, 0.7, 0.0, 0.0, 0.0, 0.8, 0.7])
-        ]
-        result = _singing_regions_from_scores(
-            windows,
-            threshold=0.05,
-            smoothing_windows=3,
-            release_seconds=35,
-        )
-        self.assertEqual(result, [AudioRegion(0, 35, "singing", confidence=0.8)])
-
-    def test_singing_hysteresis_ends_after_sustained_ast_miss(self):
+    def test_singing_candidates_do_not_bridge_classifier_misses(self):
         windows = [
             AudioRegion(index * 10, index * 10 + 5, "singing", confidence=score)
             for index, score in enumerate([0.8, 0.7, 0.0, 0.0, 0.0, 0.0, 0.8, 0.7])
@@ -294,17 +305,13 @@ class AudioAnalysisTests(unittest.TestCase):
             windows,
             threshold=0.05,
             smoothing_windows=3,
-            release_seconds=20,
         )
         self.assertEqual(
-            result,
-            [
-                AudioRegion(0, 15, "singing", confidence=0.8),
-                AudioRegion(60, 75, "singing", confidence=0.8),
-            ],
+            [(item.start, item.end) for item in result],
+            [(0, 5), (10, 15), (60, 65), (70, 75)],
         )
 
-    def test_song_state_covers_calls_instrumentals_and_short_speech(self):
+    def test_speech_evidence_does_not_erase_singing_candidate(self):
         windows = [
             AudioRegion(
                 0,
@@ -314,23 +321,6 @@ class AudioAnalysisTests(unittest.TestCase):
                 speech_confidence=0.2,
                 music_confidence=0.7,
             ),
-            AudioRegion(
-                5,
-                10,
-                "singing",
-                confidence=0.0,
-                speech_confidence=0.8,
-                music_confidence=0.7,
-            ),
-            AudioRegion(10, 15, "singing", music_confidence=0.8),
-            AudioRegion(15, 20, "singing", speech_confidence=0.9),
-            AudioRegion(
-                20,
-                25,
-                "singing",
-                confidence=0.8,
-                music_confidence=0.7,
-            ),
         ]
 
         result = _singing_regions_from_scores(
@@ -338,10 +328,9 @@ class AudioAnalysisTests(unittest.TestCase):
             threshold=0.05,
             music_threshold=0.05,
             smoothing_windows=1,
-            release_seconds=35,
         )
 
-        self.assertEqual(result, [AudioRegion(0, 25, "singing", confidence=0.8)])
+        self.assertEqual(result, [AudioRegion(0, 5, "singing", confidence=0.8)])
 
     def test_music_and_speech_cannot_start_song_without_singing_anchor(self):
         windows = [
@@ -360,7 +349,6 @@ class AudioAnalysisTests(unittest.TestCase):
             threshold=0.05,
             music_threshold=0.05,
             smoothing_windows=1,
-            release_seconds=35,
         )
 
         self.assertEqual(result, [])
@@ -381,38 +369,11 @@ class AudioAnalysisTests(unittest.TestCase):
             threshold=0.05,
             music_threshold=0.05,
             smoothing_windows=3,
-            release_seconds=35,
         )
 
-        self.assertEqual(result, [AudioRegion(0, 15, "singing", confidence=0.06)])
+        self.assertEqual(result, [AudioRegion(5, 10, "singing", confidence=0.06)])
 
-    def test_sustained_speech_takeover_closes_after_final_anchor(self):
-        result = _singing_regions_from_scores(
-            [
-                AudioRegion(
-                    0,
-                    5,
-                    "singing",
-                    confidence=0.8,
-                    music_confidence=0.7,
-                ),
-                AudioRegion(
-                    5,
-                    10,
-                    "singing",
-                    speech_confidence=0.8,
-                    music_confidence=0.2,
-                ),
-            ],
-            threshold=0.05,
-            music_threshold=0.05,
-            smoothing_windows=1,
-            release_seconds=35,
-        )
-
-        self.assertEqual(result, [AudioRegion(0, 5, "singing", confidence=0.8)])
-
-    def test_song_state_audit_records_evidence_and_transitions(self):
+    def test_singing_candidate_audit_records_independent_decisions(self):
         audit = {}
         _singing_regions_from_scores(
             [
@@ -428,15 +389,12 @@ class AudioAnalysisTests(unittest.TestCase):
             threshold=0.05,
             music_threshold=0.05,
             smoothing_windows=1,
-            release_seconds=35,
             audit=audit,
         )
 
-        self.assertEqual(audit["windows"][1]["state"], "in_song")
-        self.assertEqual(
-            [(item["from"], item["to"]) for item in audit["transitions"]],
-            [("outside", "in_song"), ("in_song", "outside")],
-        )
+        self.assertTrue(audit["windows"][0]["selected"])
+        self.assertFalse(audit["windows"][1]["selected"])
+        self.assertEqual(len(audit["candidates"]), 1)
 
     def test_singing_score_smoothing_removes_isolated_ast_hit(self):
         windows = [
@@ -448,7 +406,6 @@ class AudioAnalysisTests(unittest.TestCase):
                 windows,
                 threshold=0.05,
                 smoothing_windows=3,
-                release_seconds=35,
             ),
             [],
         )
@@ -463,72 +420,9 @@ class AudioAnalysisTests(unittest.TestCase):
                 windows,
                 threshold=0.05,
                 smoothing_windows=3,
-                release_seconds=35,
             ),
             [],
         )
-
-    def test_speech_with_bgm_does_not_become_singing(self):
-        singing, ambiguous = _arbitrate_singing_regions(
-            [AudioRegion(0, 10, "singing", confidence=0.8)],
-            [],
-            [AudioRegion(0, 8, "speech", "A")],
-            speech_bgm_coverage=0.35,
-            release_seconds=35,
-        )
-        self.assertEqual(singing, [])
-        self.assertEqual(ambiguous, [])
-
-    def test_vocal_stem_confirms_singing_before_release_hysteresis(self):
-        singing, ambiguous = _arbitrate_singing_regions(
-            [
-                AudioRegion(0, 5, "singing", confidence=0.8),
-                AudioRegion(30, 35, "singing", confidence=0.7),
-            ],
-            [
-                AudioRegion(0, 5, "singing", confidence=0.7),
-                AudioRegion(30, 35, "singing", confidence=0.6),
-            ],
-            [],
-            speech_bgm_coverage=0.35,
-            release_seconds=35,
-        )
-        self.assertEqual(singing, [AudioRegion(0, 35, "singing", confidence=0.7)])
-        self.assertEqual(ambiguous, [])
-
-    def test_uncertain_non_speech_candidate_uses_dual_asr(self):
-        singing, ambiguous = _arbitrate_singing_regions(
-            [AudioRegion(10, 20, "singing", confidence=0.4)],
-            [],
-            [AudioRegion(10, 11, "speech", "A")],
-            speech_bgm_coverage=0.35,
-            release_seconds=35,
-        )
-        self.assertEqual(singing, [])
-        self.assertEqual(ambiguous, [AudioRegion(10, 20, "singing", confidence=0.4)])
-
-    def test_confirmed_song_fragments_are_coalesced_to_long_asr_blocks(self):
-        result = _coalesce_singing_phrases(
-            [
-                AudioRegion(45.0, 61.742, "singing", confidence=0.7),
-                AudioRegion(63.837, 65.068, "singing", confidence=0.7),
-                AudioRegion(70.06, 117.5, "singing", confidence=0.7),
-            ],
-            minimum_seconds=30,
-        )
-        self.assertEqual(result, [AudioRegion(45.0, 117.5, "singing", confidence=0.7)])
-
-    def test_short_vocal_episode_is_confirmed_by_vocal_stem(self):
-        singing, ambiguous = _arbitrate_singing_regions(
-            [AudioRegion(0, 20, "singing", confidence=0.8)],
-            [AudioRegion(0, 20, "singing", confidence=0.8)],
-            [],
-            speech_bgm_coverage=0.35,
-            release_seconds=35,
-            minimum_singing_seconds=30,
-        )
-        self.assertEqual(singing, [AudioRegion(0, 20, "singing", confidence=0.8)])
-        self.assertEqual(ambiguous, [])
 
     def test_channel_metadata_identifies_solo_member(self):
         self.assertEqual(

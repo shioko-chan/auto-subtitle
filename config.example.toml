@@ -80,22 +80,16 @@ singing_threshold = 0.015
 # Music cannot start a song by itself, but it keeps a confirmed performance
 # active through calls, instrumental passages and short in-song speech.
 singing_music_threshold = 0.05
-# After the final singing anchor, sustained speech above this score can close
-# the performance at the start of the speech takeover.
+# Speech at or above this score is strong evidence and independently enables
+# speech ASR, even when the same phrase also routes through ALT.
 singing_speech_takeover_threshold = 0.5
-# Raw AST only proposes candidates. Vocal-stem AST confirms actual singing;
-# speech-heavy candidates without vocal singing remain ordinary speech+BGM.
+# Raw AST and vocal-stem AST provide independent singing evidence. Speech
+# evidence remains available even when the same phrase is routed through ALT.
 singing_vocal_threshold = 0.15
-singing_speech_bgm_coverage = 0.35
-singing_ambiguous_min_seconds = 15.0
-# Smooth isolated AST misses/hits, then keep the song state through short gaps.
+# Smooth isolated AST misses/hits and merge only nearby candidate windows.
 singing_merge_gap_seconds = 1.5
 singing_smoothing_windows = 3
-singing_release_seconds = 15.0
 singing_phrase_silence_seconds = 0.45
-# Coalesce lyric-phrase ASR blocks toward this duration. A short performance can
-# still be confirmed when vocal-stem AST supplies a real singing anchor.
-singing_min_phrase_seconds = 30.0
 # Adaptive offline singing ASR windows. Short acoustic phrases reduce language
 # switching inside a window. Prefer a non-singing vocal gap, then a vocal-energy
 # valley, then a phrase boundary.
@@ -131,7 +125,7 @@ search_worker_project = "tools/song_search"
 seconds_before_start = 30.0
 seconds_after_start = 15.0
 sample_interval_seconds = 1.0
-song_gap_seconds = 35.0
+song_search_group_gap_seconds = 35.0
 minimum_ocr_score = 0.45
 minimum_persistent_frames = 2
 max_search_results = 5
@@ -146,7 +140,7 @@ pyshiro_max_window_seconds = 20.0
 lyric_gap_recheck_seconds = 20.0
 lyric_gap_vocal_active_ratio = 0.08
 pyshiro_likelihood_floor = -30.0
-pyshiro_likelihood_margin = 2.0
+pyshiro_likelihood_margin = 0.2
 lyric_neighbor_max_lines = 12
 lyric_neighbor_min_coverage = 0.45
 lyric_neighbor_max_unit_seconds = 2.0

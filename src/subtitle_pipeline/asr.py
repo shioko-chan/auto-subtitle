@@ -124,172 +124,6 @@ def transcribe_with_qwen(
             )
 
 
-def transcribe_unverified_song_speech(
-    video: Path,
-    job_dir: Path,
-    reports: list[dict[str, object]],
-    existing_cues: list[Cue],
-    config: ASRConfig,
-    japanese_single_word_list: list[str] | None = None,
-) -> list[Cue]:
-    """Recover diarized speech from song episodes that lacked verified lyrics."""
-    analysis_path = job_dir / "audio-analysis.json"
-    if not analysis_path.is_file():
-        logging.warning("song speech fallback skipped: audio analysis cache is missing")
-        return []
-    try:
-        payload = json.loads(analysis_path.read_text(encoding="utf-8"))
-        raw_speech = payload["speech"]
-        if not isinstance(raw_speech, list):
-            raise TypeError
-        speech = [
-            AudioRegion(
-                **{
-                    **value,
-                    "overlap_speakers": tuple(value.get("overlap_speakers") or ()),
-                    "source_path": None,
-                    "source_offset": 0.0,
-                }
-            )
-            for value in raw_speech
-            if isinstance(value, dict)
-        ]
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError) as exc:
-        logging.warning("song speech fallback skipped: invalid audio analysis: %s", exc)
-        return []
-
-    fallback_turns = _unverified_song_speech_regions(speech, reports)
-    if not fallback_turns:
-        return []
-    windows = _speech_asr_windows(
-        AudioAnalysis(
-            speech=fallback_turns,
-            singing=[],
-            diarization=fallback_turns,
-        ),
-        config,
-    )
-    if not windows:
-        return []
-
-    duration = _media_duration(video)
-    cache_path = job_dir / "asr-song-speech-fallback-cache.json"
-    signature = {
-        **_cache_signature(video, duration, config, japanese_single_word_list),
-        "fallback_version": 1,
-        "regions": [_analysis_region_signature(region) for region in windows],
-    }
-    cache = _load_cache(cache_path, signature)
-    chunks = cache["chunks"]
-    assert isinstance(chunks, dict)
-    missing = [index for index in range(len(windows)) if str(index) not in chunks]
-
-    if missing:
-        with AudioBufferPool(video, job_dir, duration) as audio_pool:
-            raw_records: dict[int, dict[str, object]] = {}
-            raw_model = _load_qwen_model(
-                config, japanese_single_word_list, with_aligner=False
-            )
-            try:
-                for batch_start in range(
-                    0, len(missing), config.max_inference_batch_size
-                ):
-                    indices = missing[
-                        batch_start : batch_start + config.max_inference_batch_size
-                    ]
-                    raw_records.update(
-                        _transcribe_raw_speech_batch(
-                            raw_model,
-                            config,
-                            [(index, windows[index]) for index in indices],
-                            media_duration=duration,
-                            audio_buffer=audio_pool.main(),
-                        )
-                    )
-            finally:
-                del raw_model
-                _release_cuda()
-
-            records = [{**raw_records[index], "window_id": index} for index in missing]
-            aligner = _load_qwen_aligner(config, japanese_single_word_list)
-            try:
-                aligned = _align_speech_records(
-                    aligner,
-                    records,
-                    windows,
-                    audio_pool.main(),
-                    config,
-                    duration,
-                )
-            finally:
-                del aligner
-                _release_cuda()
-            for index, record in aligned.items():
-                for cue in record["cues"]:
-                    cue["speaker"] = _speaker_for_aligned_cue(
-                        float(cue["start"]), float(cue["end"]), fallback_turns
-                    )
-                    cue["kind"] = "speech"
-                    cue["speaker_assignment"] = "unverified_song_speech_fallback"
-                chunks[str(index)] = record
-                _write_cache(cache_path, cache)
-
-    recovered: list[Cue] = []
-    for index in range(len(windows)):
-        record = chunks.get(str(index))
-        if not isinstance(record, dict) or not isinstance(record.get("cues"), list):
-            continue
-        recovered.extend(
-            _decode_cached_cues(
-                record["cues"], index, raw_text=str(record.get("text") or "")
-            )
-        )
-    recovered = [
-        cue
-        for cue in recovered
-        if not any(
-            existing.kind == "speech" and _cue_overlap_ratio(cue, existing) >= 0.5
-            for existing in existing_cues
-        )
-    ]
-    logging.warning(
-        "song speech fallback recovered %d cues from %d unverified windows",
-        len(recovered),
-        len(windows),
-    )
-    return recovered
-
-
-def _unverified_song_speech_regions(
-    speech: list[AudioRegion], reports: list[dict[str, object]]
-) -> list[AudioRegion]:
-    intervals: list[tuple[float, float]] = []
-    for report in reports:
-        if report.get("song") is not None:
-            continue
-        episode = report.get("episode")
-        if not isinstance(episode, dict):
-            continue
-        try:
-            start = float(episode["start"])
-            end = float(episode["end"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if end > start:
-            intervals.append((start, end))
-    return [
-        replace(region, start=max(region.start, start), end=min(region.end, end))
-        for start, end in intervals
-        for region in speech
-        if min(region.end, end) - max(region.start, start) >= 0.08
-    ]
-
-
-def _cue_overlap_ratio(left: Cue, right: Cue) -> float:
-    overlap = max(0.0, min(left.end, right.end) - max(left.start, right.start))
-    return overlap / max(1e-6, left.end - left.start)
-
-
 def _transcribe_unanalyzed(
     video: Path,
     destination: Path,
@@ -405,7 +239,7 @@ def _transcribe_analyzed(
     cache_path = destination.parent / "asr-analysis-cache.json"
     signature = {
         **_cache_signature(video, duration, config, japanese_single_word_list),
-        "analysis_version": 11,
+        "analysis_version": 12,
         "analysis_config": asdict(analysis_config),
         "regions": [_analysis_region_signature(region) for region in regions],
     }
@@ -435,7 +269,6 @@ def _transcribe_analyzed(
         for index in missing
     ):
         raise _StaleRuntimeAudio("missing ephemeral source audio")
-    qwen_missing = [index for index in missing if regions[index].kind != "singing"]
     speaker_timeline = _speaker_assignment_timeline(analysis)
     speech_missing = [index for index in missing if regions[index].kind == "speech"]
     if speech_missing:
@@ -490,19 +323,31 @@ def _transcribe_analyzed(
             if not isinstance(value, dict):
                 raise RuntimeError(f"raw ASR cache is missing speech region {index}")
             raw_records.append({**value, "window_id": index})
-        if asr_text_corrector is not None:
+        correctable_records = [
+            record
+            for record in raw_records
+            if regions[int(record["window_id"])].asr_route != "song_speech_fallback"
+        ]
+        if asr_text_corrector is not None and correctable_records:
             with stage_metrics("asr.text_correction"):
-                corrected_records = asr_text_corrector(raw_records)
+                corrected_records = asr_text_corrector(correctable_records)
         else:
-            corrected_records = raw_records
-        if len(corrected_records) != len(raw_records):
+            corrected_records = correctable_records
+        if len(corrected_records) != len(correctable_records):
             raise RuntimeError("ASR text corrector changed the speech window count")
+        corrected_by_id = {
+            int(record["window_id"]): record for record in corrected_records
+        }
+        records = [
+            corrected_by_id.get(int(record["window_id"]), record)
+            for record in raw_records
+        ]
 
         aligner = _load_qwen_aligner(config, japanese_single_word_list)
         try:
             aligned_records = _align_speech_records(
                 aligner,
-                corrected_records,
+                records,
                 regions,
                 audio_pool.main(),
                 config,
@@ -519,6 +364,8 @@ def _transcribe_analyzed(
                     float(cue["start"]), float(cue["end"]), speaker_timeline
                 )
                 cue["kind"] = "speech"
+                if region.asr_route == "song_speech_fallback":
+                    cue["speaker_assignment"] = "acoustic_phrase_speech_fallback"
             record["window_kind"] = "mixed_speech"
             cached[str(index)] = record
             _write_cache(cache_path, cache)
@@ -530,45 +377,6 @@ def _transcribe_analyzed(
                 region.speaker or "unknown",
                 len(record["cues"]),
             )
-
-    ambiguous_missing = [
-        index for index in qwen_missing if regions[index].kind == "ambiguous"
-    ]
-    model = (
-        _load_qwen_model(config, japanese_single_word_list)
-        if ambiguous_missing
-        else None
-    )
-    for index in qwen_missing:
-        region = regions[index]
-        if region.kind == "speech":
-            continue
-        assert model is not None
-        if region.kind == "ambiguous":
-            record = _transcribe_ambiguous_range(
-                model,
-                video,
-                None,
-                config,
-                region,
-                index=index,
-                window_config=analysis_config,
-                audio_pool=audio_pool,
-            )
-        cached[str(index)] = record
-        _write_cache(cache_path, cache)
-        logging.info(
-            "cached analyzed ASR region %d/%d kind=%s speaker=%s cues=%d",
-            index + 1,
-            len(regions),
-            region.kind,
-            region.speaker or "unknown",
-            len(record["cues"]),
-        )
-
-    if model is not None:
-        del model
-        _release_cuda()
 
     singing_missing = [
         index for index in missing if regions[index].kind == "singing"
@@ -899,12 +707,17 @@ def _covered_speaker(
 
 def _analysis_regions(analysis: AudioAnalysis) -> list[AudioRegion]:
     singing = sorted(analysis.singing, key=lambda region: region.start)
-    ambiguous = sorted(analysis.ambiguous, key=lambda region: region.start)
-    excluded = sorted([*singing, *ambiguous], key=lambda region: region.start)
-    speech = [
-        fragment
-        for region in analysis.speech
-        for fragment in _subtract_singing_regions(region, excluded)
+    speech = list(analysis.speech)
+    supplemental_speech = [
+        AudioRegion(
+            phrase.start,
+            phrase.end,
+            "speech",
+            confidence=phrase.speech_score,
+            asr_route="song_speech_fallback",
+        )
+        for phrase in analysis.acoustic_phrases
+        if phrase.route_speech and phrase.diarization_overlap_seconds < 0.08
     ]
     separated_tracks: dict[tuple[str | None, str, float], AudioRegion] = {}
     ordinary_speech: list[AudioRegion] = []
@@ -950,7 +763,7 @@ def _analysis_regions(analysis: AudioAnalysis) -> list[AudioRegion]:
         else:
             merged.append(region)
     return sorted(
-        [*merged, *singing, *ambiguous],
+        [*merged, *supplemental_speech, *singing],
         key=lambda item: (item.start, item.end),
     )
 
@@ -964,105 +777,6 @@ def _analysis_region_signature(region: AudioRegion) -> dict[str, object]:
     if is_shared_audio_uri(region.source_path):
         value["source_path"] = "shared-memory"
     return value
-
-
-def _subtract_singing_regions(
-    region: AudioRegion, singing: list[AudioRegion]
-) -> list[AudioRegion]:
-    fragments = [(region.start, region.end)]
-    for song in singing:
-        updated: list[tuple[float, float]] = []
-        for start, end in fragments:
-            if song.end <= start or song.start >= end:
-                updated.append((start, end))
-                continue
-            if start < song.start:
-                updated.append((start, song.start))
-            if song.end < end:
-                updated.append((song.end, end))
-        fragments = updated
-    return [
-        replace(region, start=start, end=end)
-        for start, end in fragments
-        if end - start >= 0.08
-    ]
-
-
-def _transcribe_ambiguous_range(
-    model: Any,
-    video: Path,
-    chunk_dir: Path | None,
-    config: ASRConfig,
-    region: AudioRegion,
-    *,
-    index: int,
-    window_config: AudioAnalysisConfig,
-    audio_pool: AudioBufferPool | None = None,
-) -> dict[str, object]:
-    speech_record: dict[str, object] | None = None
-    song_record: dict[str, object] | None = None
-    speech_error: RuntimeError | None = None
-    song_error: RuntimeError | None = None
-    try:
-        speech_record = _transcribe_range(
-            model,
-            video,
-            chunk_dir,
-            config,
-            core_start=region.start,
-            core_end=region.end,
-            media_duration=_media_duration(video),
-            final_chunk=True,
-            label=f"ambiguous-speech-{index:05d}",
-            audio_buffer=audio_pool.main() if audio_pool is not None else None,
-        )
-        for cue in speech_record["cues"]:
-            cue["speaker"] = region.speaker
-            cue["kind"] = "speech"
-    except RuntimeError as exc:
-        speech_error = exc
-
-    try:
-        song_record = _transcribe_song_range(
-            model,
-            Path(region.source_path) if region.source_path else video,
-            chunk_dir,
-            config,
-            region,
-            label=f"ambiguous-song-{index:05d}",
-            window_config=window_config,
-            audio_buffer=(
-                _region_audio_buffer(region, video, audio_pool)
-                if audio_pool is not None
-                else None
-            ),
-        )
-    except RuntimeError as exc:
-        song_error = exc
-
-    if speech_record is not None and _record_timeline_is_healthy(speech_record, region):
-        speech_record["ambiguous_route"] = "speech"
-        logging.info(
-            "ambiguous %.3f-%.3fs selected forced-aligned speech",
-            region.start,
-            region.end,
-        )
-        return speech_record
-    if song_record is not None and _valid_cached_record(song_record):
-        song_record["ambiguous_route"] = "singing"
-        logging.warning(
-            "ambiguous %.3f-%.3fs selected sentence-level singing ASR",
-            region.start,
-            region.end,
-        )
-        return song_record
-    details = "; ".join(
-        str(error) for error in (speech_error, song_error) if error is not None
-    )
-    raise RuntimeError(
-        f"both ASR routes failed for ambiguous region {region.start:.3f}-"
-        f"{region.end:.3f}s{': ' + details if details else ''}"
-    )
 
 
 def _record_timeline_is_healthy(record: dict[str, object], region: AudioRegion) -> bool:
@@ -2059,10 +1773,21 @@ def _align_speech_records(
                         "cues": [asdict(cue) for cue in fallback_cues],
                     }
                 if not _record_timeline_is_healthy(aligned, region):
-                    raise RuntimeError(
-                        "forced-alignment timeline invalid after correction fallback in "
-                        f"{region.start:.3f}-{region.end:.3f}s"
+                    logging.warning(
+                        "discarding speech window %.3f-%.3fs because corrected "
+                        "and original ASR text both produced unusable forced-"
+                        "alignment timelines",
+                        region.start,
+                        region.end,
                     )
+                    aligned = {
+                        **record,
+                        "text": "",
+                        "cues": [],
+                        "skipped_empty": True,
+                        "correction_method": "alignment_unusable_discarded",
+                        "alignment_error": "corrected_and_original_timeline_invalid",
+                    }
             output[index] = aligned
     return output
 

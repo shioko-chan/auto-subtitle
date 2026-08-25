@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import subprocess
 import threading
 import warnings
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 # hooks. Keep unrelated model construction out of that process-global context.
 _MODEL_LOAD_LOCK = threading.Lock()
 
-_CACHE_VERSION = 11
+_CACHE_VERSION = 12
 _SINGING_LABELS = {
     "chant",
     "child singing",
@@ -73,11 +74,28 @@ class AudioRegion:
 
 
 @dataclass(frozen=True)
+class AcousticPhrase:
+    start: float
+    end: float
+    singing_level: str
+    speech_level: str
+    singing_score: float
+    speech_score: float
+    music_score: float
+    vocal_score: float
+    diarization_overlap_seconds: float
+    route_alt: bool
+    route_speech: bool
+    source_path: str | None = None
+    source_offset: float = 0.0
+
+
+@dataclass(frozen=True)
 class AudioAnalysis:
     speech: list[AudioRegion]
     singing: list[AudioRegion]
-    ambiguous: list[AudioRegion] = field(default_factory=list)
     diarization: list[AudioRegion] = field(default_factory=list)
+    acoustic_phrases: list[AcousticPhrase] = field(default_factory=list)
 
 
 def analyze_audio(
@@ -95,10 +113,9 @@ def analyze_audio(
     cached = None if force_runtime_sources else _load_cache(cache_path, signature)
     if cached is not None:
         logger.info(
-            "audio analysis cache: %d speech turns, %d singing, %d ambiguous",
+            "audio analysis cache: %d speech turns, %d ALT phrases",
             len(cached.speech),
             len(cached.singing),
-            len(cached.ambiguous),
         )
         return cached
 
@@ -127,23 +144,18 @@ def analyze_audio(
         raw_scores,
         threshold=config.singing_threshold,
         music_threshold=config.singing_music_threshold,
-        speech_takeover_threshold=config.singing_speech_takeover_threshold,
         smoothing_windows=config.singing_smoothing_windows,
-        release_seconds=config.singing_release_seconds,
         merge_gap_seconds=config.singing_merge_gap_seconds,
         audit=song_detection_audit,
     )
-    singing_windows: list[AudioRegion] = []
-    ambiguous_windows: list[AudioRegion] = []
-    vocal_waveform = None
-    vocal_rate = 0
     vocal_candidates: list[tuple[AudioRegion, AudioBuffer]] = []
-    vocals_path = job_dir / "source.vocals.wav"
+    vocal_scores: list[AudioRegion] = []
+    fallback_vocals_path: Path | None = None
     if raw_candidates:
         with stage_metrics("audio.vocal_separation_and_detection", config.device):
             if audio_pool is not None:
                 separation_candidates = _merge_regions(
-                    raw_candidates, config.singing_release_seconds
+                    raw_candidates, config.singing_asr_max_seconds
                 )
                 vocal_candidates = _separate_vocal_candidates(
                     video,
@@ -165,28 +177,25 @@ def analyze_audio(
                     config,
                 )
             else:
+                vocals_path = job_dir / "source.vocals.wav"
+                fallback_vocals_path = vocals_path.resolve()
                 _separate_vocals(video, vocals_path, config.device)
                 vocal_waveform, vocal_rate = _load_waveform(vocals_path)
                 vocal_scores = _score_singing_windows(
                     vocal_waveform, vocal_rate, config
                 )
-        vocal_anchors = _singing_regions_from_scores(
-            vocal_scores,
-            threshold=config.singing_vocal_threshold,
-            music_threshold=None,
-            smoothing_windows=config.singing_smoothing_windows,
-            release_seconds=0.0,
-            merge_gap_seconds=config.singing_merge_gap_seconds,
-        )
-        singing_windows, ambiguous_windows = _arbitrate_singing_regions(
-            raw_candidates,
-            vocal_anchors,
-            ordinary_diarization,
-            speech_bgm_coverage=config.singing_speech_bgm_coverage,
-            ambiguous_min_seconds=config.singing_ambiguous_min_seconds,
-            minimum_singing_seconds=config.singing_min_phrase_seconds,
-            release_seconds=config.singing_release_seconds,
-        )
+    acoustic_phrases = _build_acoustic_phrases(
+        raw_scores,
+        vocal_scores,
+        ordinary_diarization,
+        vocal_candidates,
+        config,
+    )
+    alt_regions = [
+        AudioRegion(phrase.start, phrase.end, "singing")
+        for phrase in acoustic_phrases
+        if phrase.route_alt
+    ]
     from .speakers import identify_speakers, metadata_character
 
     known_character = metadata_character(metadata or {}, config.character_styles_file)
@@ -197,76 +206,43 @@ def analyze_audio(
             speech,
             config,
             known_character=known_character,
-            excluded_regions=[*raw_candidates, *singing_windows, *ambiguous_windows],
+            excluded_regions=alt_regions,
         )
         ordinary_diarization = _resolve_diarization_speakers(
             ordinary_diarization, speech
         )
 
-    singing = singing_windows
-    if singing_windows:
-        if vocal_candidates:
-            singing = _phrases_from_vocal_candidates(
-                singing_windows,
-                vocal_candidates,
-                known_character,
-                silence_seconds=config.singing_phrase_silence_seconds,
-                minimum_seconds=config.singing_min_phrase_seconds,
-            )
-        else:
-            assert vocal_waveform is not None
-            singing = _singing_phrases(
-                vocal_waveform,
-                vocal_rate,
-                singing_windows,
-                silence_seconds=config.singing_phrase_silence_seconds,
-                minimum_seconds=config.singing_min_phrase_seconds,
-            )
-            singing = [
-                AudioRegion(
-                    **{
-                        **asdict(region),
-                        "speaker": known_character,
-                        "source_path": str(vocals_path.resolve()),
-                    }
-                )
-                for region in singing
-            ]
-
-    ambiguous = []
-    for region in ambiguous_windows:
-        source = _vocal_source_for_region(region, vocal_candidates)
-        ambiguous.append(
-            AudioRegion(
-                **{
-                    **asdict(region),
-                    "kind": "ambiguous",
-                    "speaker": _dominant_speaker(region, ordinary_diarization),
-                    "source_path": (
-                        source[1].uri
-                        if source is not None
-                        else str(vocals_path.resolve())
-                    ),
-                    "source_offset": source[0].start if source is not None else 0.0,
-                }
-            )
+    singing = [
+        AudioRegion(
+            phrase.start,
+            phrase.end,
+            "singing",
+            known_character,
+            phrase.singing_score,
+            source_path=phrase.source_path
+            or (
+                str(fallback_vocals_path) if fallback_vocals_path is not None else None
+            ),
+            source_offset=phrase.source_offset,
+            speech_confidence=phrase.speech_score,
+            music_confidence=phrase.music_score,
         )
-    ordinary_diarization = _exclude_timeline_regions(
-        ordinary_diarization, [*singing, *ambiguous]
-    )
+        for phrase in acoustic_phrases
+        if phrase.route_alt
+    ]
     result = AudioAnalysis(
         speech=speech,
         singing=singing,
-        ambiguous=ambiguous,
         diarization=ordinary_diarization,
+        acoustic_phrases=acoustic_phrases,
     )
     payload = {
         "version": _CACHE_VERSION,
         "signature": _signature(video, config, metadata or {}),
         "speech": [asdict(region) for region in speech],
         "singing": [asdict(region) for region in singing],
-        "ambiguous": [asdict(region) for region in ambiguous],
         "diarization": [asdict(region) for region in ordinary_diarization],
+        "acoustic_phrases": [asdict(phrase) for phrase in acoustic_phrases],
         "song_detection": song_detection_audit,
     }
     temporary = cache_path.with_suffix(".tmp")
@@ -276,11 +252,9 @@ def analyze_audio(
     )
     temporary.replace(cache_path)
     logger.info(
-        "audio analysis wrote %d speech turns, %d singing phrases, "
-        "%d ambiguous regions",
+        "audio analysis wrote %d speech turns and %d ALT phrases",
         len(speech),
         len(singing),
-        len(ambiguous),
     )
     return result
 
@@ -383,22 +357,6 @@ def _run_diarization(
     finally:
         del pipeline
         _release_cuda()
-
-
-def _run_singing_detection(
-    waveform: Any,
-    sample_rate: int,
-    config: AudioAnalysisConfig,
-) -> list[AudioRegion]:
-    return _singing_regions_from_scores(
-        _score_singing_windows(waveform, sample_rate, config),
-        threshold=config.singing_threshold,
-        music_threshold=config.singing_music_threshold,
-        speech_takeover_threshold=config.singing_speech_takeover_threshold,
-        smoothing_windows=config.singing_smoothing_windows,
-        release_seconds=config.singing_release_seconds,
-        merge_gap_seconds=config.singing_merge_gap_seconds,
-    )
 
 
 def _score_singing_windows(
@@ -509,77 +467,132 @@ def _singing_evidence_score(singing_score: float, speech_score: float) -> float:
     return max(0.0, singing_score)
 
 
-def _arbitrate_singing_regions(
-    raw_candidates: list[AudioRegion],
-    vocal_anchors: list[AudioRegion],
-    speech: list[AudioRegion],
-    *,
-    speech_bgm_coverage: float,
-    release_seconds: float,
-    ambiguous_min_seconds: float = 15.0,
-    minimum_singing_seconds: float = 30.0,
-) -> tuple[list[AudioRegion], list[AudioRegion]]:
-    """Confirm vocal singing and retain uncertain candidates for dual ASR."""
-    del ambiguous_min_seconds, minimum_singing_seconds
-    confirmed: list[AudioRegion] = []
-    ambiguous: list[AudioRegion] = []
-    episodes = _merge_regions(raw_candidates, release_seconds)
-    for candidate in episodes:
-        matching_vocals = [
-            vocal for vocal in vocal_anchors if _overlap_duration(candidate, vocal) > 0
-        ]
-        if matching_vocals:
-            confirmed.append(
-                AudioRegion(
-                    candidate.start,
-                    candidate.end,
-                    "singing",
-                    confidence=max(
-                        float(region.confidence or 0.0) for region in matching_vocals
-                    ),
-                )
-            )
-            continue
-        coverage = _region_coverage(candidate, speech)
-        if coverage < speech_bgm_coverage:
-            ambiguous.append(candidate)
-
-    ambiguous = [
-        fragment
-        for candidate in ambiguous
-        for fragment in _subtract_regions(
-            candidate, [(region.start, region.end) for region in confirmed]
+def _build_acoustic_phrases(
+    raw_scores: list[AudioRegion],
+    vocal_scores: list[AudioRegion],
+    diarization: list[AudioRegion],
+    vocal_candidates: list[tuple[AudioRegion, AudioBuffer]],
+    config: AudioAnalysisConfig,
+) -> list[AcousticPhrase]:
+    """Turn overlapping classifier windows into independent ASR routing units."""
+    spans = _merge_regions(raw_scores, config.singing_stride_seconds)
+    intervals: list[tuple[float, float]] = []
+    for span in spans:
+        duration = span.end - span.start
+        count = max(1, int(math.ceil(duration / config.singing_asr_max_seconds)))
+        width = duration / count
+        intervals.extend(
+            (span.start + index * width, span.start + (index + 1) * width)
+            for index in range(count)
         )
-    ]
-    return confirmed, ambiguous
+
+    phrases: list[AcousticPhrase] = []
+    for start, end in intervals:
+        raw = [
+            item
+            for item in raw_scores
+            if min(end, item.end) - max(start, item.start) > 0
+        ]
+        vocals = [
+            item
+            for item in vocal_scores
+            if min(end, item.end) - max(start, item.start) > 0
+        ]
+        singing_score = max(
+            (float(item.confidence or 0.0) for item in raw), default=0.0
+        )
+        speech_score = max(
+            (float(item.speech_confidence or 0.0) for item in raw), default=0.0
+        )
+        music_score = max(
+            (float(item.music_confidence or 0.0) for item in raw), default=0.0
+        )
+        vocal_score = max(
+            (float(item.confidence or 0.0) for item in vocals), default=0.0
+        )
+        overlap_spans = [
+            (max(start, turn.start), min(end, turn.end))
+            for turn in diarization
+            if min(end, turn.end) - max(start, turn.start) > 0
+        ]
+        diarization_overlap = sum(
+            item.end - item.start
+            for item in _merge_regions(
+                [AudioRegion(left, right, "speech") for left, right in overlap_spans],
+                0.0,
+            )
+        )
+        singing_level, speech_level, route_alt, route_speech = _acoustic_phrase_route(
+            singing_score,
+            speech_score,
+            vocal_score,
+            diarization_overlap,
+            config,
+        )
+        source = max(
+            vocal_candidates,
+            key=lambda item: _overlap_duration(
+                AudioRegion(start, end, "singing"), item[0]
+            ),
+            default=None,
+        )
+        if (
+            source is not None
+            and _overlap_duration(AudioRegion(start, end, "singing"), source[0]) <= 0
+        ):
+            source = None
+        phrases.append(
+            AcousticPhrase(
+                round(start, 3),
+                round(end, 3),
+                singing_level,
+                speech_level,
+                round(singing_score, 4),
+                round(speech_score, 4),
+                round(music_score, 4),
+                round(vocal_score, 4),
+                round(diarization_overlap, 3),
+                route_alt,
+                route_speech,
+                source[1].uri if source is not None else None,
+                source[0].start if source is not None else 0.0,
+            )
+        )
+    return phrases
+
+
+def _acoustic_phrase_route(
+    singing_score: float,
+    speech_score: float,
+    vocal_score: float,
+    diarization_overlap_seconds: float,
+    config: AudioAnalysisConfig,
+) -> tuple[str, str, bool, bool]:
+    if vocal_score >= config.singing_vocal_threshold:
+        singing_level = "high"
+    elif singing_score >= config.singing_threshold:
+        singing_level = "medium"
+    else:
+        singing_level = "low"
+    if (
+        diarization_overlap_seconds >= 0.08
+        or speech_score >= config.singing_speech_takeover_threshold
+    ):
+        speech_level = "strong"
+    elif speech_score > 0:
+        speech_level = "weak"
+    else:
+        speech_level = "none"
+    return (
+        singing_level,
+        speech_level,
+        singing_level in {"high", "medium"},
+        speech_level == "strong",
+    )
 
 
 def _overlap_duration(left: AudioRegion, right: AudioRegion) -> float:
     return max(0.0, min(left.end, right.end) - max(left.start, right.start))
-
-
-def _region_coverage(region: AudioRegion, others: list[AudioRegion]) -> float:
-    intersections = [
-        AudioRegion(
-            max(region.start, other.start),
-            min(region.end, other.end),
-            "speech",
-        )
-        for other in others
-        if _overlap_duration(region, other) > 0
-    ]
-    covered = sum(item.end - item.start for item in _merge_regions(intersections, 0))
-    return covered / max(region.end - region.start, 1e-6)
-
-
-def _dominant_speaker(region: AudioRegion, speech: list[AudioRegion]) -> str | None:
-    durations: dict[str, float] = {}
-    for turn in speech:
-        if turn.speaker:
-            durations[turn.speaker] = durations.get(turn.speaker, 0.0) + (
-                _overlap_duration(region, turn)
-            )
-    return max(durations, key=durations.get) if durations else None
 
 
 def _singing_regions_from_scores(
@@ -587,16 +600,14 @@ def _singing_regions_from_scores(
     *,
     threshold: float,
     smoothing_windows: int,
-    release_seconds: float,
     merge_gap_seconds: float = 0.0,
     music_threshold: float | None = None,
-    speech_takeover_threshold: float = 0.5,
     audit: dict[str, object] | None = None,
 ) -> list[AudioRegion]:
-    """Build song episodes without treating every AST window as a boundary."""
+    """Select independent ALT candidates from overlapping classifier windows."""
     if not windows:
         if audit is not None:
-            audit.update({"windows": [], "transitions": [], "episodes": []})
+            audit.update({"windows": [], "candidates": []})
         return []
 
     radius = smoothing_windows // 2
@@ -625,151 +636,52 @@ def _singing_regions_from_scores(
             )
         )
 
-    episodes: list[AudioRegion] = []
-    transitions: list[dict[str, object]] = []
     window_audit: list[dict[str, object]] = []
-    active_start: float | None = None
-    active_end: float | None = None
-    last_anchor_end: float | None = None
-    active_confidence = 0.0
-
-    def close_episode(reason: str) -> None:
-        nonlocal active_start, active_end, last_anchor_end, active_confidence
-        if active_start is None or active_end is None:
-            return
-        episodes.append(
-            AudioRegion(
-                round(active_start, 3),
-                round(active_end, 3),
-                "singing",
-                confidence=round(active_confidence, 4),
-            )
-        )
-        transitions.append(
-            {
-                "at": round(active_end, 3),
-                "from": "in_song",
-                "to": "outside",
-                "reason": reason,
-            }
-        )
-        active_start = None
-        active_end = None
-        last_anchor_end = None
-        active_confidence = 0.0
-
-    anchor_flags = []
+    candidates: list[AudioRegion] = []
     for raw, smooth in zip(windows, smoothed):
         music_support = (
             music_threshold is not None
             and float(smooth.music_confidence or 0.0) >= music_threshold
         )
-        anchor_flags.append(
-            float(smooth.confidence or 0.0) >= threshold
-            or (float(raw.confidence or 0.0) >= threshold and music_support)
+        selected = float(smooth.confidence or 0.0) >= threshold or (
+            float(raw.confidence or 0.0) >= threshold and music_support
         )
-
-    next_anchor_starts: list[float | None] = [None] * len(smoothed)
-    next_anchor_start: float | None = None
-    for index in range(len(smoothed) - 1, -1, -1):
-        next_anchor_starts[index] = next_anchor_start
-        if anchor_flags[index]:
-            next_anchor_start = smoothed[index].start
-
-    for index, window in enumerate(smoothed):
-        raw_singing_score = float(windows[index].confidence or 0.0)
-        singing_score = float(window.confidence or 0.0)
-        speech_score = float(window.speech_confidence or 0.0)
-        music_score = float(window.music_confidence or 0.0)
-        singing_anchor = anchor_flags[index]
-        music_support = music_threshold is not None and music_score >= music_threshold
-
-        future_anchor_within_release = (
-            next_anchor_starts[index] is not None
-            and last_anchor_end is not None
-            and float(next_anchor_starts[index]) - last_anchor_end <= release_seconds
-        )
-        speech_takeover = (
-            not singing_anchor
-            and speech_score >= speech_takeover_threshold
-            and speech_score > music_score
-            and not future_anchor_within_release
-        )
-        if active_end is not None and speech_takeover:
-            active_end = min(active_end, window.start)
-            close_episode("sustained speech takeover after final singing anchor")
-        elif (
-            last_anchor_end is not None
-            and window.start - last_anchor_end > release_seconds
-        ):
-            close_episode("sustained absence of singing and music evidence")
-
-        if active_start is None and singing_anchor:
-            start = window.start
-            if music_threshold is not None:
-                for previous in reversed(smoothed[:index]):
-                    if float(previous.music_confidence or 0.0) < music_threshold:
-                        break
-                    if window.start - previous.start > release_seconds:
-                        break
-                    start = previous.start
-            active_start = start
-            active_end = window.end
-            last_anchor_end = window.end
-            active_confidence = raw_singing_score
-            transitions.append(
-                {
-                    "at": round(start, 3),
-                    "from": "outside",
-                    "to": "in_song",
-                    "reason": "singing anchor",
-                }
+        if selected:
+            candidates.append(
+                AudioRegion(
+                    smooth.start,
+                    smooth.end,
+                    "singing",
+                    confidence=max(
+                        float(raw.confidence or 0.0),
+                        float(smooth.confidence or 0.0),
+                    ),
+                )
             )
-        elif active_start is not None and singing_anchor:
-            active_end = max(float(active_end or window.end), window.end)
-            last_anchor_end = window.end
-            active_confidence = max(active_confidence, raw_singing_score)
-        elif (
-            active_start is not None
-            and music_support
-            and last_anchor_end is not None
-            and window.end - last_anchor_end <= release_seconds
-        ):
-            active_end = max(float(active_end or window.end), window.end)
-
-        state = "outside"
-        if active_start is not None:
-            state = "in_song" if singing_anchor or music_support else "releasing"
         window_audit.append(
             {
-                "start": round(window.start, 3),
-                "end": round(window.end, 3),
-                "raw_singing": round(raw_singing_score, 4),
-                "singing": round(singing_score, 4),
-                "speech": round(speech_score, 4),
-                "music": round(music_score, 4),
-                "singing_anchor": singing_anchor,
+                "start": round(smooth.start, 3),
+                "end": round(smooth.end, 3),
+                "raw_singing": round(float(raw.confidence or 0.0), 4),
+                "singing": round(float(smooth.confidence or 0.0), 4),
+                "speech": round(float(smooth.speech_confidence or 0.0), 4),
+                "music": round(float(smooth.music_confidence or 0.0), 4),
                 "music_support": music_support,
-                "speech_takeover": speech_takeover,
-                "state": state,
+                "selected": selected,
             }
         )
 
-    close_episode("end of analyzed audio")
-    result = _merge_regions(episodes, merge_gap_seconds)
+    result = _merge_regions(candidates, merge_gap_seconds)
     if audit is not None:
         audit.update(
             {
                 "policy": {
                     "singing_threshold": threshold,
                     "music_threshold": music_threshold,
-                    "speech_takeover_threshold": speech_takeover_threshold,
-                    "release_seconds": release_seconds,
                     "smoothing_windows": smoothing_windows,
                 },
                 "windows": window_audit,
-                "transitions": transitions,
-                "episodes": [asdict(region) for region in result],
+                "candidates": [asdict(region) for region in result],
             }
         )
     return result
@@ -925,167 +837,6 @@ def _buffer_waveform(buffer: AudioBuffer) -> Any:
     import torch
 
     return torch.from_numpy(buffer.samples).unsqueeze(0)
-
-
-def _vocal_source_for_region(
-    region: AudioRegion,
-    candidates: list[tuple[AudioRegion, AudioBuffer]],
-) -> tuple[AudioRegion, AudioBuffer] | None:
-    matches = [
-        item
-        for item in candidates
-        if item[0].start <= region.start and item[0].end >= region.end
-    ]
-    return (
-        min(matches, key=lambda item: item[0].end - item[0].start) if matches else None
-    )
-
-
-def _phrases_from_vocal_candidates(
-    regions: list[AudioRegion],
-    candidates: list[tuple[AudioRegion, AudioBuffer]],
-    speaker: str | None,
-    *,
-    silence_seconds: float,
-    minimum_seconds: float,
-) -> list[AudioRegion]:
-    phrases: list[AudioRegion] = []
-    for region in regions:
-        source = _vocal_source_for_region(region, candidates)
-        if source is None:
-            raise RuntimeError(
-                f"no separated vocal source covers {region.start:.3f}-{region.end:.3f}s"
-            )
-        candidate, buffer = source
-        local = AudioRegion(
-            region.start - candidate.start,
-            region.end - candidate.start,
-            "singing",
-            confidence=region.confidence,
-        )
-        local_phrases = _singing_phrases(
-            _buffer_waveform(buffer),
-            buffer.sample_rate,
-            [local],
-            silence_seconds=silence_seconds,
-            minimum_seconds=minimum_seconds,
-        )
-        phrases.extend(
-            AudioRegion(
-                round(phrase.start + candidate.start, 3),
-                round(phrase.end + candidate.start, 3),
-                "singing",
-                speaker,
-                phrase.confidence,
-                source_path=buffer.uri,
-                source_offset=candidate.start,
-            )
-            for phrase in local_phrases
-        )
-    return phrases
-
-
-def _singing_phrases(
-    waveform: Any,
-    sample_rate: int,
-    regions: list[AudioRegion],
-    *,
-    silence_seconds: float,
-    minimum_seconds: float = 30.0,
-) -> list[AudioRegion]:
-    """Use silence in the separated vocal stem as approximate lyric-line edges."""
-    import librosa
-
-    mono = waveform.mean(dim=0).detach().cpu().numpy()
-    phrases: list[AudioRegion] = []
-    for region in regions:
-        region_phrases: list[AudioRegion] = []
-        offset = max(0, round(region.start * sample_rate))
-        end = min(len(mono), round(region.end * sample_rate))
-        intervals = librosa.effects.split(
-            mono[offset:end], top_db=35, frame_length=2048, hop_length=256
-        )
-        current: list[int] | None = None
-        for local_start, local_end in intervals:
-            if current is None:
-                current = [int(local_start), int(local_end)]
-                continue
-            gap = (int(local_start) - current[1]) / sample_rate
-            if gap <= silence_seconds:
-                current[1] = int(local_end)
-            else:
-                region_phrases.append(
-                    _vocal_interval(offset, current, sample_rate, region)
-                )
-                current = [int(local_start), int(local_end)]
-        if current is not None:
-            region_phrases.append(_vocal_interval(offset, current, sample_rate, region))
-        blocks = _coalesce_singing_phrases(
-            region_phrases,
-            minimum_seconds=minimum_seconds,
-        )
-        if (
-            blocks
-            and len(blocks) == 1
-            and blocks[0].end - blocks[0].start < minimum_seconds
-        ):
-            blocks = [
-                AudioRegion(
-                    region.start,
-                    region.end,
-                    "singing",
-                    confidence=blocks[0].confidence,
-                )
-            ]
-        phrases.extend(blocks)
-    return phrases
-
-
-def _coalesce_singing_phrases(
-    phrases: list[AudioRegion], *, minimum_seconds: float
-) -> list[AudioRegion]:
-    if not phrases:
-        return []
-    blocks: list[AudioRegion] = []
-    start = phrases[0].start
-    confidence = phrases[0].confidence
-    for phrase in phrases:
-        confidence = max(float(confidence or 0.0), float(phrase.confidence or 0.0))
-        if phrase.end - start >= minimum_seconds:
-            blocks.append(
-                AudioRegion(start, phrase.end, "singing", confidence=confidence)
-            )
-            start = phrase.end
-            confidence = phrase.confidence
-    tail_end = phrases[-1].end
-    if tail_end > start:
-        if blocks:
-            previous = blocks[-1]
-            blocks[-1] = AudioRegion(
-                previous.start,
-                tail_end,
-                "singing",
-                confidence=max(
-                    float(previous.confidence or 0.0),
-                    float(confidence or 0.0),
-                ),
-            )
-        else:
-            blocks.append(
-                AudioRegion(start, tail_end, "singing", confidence=confidence)
-            )
-    return blocks
-
-
-def _vocal_interval(
-    offset: int, interval: list[int], sample_rate: int, parent: AudioRegion
-) -> AudioRegion:
-    return AudioRegion(
-        round((offset + interval[0]) / sample_rate, 3),
-        round((offset + interval[1]) / sample_rate, 3),
-        "singing",
-        confidence=parent.confidence,
-    )
 
 
 def _mark_overlaps(regions: list[AudioRegion]) -> list[AudioRegion]:
@@ -1365,11 +1116,13 @@ def _load_cache(path: Path, signature: str) -> AudioAnalysis | None:
         result = AudioAnalysis(
             speech=[_decode_audio_region(item) for item in value["speech"]],
             singing=[_decode_audio_region(item) for item in value["singing"]],
-            ambiguous=[
-                _decode_audio_region(item) for item in value.get("ambiguous", [])
-            ],
             diarization=[
                 _decode_audio_region(item) for item in value.get("diarization", [])
+            ],
+            acoustic_phrases=[
+                AcousticPhrase(**item)
+                for item in value.get("acoustic_phrases", [])
+                if isinstance(item, dict)
             ],
         )
         return result

@@ -11,6 +11,7 @@ from subtitle_pipeline.asr import (
     _add_punctuation_boundary_hints,
     _analysis_region_signature,
     _analysis_regions,
+    _align_speech_records,
     _asr_generation_token_limit,
     _cache_signature,
     _HeartTranscriptorAdapter,
@@ -27,38 +28,64 @@ from subtitle_pipeline.asr import (
     _speaker_for_aligned_cue,
     _speech_asr_windows,
     _timeline_retry_split,
-    _transcribe_ambiguous_range,
     _transcribe_analyzed,
     _transcribe_range,
     _transcribe_song_range,
     _transcribe_speech_batch,
-    _unverified_song_speech_regions,
     _valid_cached_record,
     read_cue_sidecar,
     transcribe_with_qwen,
 )
-from subtitle_pipeline.audio_analysis import AudioAnalysis, AudioRegion
+from subtitle_pipeline.audio_analysis import AcousticPhrase, AudioAnalysis, AudioRegion
 from subtitle_pipeline.config import ASRConfig, AudioAnalysisConfig
 from subtitle_pipeline.subtitles import Cue
 
 
 class QwenASRTests(unittest.TestCase):
-    def test_unverified_song_fallback_uses_only_original_speech_intersections(self):
-        speech = [
-            AudioRegion(0, 5, "speech", "A"),
-            AudioRegion(8, 14, "speech", "B"),
-            AudioRegion(20, 25, "speech", "A"),
-        ]
-        reports = [
-            {"song": None, "episode": {"start": 3, "end": 10}},
-            {"song": "verified", "episode": {"start": 20, "end": 25}},
-        ]
+    def test_corrected_and_original_unalignable_speech_is_discarded(self):
+        aligner = Mock()
+        aligner.align.side_effect = [[object()], [object()]]
+        record = {
+            "window_id": 0,
+            "core_start": 10.0,
+            "core_end": 20.0,
+            "language": "English",
+            "text": "corrected text",
+            "original_text": "original text",
+        }
+        audio_buffer = SimpleNamespace(
+            sample_rate=16000,
+            slice=Mock(return_value=np.zeros(16000, dtype=np.float32)),
+        )
 
-        result = _unverified_song_speech_regions(speech, reports)
+        with (
+            patch(
+                "subtitle_pipeline.asr._result_to_cues",
+                return_value=[Cue(10.0, 10.5, "text")],
+            ),
+            patch(
+                "subtitle_pipeline.asr._record_timeline_is_healthy",
+                return_value=False,
+            ),
+        ):
+            result = _align_speech_records(
+                aligner,
+                [record],
+                [AudioRegion(10.0, 20.0, "speech")],
+                audio_buffer,
+                ASRConfig(max_inference_batch_size=1),
+                30.0,
+            )[0]
 
+        self.assertEqual(result["text"], "")
+        self.assertEqual(result["cues"], [])
+        self.assertTrue(result["skipped_empty"])
         self.assertEqual(
-            [(item.start, item.end, item.speaker) for item in result],
-            [(3, 5, "A"), (8, 10, "B")],
+            result["correction_method"], "alignment_unusable_discarded"
+        )
+        self.assertEqual(
+            result["alignment_error"],
+            "corrected_and_original_timeline_invalid",
         )
 
     def test_heart_transcriptor_adapter_accepts_buffer_audio(self):
@@ -306,9 +333,7 @@ class QwenASRTests(unittest.TestCase):
             language="Japanese",
             text="短い音声",
             time_stamps=SimpleNamespace(
-                items=[
-                    SimpleNamespace(text="短い音声", start_time=0.1, end_time=0.4)
-                ]
+                items=[SimpleNamespace(text="短い音声", start_time=0.1, end_time=0.4)]
             ),
         )
 
@@ -396,16 +421,31 @@ class QwenASRTests(unittest.TestCase):
             AudioAnalysis(
                 speech=[
                     AudioRegion(
-                        10.0, 11.0, "speech", "A", overlap=True,
-                        source_path="a.wav", source_offset=9.0,
+                        10.0,
+                        11.0,
+                        "speech",
+                        "A",
+                        overlap=True,
+                        source_path="a.wav",
+                        source_offset=9.0,
                     ),
                     AudioRegion(
-                        12.0, 14.0, "speech", "A", overlap=True,
-                        source_path="a.wav", source_offset=9.0,
+                        12.0,
+                        14.0,
+                        "speech",
+                        "A",
+                        overlap=True,
+                        source_path="a.wav",
+                        source_offset=9.0,
                     ),
                     AudioRegion(
-                        10.5, 13.0, "speech", "B", overlap=True,
-                        source_path="b.wav", source_offset=9.0,
+                        10.5,
+                        13.0,
+                        "speech",
+                        "B",
+                        overlap=True,
+                        source_path="b.wav",
+                        source_offset=9.0,
                     ),
                 ],
                 singing=[],
@@ -440,26 +480,30 @@ class QwenASRTests(unittest.TestCase):
                 "text": "字幕",
                 "cues": [{"start": 1.0, "end": 1.5, "text": "字幕"}],
             }
-            with patch(
-                "subtitle_pipeline.asr._media_duration", return_value=30.0
-            ) as media_duration, patch(
-                "subtitle_pipeline.asr._load_qwen_model", return_value=object()
-            ), patch(
-                "subtitle_pipeline.asr._transcribe_raw_speech_batch",
-                return_value={
-                    0: {
-                        "core_start": 10.0,
-                        "core_end": 11.0,
-                        "text": "字幕",
-                        "language": "Japanese",
-                    }
-                },
-            ) as transcribe, patch(
-                "subtitle_pipeline.asr._load_qwen_aligner", return_value=object()
-            ), patch(
-                "subtitle_pipeline.asr._align_speech_records",
-                return_value={0: record},
-            ) as align:
+            with (
+                patch(
+                    "subtitle_pipeline.asr._media_duration", return_value=30.0
+                ) as media_duration,
+                patch("subtitle_pipeline.asr._load_qwen_model", return_value=object()),
+                patch(
+                    "subtitle_pipeline.asr._transcribe_raw_speech_batch",
+                    return_value={
+                        0: {
+                            "core_start": 10.0,
+                            "core_end": 11.0,
+                            "text": "字幕",
+                            "language": "Japanese",
+                        }
+                    },
+                ) as transcribe,
+                patch(
+                    "subtitle_pipeline.asr._load_qwen_aligner", return_value=object()
+                ),
+                patch(
+                    "subtitle_pipeline.asr._align_speech_records",
+                    return_value={0: record},
+                ) as align,
+            ):
                 _transcribe_analyzed(
                     video,
                     destination,
@@ -572,7 +616,9 @@ class QwenASRTests(unittest.TestCase):
         analysis = AudioAnalysis(
             speech=[],
             singing=[],
-            diarization=[AudioRegion(start, end, "speech", "A") for start, end in spans],
+            diarization=[
+                AudioRegion(start, end, "speech", "A") for start, end in spans
+            ],
         )
 
         windows = _speech_asr_windows(analysis, ASRConfig())
@@ -766,7 +812,7 @@ class QwenASRTests(unittest.TestCase):
         self.assertEqual(second_model.transcribe.call_count, 2)
         self.assertEqual([cue["text"] for cue in recovered["cues"]], ["前半", "后半"])
 
-    def test_singing_regions_are_subtracted_from_speech_timing(self):
+    def test_singing_regions_do_not_take_ownership_from_speech_timing(self):
         result = _analysis_regions(
             AudioAnalysis(
                 speech=[AudioRegion(10, 30, "speech", "A")],
@@ -776,98 +822,36 @@ class QwenASRTests(unittest.TestCase):
 
         self.assertEqual(
             [(item.start, item.end, item.kind) for item in result],
-            [(10, 15, "speech"), (15, 25, "singing"), (25, 30, "speech")],
+            [(10, 30, "speech"), (15, 25, "singing")],
         )
 
-    def test_ambiguous_regions_are_subtracted_and_routed_once(self):
+    def test_strong_acoustic_speech_without_diarization_adds_supplemental_route(self):
+        phrase = AcousticPhrase(
+            12,
+            20,
+            "high",
+            "strong",
+            0.8,
+            0.7,
+            0.6,
+            0.9,
+            0.0,
+            True,
+            True,
+        )
+
         result = _analysis_regions(
             AudioAnalysis(
-                speech=[AudioRegion(0, 20, "speech", "A")],
-                singing=[],
-                ambiguous=[AudioRegion(5, 15, "ambiguous", "A")],
+                [],
+                [AudioRegion(12, 20, "singing")],
+                acoustic_phrases=[phrase],
             )
         )
+
         self.assertEqual(
-            [(item.start, item.end, item.kind) for item in result],
-            [(0, 5, "speech"), (5, 15, "ambiguous"), (15, 20, "speech")],
+            [(item.kind, item.asr_route) for item in result],
+            [("speech", "song_speech_fallback"), ("singing", "qwen")],
         )
-
-    def test_rejects_collapsed_ambiguous_forced_alignment(self):
-        record = {
-            "text": "这是足够长的识别结果但是整个时间轴已经完全坍缩了",
-            "cues": [
-                {"start": 10.0, "end": 10.1, "text": str(index)}
-                for index in range(25)
-            ],
-        }
-        self.assertFalse(
-            _record_timeline_is_healthy(
-                record, AudioRegion(10, 20, "ambiguous")
-            )
-        )
-
-    def test_ambiguous_region_runs_both_routes_and_keeps_healthy_alignment(self):
-        speech = {
-            "text": "これは十分に長く正常に整列された発話です",
-            "cues": [{"start": 10.0, "end": 18.0, "text": "正常な発話"}],
-        }
-        singing = {
-            "text": "歌声候補",
-            "cues": [{"start": 10.0, "end": 20.0, "text": "歌声候補"}],
-        }
-        with (
-            patch("subtitle_pipeline.asr._media_duration", return_value=30.0),
-            patch(
-                "subtitle_pipeline.asr._transcribe_range", return_value=speech
-            ) as speech_route,
-            patch(
-                "subtitle_pipeline.asr._transcribe_song_range",
-                return_value=singing,
-            ) as singing_route,
-        ):
-            result = _transcribe_ambiguous_range(
-                object(),
-                Path("source.mp4"),
-                Path("chunks"),
-                ASRConfig(),
-                AudioRegion(10, 20, "ambiguous", "A"),
-                index=0,
-                window_config=AudioAnalysisConfig(),
-            )
-        self.assertEqual(result["ambiguous_route"], "speech")
-        speech_route.assert_called_once()
-        singing_route.assert_called_once()
-
-    def test_ambiguous_region_falls_back_when_alignment_collapses(self):
-        speech = {
-            "text": "これは十分に長いのに時間軸が完全に壊れた発話です",
-            "cues": [
-                {"start": 10.0, "end": 10.1, "text": str(index)}
-                for index in range(25)
-            ],
-        }
-        singing = {
-            "text": "歌声候補",
-            "cues": [{"start": 10.0, "end": 20.0, "text": "歌声候補"}],
-        }
-        with (
-            patch("subtitle_pipeline.asr._media_duration", return_value=30.0),
-            patch("subtitle_pipeline.asr._transcribe_range", return_value=speech),
-            patch(
-                "subtitle_pipeline.asr._transcribe_song_range",
-                return_value=singing,
-            ),
-        ):
-            result = _transcribe_ambiguous_range(
-                object(),
-                Path("source.mp4"),
-                Path("chunks"),
-                ASRConfig(),
-                AudioRegion(10, 20, "ambiguous", "A"),
-                index=0,
-                window_config=AudioAnalysisConfig(),
-            )
-        self.assertEqual(result["ambiguous_route"], "singing")
 
     def test_aligner_cues_are_clamped_to_owned_analysis_region(self):
         result = SimpleNamespace(
@@ -1113,12 +1097,12 @@ class QwenASRTests(unittest.TestCase):
                 slice=lambda *_args, **_kwargs: np.zeros(16000, dtype=np.float32),
             )
 
-            with patch(
-                "subtitle_pipeline.asr._media_duration", return_value=15
-            ), patch(
-                "subtitle_pipeline.asr._load_qwen_model", return_value=model
-            ) as load_model, patch(
-                "subtitle_pipeline.asr.AudioBufferPool.main", return_value=audio
+            with (
+                patch("subtitle_pipeline.asr._media_duration", return_value=15),
+                patch(
+                    "subtitle_pipeline.asr._load_qwen_model", return_value=model
+                ) as load_model,
+                patch("subtitle_pipeline.asr.AudioBufferPool.main", return_value=audio),
             ):
                 transcribe_with_qwen(video, destination, config)
                 transcribe_with_qwen(video, destination, config)
@@ -1140,9 +1124,7 @@ class QwenASRTests(unittest.TestCase):
 
     def test_rejects_zero_duration_cached_cue(self):
         self.assertFalse(
-            _valid_cached_record(
-                {"cues": [{"start": 1.0, "end": 1.0, "text": "字幕"}]}
-            )
+            _valid_cached_record({"cues": [{"start": 1.0, "end": 1.0, "text": "字幕"}]})
         )
 
     def test_rejects_cached_chunk_with_repeated_generation_loop(self):
@@ -1198,12 +1180,10 @@ class QwenASRTests(unittest.TestCase):
                 sample_rate=16000,
                 slice=lambda *_args, **_kwargs: np.zeros(16000, dtype=np.float32),
             )
-            with patch(
-                "subtitle_pipeline.asr._media_duration", return_value=40
-            ), patch(
-                "subtitle_pipeline.asr._load_qwen_model", return_value=model
-            ), patch(
-                "subtitle_pipeline.asr.AudioBufferPool.main", return_value=audio
+            with (
+                patch("subtitle_pipeline.asr._media_duration", return_value=40),
+                patch("subtitle_pipeline.asr._load_qwen_model", return_value=model),
+                patch("subtitle_pipeline.asr.AudioBufferPool.main", return_value=audio),
             ):
                 transcribe_with_qwen(video, destination, config)
 

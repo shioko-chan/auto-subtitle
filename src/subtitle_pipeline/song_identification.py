@@ -24,8 +24,8 @@ from .prompt_templates import prompt_templates_digest
 from .source_language import language_for_text
 from .subtitles import Cue, TimedTextUnit, cue_from_mapping, text_display_width
 
-_CACHE_VERSION = 10
-_PROMPT_VERSION = 7
+_CACHE_VERSION = 12
+_PROMPT_VERSION = 8
 _STABLE_METADATA_KEYS = (
     "id",
     "display_id",
@@ -48,7 +48,7 @@ _SUPPORTED_LYRIC_HOSTS = (
 
 
 @dataclass(frozen=True)
-class SongEpisode:
+class SongSearchGroup:
     start: float
     end: float
     cue_ids: tuple[int, ...]
@@ -64,9 +64,20 @@ class OCRCandidate:
 
 
 @dataclass(frozen=True)
+class VerifiedLyricSpan:
+    start: float
+    end: float
+    cue_id: int
+    song_id: str
+    lyric_line_ids: tuple[int, ...]
+    likelihood_per_frame: float
+
+
+@dataclass(frozen=True)
 class SongIdentificationResult:
     corrected_cues: list[Cue]
     reports: list[dict[str, object]]
+    verified_lyric_spans: tuple[VerifiedLyricSpan, ...] = ()
 
 
 def identify_and_align_songs(
@@ -78,8 +89,8 @@ def identify_and_align_songs(
     *,
     source_maximum_units: float | None = None,
 ) -> SongIdentificationResult:
-    episodes = group_singing_episodes(cues, config.song_gap_seconds)
-    if not config.enabled or not episodes:
+    groups = group_song_search_groups(cues, config.song_search_group_gap_seconds)
+    if not config.enabled or not groups:
         return SongIdentificationResult(cues, [])
 
     cache_path = job_dir / "song-identification-cache.json"
@@ -95,8 +106,8 @@ def identify_and_align_songs(
         return cached
 
     ocr_cache_path = job_dir / "song-ocr-cache.json"
-    ocr_signature = _ocr_signature(video, episodes, config)
-    candidate_sets = _load_ocr_cache(ocr_cache_path, ocr_signature, len(episodes))
+    ocr_signature = _ocr_signature(video, groups, config)
+    candidate_sets = _load_ocr_cache(ocr_cache_path, ocr_signature, len(groups))
     if candidate_sets is None:
         candidate_sets = []
         ocr_succeeded = False
@@ -106,14 +117,14 @@ def identify_and_align_songs(
             logging.warning(
                 "song OCR worker failed to start; continuing without OCR: %s", exc
             )
-            candidate_sets = [[] for _ in episodes]
+            candidate_sets = [[] for _ in groups]
         else:
             try:
-                for index, episode in enumerate(episodes):
+                for index, group in enumerate(groups):
                     try:
                         candidates = collect_ocr_candidates(
                             video,
-                            episode,
+                            group,
                             job_dir / "song-ocr-frames" / f"{index:03d}",
                             config,
                             ocr,
@@ -121,8 +132,8 @@ def identify_and_align_songs(
                     except Exception as exc:
                         logging.warning(
                             "song OCR failed for %.3f-%.3fs: %s",
-                            episode.start,
-                            episode.end,
+                            group.start,
+                            group.end,
                             exc,
                         )
                         candidates = []
@@ -134,15 +145,25 @@ def identify_and_align_songs(
             _write_ocr_cache(ocr_cache_path, ocr_signature, candidate_sets)
 
     reports: list[dict[str, object]] = []
+    verified_spans: list[VerifiedLyricSpan] = []
     lyric_replacements: dict[int, list[Cue]] = {}
     discarded_song_region_cues: set[int] = set()
     library = LyricsLibrary(Path(config.lyrics_library_path).resolve())
     try:
-        for index, episode in enumerate(episodes):
+        for index, group in enumerate(groups):
             candidates = candidate_sets[index]
             singing_ids = [
-                cue_id for cue_id in episode.cue_ids if cues[cue_id].kind == "singing"
+                cue_id for cue_id in group.cue_ids if cues[cue_id].kind == "singing"
             ]
+            route_cues = {
+                "alt_cue_ids": singing_ids,
+                "speech_cue_ids": [
+                    cue_id
+                    for cue_id, cue in enumerate(cues)
+                    if cue.kind == "speech"
+                    and min(group.end, cue.end) - max(group.start, cue.start) > 0
+                ],
+            }
             hypotheses = [cues[cue_id].text for cue_id in singing_ids]
             library_songs = library.songs()
             match = _match_candidates(hypotheses, library_songs, config)
@@ -181,7 +202,8 @@ def identify_and_align_songs(
                         "evidence": ["no_continuous_canonical_lyric_match"],
                         "sources": [],
                         "alignments": [],
-                        "episode": asdict(episode),
+                        "search_group": asdict(group),
+                        "route_cues": route_cues,
                         "ocr_candidates": [asdict(item) for item in candidates],
                         "web_search": web_search_audit,
                     }
@@ -197,6 +219,7 @@ def identify_and_align_songs(
                 singing_ids,
                 match,
                 timing,
+                pyshiro_audit=pyshiro_audit,
                 source_maximum_units=source_maximum_units,
             )
             recovered, recovered_alignments, gap_audit = _recover_lyric_gaps(
@@ -212,6 +235,35 @@ def identify_and_align_songs(
             alignments.extend(recovered_alignments)
             pyshiro_audit.extend(gap_audit)
             lyric_replacements.update(replacements)
+            likelihood_by_cue = {
+                int(item["cue_id"]): float(item.get("likelihood_per_frame", -1e9))
+                for item in pyshiro_audit
+                if isinstance(item, dict)
+                and item.get("status")
+                in {"aligned", "neighbor_recovered", "gap_recovered"}
+                and isinstance(item.get("cue_id"), int)
+            }
+            for cue_id, values in replacements.items():
+                for value in values:
+                    line_ids = tuple(
+                        line_id
+                        for item in alignments
+                        if item.get("asr_cue_ids") == [cue_id]
+                        and float(item.get("start", value.start)) <= value.start + 1e-3
+                        and float(item.get("end", value.end)) >= value.end - 1e-3
+                        for line_id in item.get("lyric_line_ids", [])
+                        if isinstance(line_id, int)
+                    )
+                    verified_spans.append(
+                        VerifiedLyricSpan(
+                            value.start,
+                            value.end,
+                            cue_id,
+                            song.song_id,
+                            line_ids,
+                            likelihood_by_cue.get(cue_id, -1e9),
+                        )
+                    )
             matched_ids = {item["asr_cue_ids"][0] for item in alignments}
             for cue_id in singing_ids:
                 if cue_id in matched_ids:
@@ -236,7 +288,8 @@ def identify_and_align_songs(
                     "score": round(match.score, 6),
                     "alignments": alignments,
                     "pyshiro": pyshiro_audit,
-                    "episode": asdict(episode),
+                    "search_group": asdict(group),
+                    "route_cues": route_cues,
                     "ocr_candidates": [asdict(item) for item in candidates],
                     "web_search": web_search_audit,
                 }
@@ -256,14 +309,34 @@ def identify_and_align_songs(
         if cue_id in discarded_song_region_cues:
             continue
         corrected.append(cue)
+    corrected, arbitration = arbitrate_verified_lyrics(corrected, verified_spans)
+    for report in reports:
+        group = report.get("search_group")
+        if not isinstance(group, dict):
+            report["arbitration"] = []
+            continue
+        start = float(group.get("start", -1e9))
+        end = float(group.get("end", 1e9))
+        report["arbitration"] = [
+            item
+            for item in arbitration
+            if min(end, float(item["end"])) - max(start, float(item["start"])) > 0
+        ]
     # Song discovery may add canonical lyrics to the library.
     # Sign the cache against the resulting library state, not its state at startup.
-    signature = _signature(video, cues, metadata, config)
+    signature = _signature(
+        video,
+        cues,
+        metadata,
+        config,
+        source_maximum_units=source_maximum_units,
+    )
     payload = {
         "version": _CACHE_VERSION,
         "signature": signature,
         "reports": reports,
         "corrected_cues": [asdict(cue) for cue in corrected],
+        "verified_lyric_spans": [asdict(span) for span in verified_spans],
     }
     if not any(report.get("error") or report.get("tool_errors") for report in reports):
         temporary = cache_path.with_suffix(".tmp")
@@ -271,7 +344,109 @@ def identify_and_align_songs(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
         temporary.replace(cache_path)
-    return SongIdentificationResult(corrected, reports)
+    return SongIdentificationResult(corrected, reports, tuple(verified_spans))
+
+
+def arbitrate_verified_lyrics(
+    cues: list[Cue], verified_spans: list[VerifiedLyricSpan]
+) -> tuple[list[Cue], list[dict[str, object]]]:
+    spans = sorted(verified_spans, key=lambda value: (value.start, value.end))
+    if not spans:
+        return cues, []
+    result: list[Cue] = []
+    audit: list[dict[str, object]] = []
+    for cue in cues:
+        if cue.kind != "speech":
+            result.append(cue)
+            continue
+        overlapping = [
+            span
+            for span in spans
+            if min(cue.end, span.end) - max(cue.start, span.start) > 0
+        ]
+        if not overlapping:
+            result.append(cue)
+            continue
+        units = tuple(cue.source_units)
+        if not units:
+            covered = _covered_duration(cue.start, cue.end, overlapping)
+            ratio = covered / max(1e-6, cue.end - cue.start)
+            action = "discarded_without_units" if ratio >= 0.8 else "kept_conflict"
+            audit.append(
+                {
+                    "start": cue.start,
+                    "end": cue.end,
+                    "action": action,
+                    "lyric_coverage": round(ratio, 6),
+                }
+            )
+            if ratio < 0.8:
+                result.append(cue)
+            continue
+        retained = [
+            unit
+            for unit in units
+            if _covered_duration(unit.start, unit.end, overlapping)
+            / max(1e-6, unit.end - unit.start)
+            < 0.8
+        ]
+        if not retained:
+            audit.append(
+                {
+                    "start": cue.start,
+                    "end": cue.end,
+                    "action": "discarded_covered_units",
+                    "retained_units": 0,
+                }
+            )
+            continue
+        runs: list[list[TimedTextUnit]] = [[retained[0]]]
+        for unit in retained[1:]:
+            if unit.start - runs[-1][-1].end <= 0.25:
+                runs[-1].append(unit)
+            else:
+                runs.append([unit])
+        for run in runs:
+            text = "".join(unit.text for unit in run).strip()
+            if not text:
+                continue
+            result.append(
+                replace(
+                    cue,
+                    start=run[0].start,
+                    end=run[-1].end,
+                    text=text,
+                    source_units=tuple(run),
+                )
+            )
+        audit.append(
+            {
+                "start": cue.start,
+                "end": cue.end,
+                "action": "trimmed_at_aligner_units",
+                "retained_units": len(retained),
+                "removed_units": len(units) - len(retained),
+            }
+        )
+    result.sort(key=lambda cue: (cue.start, cue.end, cue.kind, cue.speaker or ""))
+    return result, audit
+
+
+def _covered_duration(
+    start: float, end: float, spans: list[VerifiedLyricSpan]
+) -> float:
+    intersections = sorted(
+        (max(start, span.start), min(end, span.end))
+        for span in spans
+        if min(end, span.end) - max(start, span.start) > 0
+    )
+    merged: list[list[float]] = []
+    for left, right in intersections:
+        if merged and left <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], right)
+        else:
+            merged.append([left, right])
+    return sum(right - left for left, right in merged)
 
 
 def translate_aligned_song_lyrics(
@@ -353,11 +528,11 @@ def translate_aligned_song_lyrics(
                                 translated = pieces[fragment_index]
                     if translated:
                         translations[source] = translated
-            episode = report.get("episode")
-            if not isinstance(episode, dict):
+            search_group = report.get("search_group")
+            if not isinstance(search_group, dict):
                 continue
-            start = float(episode.get("start", float("-inf")))
-            end = float(episode.get("end", float("inf")))
+            start = float(search_group.get("start", float("-inf")))
+            end = float(search_group.get("end", float("inf")))
             for index, cue in enumerate(corrected):
                 translated = translations.get(cue.text)
                 if (
@@ -369,7 +544,9 @@ def translate_aligned_song_lyrics(
                     corrected[index] = replace(cue, preferred_translation=translated)
     finally:
         library.close()
-    return SongIdentificationResult(corrected, result.reports)
+    return SongIdentificationResult(
+        corrected, result.reports, result.verified_lyric_spans
+    )
 
 
 def split_aligned_song_cues(
@@ -406,7 +583,9 @@ def split_aligned_song_cues(
                     source_units=units,
                 )
             )
-    return SongIdentificationResult(corrected, result.reports)
+    return SongIdentificationResult(
+        corrected, result.reports, result.verified_lyric_spans
+    )
 
 
 def _match_candidates(
@@ -733,14 +912,15 @@ def _apply_local_match(
         tuple[tuple[int, float, float] | tuple[int, float, float, object], ...],
     ],
     *,
+    pyshiro_audit: list[dict[str, object]] | None = None,
     source_maximum_units: float | None = None,
 ) -> tuple[dict[int, list[Cue]], list[dict[str, object]]]:
     replacements: dict[int, list[Cue]] = {}
     alignments: list[dict[str, object]] = []
     for anchor in match.anchors:
         cue_id = singing_ids[anchor.cue_index]
-        lines = match.song.lines[anchor.line_start : anchor.line_end]
         line_ids = list(range(anchor.line_start, anchor.line_end))
+        lines = [match.song.lines[line_id] for line_id in line_ids]
         line_timing = timing.get(cue_id)
         if (
             line_timing is not None
@@ -800,28 +980,23 @@ def _apply_local_match(
             replacements[cue_id] = replacement
             continue
 
-        text = "".join(line.text for line in lines)
-        translation = "".join(line.translation or "" for line in lines) or None
-        replacements[cue_id] = [
-            Cue(
-                **{
-                    **asdict(cues[cue_id]),
-                    "text": text,
-                    "kind": "singing",
-                    "language": language_for_text(text, "Japanese"),
-                    "preferred_translation": translation,
-                }
-            )
-        ]
-        alignments.append(
-            {
-                "asr_cue_ids": [cue_id],
-                "lyric_line_ids": line_ids,
-                "match": "lyrics",
-                "corrected_text": text,
-                "score": round(anchor.score, 6),
-                "take_index": anchor.take_index,
-            }
+        audit = next(
+            (
+                item
+                for item in pyshiro_audit or []
+                if item.get("cue_id") == cue_id
+                and item.get("take_index") == anchor.take_index
+            ),
+            {},
+        )
+        logging.warning(
+            "canonical lyric anchor rejected by pySHIRO cue_id=%d lines=%s "
+            "reason=%s likelihood=%s competing=%s",
+            cue_id,
+            line_ids,
+            audit.get("reason", "timing_unavailable"),
+            audit.get("likelihood_per_frame"),
+            audit.get("best_competing_likelihood_per_frame"),
         )
     return replacements, alignments
 
@@ -837,7 +1012,7 @@ def _recover_lyric_gaps(
     list[dict[str, object]],
     list[dict[str, object]],
 ]:
-    if len(match.anchors) < 2:
+    if not match.anchors:
         return {}, [], []
     manifest_path = job_dir / "vocal-candidates" / "manifest.json"
     worker = Path(config.pyshiro_worker_project).resolve() / "worker.py"
@@ -909,6 +1084,7 @@ def _recover_lyric_gaps(
         audit: dict[str, object] = {
             "status": "gap_rejected",
             "gap_id": gap_id,
+            "cue_id": int(probe["left_cue_id"]),
             "take_index": left.take_index,
             "lyric_line_ids": missing_ids,
             "start": probe["start"],
@@ -944,15 +1120,26 @@ def _recover_lyric_gaps(
             audit["reason"] = "pyshiro_recheck_failed"
             audits.append(audit)
             continue
+        competitors = [baseline]
+        for alternative in _competing_line_sets(match.song, missing_ids):
+            response = _run_pyshiro_lines(
+                uv,
+                worker,
+                wav,
+                [adjacent[0], *alternative, adjacent[1]],
+                normalizer,
+            )
+            if response is not None:
+                competitors.append(response)
+        accepted, aligned_score, best_competing = _pyshiro_likelihood_wins(
+            aligned, competitors, config
+        )
         baseline_score = float(baseline.get("likelihood_per_frame", -1e9))
-        aligned_score = float(aligned.get("likelihood_per_frame", -1e9))
         audit["baseline_likelihood_per_frame"] = baseline_score
         audit["expanded_likelihood_per_frame"] = aligned_score
-        if (
-            aligned_score < config.pyshiro_likelihood_floor
-            or aligned_score < baseline_score - config.pyshiro_likelihood_margin
-        ):
-            audit["reason"] = "pyshiro_likelihood_rejected"
+        audit["best_competing_likelihood_per_frame"] = best_competing
+        if not accepted:
+            audit["reason"] = "pyshiro_candidate_not_preferred"
             audits.append(audit)
             continue
         ranges = aligned.get("lines")
@@ -1052,6 +1239,25 @@ def _recover_lyric_gaps(
         replacements.setdefault(cue_id, []).extend(values)
     alignments.extend(neighbor_alignments)
     audits.extend(neighbor_audits)
+    phrase_replacements, phrase_alignments, phrase_audits = (
+        _recover_acoustic_phrase_neighbors(
+            job_dir,
+            cues,
+            singing_ids,
+            match,
+            config,
+            manifests,
+            manifest_path,
+            uv,
+            worker,
+            normalizer,
+            output_dir,
+        )
+    )
+    for cue_id, values in phrase_replacements.items():
+        replacements.setdefault(cue_id, []).extend(values)
+    alignments.extend(phrase_alignments)
+    audits.extend(phrase_audits)
     return replacements, alignments, audits
 
 
@@ -1081,13 +1287,42 @@ def _recover_take_neighbor_lyrics(
     replacements: dict[int, list[Cue]] = {}
     alignments: list[dict[str, object]] = []
     audits: list[dict[str, object]] = []
+    candidates: list[tuple[int, list[int], str, int]] = []
+    if takes:
+        first = takes[0][0]
+        if first.cue_index > 0 and first.line_start > 0:
+            position = first.cue_index - 1
+            start = max(0, first.line_start - config.lyric_neighbor_max_lines)
+            candidates.append(
+                (
+                    position,
+                    list(range(start, first.line_start)),
+                    "performance_prefix",
+                    first.take_index,
+                )
+            )
+        last = takes[-1][-1]
+        if last.cue_index + 1 < len(singing_ids):
+            position = last.cue_index + 1
+            cue = cues[singing_ids[position]]
+            line_ids = _select_suffix_neighbor_lines(
+                match.song,
+                last.line_end,
+                cue.text,
+                cue.end - cue.start,
+                config.lyric_neighbor_max_lines,
+                normalizer,
+            )
+            if line_ids:
+                candidates.append(
+                    (position, line_ids, "performance_suffix", last.take_index)
+                )
     for left_take, right_take in pairwise(takes):
         left = left_take[-1]
         right = right_take[0]
         positions = list(range(left.cue_index + 1, right.cue_index))
         if not positions:
             continue
-        candidates: list[tuple[int, list[int], str, int]] = []
         suffix_position = positions[0]
         suffix_cue = cues[singing_ids[suffix_position]]
         suffix_ids = _select_suffix_neighbor_lines(
@@ -1120,28 +1355,28 @@ def _recover_take_neighbor_lyrics(
                     (prefix_position, prefix_ids, "take_prefix", right.take_index)
                 )
 
-        for position, line_ids, route, take_index in candidates:
-            cue_id = singing_ids[position]
-            recovered, recovered_alignments, audit = _align_acoustic_neighbor(
-                cues[cue_id],
-                cue_id,
-                line_ids,
-                route,
-                take_index,
-                match,
-                config,
-                manifests,
-                manifest_path,
-                uv,
-                worker,
-                normalizer,
-                output_dir,
-            )
-            audits.append(audit)
-            if not recovered:
-                continue
-            replacements.setdefault(cue_id, []).extend(recovered)
-            alignments.extend(recovered_alignments)
+    for position, line_ids, route, take_index in candidates:
+        cue_id = singing_ids[position]
+        recovered, recovered_alignments, audit = _align_acoustic_neighbor(
+            cues[cue_id],
+            cue_id,
+            line_ids,
+            route,
+            take_index,
+            match,
+            config,
+            manifests,
+            manifest_path,
+            uv,
+            worker,
+            normalizer,
+            output_dir,
+        )
+        audits.append(audit)
+        if not recovered:
+            continue
+        replacements.setdefault(cue_id, []).extend(recovered)
+        alignments.extend(recovered_alignments)
     return replacements, alignments, audits
 
 
@@ -1180,6 +1415,126 @@ def _select_suffix_neighbor_lines(
     if not candidates:
         return []
     return max(candidates, key=lambda value: value[:2])[2]
+
+
+def _recover_acoustic_phrase_neighbors(
+    job_dir: Path,
+    cues: list[Cue],
+    singing_ids: list[int],
+    match: SongMatch,
+    config: SongIdentificationConfig,
+    manifests: list[dict[str, object]],
+    manifest_path: Path,
+    uv: str,
+    worker: Path,
+    normalizer: JapaneseNormalizer,
+    output_dir: Path,
+) -> tuple[
+    dict[int, list[Cue]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
+    analysis_path = job_dir / "audio-analysis.json"
+    if not analysis_path.is_file() or not match.anchors:
+        return {}, [], []
+    try:
+        payload = json.loads(analysis_path.read_text(encoding="utf-8"))
+        raw_phrases = payload["acoustic_phrases"]
+        phrases = [
+            value
+            for value in raw_phrases
+            if isinstance(value, dict) and value.get("route_alt") is False
+        ]
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+        return {}, [], []
+    if not phrases:
+        return {}, [], []
+
+    ordered = sorted(match.anchors, key=lambda value: (value.take_index, value.cue_index))
+    first = ordered[0]
+    last = ordered[-1]
+    first_cue_id = singing_ids[first.cue_index]
+    last_cue_id = singing_ids[last.cue_index]
+    first_cue = cues[first_cue_id]
+    last_cue = cues[last_cue_id]
+    candidates: list[tuple[dict[str, object], int, list[int], str, int]] = []
+    before = [
+        value
+        for value in phrases
+        if 0 <= first_cue.start - float(value.get("end", -1))
+        <= config.song_search_group_gap_seconds
+    ]
+    if before and first.line_start > 0:
+        phrase = max(before, key=lambda value: float(value["end"]))
+        line_start = max(0, first.line_start - config.lyric_neighbor_max_lines)
+        candidates.append(
+            (
+                phrase,
+                first_cue_id,
+                list(range(line_start, first.line_start)),
+                "acoustic_phrase_prefix",
+                first.take_index,
+            )
+        )
+    after = [
+        value
+        for value in phrases
+        if 0 <= float(value.get("start", -1)) - last_cue.end
+        <= config.song_search_group_gap_seconds
+    ]
+    if after and last.line_end < len(match.song.lines):
+        phrase = min(after, key=lambda value: float(value["start"]))
+        line_ids = _select_suffix_neighbor_lines(
+            match.song,
+            last.line_end,
+            "",
+            float(phrase["end"]) - float(phrase["start"]),
+            config.lyric_neighbor_max_lines,
+            normalizer,
+        )
+        if line_ids:
+            candidates.append(
+                (
+                    phrase,
+                    last_cue_id,
+                    line_ids,
+                    "acoustic_phrase_suffix",
+                    last.take_index,
+                )
+            )
+
+    replacements: dict[int, list[Cue]] = {}
+    alignments: list[dict[str, object]] = []
+    audits: list[dict[str, object]] = []
+    for phrase, cue_id, line_ids, route, take_index in candidates:
+        probe = Cue(
+            float(phrase["start"]),
+            float(phrase["end"]),
+            "",
+            cues[cue_id].speaker,
+            "singing",
+        )
+        recovered, recovered_alignments, audit = _align_acoustic_neighbor(
+            probe,
+            cue_id,
+            line_ids,
+            route,
+            take_index,
+            match,
+            config,
+            manifests,
+            manifest_path,
+            uv,
+            worker,
+            normalizer,
+            output_dir,
+        )
+        audits.append(audit)
+        if not recovered:
+            continue
+        replacements.setdefault(cue_id, []).extend(recovered)
+        alignments.extend(recovered_alignments)
+    return replacements, alignments, audits
 
 
 def _align_acoustic_neighbor(
@@ -1241,10 +1596,19 @@ def _align_acoustic_neighbor(
     if response is None:
         audit["reason"] = "pyshiro_neighbor_failed"
         return [], [], audit
-    likelihood = float(response.get("likelihood_per_frame", -1e9))
+    alternatives = [
+        value
+        for lines_value in _competing_line_sets(match.song, line_ids)
+        if (value := _run_pyshiro_lines(uv, worker, wav, lines_value, normalizer))
+        is not None
+    ]
+    accepted, likelihood, best_alternative = _pyshiro_likelihood_wins(
+        response, alternatives, config
+    )
     audit["likelihood_per_frame"] = likelihood
-    if likelihood < config.pyshiro_likelihood_floor:
-        audit["reason"] = "pyshiro_likelihood_rejected"
+    audit["best_competing_likelihood_per_frame"] = best_alternative
+    if not accepted:
+        audit["reason"] = "pyshiro_candidate_not_preferred"
         return [], [], audit
     ranges = response.get("lines")
     units_by_line = response.get("units")
@@ -1407,6 +1771,42 @@ def _run_pyshiro_lines(
     return response if response.get("ok") is True else None
 
 
+def _pyshiro_likelihood_wins(
+    candidate: dict[str, object],
+    alternatives: list[dict[str, object]],
+    config: SongIdentificationConfig,
+) -> tuple[bool, float, float | None]:
+    score = float(candidate.get("likelihood_per_frame", -1e9))
+    alternative_scores = [
+        float(value.get("likelihood_per_frame", -1e9)) for value in alternatives
+    ]
+    best_alternative = max(alternative_scores) if alternative_scores else None
+    accepted = score >= config.pyshiro_likelihood_floor and (
+        best_alternative is None
+        or score >= best_alternative + config.pyshiro_likelihood_margin
+    )
+    return accepted, score, best_alternative
+
+
+def _competing_line_sets(
+    song: LibrarySong, line_ids: list[int], *, minimum: int = 2
+) -> list[list[LyricLine]]:
+    width = len(line_ids)
+    if width <= 0:
+        return []
+    candidates: list[tuple[int, list[LyricLine]]] = []
+    target_start = line_ids[0]
+    for start in range(0, len(song.lines) - width + 1):
+        ids = list(range(start, start + width))
+        if ids == line_ids:
+            continue
+        candidates.append(
+            (abs(start - target_start), list(song.lines[start : start + width]))
+        )
+    candidates.sort(key=lambda item: item[0])
+    return [lines for _distance, lines in candidates[:minimum]]
+
+
 def _parse_worker_json_output(output: str) -> dict[str, object]:
     candidates = [output.strip()]
     candidates.extend(line.strip() for line in reversed(output.splitlines()))
@@ -1526,7 +1926,20 @@ def _align_match_with_pyshiro(
                 }
             )
             continue
-        lines = match.song.lines[anchor.line_start : anchor.line_end]
+        active_ratio = _vocal_active_ratio(wav)
+        if active_ratio < config.lyric_gap_vocal_active_ratio:
+            audits.append(
+                {
+                    "cue_id": cue_id,
+                    "take_index": anchor.take_index,
+                    "status": "rejected",
+                    "reason": "insufficient_vocal_activity",
+                    "vocal_active_ratio": round(active_ratio, 6),
+                }
+            )
+            continue
+        line_ids = list(range(anchor.line_start, anchor.line_end))
+        lines = [match.song.lines[line_id] for line_id in line_ids]
         display_units = [
             normalizer.display_units(line.text, line.reading) for line in lines
         ]
@@ -1579,6 +1992,27 @@ def _align_match_with_pyshiro(
                 }
             )
             continue
+        competing = [
+            value
+            for lines_value in _competing_line_sets(match.song, line_ids)
+            if (value := _run_pyshiro_lines(uv, worker, wav, lines_value, normalizer))
+            is not None
+        ]
+        accepted, likelihood, best_competing = _pyshiro_likelihood_wins(
+            response, competing, config
+        )
+        if not accepted:
+            audits.append(
+                {
+                    "cue_id": cue_id,
+                    "take_index": anchor.take_index,
+                    "status": "rejected",
+                    "reason": "pyshiro_candidate_not_preferred",
+                    "likelihood_per_frame": likelihood,
+                    "best_competing_likelihood_per_frame": best_competing,
+                }
+            )
+            continue
         ranges = response.get("lines")
         owned_units = response.get("units")
         if not isinstance(ranges, list) or not ranges:
@@ -1591,7 +2025,6 @@ def _align_match_with_pyshiro(
                 }
             )
             continue
-        line_ids = list(range(anchor.line_start, anchor.line_end))
         if (
             len(ranges) != len(line_ids)
             or not all(isinstance(value, list) and len(value) == 2 for value in ranges)
@@ -1622,6 +2055,16 @@ def _align_match_with_pyshiro(
                 if isinstance(unit, dict)
             )
             if not units:
+                line_ranges_values = []
+                break
+            if any(
+                unit.end <= unit.start
+                or unit.end - unit.start > config.lyric_neighbor_max_unit_seconds
+                for unit in units
+            ):
+                line_ranges_values = []
+                break
+            if line_ranges_values and units[0].start < line_ranges_values[-1][2] - 1e-3:
                 line_ranges_values = []
                 break
             line_ranges_values.append(
@@ -1668,7 +2111,9 @@ def _align_match_with_pyshiro(
                     }
                     for line_id, start, end, units in line_ranges
                 ],
-                "likelihood_per_frame": response.get("likelihood_per_frame"),
+                "likelihood_per_frame": likelihood,
+                "best_competing_likelihood_per_frame": best_competing,
+                "vocal_active_ratio": round(active_ratio, 6),
                 "phonemes": response.get("phonemes"),
             }
         )
@@ -1679,7 +2124,9 @@ def _align_match_with_pyshiro(
     return timings, audits
 
 
-def group_singing_episodes(cues: list[Cue], maximum_gap: float) -> list[SongEpisode]:
+def group_song_search_groups(
+    cues: list[Cue], maximum_gap: float
+) -> list[SongSearchGroup]:
     singing = [(index, cue) for index, cue in enumerate(cues) if cue.kind == "singing"]
     if not singing:
         return []
@@ -1690,10 +2137,10 @@ def group_singing_episodes(cues: list[Cue], maximum_gap: float) -> list[SongEpis
         else:
             groups.append([item])
     return [
-        SongEpisode(
+        SongSearchGroup(
             group[0][1].start,
             group[-1][1].end,
-            tuple(range(group[0][0], group[-1][0] + 1)),
+            tuple(item[0] for item in group),
         )
         for group in groups
     ]
@@ -1701,13 +2148,13 @@ def group_singing_episodes(cues: list[Cue], maximum_gap: float) -> list[SongEpis
 
 def collect_ocr_candidates(
     video: Path,
-    episode: SongEpisode,
+    group: SongSearchGroup,
     frame_dir: Path,
     config: SongIdentificationConfig,
     ocr: Any,
 ) -> list[OCRCandidate]:
-    start = max(0.0, episode.start - config.seconds_before_start)
-    end = episode.start + config.seconds_after_start
+    start = max(0.0, group.start - config.seconds_before_start)
+    end = group.start + config.seconds_after_start
     frames = _extract_frames(
         video, frame_dir, start, end, config.sample_interval_seconds
     )
@@ -1765,8 +2212,10 @@ def apply_lyric_corrections(
         if report.get("confidence") not in {"high", "medium"}:
             continue
         alignments = report.get("alignments", [])
-        episode = report.get("episode", {})
-        raw_allowed = episode.get("cue_ids", []) if isinstance(episode, dict) else []
+        search_group = report.get("search_group", {})
+        raw_allowed = (
+            search_group.get("cue_ids", []) if isinstance(search_group, dict) else []
+        )
         allowed_ids = (
             set(raw_allowed)
             if isinstance(raw_allowed, (list, tuple))
@@ -1944,39 +2393,6 @@ def _extract_frames(
     return sorted(directory.glob("frame-*.jpg"))
 
 
-def _episode_evidence(
-    cues: list[Cue],
-    episode: SongEpisode,
-    metadata: dict[str, object],
-    candidates: list[OCRCandidate],
-) -> dict[str, object]:
-    preceding = [
-        {"id": i, "start": cue.start, "text": cue.text}
-        for i, cue in enumerate(cues)
-        if cue.kind != "singing" and episode.start - 45 <= cue.end <= episode.start + 5
-    ]
-    singing = [
-        {
-            "id": i,
-            "start": cues[i].start,
-            "end": cues[i].end,
-            "kind": cues[i].kind,
-            "text": cues[i].text,
-        }
-        for i in episode.cue_ids
-    ]
-    return {
-        "video": {
-            key: metadata.get(key)
-            for key in ("title", "description", "channel", "uploader")
-            if metadata.get(key)
-        },
-        "ocr": [asdict(item) for item in candidates[:30]],
-        "announcement_asr": preceding[-20:],
-        "singing_asr": singing,
-    }
-
-
 class _WebTools:
     def __init__(self, config: SongIdentificationConfig):
         self.config = config
@@ -2129,14 +2545,14 @@ def _signature(
 
 def _ocr_signature(
     video: Path,
-    episodes: list[SongEpisode],
+    groups: list[SongSearchGroup],
     config: SongIdentificationConfig,
 ) -> str:
     stat = video.stat()
     payload = {
         "version": _CACHE_VERSION,
         "video": [stat.st_size, stat.st_mtime_ns],
-        "episodes": [asdict(episode) for episode in episodes],
+        "search_groups": [asdict(group) for group in groups],
         "ocr": {
             key: value
             for key, value in asdict(config).items()
@@ -2160,7 +2576,7 @@ def _ocr_signature(
 
 
 def _load_ocr_cache(
-    path: Path, signature: str, episode_count: int
+    path: Path, signature: str, group_count: int
 ) -> list[list[OCRCandidate]] | None:
     if not path.is_file():
         return None
@@ -2172,16 +2588,16 @@ def _load_ocr_cache(
         ):
             return None
         groups = value["candidate_sets"]
-        if not isinstance(groups, list) or len(groups) != episode_count:
+        if not isinstance(groups, list) or len(groups) != group_count:
             return None
         candidates = [
             [OCRCandidate(**item) for item in group]
             for group in groups
             if isinstance(group, list)
         ]
-        if len(candidates) != episode_count:
+        if len(candidates) != group_count:
             return None
-        logging.info("using song OCR cache with %d episodes", len(candidates))
+        logging.info("using song OCR cache with %d search groups", len(candidates))
         return candidates
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         logging.warning("ignoring unreadable song OCR cache %s: %s", path, exc)
@@ -2223,8 +2639,18 @@ def _load_cache(
         if not isinstance(raw_corrected, list) or not isinstance(reports, list):
             return None
         corrected = [cue_from_mapping(item) for item in raw_corrected]
+        spans = tuple(
+            VerifiedLyricSpan(
+                **{
+                    **item,
+                    "lyric_line_ids": tuple(item.get("lyric_line_ids", ())),
+                }
+            )
+            for item in value.get("verified_lyric_spans", [])
+            if isinstance(item, dict)
+        )
         logging.info("using song identification cache with %d reports", len(reports))
-        return SongIdentificationResult(corrected, reports)
+        return SongIdentificationResult(corrected, reports, spans)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         logging.warning(
             "ignoring unreadable song identification cache %s: %s", path, exc

@@ -49,9 +49,7 @@ class ConfigTests(unittest.TestCase):
             self.assertFalse(config.audio_analysis.debug_audio_artifacts)
             self.assertEqual(config.audio_analysis.initial_analysis_concurrency, 1)
             self.assertEqual(config.audio_analysis.diarization_backend, "pyannote")
-            self.assertEqual(
-                config.audio_analysis.overlap_conditioned_asr_seconds, 0.5
-            )
+            self.assertEqual(config.audio_analysis.overlap_conditioned_asr_seconds, 0.5)
             self.assertEqual(config.audio_analysis.conditioned_asr_backend, "dicow")
             self.assertEqual(config.audio_analysis.conditioned_asr_batch_size, 4)
             self.assertEqual(config.audio_analysis.moss_window_seconds, 480.0)
@@ -82,17 +80,16 @@ class ConfigTests(unittest.TestCase):
             )
             self.assertEqual(config.audio_analysis.singing_threshold, 0.015)
             self.assertEqual(config.audio_analysis.singing_vocal_threshold, 0.15)
-            self.assertEqual(config.audio_analysis.singing_speech_bgm_coverage, 0.35)
-            self.assertEqual(config.audio_analysis.singing_ambiguous_min_seconds, 15.0)
             self.assertEqual(config.audio_analysis.singing_smoothing_windows, 3)
-            self.assertEqual(config.audio_analysis.singing_release_seconds, 15.0)
-            self.assertEqual(config.audio_analysis.singing_min_phrase_seconds, 30.0)
             self.assertEqual(config.audio_analysis.singing_asr_target_seconds, 10.0)
             self.assertEqual(config.audio_analysis.singing_asr_min_seconds, 6.0)
             self.assertEqual(config.audio_analysis.singing_asr_max_seconds, 15.0)
             self.assertEqual(config.audio_analysis.singing_asr_search_seconds, 4.0)
             self.assertFalse(config.song_identification.enabled)
             self.assertEqual(config.song_identification.device, "gpu:0")
+            self.assertEqual(
+                config.song_identification.song_search_group_gap_seconds, 35.0
+            )
             self.assertEqual(config.song_identification.lyric_gap_recheck_seconds, 20.0)
             self.assertEqual(
                 config.song_identification.lyric_gap_vocal_active_ratio, 0.08
@@ -105,9 +102,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.segmentation.request_batch_chars, 3000)
             self.assertEqual(config.llm.max_concurrency, 16)
             self.assertFalse(config.llm.local_server_enabled)
-            self.assertEqual(
-                config.llm.local_translation_model, "facebook/m2m100_418M"
-            )
+            self.assertEqual(config.llm.local_translation_model, "facebook/m2m100_418M")
             self.assertEqual(config.llm.local_translation_device, "cpu")
             self.assertEqual(config.render.font_size_ratio, 0.066)
             self.assertEqual(config.render.portrait_font_size_ratio, 0.077)
@@ -132,9 +127,7 @@ class ConfigTests(unittest.TestCase):
     def test_rejects_invalid_download_fragment_concurrency(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.toml"
-            path.write_text(
-                "[download]\nconcurrent_fragments = 0\n", encoding="utf-8"
-            )
+            path.write_text("[download]\nconcurrent_fragments = 0\n", encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, "concurrent_fragments"):
                 load_config(path)
 
@@ -162,9 +155,7 @@ class ConfigTests(unittest.TestCase):
     def test_rejects_empty_local_translation_model(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.toml"
-            path.write_text(
-                '[llm]\nlocal_translation_model = ""\n', encoding="utf-8"
-            )
+            path.write_text('[llm]\nlocal_translation_model = ""\n', encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, "local_translation_model"):
                 load_config(path)
 

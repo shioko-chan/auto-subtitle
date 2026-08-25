@@ -80,13 +80,9 @@ class AudioAnalysisConfig:
     singing_music_threshold: float = 0.05
     singing_speech_takeover_threshold: float = 0.5
     singing_vocal_threshold: float = 0.15
-    singing_speech_bgm_coverage: float = 0.35
-    singing_ambiguous_min_seconds: float = 15.0
     singing_merge_gap_seconds: float = 1.5
     singing_smoothing_windows: int = 3
-    singing_release_seconds: float = 15.0
     singing_phrase_silence_seconds: float = 0.45
-    singing_min_phrase_seconds: float = 30.0
     singing_asr_target_seconds: float = 10.0
     singing_asr_min_seconds: float = 6.0
     singing_asr_max_seconds: float = 15.0
@@ -116,7 +112,7 @@ class SongIdentificationConfig:
     seconds_before_start: float = 30.0
     seconds_after_start: float = 15.0
     sample_interval_seconds: float = 1.0
-    song_gap_seconds: float = 35.0
+    song_search_group_gap_seconds: float = 35.0
     minimum_ocr_score: float = 0.45
     minimum_persistent_frames: int = 2
     max_search_results: int = 5
@@ -130,7 +126,7 @@ class SongIdentificationConfig:
     lyric_gap_recheck_seconds: float = 20.0
     lyric_gap_vocal_active_ratio: float = 0.08
     pyshiro_likelihood_floor: float = -30.0
-    pyshiro_likelihood_margin: float = 2.0
+    pyshiro_likelihood_margin: float = 0.2
     lyric_neighbor_max_lines: int = 12
     lyric_neighbor_min_coverage: float = 0.45
     lyric_neighbor_max_unit_seconds: float = 2.0
@@ -503,14 +499,6 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError(
             "audio_analysis.singing_vocal_threshold must be between 0 and 1"
         )
-    if not 0 <= analysis.singing_speech_bgm_coverage <= 1:
-        raise ConfigError(
-            "audio_analysis.singing_speech_bgm_coverage must be between 0 and 1"
-        )
-    if analysis.singing_ambiguous_min_seconds <= 0:
-        raise ConfigError(
-            "audio_analysis.singing_ambiguous_min_seconds must be positive"
-        )
     if analysis.singing_merge_gap_seconds < 0:
         raise ConfigError("audio_analysis.singing_merge_gap_seconds cannot be negative")
     if (
@@ -520,14 +508,10 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError(
             "audio_analysis.singing_smoothing_windows must be a positive odd integer"
         )
-    if analysis.singing_release_seconds < 0:
-        raise ConfigError("audio_analysis.singing_release_seconds cannot be negative")
     if analysis.singing_phrase_silence_seconds <= 0:
         raise ConfigError(
             "audio_analysis.singing_phrase_silence_seconds must be positive"
         )
-    if analysis.singing_min_phrase_seconds <= 0:
-        raise ConfigError("audio_analysis.singing_min_phrase_seconds must be positive")
     if analysis.singing_asr_min_seconds <= 0:
         raise ConfigError("audio_analysis.singing_asr_min_seconds must be positive")
     if not (
@@ -596,8 +580,10 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError(
             "song_identification.sample_interval_seconds must be positive"
         )
-    if songs.song_gap_seconds < 0:
-        raise ConfigError("song_identification.song_gap_seconds cannot be negative")
+    if songs.song_search_group_gap_seconds < 0:
+        raise ConfigError(
+            "song_identification.song_search_group_gap_seconds cannot be negative"
+        )
     if not 0 <= songs.minimum_ocr_score <= 1:
         raise ConfigError(
             "song_identification.minimum_ocr_score must be between 0 and 1"
