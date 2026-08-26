@@ -24,24 +24,31 @@ from subtitle_pipeline.subtitles import Cue, TimedTextUnit
 
 
 class MediaDownloadTests(unittest.TestCase):
-    def test_downloads_video_and_metadata_without_youtube_subtitles(self):
+    def test_downloads_video_metadata_and_temporary_chat_replay(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
 
-            def fake_run(_command):
+            def fake_run(command):
                 (directory / "source.info.json").write_text(
                     json.dumps({"title": "Video", "language": "ja"}),
                     encoding="utf-8",
                 )
                 (directory / "source.mp4").write_bytes(b"video")
+                if "live_chat" in command:
+                    (directory / "source.live_chat.json").write_text(
+                        "chat", encoding="utf-8"
+                    )
 
             def find_runtime(name):
                 return "/usr/bin/node" if name == "node" else None
 
-            with patch(
-                "subtitle_pipeline.media.require_command", return_value="/venv/bin/yt-dlp"
-            ), patch("subtitle_pipeline.media.run", side_effect=fake_run) as run, patch(
-                "subtitle_pipeline.media.shutil.which", side_effect=find_runtime
+            with (
+                patch(
+                    "subtitle_pipeline.media.require_command",
+                    return_value="/venv/bin/yt-dlp",
+                ),
+                patch("subtitle_pipeline.media.run", side_effect=fake_run) as run,
+                patch("subtitle_pipeline.media.shutil.which", side_effect=find_runtime),
             ):
                 result = download_youtube(
                     "https://www.youtube.com/watch?v=test",
@@ -51,10 +58,14 @@ class MediaDownloadTests(unittest.TestCase):
 
             self.assertEqual(result.video, directory / "source.mp4")
             self.assertEqual(result.metadata["title"], "Video")
-            run.assert_called_once()
-            video_command = run.call_args.args[0]
+            self.assertEqual(result.chat_replay, directory / "source.live_chat.json")
+            self.assertEqual(run.call_count, 2)
+            video_command = run.call_args_list[0].args[0]
+            chat_command = run.call_args_list[1].args[0]
             self.assertNotIn("--write-subs", video_command)
             self.assertNotIn("--write-auto-subs", video_command)
+            self.assertIn("--write-subs", chat_command)
+            self.assertIn("live_chat", chat_command)
             self.assertIn("node:/usr/bin/node", video_command)
             self.assertIn(DownloadConfig().video_format, video_command)
             fragments_index = video_command.index("--concurrent-fragments")
@@ -71,13 +82,14 @@ class MediaDownloadTests(unittest.TestCase):
                 (directory / "source.mp4").write_bytes(b"video")
                 (directory / "source.en.srt").write_text("subtitle", encoding="utf-8")
 
-            with patch(
-                "subtitle_pipeline.media.require_command", return_value="yt-dlp"
-            ), patch("subtitle_pipeline.media.run", side_effect=fake_run) as run:
+            with (
+                patch("subtitle_pipeline.media.require_command", return_value="yt-dlp"),
+                patch("subtitle_pipeline.media.run", side_effect=fake_run) as run,
+            ):
                 result = download_youtube(
                     "https://youtu.be/test",
                     directory,
-                    DownloadConfig(js_runtime=None),
+                    DownloadConfig(js_runtime=None, download_chat_replay=False),
                 )
 
             self.assertEqual(result.video, directory / "source.mp4")
@@ -92,16 +104,21 @@ class SubtitleRenderTests(unittest.TestCase):
             subtitle = directory / "translated.srt"
             destination = directory / "rendered.mp4"
             video.write_bytes(b"video")
-            subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\n字幕\n", encoding="utf-8")
-            with patch(
-                "subtitle_pipeline.media.subtitle_layout",
-                return_value=SubtitleLayout(1920, 1080, 71, 144, 54, 3, 22, 27),
-            ), patch(
-                "subtitle_pipeline.media._render_subtitles_cuda",
-                side_effect=CommandError("unsupported codec"),
-            ), patch(
-                "subtitle_pipeline.media.require_command", return_value="ffmpeg"
-            ), patch("subtitle_pipeline.media.run") as run:
+            subtitle.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\n字幕\n", encoding="utf-8"
+            )
+            with (
+                patch(
+                    "subtitle_pipeline.media.subtitle_layout",
+                    return_value=SubtitleLayout(1920, 1080, 71, 144, 54, 3, 22, 27),
+                ),
+                patch(
+                    "subtitle_pipeline.media._render_subtitles_cuda",
+                    side_effect=CommandError("unsupported codec"),
+                ),
+                patch("subtitle_pipeline.media.require_command", return_value="ffmpeg"),
+                patch("subtitle_pipeline.media.run") as run,
+            ):
                 result = render_subtitles(
                     video,
                     subtitle,
@@ -122,10 +139,13 @@ class SubtitleRenderTests(unittest.TestCase):
             video.write_bytes(b"video")
             subtitle.write_text("ass", encoding="utf-8")
 
-            with patch(
-                "subtitle_pipeline.media.require_command",
-                side_effect=["ass-cuda-render", "ffmpeg"],
-            ), patch("subtitle_pipeline.media.run") as run:
+            with (
+                patch(
+                    "subtitle_pipeline.media.require_command",
+                    side_effect=["ass-cuda-render", "ffmpeg"],
+                ),
+                patch("subtitle_pipeline.media.run") as run,
+            ):
                 result = _render_subtitles_cuda(
                     video,
                     subtitle,
@@ -177,14 +197,14 @@ class SubtitleRenderTests(unittest.TestCase):
         self.assertTrue(all("\n" not in cue.text for cue in result))
 
     def test_rendered_lines_drop_plain_terminal_punctuation(self):
-        text = '前半句，后半句。真的吗？太好了！等等...他说：“好的，”'
+        text = "前半句，后半句。真的吗？太好了！等等...他说：“好的，”"
         segments = [
             "前半句，",
             "后半句。",
             "真的吗？",
             "太好了！",
             "等等...",
-            '他说：“好的，”',
+            "他说：“好的，”",
         ]
         result = _layout_subtitle_cues(
             [Cue(0, 12, text)],
@@ -194,7 +214,7 @@ class SubtitleRenderTests(unittest.TestCase):
 
         self.assertEqual(
             [cue.text for cue in result],
-            ["前半句", "后半句", "真的吗？", "太好了！", "等等...", '他说：“好的”'],
+            ["前半句", "后半句", "真的吗？", "太好了！", "等等...", "他说：“好的”"],
         )
 
     def test_wraps_oversized_cue_into_two_balanced_lines(self):
@@ -233,7 +253,8 @@ class SubtitleRenderTests(unittest.TestCase):
         self.assertIn("PlayResY: 1920", content)
         self.assertIn(
             "Style: Default,Noto Sans CJK SC,48,&H00FFFFFF,&H000000FF,"
-            "&H00000000,&H00000000,", content
+            "&H00000000,&H00000000,",
+            content,
         )
         self.assertIn(",2,1,1,96,1", content)
         self.assertNotIn(r"\fs", content)
@@ -261,8 +282,7 @@ class SubtitleRenderTests(unittest.TestCase):
             content,
         )
         self.assertIn(
-            "Dialogue: 0,0:00:01.00,0:00:02.00,Japanese,,0,0,0,,"
-            "おはようございます",
+            "Dialogue: 0,0:00:01.00,0:00:02.00,Japanese,,0,0,0,,おはようございます",
             content,
         )
 
@@ -276,9 +296,7 @@ class SubtitleRenderTests(unittest.TestCase):
                         2,
                         "早上好",
                         source_text="おはよう。",
-                        source_units=(
-                            TimedTextUnit("おはよう。", 1.0, 1.6),
-                        ),
+                        source_units=(TimedTextUnit("おはよう。", 1.0, 1.6),),
                     )
                 ],
                 path,
@@ -506,9 +524,10 @@ class SubtitleRenderTests(unittest.TestCase):
             ),
             "",
         )
-        with patch(
-            "subtitle_pipeline.media.require_command", return_value="ffprobe"
-        ), patch("subtitle_pipeline.media.subprocess.run", return_value=response):
+        with (
+            patch("subtitle_pipeline.media.require_command", return_value="ffprobe"),
+            patch("subtitle_pipeline.media.subprocess.run", return_value=response),
+        ):
             self.assertEqual(_video_dimensions(Path("video.mp4")), (1080, 1920))
 
 

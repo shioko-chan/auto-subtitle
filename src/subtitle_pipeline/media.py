@@ -8,6 +8,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .chat_context import remove_youtube_chat_files
 from .commands import CommandError, require_command, run
 from .config import DownloadConfig, RenderConfig
 from .speakers import CharacterStyle
@@ -21,11 +22,9 @@ from .subtitles import (
 from .telemetry import stage_metrics
 
 _RENDER_TERMINAL_PLAIN_PUNCTUATION_RE = re.compile(
-    r'''[，、；：。．,;:]+(?=["'”’」』）)\]]*$)'''
+    r"""[，、；：。．,;:]+(?=["'”’」』）)\]]*$)"""
 )
-_RENDER_TERMINAL_ASCII_PERIOD_RE = re.compile(
-    r'''(?<!\.)\.(?=["'”’」』）)\]]*$)'''
-)
+_RENDER_TERMINAL_ASCII_PERIOD_RE = re.compile(r"""(?<!\.)\.(?=["'”’」』）)\]]*$)""")
 _WRAP_PUNCTUATION = frozenset("，、；：。！？!?…—,;:")
 _SINGING_GRADIENT_MARKER = "#F9A8D4"
 _KARAOKE_HIGHLIGHT_COLOR = "#AFFF5C"
@@ -35,6 +34,7 @@ _KARAOKE_HIGHLIGHT_COLOR = "#AFFF5C"
 class DownloadResult:
     video: Path
     metadata: dict[str, object]
+    chat_replay: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -60,7 +60,9 @@ class RenderCue:
     source_units: tuple[TimedTextUnit, ...] = ()
 
 
-def download_youtube(url: str, directory: Path, config: DownloadConfig) -> DownloadResult:
+def download_youtube(
+    url: str, directory: Path, config: DownloadConfig
+) -> DownloadResult:
     yt_dlp = require_command("yt-dlp")
     directory.mkdir(parents=True, exist_ok=True)
     output = directory / "source.%(ext)s"
@@ -81,6 +83,12 @@ def download_youtube(url: str, directory: Path, config: DownloadConfig) -> Downl
     ]
     run(video_command)
 
+    chat_replay = (
+        _download_youtube_chat_replay(url, directory, config, common)
+        if config.download_chat_replay
+        else None
+    )
+
     info_path = directory / "source.info.json"
     if not info_path.exists():
         raise RuntimeError("yt-dlp completed but did not create source.info.json")
@@ -96,7 +104,49 @@ def download_youtube(url: str, directory: Path, config: DownloadConfig) -> Downl
     video = max(candidates, key=lambda path: path.stat().st_size)
 
     logging.info("downloaded video: %s", video)
-    return DownloadResult(video, metadata)
+    return DownloadResult(video, metadata, chat_replay)
+
+
+def _download_youtube_chat_replay(
+    url: str,
+    directory: Path,
+    config: DownloadConfig,
+    common: list[str] | None = None,
+) -> Path | None:
+    expected = directory / "source.live_chat.json"
+    if expected.is_file():
+        return expected
+    command = [
+        *(
+            common
+            or [
+                require_command("yt-dlp"),
+                "--no-playlist",
+                *_runtime_arguments(config),
+                *_authentication_arguments(config),
+            ]
+        ),
+        "--ignore-no-formats-error",
+        "--no-progress",
+        "--skip-download",
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-langs",
+        "live_chat",
+        "--output",
+        str(directory / "source.%(ext)s"),
+        url,
+    ]
+    try:
+        run(command)
+    except CommandError as exc:
+        logging.warning("current-video chat replay unavailable: %s", exc)
+        remove_youtube_chat_files(directory)
+        return None
+    if expected.is_file():
+        return expected
+    remove_youtube_chat_files(directory)
+    return None
 
 
 def _authentication_arguments(config: DownloadConfig) -> list[str]:
@@ -290,9 +340,7 @@ def subtitle_layout(video: Path, config: RenderConfig) -> SubtitleLayout:
 
 def _adaptive_font_size(width: int, height: int, config: RenderConfig) -> int:
     ratio = (
-        config.portrait_font_size_ratio
-        if height > width
-        else config.font_size_ratio
+        config.portrait_font_size_ratio if height > width else config.font_size_ratio
     )
     return max(
         config.min_font_size,
@@ -300,9 +348,7 @@ def _adaptive_font_size(width: int, height: int, config: RenderConfig) -> int:
     )
 
 
-def _adaptive_horizontal_margin(
-    width: int, height: int, config: RenderConfig
-) -> int:
+def _adaptive_horizontal_margin(width: int, height: int, config: RenderConfig) -> int:
     ratio = (
         config.portrait_margin_horizontal_ratio
         if height > width
@@ -377,7 +423,9 @@ def _layout_subtitle_cues(
 ) -> list[RenderCue]:
     hard_limit = max_line_units if hard_max_line_units is None else hard_max_line_units
     if hard_limit < max_line_units:
-        raise ValueError("hard line limit cannot be smaller than the preferred line limit")
+        raise ValueError(
+            "hard line limit cannot be smaller than the preferred line limit"
+        )
     segments_by_id = semantic_segments or {}
     rendered: list[RenderCue] = []
     for index, cue in enumerate(cues):
@@ -467,7 +515,10 @@ def _wrap_two_lines(text: str, maximum_units: float) -> str:
         raise ValueError("subtitle cannot be balanced into two lines")
     _, _, _, _, left, right = min(candidates)
     return "\n".join(
-        (_strip_render_terminal_punctuation(left), _strip_render_terminal_punctuation(right))
+        (
+            _strip_render_terminal_punctuation(left),
+            _strip_render_terminal_punctuation(right),
+        )
     )
 
 
@@ -550,7 +601,9 @@ def _write_ass(
             continue
         active = [(end, lane) for end, lane in active if end > cue.start]
         occupied = {lane for _end, lane in active}
-        lane = next(index for index in range(len(occupied) + 1) if index not in occupied)
+        lane = next(
+            index for index in range(len(occupied) + 1) if index not in occupied
+        )
         active.append((cue.end, lane))
         speaker = getattr(cue, "speaker", None)
         is_singing = getattr(cue, "kind", "speech") == "singing"
@@ -587,15 +640,13 @@ def _write_ass(
                 else (
                     rf"{{\1c&HFFFFFF&"
                     rf"\3c{_ass_override_color(_SINGING_GRADIENT_MARKER)}"
-                    rf"\3a&H01&}}"
-                    + _decorate_singing_text(escaped_source_text)
+                    rf"\3a&H01&}}" + _decorate_singing_text(escaped_source_text)
                 )
             )
             event_text = (
                 rf"{{\1c&HFFFFFF&"
                 rf"\3c{_ass_override_color(_SINGING_GRADIENT_MARKER)}"
-                rf"\3a&H01&}}"
-                + _decorate_singing_text(event_text)
+                rf"\3a&H01&}}" + _decorate_singing_text(event_text)
             )
         if source_text:
             source_lines = max(1, len(source_text.splitlines()))
@@ -690,9 +741,7 @@ def _karaoke_text(
     ]
     final_offset = max(offsets[-1], round((cue_end - cue_start) * 100))
     outline_override = (
-        rf"\3c{_ass_override_color(outline_color)}\3a&H01&"
-        if outline_color
-        else ""
+        rf"\3c{_ass_override_color(outline_color)}\3a&H01&" if outline_color else ""
     )
     neutral = rf"{{\1c&HFFFFFF&\2c&HFFFFFF&{outline_override}}}"
     karaoke = (

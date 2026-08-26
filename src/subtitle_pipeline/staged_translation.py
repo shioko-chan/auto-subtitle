@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from .config import LLMConfig, SegmentationConfig
+from .fan_knowledge import KnowledgeHit
 from .joint_translation import (
     _best_split,
     _contains_kana,
@@ -162,6 +163,8 @@ def run_fixed_translation(
     maximum_units: float,
     honorific_rules: str,
     cache_path: Path | None,
+    retrieve_knowledge: Callable[[list[Cue], str], list[KnowledgeHit]] | None = None,
+    retrieve_chat: Callable[[list[Cue]], str] | None = None,
 ) -> list[Cue]:
     signature = _signature(
         "translation",
@@ -220,6 +223,9 @@ def run_fixed_translation(
             replacements,
             maximum_units,
             honorific_rules,
+            segmentation,
+            retrieve_knowledge,
+            retrieve_chat,
         )
 
     if groups:
@@ -454,11 +460,24 @@ def _translate_resilient(
         [str, Exception, object, dict[str, object] | None, object], None
     ],
     local_translate: Callable[[str], str],
-    context: dict[str, object],
+    base_context: dict[str, object],
     replacements: tuple[tuple[str, str], ...],
     maximum_units: float,
     honorific_rules: str,
+    segmentation: SegmentationConfig,
+    retrieve_knowledge: Callable[[list[Cue], str], list[KnowledgeHit]] | None,
+    retrieve_chat: Callable[[list[Cue]], str] | None,
 ) -> dict[int, str]:
+    selected = [cues[cue_id] for cue_id in ids]
+    chat_evidence = retrieve_chat(selected) if retrieve_chat else ""
+    context = base_context
+    if retrieve_knowledge is not None:
+        hits = retrieve_knowledge(selected, chat_evidence)
+        if hits:
+            context = {
+                **base_context,
+                "fan_knowledge": [hit.prompt_value() for hit in hits],
+            }
     try:
         return _request_translation(
             ids,
@@ -475,6 +494,8 @@ def _translate_resilient(
             replacements,
             maximum_units,
             honorific_rules,
+            segmentation,
+            chat_evidence,
         )
     except Exception as exc:
         if is_nontransient(exc) or retry_delay(exc, 1) is not None:
@@ -504,10 +525,13 @@ def _translate_resilient(
                 is_nontransient,
                 log_invalid_response,
                 local_translate,
-                context,
+                base_context,
                 replacements,
                 maximum_units,
                 honorific_rules,
+                segmentation,
+                retrieve_knowledge,
+                retrieve_chat,
             ),
             **_translate_resilient(
                 ids[middle:],
@@ -520,10 +544,13 @@ def _translate_resilient(
                 is_nontransient,
                 log_invalid_response,
                 local_translate,
-                context,
+                base_context,
                 replacements,
                 maximum_units,
                 honorific_rules,
+                segmentation,
+                retrieve_knowledge,
+                retrieve_chat,
             ),
         }
 
@@ -545,6 +572,8 @@ def _request_translation(
     replacements: tuple[tuple[str, str], ...],
     maximum_units: float,
     honorific_rules: str,
+    segmentation: SegmentationConfig,
+    chat_evidence: str,
 ) -> dict[int, str]:
     previous_error: Exception | None = None
     transient_attempts = 0
@@ -553,17 +582,16 @@ def _request_translation(
         selected = [cues[value] for value in ids]
         start = min(cue.start for cue in selected)
         end = max(cue.end for cue in selected)
-        dialogue = [
-            cue
-            for cue in cues
-            if cue.end >= start - 5.0 and cue.start <= end + 5.0 and cue not in selected
-        ]
+        dialogue = _translation_dialogue_context(
+            cues, selected, start, end, segmentation
+        )
         prompt = render_user_prompt(
             _TRANSLATE_PROMPT,
             TARGET_LANGUAGE=llm.target_language,
             MAXIMUM_UNITS=f"{maximum_units:.3f}",
             HONORIFIC_TRANSLATION_RULES=honorific_rules,
             REFERENCE_TEXT=_reference_text(context),
+            CHAT_EVIDENCE=chat_evidence or "(none)",
             DIALOGUE_CONTEXT="\n".join(
                 f"<{cue.speaker or 'unknown'}>{_escape(cue.text)}" for cue in dialogue
             )
@@ -756,6 +784,35 @@ def _body(llm: LLMConfig, prompt_name: str, prompt: str) -> dict[str, object]:
     if llm.json_mode:
         body["response_format"] = {"type": "json_object"}
     return body
+
+
+def _translation_dialogue_context(
+    cues: list[Cue],
+    selected: list[Cue],
+    start: float,
+    end: float,
+    config: SegmentationConfig,
+) -> list[Cue]:
+    selected_ids = {id(cue) for cue in selected}
+    candidates = [
+        cue
+        for cue in cues
+        if cue.end >= start - config.dialogue_context_before_seconds
+        and cue.start <= end + config.dialogue_context_after_seconds
+        and id(cue) not in selected_ids
+    ]
+    center = (start + end) / 2
+    candidates.sort(key=lambda cue: abs((cue.start + cue.end) / 2 - center))
+    kept: list[Cue] = []
+    used = 0
+    for cue in candidates:
+        line_chars = len(cue.text) + len(cue.speaker or "unknown") + 3
+        if used + line_chars > config.dialogue_context_max_chars:
+            continue
+        kept.append(cue)
+        used += line_chars
+    kept.sort(key=lambda cue: (cue.start, cue.end, cue.speaker or ""))
+    return kept
 
 
 def _signature(kind: str, payload: dict[str, object]) -> str:

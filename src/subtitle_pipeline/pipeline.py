@@ -18,7 +18,14 @@ from .asr import (
     transcribe_with_qwen,
 )
 from .asr_correction import correct_asr_windows, entities_from_context
+from .chat_context import CurrentVideoChatIndex, remove_youtube_chat_files
 from .config import AppConfig, LLMConfig, llm_api_key
+from .fan_knowledge import (
+    FanKnowledgeRetriever,
+    KnowledgeHit,
+    KnowledgeQuery,
+    video_date_from_metadata,
+)
 from .local_llm_server import LocalLLMServer
 from .media import download_youtube, render_subtitles, subtitle_layout
 from .song_identification import (
@@ -75,6 +82,14 @@ def run_pipeline(
     job_dir.mkdir(parents=True, exist_ok=True)
     logging.info("job directory: %s", job_dir)
     local_llm_server = LocalLLMServer(config.llm, job_dir / "local-llm-server.log")
+    fan_knowledge = (
+        FanKnowledgeRetriever(
+            Path(config.fan_knowledge.database_path).expanduser(),
+            audit_path=job_dir / "fan-knowledge-audit.jsonl",
+        )
+        if config.fan_knowledge.enabled
+        else None
+    )
 
     try:
         with (
@@ -87,9 +102,12 @@ def run_pipeline(
                 job_dir,
                 upload_override=upload_override,
                 local_llm_server=local_llm_server,
+                fan_knowledge=fan_knowledge,
             )
     finally:
         local_llm_server.stop()
+        if fan_knowledge is not None:
+            fan_knowledge.close()
 
 
 def _deepseek_task_delay(config: LLMConfig, now: datetime) -> float:
@@ -137,13 +155,43 @@ def _run_pipeline_stages(
     *,
     upload_override: bool | None,
     local_llm_server: LocalLLMServer,
+    fan_knowledge: FanKnowledgeRetriever | None,
 ) -> PipelineResult:
     with stage_metrics("pipeline.download"):
         downloaded = download_youtube(url, job_dir, config.download)
 
+    current_chat: CurrentVideoChatIndex | None = None
+    if downloaded.chat_replay is not None:
+        with stage_metrics("pipeline.current_video_chat"):
+            try:
+                current_chat = CurrentVideoChatIndex.from_path(
+                    downloaded.chat_replay,
+                    lookback_seconds=(
+                        config.fan_knowledge.current_video_chat_lookback_seconds
+                    ),
+                    lookahead_seconds=(
+                        config.fan_knowledge.current_video_chat_lookahead_seconds
+                    ),
+                    maximum_chars=config.fan_knowledge.current_video_chat_max_chars,
+                    audit_path=job_dir / "current-video-chat-audit.jsonl",
+                )
+                logging.info(
+                    "loaded %d current-video chat messages for time-local context",
+                    len(current_chat),
+                )
+            except (OSError, UnicodeError) as exc:
+                logging.warning("could not read current-video chat replay: %s", exc)
+            finally:
+                remove_youtube_chat_files(job_dir)
+
     translation_context = _translation_context(
         downloaded.metadata, config.llm.glossary_files
     )
+    video_date = video_date_from_metadata(downloaded.metadata)
+    current_video_id = str(downloaded.metadata.get("id") or "").strip() or None
+    if fan_knowledge is not None:
+        imported = fan_knowledge.ingest_translation_context(translation_context)
+        logging.info("indexed %d curated fan-knowledge records", imported)
     japanese_single_word_list = _japanese_single_word_list(translation_context)
     if japanese_single_word_list:
         logging.info(
@@ -158,6 +206,20 @@ def _run_pipeline_stages(
     asr_entities = entities_from_context(translation_context)
 
     def correct_asr_text(records: list[dict[str, object]]) -> list[dict[str, object]]:
+        if current_chat:
+            records = [
+                {
+                    **record,
+                    "chat_text": current_chat.evidence(
+                        float(record.get("core_start") or 0.0),
+                        float(record.get("core_end") or 0.0),
+                        str(record.get("text") or ""),
+                        stage="asr_correction",
+                        target_id=record.get("window_id", index),
+                    ),
+                }
+                for index, record in enumerate(records)
+            ]
         if config.llm.local_server_enabled:
             with stage_metrics("pipeline.local_llm_asr_correction_startup"):
                 local_llm_server.start()
@@ -171,6 +233,28 @@ def _run_pipeline_stages(
                 audit_path=job_dir / "asr-correction-audit.jsonl",
                 batch_windows=config.llm.asr_correction_batch_windows,
                 batch_chars=config.llm.asr_correction_batch_chars,
+                context_before_seconds=(
+                    config.llm.asr_correction_context_before_seconds
+                ),
+                context_after_seconds=config.llm.asr_correction_context_after_seconds,
+                context_max_chars=config.llm.asr_correction_context_max_chars,
+                retrieve_knowledge=(
+                    lambda record, text: (
+                        fan_knowledge.retrieve(
+                            KnowledgeQuery(
+                                text=text,
+                                speaker=str(record.get("speaker") or "") or None,
+                                video_date=video_date,
+                                ocr_text=str(record.get("ocr_text") or ""),
+                                chat_text=str(record.get("chat_text") or ""),
+                                exclude_video_id=current_video_id,
+                                top_k=config.fan_knowledge.top_k_asr,
+                            )
+                        )
+                        if fan_knowledge is not None
+                        else None
+                    )
+                ),
             )
         finally:
             if config.llm.local_server_enabled:
@@ -274,6 +358,37 @@ def _run_pipeline_stages(
                 translation_context=translation_context,
                 max_line_units=layout.max_line_units,
                 cache_path=job_dir / "cue-translation-cache.json",
+                retrieve_knowledge=(
+                    lambda selected, chat_text: (
+                        _retrieve_translation_knowledge(
+                            fan_knowledge,
+                            selected,
+                            video_date=video_date,
+                            top_k=config.fan_knowledge.top_k_translation,
+                            query_chars=config.fan_knowledge.translation_query_chars,
+                            exclude_video_id=current_video_id,
+                            chat_text=chat_text,
+                        )
+                        if fan_knowledge is not None
+                        else None
+                    )
+                ),
+                retrieve_chat=(
+                    (
+                        lambda selected: current_chat.evidence(
+                            min(cue.start for cue in selected),
+                            max(cue.end for cue in selected),
+                            "\n".join(cue.text for cue in selected),
+                            stage="translation",
+                            target_id=(
+                                f"{min(cue.start for cue in selected):.3f}-"
+                                f"{max(cue.end for cue in selected):.3f}"
+                            ),
+                        )
+                    )
+                    if current_chat
+                    else None
+                ),
             )
     else:  # Compatibility for embedders implementing the former translator API.
         with stage_metrics("pipeline.joint_segmentation_translation"):
@@ -508,6 +623,63 @@ def _subtitle_evidence(cues: list[Cue], limit: int) -> str:
     )[:limit]
 
 
+def _retrieve_translation_knowledge(
+    retriever: FanKnowledgeRetriever,
+    cues: list[Cue],
+    *,
+    video_date: str | None,
+    top_k: int,
+    query_chars: int,
+    exclude_video_id: str | None,
+    chat_text: str,
+) -> list[KnowledgeHit]:
+    hits_by_id: dict[str, KnowledgeHit] = {}
+    remaining = query_chars
+    chunk: list[str] = []
+    chunk_chars = 0
+    chunk_speaker: str | None = None
+
+    def flush() -> None:
+        nonlocal chunk, chunk_chars, chunk_speaker
+        if not chunk:
+            return
+        for hit in retriever.retrieve(
+            KnowledgeQuery(
+                text="\n".join(chunk),
+                speaker=chunk_speaker,
+                video_date=video_date,
+                chat_text=chat_text,
+                exclude_video_id=exclude_video_id,
+                top_k=top_k,
+            )
+        ):
+            previous = hits_by_id.get(hit.record_id)
+            if previous is None or hit.score.total > previous.score.total:
+                hits_by_id[hit.record_id] = hit
+        chunk = []
+        chunk_chars = 0
+        chunk_speaker = None
+
+    for cue in cues:
+        text = cue.text.strip()
+        if not text or remaining <= 0:
+            continue
+        text = text[:remaining]
+        speaker = cue.speaker
+        if chunk and (speaker != chunk_speaker or chunk_chars + len(text) > 2000):
+            flush()
+        if not chunk:
+            chunk_speaker = speaker
+        chunk.append(text)
+        chunk_chars += len(text)
+        remaining -= len(text)
+    flush()
+    return sorted(
+        hits_by_id.values(),
+        key=lambda hit: (-hit.score.total, hit.record_id),
+    )[:top_k]
+
+
 def _load_optional_json_object(path_value: str | None, label: str) -> dict[str, object]:
     if not path_value:
         return {}
@@ -554,6 +726,7 @@ def _translation_context(
     terms: dict[str, str] = {}
     characters_by_id: dict[str, dict[str, object]] = {}
     asr_entities_by_surface: dict[str, dict[str, object]] = {}
+    knowledge_records: list[dict[str, object]] = []
     for glossary in glossaries:
         matches = glossary["match"]
         assert isinstance(matches, list)
@@ -594,12 +767,16 @@ def _translation_context(
             surface = entity["surface"]
             assert isinstance(surface, str)
             asr_entities_by_surface[surface] = entity
+        glossary_knowledge = glossary.get("knowledge", [])
+        assert isinstance(glossary_knowledge, list)
+        knowledge_records.extend(glossary_knowledge)
     return {
         "video": identity,
         "franchises": franchises,
         "characters": list(characters_by_id.values()),
         "terms": terms,
         "asr_entities": list(asr_entities_by_surface.values()),
+        "knowledge_records": knowledge_records,
     }
 
 
@@ -725,6 +902,34 @@ def _validate_translation_glossary(value: object, label: str) -> dict[str, objec
             isinstance(alias, str) and alias.strip() for alias in aliases
         ):
             raise ValueError(f"{entity_label} aliases must be non-empty strings")
+    knowledge = value.get("knowledge", [])
+    if not isinstance(knowledge, list):
+        raise ValueError(f"translation glossary {label} knowledge must be a list")
+    seen_knowledge_ids: set[str] = set()
+    for position, item in enumerate(knowledge):
+        item_label = f"translation glossary {label} knowledge {position}"
+        if not isinstance(item, dict):
+            raise ValueError(f"{item_label} must be an object")
+        record_id = item.get("id")
+        if not isinstance(record_id, str) or not record_id.strip():
+            raise ValueError(f"{item_label} requires a non-empty id")
+        if record_id in seen_knowledge_ids:
+            raise ValueError(
+                f"translation glossary {label} duplicates knowledge id {record_id}"
+            )
+        seen_knowledge_ids.add(record_id)
+        for key in ("title", "body"):
+            if not isinstance(item.get(key), str) or not item[key].strip():
+                raise ValueError(f"{item_label} requires a non-empty {key}")
+        for key in ("aliases", "keywords"):
+            values = item.get(key, [])
+            if not isinstance(values, list) or not all(
+                isinstance(candidate, str) and candidate.strip() for candidate in values
+            ):
+                raise ValueError(f"{item_label} {key} must be non-empty strings")
+        reliability = item.get("reliability", 0.8)
+        if not isinstance(reliability, (int, float)) or not 0 <= reliability <= 1:
+            raise ValueError(f"{item_label} reliability must be between 0 and 1")
     return value
 
 

@@ -269,6 +269,29 @@
     "fairy book": "妖精花束",
     "フェアリーブック": "妖精花束"
   },
+  "knowledge": [
+    {
+      "id": "community-ty-thank-you",
+      "kind": "community_term",
+      "title": "TY",
+      "body": "在直播聊天、礼物和主播读留言的语境中，TY通常是英语Thank You的缩写，不是人物姓名。",
+      "aliases": [
+        "ティーワイ",
+        "Thank You"
+      ],
+      "keywords": [
+        "ありがとう",
+        "感谢",
+        "貢ぎ物",
+        "お納めください",
+        "プレゼント",
+        "SC",
+        "Super Chat"
+      ],
+      "source_type": "user_verified",
+      "reliability": 0.95
+    }
+  ],
   "sources": [
     "https://bang-dream.com/artist/yumemita/",
     "https://bang-dream.com/discographies/?artist=yumemita",

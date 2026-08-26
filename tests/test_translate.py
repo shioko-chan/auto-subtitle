@@ -26,8 +26,57 @@ from subtitle_pipeline.translate import (
     _normalize_api_response,
     _parse_joint_records,
     _parse_json_object,
+    _prompt_section_sizes,
     _transient_retry_delay,
 )
+
+
+class PromptBudgetTests(unittest.TestCase):
+    def test_prompt_section_sizes_separate_dynamic_evidence(self):
+        sections = _prompt_section_sizes(
+            "rules\nREFERENCE:\nref\nCURRENT_VIDEO_CHAT:\nchat\n"
+            "DIALOGUE_CONTEXT:\ncontext\nSOURCE:\nsource"
+        )
+
+        self.assertEqual(sections["reference"]["characters"], 3)
+        self.assertEqual(sections["current_video_chat"]["characters"], 4)
+        self.assertEqual(sections["dialogue_context"]["characters"], 7)
+        self.assertEqual(sections["source"]["characters"], 6)
+        self.assertEqual(sections["fixed_prompt"]["characters"], 5)
+
+    def test_request_context_audit_records_actual_usage_and_section_sizes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "llm-audit.jsonl"
+            translator = OpenAICompatibleTranslator(
+                LLMConfig(local_server_enabled=True, local_server_context_size=16384),
+                "secret",
+                audit_path=audit,
+            )
+            translator._log_request_context(
+                {
+                    "model": "test",
+                    "max_tokens": 8192,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "SOURCE:\n原文\nCURRENT_VIDEO_CHAT:\n聊天",
+                        }
+                    ],
+                },
+                {
+                    "usage": {
+                        "prompt_tokens": 123,
+                        "completion_tokens": 45,
+                    }
+                },
+            )
+            event = json.loads(audit.read_text())
+
+        self.assertEqual(event["prompt_tokens"], 123)
+        self.assertEqual(event["completion_tokens"], 45)
+        self.assertEqual(event["context_capacity"], 16384)
+        self.assertIn("source", event["sections"])
+        self.assertIn("current_video_chat", event["sections"])
 
 
 def _response(content):
@@ -416,11 +465,7 @@ class JointTranslationTests(unittest.TestCase):
             self.assertIn("<0>嬉しい", prompt)
             return _response(
                 json.dumps(
-                    {
-                        "cues": [
-                            {"start_id": 0, "end_id": 0, "text": "很开心"}
-                        ]
-                    },
+                    {"cues": [{"start_id": 0, "end_id": 0, "text": "很开心"}]},
                     ensure_ascii=False,
                 )
             )
@@ -450,7 +495,9 @@ class JointTranslationTests(unittest.TestCase):
         with patch.object(
             translator,
             "_request",
-            side_effect=AssertionError("general LLM must not translate verified lyrics"),
+            side_effect=AssertionError(
+                "general LLM must not translate verified lyrics"
+            ),
         ):
             result = translator.plan_and_translate(
                 [cue], SegmentationConfig(), max_line_units=30
@@ -481,9 +528,7 @@ class JointTranslationTests(unittest.TestCase):
                     max_line_units=20,
                 )
 
-            local_translate.assert_called_once_with(
-                "原文", source_language="Japanese"
-            )
+            local_translate.assert_called_once_with("原文", source_language="Japanese")
             self.assertEqual(result.translated_cues[0].text, "本地译文")
             self.assertIn(
                 "reason=single_unit_CoverageValidationError",

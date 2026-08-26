@@ -5,16 +5,13 @@ import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
-import alkana
 from sudachipy import dictionary, tokenizer
 
+from .english_g2p import EnglishJapaneseG2P
 from .lyrics_library import LibrarySong
 
 _SMALL_KANA = frozenset("ぁぃぅぇぉゃゅょゎァィゥェォャュョヮ")
 _ENGLISH_WORD_RE = re.compile(r"[A-Za-z]+(?:['’-][A-Za-z]+)*")
-_ENGLISH_KATAKANA_OVERRIDES = {
-    "newtype": "ニュータイプ",
-}
 _MAX_LYRIC_LINES_PER_ANCHOR = 24
 _MAX_LYRIC_LENGTH_RATIO = 1.75
 
@@ -38,6 +35,7 @@ class SongMatch:
 class JapaneseNormalizer:
     def __init__(self) -> None:
         self._tokenizer = dictionary.Dictionary().create()
+        self._english_g2p: EnglishJapaneseG2P | None = None
 
     def __call__(self, text: str) -> str:
         values: list[str] = []
@@ -103,8 +101,10 @@ class JapaneseNormalizer:
         cursor = 0
         for match in _ENGLISH_WORD_RE.finditer(text):
             self._append_non_english_units(units, text[cursor : match.start()])
-            reading = _english_katakana(match.group(0))
-            if reading is None:
+            if self._english_g2p is None:
+                self._english_g2p = EnglishJapaneseG2P()
+            reading = self._english_g2p.katakana(match.group(0))
+            if not reading:
                 return []
             prefix = ""
             if units and not units[-1][1]:
@@ -179,41 +179,6 @@ class JapaneseNormalizer:
             chr(ord(char) - 0x60) if "ァ" <= char <= "ヶ" else char for char in value
         )
         return re.sub(r"[^0-9a-zぁ-ゖー]", "", value)
-
-
-def _english_katakana(word: str) -> str | None:
-    normalized = word.casefold().replace("’", "'")
-    value = _ENGLISH_KATAKANA_OVERRIDES.get(normalized) or alkana.get_kana(
-        normalized
-    )
-    if value:
-        return str(value)
-    expansions = {
-        "aren't": ("are", "not"),
-        "can't": ("can", "not"),
-        "couldn't": ("could", "not"),
-        "didn't": ("did", "not"),
-        "doesn't": ("does", "not"),
-        "don't": ("do", "not"),
-        "i'm": ("i", "am"),
-        "isn't": ("is", "not"),
-        "it's": ("it", "is"),
-        "let's": ("let", "us"),
-        "they're": ("they", "are"),
-        "wasn't": ("was", "not"),
-        "we're": ("we", "are"),
-        "weren't": ("were", "not"),
-        "won't": ("will", "not"),
-        "wouldn't": ("would", "not"),
-        "you're": ("you", "are"),
-    }
-    pieces = expansions.get(normalized)
-    if pieces is None and "-" in normalized:
-        pieces = tuple(part for part in normalized.split("-") if part)
-    if not pieces:
-        return None
-    readings = [alkana.get_kana(piece) for piece in pieces]
-    return "".join(str(item) for item in readings) if all(readings) else None
 
 
 def _is_nonpronounced_word(word: object) -> bool:

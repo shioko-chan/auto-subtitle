@@ -72,7 +72,7 @@ class JapaneseNormalizerTests(unittest.TestCase):
         )
         self.assertEqual(
             [reading for _text, reading in units],
-            ["れでぃー", "せっと", "あんど", "ふぁいんど", "あうと"],
+            ["れでぃ", "せっと", "あんど", "ふぁいんど", "あうと"],
         )
 
     def test_mixed_lyrics_only_transliterate_english_words(self):
@@ -101,8 +101,30 @@ class JapaneseNormalizerTests(unittest.TestCase):
         )
         self.assertEqual(
             "".join(reading for _text, reading in units),
-            "いっつおんりーわんにゅーたいぷ",
+            "いっつおうんりうぉんにゅーたいぷ",
         )
+
+    def test_single_letter_and_compound_english_words_have_g2p_readings(self):
+        normalizer = JapaneseNormalizer()
+
+        units = normalizer.display_units("I wanna be free, NewWorld")
+
+        self.assertEqual(
+            "".join(text for text, _reading in units),
+            "I wanna be free, NewWorld",
+        )
+        readings = {text.strip(" ,"): reading for text, reading in units}
+        self.assertEqual(readings["I"], "あい")
+        self.assertEqual(readings["NewWorld"], "にゅーわーるど")
+
+    def test_out_of_dictionary_english_word_does_not_drop_lyric_line(self):
+        normalizer = JapaneseNormalizer()
+
+        units = normalizer.display_units("HyperNewWorldX")
+
+        self.assertTrue(units)
+        self.assertEqual("".join(text for text, _reading in units), "HyperNewWorldX")
+        self.assertTrue(all(reading for _text, reading in units))
 
     def test_english_lyrics_participate_in_song_matching(self):
         song = LibrarySong(

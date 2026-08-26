@@ -50,6 +50,7 @@
         cuda.libcusparse
         cuda.libnvjitlink
         pkgs.ffmpeg
+        pkgs.espeak-ng
         pkgs.glib
         pkgs.libglvnd
         pkgs.stdenv.cc.cc.lib
@@ -62,6 +63,7 @@
           pkgs.python311
           pkgs.uv
           pkgs.ffmpeg
+          pkgs.espeak-ng
           cuda.cuda_nvcc
           cuda.cuda_cccl
           assCudaRender

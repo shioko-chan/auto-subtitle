@@ -9,6 +9,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -17,6 +18,7 @@ from pathlib import Path
 import certifi
 
 from .config import LLMConfig, SegmentationConfig
+from .fan_knowledge import KnowledgeHit
 from .local_segmentation import build_speaker_tracks
 from .local_translation import LocalJapaneseTranslator
 from .prompt_templates import prompt_system, render_user_prompt
@@ -184,6 +186,9 @@ class OpenAICompatibleTranslator:
         translation_context: dict[str, object] | None = None,
         max_line_units: float,
         cache_path: Path | None = None,
+        retrieve_knowledge: Callable[[list[Cue], str], list[KnowledgeHit]]
+        | None = None,
+        retrieve_chat: Callable[[list[Cue]], str] | None = None,
     ) -> list[Cue]:
         if not cues:
             return []
@@ -204,6 +209,8 @@ class OpenAICompatibleTranslator:
             is_nontransient=_is_nontransient_http_error,
             log_invalid_response=self._log_invalid_response,
             local_translate=self.local_translator.translate,
+            retrieve_knowledge=retrieve_knowledge,
+            retrieve_chat=retrieve_chat,
         )
 
     def translate_lyrics(
@@ -482,6 +489,7 @@ class OpenAICompatibleTranslator:
                 payload = json.loads(response.read().decode("utf-8"))
                 normalized = _normalize_api_response(self.config, payload)
                 _log_response_usage(normalized)
+                self._log_request_context(body, normalized)
                 return normalized
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
@@ -489,6 +497,48 @@ class OpenAICompatibleTranslator:
             if exc.headers is not None:
                 retry_after = _parse_retry_after(exc.headers.get("Retry-After"))
             raise LLMHTTPError(exc.code, detail, retry_after) from exc
+
+    def _log_request_context(
+        self, body: dict[str, object], response: dict[str, object]
+    ) -> None:
+        if self.audit_path is None:
+            return
+        messages = body.get("messages")
+        contents = (
+            [
+                str(message.get("content") or "")
+                for message in messages
+                if isinstance(message, dict) and isinstance(message.get("content"), str)
+            ]
+            if isinstance(messages, list)
+            else []
+        )
+        prompt = "\n\n".join(contents)
+        usage = response.get("usage")
+        prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+        completion_tokens = (
+            usage.get("completion_tokens") if isinstance(usage, dict) else None
+        )
+        entry = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "event": "llm_request_context",
+            "model": body.get("model", self.config.model),
+            "input_characters": len(prompt),
+            "estimated_input_tokens": _estimate_tokens(prompt),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "max_output_tokens": body.get("max_tokens", self.config.max_tokens),
+            "context_capacity": (
+                self.config.local_server_context_size
+                if self.config.local_server_enabled
+                else None
+            ),
+            "sections": _prompt_section_sizes(prompt),
+        }
+        with self._audit_lock:
+            self.audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.audit_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def _prepare_api_request(
@@ -842,6 +892,53 @@ def _log_response_usage(response: object) -> None:
         completion if completion is not None else "unknown",
         total if total is not None else "unknown",
     )
+
+
+def _estimate_tokens(text: str) -> int:
+    cjk = sum(
+        "\u3040" <= character <= "\u30ff" or "\u3400" <= character <= "\u9fff"
+        for character in text
+    )
+    return cjk + math.ceil((len(text) - cjk) / 4)
+
+
+def _prompt_section_sizes(prompt: str) -> dict[str, dict[str, int]]:
+    marker_names = {
+        "ENTITY_REFERENCE:": "entity_reference",
+        "WINDOW_EVIDENCE:": "window_evidence",
+        "READ_ONLY_CONTEXT:": "read_only_context",
+        "REFERENCE:": "reference",
+        "CURRENT_VIDEO_CHAT:": "current_video_chat",
+        "DIALOGUE_CONTEXT:": "dialogue_context",
+        "SOURCE:": "source",
+        "TARGET:": "target",
+    }
+    sections: dict[str, list[str]] = {}
+    fixed: list[str] = []
+    current: str | None = None
+    for line in prompt.splitlines(keepends=True):
+        marker = marker_names.get(line.strip())
+        if marker is not None:
+            current = marker
+            sections.setdefault(marker, [])
+        elif current is None:
+            fixed.append(line)
+        else:
+            sections[current].append(line)
+    values = {
+        name: {
+            "characters": len(text),
+            "estimated_tokens": _estimate_tokens(text),
+        }
+        for name, lines in sections.items()
+        if (text := "".join(lines).strip())
+    }
+    fixed_text = "".join(fixed).strip()
+    values["fixed_prompt"] = {
+        "characters": len(fixed_text),
+        "estimated_tokens": _estimate_tokens(fixed_text),
+    }
+    return values
 
 
 def _create_ssl_context() -> ssl.SSLContext:

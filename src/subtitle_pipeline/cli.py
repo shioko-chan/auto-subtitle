@@ -5,9 +5,21 @@ import logging
 import shutil
 import sys
 import warnings
+from dataclasses import replace
 from pathlib import Path
 
 from .config import AppConfig, ConfigError, load_config
+from .chat_context import remove_youtube_chat_files
+from .fan_knowledge import FanKnowledgeRetriever
+from .knowledge_ingestion import (
+    IngestionSummary,
+    download_youtube_subtitles,
+    ingest_jsonl,
+    ingest_document_mapping,
+    ingest_work_directory,
+    ingest_youtube_cache,
+)
+from .knowledge_collection import collect_official_documents, collect_sns_documents
 from .pipeline import run_pipeline
 
 
@@ -33,6 +45,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("check", help="check local executables and configuration")
+
+    knowledge_parser = subparsers.add_parser(
+        "knowledge", help="collect and inspect the local fan knowledge base"
+    )
+    knowledge_commands = knowledge_parser.add_subparsers(
+        dest="knowledge_command", required=True
+    )
+    work_parser = knowledge_commands.add_parser(
+        "ingest-work", help="import existing pipeline ASR and metadata"
+    )
+    work_parser.add_argument("--path", type=Path)
+
+    youtube_parser = knowledge_commands.add_parser(
+        "ingest-youtube", help="download and import YouTube subtitles"
+    )
+    youtube_parser.add_argument("urls", nargs="+")
+    youtube_parser.add_argument("--cache-dir", type=Path)
+    youtube_parser.add_argument("--browser")
+    youtube_parser.add_argument("--playlist-end", type=int, default=100)
+    youtube_parser.add_argument("--languages", nargs="+")
+
+    jsonl_parser = knowledge_commands.add_parser(
+        "ingest-jsonl", help="import normalized SNS or website documents"
+    )
+    jsonl_parser.add_argument("paths", nargs="+", type=Path)
+    official_parser = knowledge_commands.add_parser(
+        "ingest-official", help="collect official webpages or RSS/Atom feeds"
+    )
+    official_parser.add_argument("urls", nargs="+")
+    official_parser.add_argument("--source-type", default="official_news")
+    official_parser.add_argument("--follow-links", action="store_true")
+    official_parser.add_argument("--link-pattern")
+    official_parser.add_argument("--maximum-documents", type=int, default=1000)
+    official_parser.add_argument("--required-text", nargs="+")
+    official_parser.add_argument("--maximum-depth", type=int)
+    sns_parser = knowledge_commands.add_parser(
+        "ingest-sns", help="collect X or Instagram metadata through gallery-dl"
+    )
+    sns_parser.add_argument("urls", nargs="+")
+    sns_parser.add_argument("--browser")
+    knowledge_commands.add_parser("stats", help="show knowledge database counts")
     return parser
 
 
@@ -47,6 +100,8 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(args.config)
         if args.command == "check":
             return _check(config)
+        if args.command == "knowledge":
+            return _knowledge(config, args)
         override = True if args.upload else False if args.no_upload else None
         result = run_pipeline(args.url, config, upload_override=override)
         logging.info("complete: %s", result.rendered_video)
@@ -55,6 +110,118 @@ def main(argv: list[str] | None = None) -> int:
     except (ConfigError, RuntimeError, ValueError) as exc:
         logging.error("%s", exc)
         return 1
+
+
+def _knowledge(config: AppConfig, args: argparse.Namespace) -> int:
+    knowledge = config.fan_knowledge
+    with FanKnowledgeRetriever(Path(knowledge.database_path).expanduser()) as retriever:
+        command = args.knowledge_command
+        if command == "stats":
+            logging.info(
+                "knowledge database: documents=%d chunks=%d",
+                retriever.document_count(),
+                retriever.chunk_count(),
+            )
+            return 0
+        if command == "ingest-work":
+            summary = ingest_work_directory(
+                retriever,
+                args.path or config.work_dir,
+                target_seconds=knowledge.chunk_target_seconds,
+                maximum_chars=knowledge.chunk_max_chars,
+                include_regular_chat=knowledge.include_regular_chat,
+            )
+        elif command == "ingest-jsonl":
+            summary = IngestionSummary()
+            for path in args.paths:
+                summary = summary.merge(
+                    ingest_jsonl(
+                        retriever,
+                        path,
+                        maximum_chars=knowledge.chunk_max_chars,
+                    )
+                )
+        elif command == "ingest-youtube":
+            if args.playlist_end < 1:
+                raise ValueError("--playlist-end must be at least 1")
+            cache_dir = args.cache_dir or Path(knowledge.collection_cache_dir)
+            download = (
+                replace(config.download, cookies_from_browser=args.browser)
+                if args.browser
+                else config.download
+            )
+            languages = tuple(args.languages or knowledge.youtube_subtitle_languages)
+            summary = IngestionSummary()
+
+            def ingest_downloaded_batch(video_ids: tuple[str, ...]) -> None:
+                nonlocal summary
+                summary = summary.merge(
+                    ingest_youtube_cache(
+                        retriever,
+                        cache_dir,
+                        target_seconds=knowledge.chunk_target_seconds,
+                        maximum_chars=knowledge.chunk_max_chars,
+                        language_priority=tuple(
+                            value.removesuffix(".*") for value in languages
+                        ),
+                        include_regular_chat=knowledge.include_regular_chat,
+                        video_ids=set(video_ids),
+                    )
+                )
+                for video_id in video_ids:
+                    remove_youtube_chat_files(cache_dir / video_id)
+
+            download_youtube_subtitles(
+                args.urls,
+                cache_dir,
+                download,
+                languages=languages,
+                playlist_end=args.playlist_end,
+                after_batch=ingest_downloaded_batch,
+            )
+        elif command in {"ingest-official", "ingest-sns"}:
+            values = (
+                collect_official_documents(
+                    args.urls,
+                    source_type=args.source_type,
+                    follow_links=args.follow_links,
+                    link_pattern=args.link_pattern,
+                    maximum_documents=args.maximum_documents,
+                    required_terms=tuple(args.required_text or ()),
+                    maximum_depth=args.maximum_depth,
+                )
+                if command == "ingest-official"
+                else collect_sns_documents(
+                    args.urls,
+                    cookies_from_browser=args.browser
+                    or config.download.cookies_from_browser,
+                )
+            )
+            summary = IngestionSummary()
+            for index, value in enumerate(values):
+                summary = summary.add(
+                    ingest_document_mapping(
+                        retriever,
+                        value,
+                        fallback_external_id=f"{command}:{index}",
+                        maximum_chars=knowledge.chunk_max_chars,
+                    )
+                )
+        else:
+            raise ValueError(f"unknown knowledge command: {command}")
+        _log_ingestion_summary(summary)
+    return 0
+
+
+def _log_ingestion_summary(summary: IngestionSummary) -> None:
+    logging.info(
+        "knowledge ingestion: scanned=%d changed=%d unchanged=%d chunks=%d skipped=%d",
+        summary.scanned,
+        summary.inserted_or_updated,
+        summary.unchanged,
+        summary.chunks,
+        summary.skipped,
+    )
 
 
 def _check(config: AppConfig) -> int:

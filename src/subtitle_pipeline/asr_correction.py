@@ -12,10 +12,13 @@ from difflib import SequenceMatcher
 from functools import cache
 from pathlib import Path
 
+from .fan_knowledge import KnowledgeHit
 from .prompt_templates import prompt_system, prompt_templates_digest, render_user_prompt
 
+logger = logging.getLogger(__name__)
+
 _PROMPT = "asr-correct.md"
-_CACHE_VERSION = 1
+_CACHE_VERSION = 3
 _JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 _SPACE_RE = re.compile(r"\s+")
 
@@ -66,6 +69,11 @@ def correct_asr_windows(
     audit_path: Path,
     batch_windows: int = 6,
     batch_chars: int = 3000,
+    context_before_seconds: float = 20.0,
+    context_after_seconds: float = 10.0,
+    context_max_chars: int = 2000,
+    retrieve_knowledge: Callable[[dict[str, object], str], list[KnowledgeHit]]
+    | None = None,
 ) -> list[dict[str, object]]:
     if not records:
         return []
@@ -73,12 +81,22 @@ def correct_asr_windows(
     lock = threading.Lock()
     corrected: list[dict[str, object] | None] = [None] * len(records)
     pending: list[tuple[int, dict[str, object], str, list[ASREntity]]] = []
+    knowledge_by_index: dict[int, list[KnowledgeHit]] = {}
     for index, record in enumerate(records):
         text = str(record.get("text") or "")
         deterministic = _replace_exact_aliases(text, entities)
         candidates = _candidate_entities(deterministic, entities)
+        knowledge = (
+            retrieve_knowledge(record, deterministic)
+            if retrieve_knowledge is not None
+            else []
+        )
+        knowledge_by_index[index] = knowledge
         signature = _record_signature(
-            deterministic, str(record.get("language") or ""), candidates, model
+            deterministic,
+            str(record.get("language") or ""),
+            candidates,
+            model,
         )
         cached = cache["records"].get(signature)
         if isinstance(cached, str):
@@ -90,6 +108,9 @@ def correct_asr_windows(
         entity_union = _unique_entities(
             entity for _, _, _, candidates in batch for entity in candidates
         )
+        knowledge_union = _unique_knowledge(
+            hit for index, _, _, _ in batch for hit in knowledge_by_index[index]
+        )
         body = {
             "model": model,
             "messages": [
@@ -99,6 +120,16 @@ def correct_asr_windows(
                     "content": render_user_prompt(
                         _PROMPT,
                         ENTITY_REFERENCE=_format_entities(entity_union),
+                        WINDOW_EVIDENCE=_format_window_evidence(
+                            batch, knowledge_by_index
+                        ),
+                        READ_ONLY_CONTEXT=_format_read_only_context(
+                            records,
+                            batch,
+                            before_seconds=context_before_seconds,
+                            after_seconds=context_after_seconds,
+                            maximum_chars=context_max_chars,
+                        ),
                         TARGET="\n".join(
                             f"<{position} candidates="
                             f"{'｜'.join(entity.surface for entity in candidates) or '(none)'}>"
@@ -122,7 +153,7 @@ def correct_asr_windows(
             response = request(body)
             parsed = _parse_response(response, len(batch))
         except Exception as exc:  # noqa: BLE001 - API and validation failures fail open.
-            logging.warning(
+            logger.warning(
                 "ASR correction downgraded %d windows to rule-normalized text: %s",
                 len(batch),
                 exc,
@@ -139,6 +170,7 @@ def correct_asr_windows(
                 "request": body,
                 "response": response,
                 "error": batch_error,
+                "knowledge_ids": [hit.record_id for hit in knowledge_union],
             },
         )
         for position, (index, record, deterministic, candidates) in enumerate(batch):
@@ -178,6 +210,9 @@ def correct_asr_windows(
                         "method": method,
                         "error": error,
                         "candidates": [entity.surface for entity in candidates],
+                        "knowledge_ids": [
+                            hit.record_id for hit in knowledge_by_index[index]
+                        ],
                     },
                 )
     return [value for value in corrected if value is not None]
@@ -269,7 +304,7 @@ def _parse_response(response: dict[str, object], expected: int) -> list[str]:
         raise ValueError("ASR correction response has no choices")
     message = choices[0].get("message")
     if not isinstance(message, dict) or not isinstance(message.get("content"), str):
-        raise ValueError("ASR correction response has no message content")
+        raise TypeError("ASR correction response has no message content")
     value = json.loads(message["content"])
     windows = value.get("windows") if isinstance(value, dict) else None
     if not isinstance(windows, list) or len(windows) != expected:
@@ -277,7 +312,7 @@ def _parse_response(response: dict[str, object], expected: int) -> list[str]:
     output: list[str] = []
     for expected_id, window in enumerate(windows):
         if not isinstance(window, dict):
-            raise ValueError("ASR correction window is not an object")
+            raise TypeError("ASR correction window is not an object")
         try:
             window_id = int(window.get("window_id"))
         except (TypeError, ValueError) as exc:
@@ -309,6 +344,90 @@ def _format_entities(entities: list[ASREntity]) -> str:
     )
 
 
+def _format_window_evidence(
+    batch: list[tuple[int, dict[str, object], str, list[ASREntity]]],
+    knowledge_by_index: dict[int, list[KnowledgeHit]],
+) -> str:
+    values: list[str] = []
+    for position, (index, record, _text, _candidates) in enumerate(batch):
+        knowledge = knowledge_by_index[index][:3]
+        knowledge_text = (
+            "\n".join(
+                f"- <{hit.kind}:{hit.title}> {hit.body[:180]}" for hit in knowledge
+            )
+            or "(none)"
+        )
+        chat_text = str(record.get("chat_text") or "").strip() or "(none)"
+        values.append(
+            f"<{position}>\nFAN_KNOWLEDGE:\n{knowledge_text}\n"
+            f"CURRENT_VIDEO_CHAT:\n{chat_text}"
+        )
+    return "\n\n".join(values) or "(none)"
+
+
+def _format_read_only_context(
+    records: list[dict[str, object]],
+    batch: list[tuple[int, dict[str, object], str, list[ASREntity]]],
+    *,
+    before_seconds: float,
+    after_seconds: float,
+    maximum_chars: int,
+) -> str:
+    selected_indexes = {index for index, _record, _text, _entities in batch}
+    starts = [float(record.get("core_start") or 0.0) for _, record, _, _ in batch]
+    ends = [float(record.get("core_end") or 0.0) for _, record, _, _ in batch]
+    lower = min(starts) - before_seconds
+    upper = max(ends) + after_seconds
+    center = (min(starts) + max(ends)) / 2
+    candidates = [
+        (index, record)
+        for index, record in enumerate(records)
+        if index not in selected_indexes
+        and float(record.get("core_end") or 0.0) >= lower
+        and float(record.get("core_start") or 0.0) <= upper
+    ]
+    candidates.sort(
+        key=lambda value: abs(
+            (
+                float(value[1].get("core_start") or 0.0)
+                + float(value[1].get("core_end") or 0.0)
+            )
+            / 2
+            - center
+        )
+    )
+    kept: list[tuple[int, dict[str, object]]] = []
+    used = 0
+    for index, record in candidates:
+        text = str(record.get("text") or "").strip()
+        line_chars = len(text) + 32
+        if not text or used + line_chars > maximum_chars:
+            continue
+        kept.append((index, record))
+        used += line_chars
+    kept.sort(key=lambda value: float(value[1].get("core_start") or 0.0))
+    return (
+        "\n".join(
+            f"<window={record.get('window_id', index)} "
+            f"time={float(record.get('core_start') or 0.0):.3f}-"
+            f"{float(record.get('core_end') or 0.0):.3f}>"
+            f"{str(record.get('text') or '').strip()}"
+            for index, record in kept
+        )
+        or "(none)"
+    )
+
+
+def _unique_knowledge(values: object) -> list[KnowledgeHit]:
+    output: list[KnowledgeHit] = []
+    seen: set[str] = set()
+    for value in values:
+        if value.record_id not in seen:
+            seen.add(value.record_id)
+            output.append(value)
+    return output
+
+
 def _unique_entities(values: object) -> list[ASREntity]:
     output: list[ASREntity] = []
     seen: set[str] = set()
@@ -321,7 +440,10 @@ def _unique_entities(values: object) -> list[ASREntity]:
 
 
 def _record_signature(
-    text: str, language: str, entities: list[ASREntity], model: str
+    text: str,
+    language: str,
+    entities: list[ASREntity],
+    model: str,
 ) -> str:
     payload = {
         "version": _CACHE_VERSION,

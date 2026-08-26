@@ -98,7 +98,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.segmentation.local_unit_max_seconds, 6.0)
             self.assertEqual(config.segmentation.model_window_units, 80)
             self.assertEqual(config.segmentation.model_window_chars, 3000)
-            self.assertEqual(config.segmentation.request_batch_windows, 8)
+            self.assertEqual(config.segmentation.request_batch_windows, 32)
             self.assertEqual(config.segmentation.request_batch_chars, 3000)
             self.assertEqual(config.llm.max_concurrency, 16)
             self.assertFalse(config.llm.local_server_enabled)

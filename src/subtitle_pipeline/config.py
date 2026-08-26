@@ -20,9 +20,9 @@ class DownloadConfig:
     cookies_file: str | None = None
     js_runtime: str | None = "auto"
     concurrent_fragments: int = 8
+    download_chat_replay: bool = True
     video_format: str = (
-        "bv*[vcodec^=vp9]+ba/bv*[vcodec^=vp09]+ba/"
-        "bv*[vcodec^=avc1]+ba/b"
+        "bv*[vcodec^=vp9]+ba/bv*[vcodec^=vp09]+ba/bv*[vcodec^=avc1]+ba/b"
     )
 
 
@@ -116,7 +116,7 @@ class SongIdentificationConfig:
     minimum_ocr_score: float = 0.45
     minimum_persistent_frames: int = 2
     max_search_results: int = 5
-    lyrics_library_path: str = "work/lyrics/library.sqlite3"
+    lyrics_library_path: str = "databases/lyrics.sqlite3"
     match_anchor_threshold: float = 0.48
     match_minimum_anchors: int = 3
     match_minimum_score: float = 0.48
@@ -140,10 +140,30 @@ class SegmentationConfig:
     speaker_episode_gap_seconds: float = 2.0
     model_window_units: int = 80
     model_window_chars: int = 3000
-    request_batch_windows: int = 8
+    request_batch_windows: int = 32
     request_batch_chars: int = 3000
-    dialogue_context_seconds: float = 5.0
+    dialogue_context_before_seconds: float = 20.0
+    dialogue_context_after_seconds: float = 10.0
     dialogue_context_max_chars: int = 4000
+
+
+@dataclass(frozen=True)
+class FanKnowledgeConfig:
+    enabled: bool = True
+    database_path: str = "databases/fan-knowledge.sqlite3"
+    collection_cache_dir: str = "work/knowledge/youtube"
+    chunk_target_seconds: float = 45.0
+    chunk_max_chars: int = 1400
+    youtube_subtitle_languages: list[str] = field(
+        default_factory=lambda: ["ja.*", "ja", "en.*", "en"]
+    )
+    include_regular_chat: bool = False
+    current_video_chat_lookback_seconds: float = 30.0
+    current_video_chat_lookahead_seconds: float = 15.0
+    current_video_chat_max_chars: int = 900
+    top_k_asr: int = 6
+    top_k_translation: int = 12
+    translation_query_chars: int = 12000
 
 
 @dataclass(frozen=True)
@@ -160,6 +180,9 @@ class LLMConfig:
     max_tokens: int = 16384
     asr_correction_batch_windows: int = 6
     asr_correction_batch_chars: int = 3000
+    asr_correction_context_before_seconds: float = 20.0
+    asr_correction_context_after_seconds: float = 10.0
+    asr_correction_context_max_chars: int = 2000
     local_server_enabled: bool = False
     local_server_command: str = "llama-server"
     local_server_model_path: str | None = None
@@ -236,6 +259,7 @@ class AppConfig:
         default_factory=SongIdentificationConfig
     )
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
+    fan_knowledge: FanKnowledgeConfig = field(default_factory=FanKnowledgeConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
     upload: UploadConfig = field(default_factory=UploadConfig)
@@ -267,6 +291,7 @@ def load_config(path: Path) -> AppConfig:
                 **_section(data, "song_identification")
             ),
             segmentation=SegmentationConfig(**_section(data, "segmentation")),
+            fan_knowledge=FanKnowledgeConfig(**_section(data, "fan_knowledge")),
             llm=LLMConfig(**_section(data, "llm")),
             render=RenderConfig(**_section(data, "render")),
             upload=UploadConfig(**_section(data, "upload")),
@@ -284,6 +309,14 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("llm.max_tokens must be at least 1")
     if config.llm.asr_correction_batch_windows < 1:
         raise ConfigError("llm.asr_correction_batch_windows must be at least 1")
+    if config.llm.asr_correction_context_before_seconds < 0:
+        raise ConfigError(
+            "llm.asr_correction_context_before_seconds cannot be negative"
+        )
+    if config.llm.asr_correction_context_after_seconds < 0:
+        raise ConfigError("llm.asr_correction_context_after_seconds cannot be negative")
+    if config.llm.asr_correction_context_max_chars < 1:
+        raise ConfigError("llm.asr_correction_context_max_chars must be positive")
     if config.llm.asr_correction_batch_chars < 1:
         raise ConfigError("llm.asr_correction_batch_chars must be at least 1")
     if config.llm.local_server_enabled:
@@ -341,9 +374,7 @@ def load_config(path: Path) -> AppConfig:
     if not config.llm.local_translation_device.strip():
         raise ConfigError("llm.local_translation_device cannot be empty")
     if config.llm.api_style not in {"chat_completions", "responses"}:
-        raise ConfigError(
-            "llm.api_style must be 'chat_completions' or 'responses'"
-        )
+        raise ConfigError("llm.api_style must be 'chat_completions' or 'responses'")
     if config.llm.thinking not in (None, "enabled", "disabled"):
         raise ConfigError("llm.thinking must be 'enabled' or 'disabled'")
     if config.llm.reasoning_effort not in (
@@ -423,9 +454,7 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("asr.speech_window_min_coverage must be between 0 and 1")
     analysis = config.audio_analysis
     if analysis.initial_analysis_concurrency not in {1, 2}:
-        raise ConfigError(
-            "audio_analysis.initial_analysis_concurrency must be 1 or 2"
-        )
+        raise ConfigError("audio_analysis.initial_analysis_concurrency must be 1 or 2")
     if analysis.diarization_backend not in {"moss", "pyannote"}:
         raise ConfigError(
             "audio_analysis.diarization_backend must be 'moss' or 'pyannote'"
@@ -435,9 +464,7 @@ def load_config(path: Path) -> AppConfig:
             "audio_analysis.overlap_conditioned_asr_seconds cannot be negative"
         )
     if analysis.overlap_context_seconds < 0:
-        raise ConfigError(
-            "audio_analysis.overlap_context_seconds cannot be negative"
-        )
+        raise ConfigError("audio_analysis.overlap_context_seconds cannot be negative")
     if analysis.conditioned_asr_backend not in {"dicow", "disabled"}:
         raise ConfigError(
             "audio_analysis.conditioned_asr_backend must be 'dicow' or 'disabled'"
@@ -457,11 +484,7 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("audio_analysis.moss_transcribe_model cannot be empty")
     if analysis.moss_window_seconds <= 0:
         raise ConfigError("audio_analysis.moss_window_seconds must be positive")
-    if not (
-        analysis.moss_window_seconds
-        <= analysis.moss_max_window_seconds
-        <= 900
-    ):
+    if not (analysis.moss_window_seconds <= analysis.moss_max_window_seconds <= 900):
         raise ConfigError(
             "audio_analysis.moss_max_window_seconds must be between "
             "moss_window_seconds and 900"
@@ -526,14 +549,15 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError(
             "audio_analysis.singing_asr_search_seconds cannot be negative"
         )
-    if not (0 <= analysis.singing_asr_overlap_seconds < analysis.singing_asr_min_seconds):
+    if not (
+        0 <= analysis.singing_asr_overlap_seconds < analysis.singing_asr_min_seconds
+    ):
         raise ConfigError(
             "audio_analysis.singing_asr_overlap_seconds must be non-negative and "
             "smaller than singing_asr_min_seconds"
         )
     if analysis.singing_asr_max_seconds < (
-        2 * analysis.singing_asr_min_seconds
-        - analysis.singing_asr_overlap_seconds
+        2 * analysis.singing_asr_min_seconds - analysis.singing_asr_overlap_seconds
     ):
         raise ConfigError(
             "audio_analysis.singing_asr_max_seconds must meet the minimum "
@@ -595,21 +619,35 @@ def load_config(path: Path) -> AppConfig:
     if songs.max_search_results < 1:
         raise ConfigError("song identification search limits must be at least 1")
     if not 0 <= songs.match_anchor_threshold <= 1:
-        raise ConfigError("song_identification.match_anchor_threshold must be between 0 and 1")
+        raise ConfigError(
+            "song_identification.match_anchor_threshold must be between 0 and 1"
+        )
     if songs.match_minimum_anchors < 2:
-        raise ConfigError("song_identification.match_minimum_anchors must be at least 2")
+        raise ConfigError(
+            "song_identification.match_minimum_anchors must be at least 2"
+        )
     if not 0 <= songs.match_minimum_score <= 1 or songs.match_minimum_margin < 0:
         raise ConfigError("song identification match score settings are invalid")
     if songs.pyshiro_max_window_seconds <= 0 or songs.pyshiro_max_window_seconds > 20:
-        raise ConfigError("song_identification.pyshiro_max_window_seconds must be in (0, 20]")
+        raise ConfigError(
+            "song_identification.pyshiro_max_window_seconds must be in (0, 20]"
+        )
     if not 0 < songs.lyric_gap_recheck_seconds <= 20:
-        raise ConfigError("song_identification.lyric_gap_recheck_seconds must be in (0, 20]")
+        raise ConfigError(
+            "song_identification.lyric_gap_recheck_seconds must be in (0, 20]"
+        )
     if not 0 <= songs.lyric_gap_vocal_active_ratio <= 1:
-        raise ConfigError("song_identification.lyric_gap_vocal_active_ratio must be between 0 and 1")
+        raise ConfigError(
+            "song_identification.lyric_gap_vocal_active_ratio must be between 0 and 1"
+        )
     if songs.pyshiro_likelihood_margin < 0:
-        raise ConfigError("song_identification.pyshiro_likelihood_margin cannot be negative")
+        raise ConfigError(
+            "song_identification.pyshiro_likelihood_margin cannot be negative"
+        )
     if songs.lyric_neighbor_max_lines < 1:
-        raise ConfigError("song_identification.lyric_neighbor_max_lines must be at least 1")
+        raise ConfigError(
+            "song_identification.lyric_neighbor_max_lines must be at least 1"
+        )
     if not 0 <= songs.lyric_neighbor_min_coverage <= 1:
         raise ConfigError(
             "song_identification.lyric_neighbor_min_coverage must be between 0 and 1"
@@ -643,12 +681,48 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("segmentation.request_batch_windows must be at least 1")
     if segmentation.request_batch_chars < 1:
         raise ConfigError("segmentation.request_batch_chars must be at least 1")
-    if segmentation.dialogue_context_seconds < 0:
-        raise ConfigError("segmentation.dialogue_context_seconds cannot be negative")
-    if segmentation.dialogue_context_max_chars < 1:
+    if segmentation.dialogue_context_before_seconds < 0:
         raise ConfigError(
-            "segmentation.dialogue_context_max_chars must be at least 1"
+            "segmentation.dialogue_context_before_seconds cannot be negative"
         )
+    if segmentation.dialogue_context_after_seconds < 0:
+        raise ConfigError(
+            "segmentation.dialogue_context_after_seconds cannot be negative"
+        )
+    if segmentation.dialogue_context_max_chars < 1:
+        raise ConfigError("segmentation.dialogue_context_max_chars must be at least 1")
+    knowledge = config.fan_knowledge
+    if not knowledge.database_path.strip():
+        raise ConfigError("fan_knowledge.database_path cannot be empty")
+    if not knowledge.collection_cache_dir.strip():
+        raise ConfigError("fan_knowledge.collection_cache_dir cannot be empty")
+    if knowledge.chunk_target_seconds <= 0:
+        raise ConfigError("fan_knowledge.chunk_target_seconds must be positive")
+    if knowledge.chunk_max_chars < 100:
+        raise ConfigError("fan_knowledge.chunk_max_chars must be at least 100")
+    if knowledge.current_video_chat_lookback_seconds < 0:
+        raise ConfigError(
+            "fan_knowledge.current_video_chat_lookback_seconds cannot be negative"
+        )
+    if knowledge.current_video_chat_lookahead_seconds < 0:
+        raise ConfigError(
+            "fan_knowledge.current_video_chat_lookahead_seconds cannot be negative"
+        )
+    if knowledge.current_video_chat_max_chars < 100:
+        raise ConfigError(
+            "fan_knowledge.current_video_chat_max_chars must be at least 100"
+        )
+    if not knowledge.youtube_subtitle_languages or not all(
+        isinstance(value, str) and value.strip()
+        for value in knowledge.youtube_subtitle_languages
+    ):
+        raise ConfigError(
+            "fan_knowledge.youtube_subtitle_languages must contain strings"
+        )
+    if knowledge.top_k_asr < 1 or knowledge.top_k_translation < 1:
+        raise ConfigError("fan_knowledge top-k limits must be at least 1")
+    if knowledge.translation_query_chars < 1:
+        raise ConfigError("fan_knowledge.translation_query_chars must be at least 1")
     if config.render.font_size_ratio <= 0:
         raise ConfigError("render.font_size_ratio must be positive")
     if config.render.portrait_font_size_ratio <= 0:

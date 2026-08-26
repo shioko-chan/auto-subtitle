@@ -5,7 +5,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from subtitle_pipeline.config import AppConfig, LLMConfig, UploadConfig
+from subtitle_pipeline.config import (
+    AppConfig,
+    FanKnowledgeConfig,
+    LLMConfig,
+    UploadConfig,
+)
 from subtitle_pipeline.media import DownloadResult
 from subtitle_pipeline.pipeline import (
     _canonicalize_catalog_tags,
@@ -18,6 +23,7 @@ from subtitle_pipeline.pipeline import (
     normalize_youtube_url,
     run_pipeline,
 )
+from subtitle_pipeline.reference_context import compact_reference_context
 from subtitle_pipeline.subtitles import Cue, write_srt
 from subtitle_pipeline.translate import CueTranslationResult
 
@@ -178,6 +184,35 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(context["characters"][-1]["id"], "example")
         self.assertEqual(context["terms"], {})
+
+    def test_translation_glossary_keeps_structured_knowledge_out_of_reference(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "knowledge.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "name": "Expert fan notes",
+                        "background": "Project background",
+                        "match": ["expert-video"],
+                        "knowledge": [
+                            {
+                                "id": "ty-meaning",
+                                "kind": "catchphrase",
+                                "title": "TY",
+                                "body": "TY means Thank You.",
+                                "aliases": ["ティーワイ"],
+                                "reliability": 1.0,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            context = _translation_context({"title": "expert-video"}, [str(path)])
+
+        self.assertEqual(context["knowledge_records"][0]["id"], "ty-meaning")
+        self.assertNotIn("knowledge_records", compact_reference_context(context))
 
     def test_japanese_single_words_include_names_nicknames_and_terms(self):
         context = {
@@ -343,7 +378,9 @@ class PipelineTests(unittest.TestCase):
                     return "中文标题", "中文简介", "内容摘要", ["动画", "音乐企划"]
 
             config = AppConfig(
-                work_dir=root / "work", upload=UploadConfig(enabled=True)
+                work_dir=root / "work",
+                fan_knowledge=FanKnowledgeConfig(enabled=False),
+                upload=UploadConfig(enabled=True),
             )
             with patch(
                 "subtitle_pipeline.pipeline.download_youtube", return_value=downloaded

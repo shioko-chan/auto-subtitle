@@ -219,9 +219,7 @@ def run_joint_translation(
 
     missing = [item for item in ranges if _range_key(*item) not in windows]
     if missing:
-        groups = _batch_range_groups(
-            missing, track_map, all_units, segmentation
-        )
+        groups = _batch_range_groups(missing, track_map, all_units, segmentation)
         logger.info(
             "jointly segmenting and translating %d/%d speaker-track windows "
             "in %d API request group(s) with concurrency=%d",
@@ -488,9 +486,7 @@ def _request_batch_windows(
                     validation_maximum_units,
                     llm.target_language,
                     validate_language=False,
-                    reference_replacements=_reference_replacements(
-                        translation_context
-                    ),
+                    reference_replacements=_reference_replacements(translation_context),
                     local_translate=local_translate,
                 )
             except (RuntimeError, TypeError) as exc:
@@ -903,8 +899,8 @@ def _dialogue_context(
     selected: tuple[LocalUnit, ...],
     config: SegmentationConfig,
 ) -> str:
-    lower = selected[0].start - config.dialogue_context_seconds
-    upper = selected[-1].end + config.dialogue_context_seconds
+    lower = selected[0].start - config.dialogue_context_before_seconds
+    upper = selected[-1].end + config.dialogue_context_after_seconds
     selected_keys = {(unit.track, unit.local_id) for unit in selected}
     candidates = [
         unit
@@ -919,10 +915,7 @@ def _dialogue_context(
     used = 0
     for unit in candidates:
         unit_language = language_for_text(unit.text, unit.language) or "unknown"
-        line = (
-            f"<{unit.track} language={unit_language}>"
-            f"{_escape(unit.text)}"
-        )
+        line = f"<{unit.track} language={unit_language}>{_escape(unit.text)}"
         if used + len(line) + 1 > config.dialogue_context_max_chars:
             continue
         kept.append(unit)
@@ -1311,9 +1304,7 @@ def _records_to_result(
         source_cue = Cue(
             start,
             end,
-            join_source_fragments(
-                (cue.text, cue.language) for cue in source_values
-            ),
+            join_source_fragments((cue.text, cue.language) for cue in source_values),
             speaker,
             kind,
             source_units=source_units,
@@ -1349,12 +1340,15 @@ def _source_timed_units(source: list[Cue]) -> tuple[TimedTextUnit, ...]:
             else:
                 text = unit.text
                 if values:
-                    text = source_separator(
-                        values[-1].text,
-                        text,
-                        language_for_text(values[-1].text),
-                        language_for_text(text, cue.language),
-                    ) + text
+                    text = (
+                        source_separator(
+                            values[-1].text,
+                            text,
+                            language_for_text(values[-1].text),
+                            language_for_text(text, cue.language),
+                        )
+                        + text
+                    )
                 values.append(TimedTextUnit(text, unit.start, unit.end))
     return tuple(values)
 

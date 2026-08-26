@@ -5,6 +5,8 @@ work_dir = "work"
 video_format = "bv*[vcodec^=vp9]+ba/bv*[vcodec^=vp09]+ba/bv*[vcodec^=avc1]+ba/b"
 # Download DASH/HLS fragments in parallel. Plain single-file streams ignore this.
 concurrent_fragments = 8
+# Download chat replay as temporary, time-local evidence for ASR correction and translation.
+download_chat_replay = true
 # Automatically use Deno, Node or QuickJS when available; set "" to disable.
 js_runtime = "auto"
 # cookies_from_browser = "chrome"
@@ -129,7 +131,7 @@ song_search_group_gap_seconds = 35.0
 minimum_ocr_score = 0.45
 minimum_persistent_frames = 2
 max_search_results = 5
-lyrics_library_path = "work/lyrics/library.sqlite3"
+lyrics_library_path = "databases/lyrics.sqlite3"
 match_anchor_threshold = 0.48
 match_minimum_anchors = 3
 match_minimum_score = 0.48
@@ -152,10 +154,29 @@ local_unit_max_seconds = 6.0
 speaker_episode_gap_seconds = 2.0
 model_window_units = 80
 model_window_chars = 3000
-request_batch_windows = 8
+request_batch_windows = 32
 request_batch_chars = 3000
-dialogue_context_seconds = 5.0
+dialogue_context_before_seconds = 20.0
+dialogue_context_after_seconds = 10.0
 dialogue_context_max_chars = 4000
+
+[fan_knowledge]
+# Local, reusable fan-domain knowledge base. Retrieval details for each job are
+# written to work/<job-id>/fan-knowledge-audit.jsonl.
+enabled = true
+database_path = "databases/fan-knowledge.sqlite3"
+collection_cache_dir = "work/knowledge/youtube"
+chunk_target_seconds = 45.0
+chunk_max_chars = 1400
+youtube_subtitle_languages = ["ja.*", "ja", "en.*", "en"]
+# Full chat is temporary: SC is indexed, then the raw chat replay is deleted.
+include_regular_chat = false
+current_video_chat_lookback_seconds = 30.0
+current_video_chat_lookahead_seconds = 15.0
+current_video_chat_max_chars = 900
+top_k_asr = 6
+top_k_translation = 12
+translation_query_chars = 12000
 
 [llm]
 base_url = "http://127.0.0.1:8080/v1"
@@ -172,6 +193,9 @@ max_tokens = 8192
 # than ordinary context capacity even when the output token cap is large.
 asr_correction_batch_windows = 6
 asr_correction_batch_chars = 3000
+asr_correction_context_before_seconds = 20.0
+asr_correction_context_after_seconds = 10.0
+asr_correction_context_max_chars = 2000
 # llama.cpp starts after ASR and stops before rendering, so the 22 GB GPU does
 # not need to hold both model families. The first run downloads the 16.5 GB GGUF.
 local_server_enabled = true
