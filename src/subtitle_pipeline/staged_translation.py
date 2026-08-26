@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from .config import LLMConfig, SegmentationConfig
+from .config import LLMConfig, SegmentationConfig, TranslationConfig
 from .fan_knowledge import KnowledgeHit
 from .joint_translation import (
     _best_split,
@@ -149,7 +149,7 @@ def run_fixed_translation(
     *,
     source_cues: list[Cue],
     llm: LLMConfig,
-    segmentation: SegmentationConfig,
+    translation: TranslationConfig,
     request: Callable[[dict[str, object]], dict[str, object]],
     parse_content: Callable[[object], list[object]],
     finish_reason: Callable[[object], str | None],
@@ -171,7 +171,8 @@ def run_fixed_translation(
         {
             "source": [asdict(cue) for cue in source_cues],
             "model": llm.model,
-            "target_language": llm.target_language,
+            "target_language": translation.target_language,
+            "translation": asdict(translation),
             "maximum_units": maximum_units,
             "context": translation_context,
             "prompt": prompt_templates_digest(_TRANSLATE_PROMPT),
@@ -194,8 +195,8 @@ def run_fixed_translation(
     for cue_id in pending:
         cue_chars = len(source_cues[cue_id].text)
         if current and (
-            len(current) >= segmentation.request_batch_windows
-            or characters + cue_chars > segmentation.request_batch_chars
+            len(current) >= translation.batch_cues
+            or characters + cue_chars > translation.batch_chars
         ):
             groups.append(current)
             current = []
@@ -223,7 +224,7 @@ def run_fixed_translation(
             replacements,
             maximum_units,
             honorific_rules,
-            segmentation,
+            translation,
             retrieve_knowledge,
             retrieve_chat,
         )
@@ -374,7 +375,7 @@ def _request_segmentation(
             if previous_error is None
             else f"\n\nPREVIOUS_RESPONSE_ERROR: {previous_error}",
         )
-        body = _body(llm, _SEGMENT_PROMPT, prompt)
+        body = _body(llm, _SEGMENT_PROMPT, prompt, config.max_tokens)
         content: object = None
         response: object = None
         try:
@@ -464,7 +465,7 @@ def _translate_resilient(
     replacements: tuple[tuple[str, str], ...],
     maximum_units: float,
     honorific_rules: str,
-    segmentation: SegmentationConfig,
+    translation: TranslationConfig,
     retrieve_knowledge: Callable[[list[Cue], str], list[KnowledgeHit]] | None,
     retrieve_chat: Callable[[list[Cue]], str] | None,
 ) -> dict[int, str]:
@@ -494,7 +495,7 @@ def _translate_resilient(
             replacements,
             maximum_units,
             honorific_rules,
-            segmentation,
+            translation,
             chat_evidence,
         )
     except Exception as exc:
@@ -529,7 +530,7 @@ def _translate_resilient(
                 replacements,
                 maximum_units,
                 honorific_rules,
-                segmentation,
+                translation,
                 retrieve_knowledge,
                 retrieve_chat,
             ),
@@ -548,7 +549,7 @@ def _translate_resilient(
                 replacements,
                 maximum_units,
                 honorific_rules,
-                segmentation,
+                translation,
                 retrieve_knowledge,
                 retrieve_chat,
             ),
@@ -572,7 +573,7 @@ def _request_translation(
     replacements: tuple[tuple[str, str], ...],
     maximum_units: float,
     honorific_rules: str,
-    segmentation: SegmentationConfig,
+    translation: TranslationConfig,
     chat_evidence: str,
 ) -> dict[int, str]:
     previous_error: Exception | None = None
@@ -583,11 +584,11 @@ def _request_translation(
         start = min(cue.start for cue in selected)
         end = max(cue.end for cue in selected)
         dialogue = _translation_dialogue_context(
-            cues, selected, start, end, segmentation
+            cues, selected, start, end, translation
         )
         prompt = render_user_prompt(
             _TRANSLATE_PROMPT,
-            TARGET_LANGUAGE=llm.target_language,
+            TARGET_LANGUAGE=translation.target_language,
             MAXIMUM_UNITS=f"{maximum_units:.3f}",
             HONORIFIC_TRANSLATION_RULES=honorific_rules,
             REFERENCE_TEXT=_reference_text(context),
@@ -604,7 +605,7 @@ def _request_translation(
             if previous_error is None
             else f"\n\nPREVIOUS_RESPONSE_ERROR: {previous_error}",
         )
-        body = _body(llm, _TRANSLATE_PROMPT, prompt)
+        body = _body(llm, _TRANSLATE_PROMPT, prompt, translation.max_tokens)
         content: object = None
         response: object = None
         try:
@@ -640,7 +641,7 @@ def _request_translation(
                         cue.text,
                     )
                     text = _fallback(cue, replacements, local_translate)
-                elif _contains_kana(text, llm.target_language):
+                elif _contains_kana(text, translation.target_language):
                     logger.warning(
                         "LLM translation downgrade reason=residual_japanese fallback=protected_machine_translation cue_id=%d text=%r",
                         global_id,
@@ -769,11 +770,16 @@ def _integer(value: object, field: str, position: int) -> int:
     raise TypeError(f"cue {position} {field} is not an integer")
 
 
-def _body(llm: LLMConfig, prompt_name: str, prompt: str) -> dict[str, object]:
+def _body(
+    llm: LLMConfig,
+    prompt_name: str,
+    prompt: str,
+    max_tokens: int,
+) -> dict[str, object]:
     body: dict[str, object] = {
         "model": llm.model,
         "temperature": 0.1,
-        "max_tokens": llm.max_tokens,
+        "max_tokens": max_tokens,
         "messages": [
             {"role": "system", "content": prompt_system(prompt_name)},
             {"role": "user", "content": prompt},
@@ -791,14 +797,14 @@ def _translation_dialogue_context(
     selected: list[Cue],
     start: float,
     end: float,
-    config: SegmentationConfig,
+    config: TranslationConfig,
 ) -> list[Cue]:
     selected_ids = {id(cue) for cue in selected}
     candidates = [
         cue
         for cue in cues
-        if cue.end >= start - config.dialogue_context_before_seconds
-        and cue.start <= end + config.dialogue_context_after_seconds
+        if cue.end >= start - config.context_before_seconds
+        and cue.start <= end + config.context_after_seconds
         and id(cue) not in selected_ids
     ]
     center = (start + end) / 2
@@ -807,7 +813,7 @@ def _translation_dialogue_context(
     used = 0
     for cue in candidates:
         line_chars = len(cue.text) + len(cue.speaker or "unknown") + 3
-        if used + line_chars > config.dialogue_context_max_chars:
+        if used + line_chars > config.context_max_chars:
             continue
         kept.append(cue)
         used += line_chars

@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from subtitle_pipeline.config import LLMConfig, SegmentationConfig
+from subtitle_pipeline.config import LLMConfig, SegmentationConfig, TranslationConfig
 from subtitle_pipeline.fan_knowledge import KnowledgeHit, KnowledgeScore
 from subtitle_pipeline.local_segmentation import LocalUnit, SpeakerTrack
 from subtitle_pipeline.song_identification import (
@@ -65,7 +65,7 @@ class StagedTranslationTests(unittest.TestCase):
         result = run_fixed_translation(
             source_cues=source,
             llm=LLMConfig(),
-            segmentation=SegmentationConfig(),
+            translation=TranslationConfig(),
             request=request,
             parse_content=parse_cues,
             finish_reason=finish_reason,
@@ -150,7 +150,7 @@ class StagedTranslationTests(unittest.TestCase):
         translated = run_fixed_translation(
             source_cues=source,
             llm=LLMConfig(),
-            segmentation=SegmentationConfig(),
+            translation=TranslationConfig(),
             request=request,
             parse_content=parse_cues,
             finish_reason=finish_reason,
@@ -204,7 +204,7 @@ class StagedTranslationTests(unittest.TestCase):
         run_fixed_translation(
             source_cues=source,
             llm=LLMConfig(),
-            segmentation=SegmentationConfig(),
+            translation=TranslationConfig(),
             request=request,
             parse_content=parse_cues,
             finish_reason=finish_reason,
@@ -251,7 +251,7 @@ class StagedTranslationTests(unittest.TestCase):
         run_fixed_translation(
             source_cues=source,
             llm=LLMConfig(),
-            segmentation=SegmentationConfig(),
+            translation=TranslationConfig(),
             request=request,
             parse_content=parse_cues,
             finish_reason=finish_reason,
@@ -299,7 +299,7 @@ class StagedTranslationTests(unittest.TestCase):
         run_fixed_translation(
             source_cues=source,
             llm=LLMConfig(),
-            segmentation=SegmentationConfig(),
+            translation=TranslationConfig(),
             request=request,
             parse_content=parse_cues,
             finish_reason=finish_reason,
@@ -339,7 +339,7 @@ class StagedTranslationTests(unittest.TestCase):
             arguments = {
                 "source_cues": source,
                 "llm": LLMConfig(),
-                "segmentation": SegmentationConfig(),
+                "translation": TranslationConfig(),
                 "parse_content": parse_cues,
                 "finish_reason": finish_reason,
                 "retry_delay": no_delay,

@@ -76,6 +76,35 @@ class ASRCorrectionTests(unittest.TestCase):
             [[item[0] for item in batch] for batch in batches], [[0], [1, 2]]
         )
 
+    def test_request_uses_stage_output_limit(self) -> None:
+        bodies: list[dict[str, object]] = []
+
+        def request(body: dict[str, object]) -> dict[str, object]:
+            bodies.append(body)
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"windows":[{"window_id":0,"corrected_text":"修正"}]}'
+                        }
+                    }
+                ]
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            correct_asr_windows(
+                [{"text": "原文", "language": "Japanese"}],
+                entities=[],
+                request=request,
+                model="test-model",
+                cache_path=root / "cache.json",
+                audit_path=root / "audit.jsonl",
+                max_tokens=1234,
+            )
+
+        self.assertEqual(bodies[0]["max_tokens"], 1234)
+
     def test_entities_from_context_ignores_translation_terms(self) -> None:
         entities = entities_from_context(
             {
@@ -324,6 +353,37 @@ class ASRCorrectionTests(unittest.TestCase):
 
         self.assertEqual(first[0]["text"], "修正")
         self.assertEqual(second[0]["text"], "修正")
+
+    def test_asr_cache_changes_with_stage_configuration(self) -> None:
+        calls = 0
+
+        def request(_body: dict[str, object]) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"windows":[{"window_id":0,"corrected_text":"修正"}]}'
+                        }
+                    }
+                ]
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            arguments = {
+                "records": [{"text": "原文", "language": "Japanese"}],
+                "entities": [],
+                "request": request,
+                "model": "test-model",
+                "cache_path": root / "cache.json",
+                "audit_path": root / "audit.jsonl",
+            }
+            correct_asr_windows(**arguments, max_tokens=1024)
+            correct_asr_windows(**arguments, max_tokens=2048)
+
+        self.assertEqual(calls, 2)
 
 
 if __name__ == "__main__":

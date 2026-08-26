@@ -147,20 +147,50 @@ pyshiro_likelihood_floor = -30.0
 pyshiro_likelihood_margin = 0.2
 lyric_neighbor_max_lines = 12
 lyric_neighbor_min_coverage = 0.45
-lyric_neighbor_max_unit_seconds = 2.0
+
+[asr_correction]
+# ASR correction repeats every source window, so keep batches below the model
+# context capacity even when the output token cap is large.
+batch_windows = 6
+batch_chars = 3000
+max_tokens = 8192
+context_before_seconds = 20.0
+context_after_seconds = 10.0
+context_max_chars = 2000
 
 [segmentation]
 boundary_score_threshold = 3
 local_unit_min_fallback_seconds = 2.0
 local_unit_max_seconds = 6.0
 speaker_episode_gap_seconds = 2.0
-model_window_units = 80
+model_window_units = 240
 model_window_chars = 3000
-request_batch_windows = 32
-request_batch_chars = 3000
+max_tokens = 8192
 dialogue_context_before_seconds = 20.0
 dialogue_context_after_seconds = 10.0
 dialogue_context_max_chars = 4000
+
+[translation]
+target_language = "简体中文"
+batch_cues = 32
+batch_chars = 3000
+max_tokens = 8192
+context_before_seconds = 20.0
+context_after_seconds = 10.0
+context_max_chars = 4000
+# Loaded lazily only when an LLM cue is empty or still contains Japanese kana.
+local_model = "facebook/m2m100_418M"
+local_device = "cpu"
+translate_metadata = true
+# Only this many source-description characters are sent to the LLM.
+metadata_description_max_chars = 6000
+# Number of Bilibili tags generated in the same metadata request.
+metadata_tag_count = 5
+# Beginning/middle/end subtitle evidence supplied to metadata analysis.
+metadata_subtitle_max_chars = 4000
+# ip_aliases_file = "ip_aliases.json"
+# Additional glossary files override matching terms in built-in glossaries.
+glossary_files = []
 
 [fan_knowledge]
 # Local, reusable fan-domain knowledge base. Retrieval details for each job are
@@ -186,18 +216,9 @@ api_style = "chat_completions"
 api_key_pass_entry = ""
 api_key_env = "LOCAL_LLM_API_KEY"
 model = "Qwen3.8-27B"
-target_language = "简体中文"
 timeout_seconds = 120
 max_retries = 5
 max_concurrency = 3
-max_tokens = 8192
-# ASR correction must repeat every source window, so keep these batches smaller
-# than ordinary context capacity even when the output token cap is large.
-asr_correction_batch_windows = 6
-asr_correction_batch_chars = 3000
-asr_correction_context_before_seconds = 20.0
-asr_correction_context_after_seconds = 10.0
-asr_correction_context_max_chars = 2000
 # llama.cpp starts after ASR and stops before rendering, so the 22 GB GPU does
 # not need to hold both model families. The first run downloads the 16.5 GB GGUF.
 local_server_enabled = true
@@ -212,9 +233,6 @@ local_server_gpu_layers = 99
 local_server_parallel = 3
 local_server_reasoning = "off"
 local_server_startup_timeout_seconds = 1800
-# Loaded lazily only when an LLM cue is empty or still contains Japanese kana.
-local_translation_model = "facebook/m2m100_418M"
-local_translation_device = "cpu"
 # Joint subtitles and metadata use json_object.
 # Set false if an OpenAI-compatible provider rejects response_format=json_object.
 json_mode = true
@@ -228,16 +246,6 @@ json_mode = true
 # model = "gpt-5.6"
 # Remove `thinking` above when using Responses. Optionally set:
 # reasoning_effort = "low"
-translate_metadata = true
-# Only this many source-description characters are sent to the LLM.
-metadata_description_max_chars = 6000
-# Number of Bilibili tags generated in the same metadata request.
-metadata_tag_count = 5
-# Beginning/middle/end subtitle evidence supplied to metadata analysis.
-metadata_subtitle_max_chars = 4000
-# ip_aliases_file = "ip_aliases.json"
-# Additional glossary files override matching terms in built-in glossaries.
-glossary_files = []
 
 [render]
 # auto tries the sparse libass/CUDA/NVENC renderer and falls back to CPU libass.

@@ -14,6 +14,7 @@ from subtitle_pipeline.song_identification import (
     _apply_local_match,
     _build_lyric_search_queries,
     _load_cache,
+    _lyric_unit_timeline_errors,
     _parse_worker_json_output,
     _public_http_url,
     _pyshiro_likelihood_wins,
@@ -31,6 +32,21 @@ from subtitle_pipeline.subtitles import Cue, TimedTextUnit
 
 
 class SongIdentificationTests(unittest.TestCase):
+    def test_lyric_unit_timeline_errors_allow_long_positive_units(self):
+        errors = _lyric_unit_timeline_errors(
+            (
+                TimedTextUnit("長", 1.0, 4.25),
+                TimedTextUnit("逆", 5.0, 4.5),
+            ),
+            line_id=7,
+            lyric_text="長い歌声",
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["issue"], "non_positive_unit_duration")
+        self.assertEqual(errors[0]["unit_text"], "逆")
+        self.assertEqual(errors[0]["lyric_text"], "長い歌声")
+
     def test_pyshiro_json_parser_ignores_worker_stdout_noise(self):
         self.assertEqual(
             _parse_worker_json_output('loading model...\n{"ok":true,"lines":[]}\n'),
@@ -160,7 +176,7 @@ class SongIdentificationTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "song-cache.json"
             path.write_text(
-                '{"version":13,"signature":"test","reports":[],"corrected_cues":[]}',
+                '{"version":14,"signature":"test","reports":[],"corrected_cues":[]}',
                 encoding="utf-8",
             )
 

@@ -69,6 +69,7 @@ def correct_asr_windows(
     audit_path: Path,
     batch_windows: int = 6,
     batch_chars: int = 3000,
+    max_tokens: int = 8192,
     context_before_seconds: float = 20.0,
     context_after_seconds: float = 10.0,
     context_max_chars: int = 2000,
@@ -82,6 +83,14 @@ def correct_asr_windows(
     corrected: list[dict[str, object] | None] = [None] * len(records)
     pending: list[tuple[int, dict[str, object], str, list[ASREntity]]] = []
     knowledge_by_index: dict[int, list[KnowledgeHit]] = {}
+    correction_config = {
+        "batch_windows": batch_windows,
+        "batch_chars": batch_chars,
+        "max_tokens": max_tokens,
+        "context_before_seconds": context_before_seconds,
+        "context_after_seconds": context_after_seconds,
+        "context_max_chars": context_max_chars,
+    }
     for index, record in enumerate(records):
         text = str(record.get("text") or "")
         deterministic = _replace_exact_aliases(text, entities)
@@ -97,6 +106,7 @@ def correct_asr_windows(
             str(record.get("language") or ""),
             candidates,
             model,
+            correction_config,
         )
         cached = cache["records"].get(signature)
         if isinstance(cached, str):
@@ -113,6 +123,7 @@ def correct_asr_windows(
         )
         body = {
             "model": model,
+            "max_tokens": max_tokens,
             "messages": [
                 {"role": "system", "content": prompt_system(_PROMPT)},
                 {
@@ -193,6 +204,7 @@ def correct_asr_windows(
                 str(record.get("language") or ""),
                 candidates,
                 model,
+                correction_config,
             )
             with lock:
                 cache["records"][signature] = value
@@ -444,6 +456,7 @@ def _record_signature(
     language: str,
     entities: list[ASREntity],
     model: str,
+    correction_config: dict[str, int | float],
 ) -> str:
     payload = {
         "version": _CACHE_VERSION,
@@ -451,6 +464,7 @@ def _record_signature(
         "language": language,
         "entities": [(item.surface, item.reading, item.aliases) for item in entities],
         "model": model,
+        "config": correction_config,
         "prompt": prompt_templates_digest(_PROMPT),
     }
     return hashlib.sha256(

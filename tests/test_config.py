@@ -40,9 +40,6 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(
                 config.song_identification.lyric_neighbor_min_coverage, 0.45
             )
-            self.assertEqual(
-                config.song_identification.lyric_neighbor_max_unit_seconds, 2.0
-            )
             self.assertEqual(config.asr.dtype, "float16")
             self.assertIsNone(config.asr.language)
             self.assertTrue(config.audio_analysis.enabled)
@@ -96,14 +93,16 @@ class ConfigTests(unittest.TestCase):
             )
             self.assertEqual(config.segmentation.boundary_score_threshold, 3)
             self.assertEqual(config.segmentation.local_unit_max_seconds, 6.0)
-            self.assertEqual(config.segmentation.model_window_units, 80)
+            self.assertEqual(config.segmentation.model_window_units, 240)
             self.assertEqual(config.segmentation.model_window_chars, 3000)
-            self.assertEqual(config.segmentation.request_batch_windows, 32)
-            self.assertEqual(config.segmentation.request_batch_chars, 3000)
+            self.assertEqual(config.asr_correction.batch_windows, 6)
+            self.assertEqual(config.asr_correction.batch_chars, 3000)
+            self.assertEqual(config.translation.batch_cues, 32)
+            self.assertEqual(config.translation.batch_chars, 3000)
             self.assertEqual(config.llm.max_concurrency, 16)
             self.assertFalse(config.llm.local_server_enabled)
-            self.assertEqual(config.llm.local_translation_model, "facebook/m2m100_418M")
-            self.assertEqual(config.llm.local_translation_device, "cpu")
+            self.assertEqual(config.translation.local_model, "facebook/m2m100_418M")
+            self.assertEqual(config.translation.local_device, "cpu")
             self.assertEqual(config.render.font_size_ratio, 0.066)
             self.assertEqual(config.render.portrait_font_size_ratio, 0.077)
             self.assertEqual(config.render.max_font_size, 144)
@@ -141,7 +140,7 @@ class ConfigTests(unittest.TestCase):
     def test_rejects_invalid_max_tokens(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.toml"
-            path.write_text("[llm]\nmax_tokens = 0\n", encoding="utf-8")
+            path.write_text("[translation]\nmax_tokens = 0\n", encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, "max_tokens"):
                 load_config(path)
 
@@ -155,8 +154,17 @@ class ConfigTests(unittest.TestCase):
     def test_rejects_empty_local_translation_model(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.toml"
-            path.write_text('[llm]\nlocal_translation_model = ""\n', encoding="utf-8")
-            with self.assertRaisesRegex(ConfigError, "local_translation_model"):
+            path.write_text('[translation]\nlocal_model = ""\n', encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "translation.local_model"):
+                load_config(path)
+
+    def test_rejects_stage_fields_in_llm_section(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(
+                "[llm]\nasr_correction_batch_windows = 6\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ConfigError, "unknown.*configuration field"):
                 load_config(path)
 
     def test_rejects_invalid_song_ocr_interval(self):

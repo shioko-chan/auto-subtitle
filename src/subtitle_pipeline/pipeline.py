@@ -185,7 +185,7 @@ def _run_pipeline_stages(
                 remove_youtube_chat_files(job_dir)
 
     translation_context = _translation_context(
-        downloaded.metadata, config.llm.glossary_files
+        downloaded.metadata, config.translation.glossary_files
     )
     video_date = video_date_from_metadata(downloaded.metadata)
     current_video_id = str(downloaded.metadata.get("id") or "").strip() or None
@@ -200,6 +200,7 @@ def _run_pipeline_stages(
         )
     translator = OpenAICompatibleTranslator(
         config.llm,
+        config.translation,
         llm_api_key(config.llm),
         audit_path=job_dir / "llm-audit.jsonl",
     )
@@ -231,13 +232,12 @@ def _run_pipeline_stages(
                 model=config.llm.model,
                 cache_path=job_dir / "asr-correction-cache.json",
                 audit_path=job_dir / "asr-correction-audit.jsonl",
-                batch_windows=config.llm.asr_correction_batch_windows,
-                batch_chars=config.llm.asr_correction_batch_chars,
-                context_before_seconds=(
-                    config.llm.asr_correction_context_before_seconds
-                ),
-                context_after_seconds=config.llm.asr_correction_context_after_seconds,
-                context_max_chars=config.llm.asr_correction_context_max_chars,
+                batch_windows=config.asr_correction.batch_windows,
+                batch_chars=config.asr_correction.batch_chars,
+                max_tokens=config.asr_correction.max_tokens,
+                context_before_seconds=config.asr_correction.context_before_seconds,
+                context_after_seconds=config.asr_correction.context_after_seconds,
+                context_max_chars=config.asr_correction.context_max_chars,
                 retrieve_knowledge=(
                     lambda record, text: (
                         fan_knowledge.retrieve(
@@ -355,7 +355,6 @@ def _run_pipeline_stages(
         with stage_metrics("pipeline.llm_cue_translation"):
             translated = translator.translate_segmented_cues(
                 segmented,
-                config.segmentation,
                 translation_context=translation_context,
                 max_line_units=layout.max_line_units,
                 cache_path=job_dir / "cue-translation-cache.json",
@@ -443,8 +442,12 @@ def _run_pipeline_stages(
     translated_path = job_dir / "translated.zh-CN.srt"
     write_srt(translated, translated_path)
 
-    subtitle_evidence = _subtitle_evidence(cues, config.llm.metadata_subtitle_max_chars)
-    ip_aliases = _load_optional_json_object(config.llm.ip_aliases_file, "IP aliases")
+    subtitle_evidence = _subtitle_evidence(
+        cues, config.translation.metadata_subtitle_max_chars
+    )
+    ip_aliases = _load_optional_json_object(
+        config.translation.ip_aliases_file, "IP aliases"
+    )
     tag_catalog = _load_optional_json_object(
         config.upload.tag_catalog_file, "Bilibili tag catalog"
     )
@@ -452,7 +455,7 @@ def _run_pipeline_stages(
     content_summary = ""
     generated_tags: list[str] = []
     with stage_metrics("pipeline.metadata_translation"):
-        if config.llm.translate_metadata:
+        if config.translation.translate_metadata:
             logging.info("translating video title and description and generating tags")
             title, description, content_summary, generated_tags = (
                 translator.translate_metadata(

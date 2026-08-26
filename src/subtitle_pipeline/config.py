@@ -130,7 +130,16 @@ class SongIdentificationConfig:
     pyshiro_likelihood_margin: float = 0.2
     lyric_neighbor_max_lines: int = 12
     lyric_neighbor_min_coverage: float = 0.45
-    lyric_neighbor_max_unit_seconds: float = 2.0
+
+
+@dataclass(frozen=True)
+class ASRCorrectionConfig:
+    batch_windows: int = 6
+    batch_chars: int = 3000
+    max_tokens: int = 8192
+    context_before_seconds: float = 20.0
+    context_after_seconds: float = 10.0
+    context_max_chars: int = 2000
 
 
 @dataclass(frozen=True)
@@ -139,13 +148,31 @@ class SegmentationConfig:
     local_unit_min_fallback_seconds: float = 2.0
     local_unit_max_seconds: float = 6.0
     speaker_episode_gap_seconds: float = 2.0
-    model_window_units: int = 80
+    model_window_units: int = 240
     model_window_chars: int = 3000
-    request_batch_windows: int = 32
-    request_batch_chars: int = 3000
+    max_tokens: int = 8192
     dialogue_context_before_seconds: float = 20.0
     dialogue_context_after_seconds: float = 10.0
     dialogue_context_max_chars: int = 4000
+
+
+@dataclass(frozen=True)
+class TranslationConfig:
+    target_language: str = "简体中文"
+    batch_cues: int = 32
+    batch_chars: int = 3000
+    max_tokens: int = 8192
+    context_before_seconds: float = 20.0
+    context_after_seconds: float = 10.0
+    context_max_chars: int = 4000
+    local_model: str = "facebook/m2m100_418M"
+    local_device: str = "cpu"
+    translate_metadata: bool = True
+    metadata_description_max_chars: int = 6000
+    metadata_tag_count: int = 5
+    metadata_subtitle_max_chars: int = 4000
+    ip_aliases_file: str | None = None
+    glossary_files: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -174,16 +201,9 @@ class LLMConfig:
     api_key_pass_entry: str | None = "api/deepseek"
     api_key_env: str = "DEEPSEEK_API_KEY"
     model: str = "deepseek-chat"
-    target_language: str = "简体中文"
     timeout_seconds: int = 120
     max_retries: int = 5
     max_concurrency: int = 16
-    max_tokens: int = 16384
-    asr_correction_batch_windows: int = 6
-    asr_correction_batch_chars: int = 3000
-    asr_correction_context_before_seconds: float = 20.0
-    asr_correction_context_after_seconds: float = 10.0
-    asr_correction_context_max_chars: int = 2000
     local_server_enabled: bool = False
     local_server_command: str = "llama-server"
     local_server_model_path: str | None = None
@@ -195,17 +215,9 @@ class LLMConfig:
     local_server_parallel: int = 2
     local_server_reasoning: str = "off"
     local_server_startup_timeout_seconds: int = 1800
-    local_translation_model: str = "facebook/m2m100_418M"
-    local_translation_device: str = "cpu"
     json_mode: bool = True
     thinking: str | None = None
     reasoning_effort: str | None = None
-    translate_metadata: bool = True
-    metadata_description_max_chars: int = 6000
-    metadata_tag_count: int = 5
-    metadata_subtitle_max_chars: int = 4000
-    ip_aliases_file: str | None = None
-    glossary_files: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -259,7 +271,9 @@ class AppConfig:
     song_identification: SongIdentificationConfig = field(
         default_factory=SongIdentificationConfig
     )
+    asr_correction: ASRCorrectionConfig = field(default_factory=ASRCorrectionConfig)
     segmentation: SegmentationConfig = field(default_factory=SegmentationConfig)
+    translation: TranslationConfig = field(default_factory=TranslationConfig)
     fan_knowledge: FanKnowledgeConfig = field(default_factory=FanKnowledgeConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
@@ -291,7 +305,9 @@ def load_config(path: Path) -> AppConfig:
             song_identification=SongIdentificationConfig(
                 **_section(data, "song_identification")
             ),
+            asr_correction=ASRCorrectionConfig(**_section(data, "asr_correction")),
             segmentation=SegmentationConfig(**_section(data, "segmentation")),
+            translation=TranslationConfig(**_section(data, "translation")),
             fan_knowledge=FanKnowledgeConfig(**_section(data, "fan_knowledge")),
             llm=LLMConfig(**_section(data, "llm")),
             render=RenderConfig(**_section(data, "render")),
@@ -306,20 +322,13 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("llm.max_retries must be at least 1")
     if config.llm.max_concurrency < 1:
         raise ConfigError("llm.max_concurrency must be at least 1")
-    if config.llm.max_tokens < 1:
-        raise ConfigError("llm.max_tokens must be at least 1")
-    if config.llm.asr_correction_batch_windows < 1:
-        raise ConfigError("llm.asr_correction_batch_windows must be at least 1")
-    if config.llm.asr_correction_context_before_seconds < 0:
-        raise ConfigError(
-            "llm.asr_correction_context_before_seconds cannot be negative"
-        )
-    if config.llm.asr_correction_context_after_seconds < 0:
-        raise ConfigError("llm.asr_correction_context_after_seconds cannot be negative")
-    if config.llm.asr_correction_context_max_chars < 1:
-        raise ConfigError("llm.asr_correction_context_max_chars must be positive")
-    if config.llm.asr_correction_batch_chars < 1:
-        raise ConfigError("llm.asr_correction_batch_chars must be at least 1")
+    for section_name, max_tokens in (
+        ("asr_correction", config.asr_correction.max_tokens),
+        ("segmentation", config.segmentation.max_tokens),
+        ("translation", config.translation.max_tokens),
+    ):
+        if max_tokens < 1:
+            raise ConfigError(f"{section_name}.max_tokens must be at least 1")
     if config.llm.local_server_enabled:
         if config.llm.api_style != "chat_completions":
             raise ConfigError(
@@ -370,10 +379,6 @@ def load_config(path: Path) -> AppConfig:
             raise ConfigError(
                 "llm.base_url must point to the configured local HTTP server port"
             )
-    if not config.llm.local_translation_model.strip():
-        raise ConfigError("llm.local_translation_model cannot be empty")
-    if not config.llm.local_translation_device.strip():
-        raise ConfigError("llm.local_translation_device cannot be empty")
     if config.llm.api_style not in {"chat_completions", "responses"}:
         raise ConfigError("llm.api_style must be 'chat_completions' or 'responses'")
     if config.llm.thinking not in (None, "enabled", "disabled"):
@@ -401,16 +406,6 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError(
             "llm.reasoning_effort is only supported when api_style='responses'"
         )
-    if config.llm.metadata_description_max_chars < 0:
-        raise ConfigError("llm.metadata_description_max_chars cannot be negative")
-    if not 1 <= config.llm.metadata_tag_count <= 10:
-        raise ConfigError("llm.metadata_tag_count must be between 1 and 10")
-    if config.llm.metadata_subtitle_max_chars < 0:
-        raise ConfigError("llm.metadata_subtitle_max_chars cannot be negative")
-    if not isinstance(config.llm.glossary_files, list) or not all(
-        isinstance(path, str) and path.strip() for path in config.llm.glossary_files
-    ):
-        raise ConfigError("llm.glossary_files must be a list of non-empty paths")
     if not config.asr.model.strip():
         raise ConfigError("asr.model cannot be empty")
     if not config.asr.aligner_model.strip():
@@ -653,10 +648,17 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError(
             "song_identification.lyric_neighbor_min_coverage must be between 0 and 1"
         )
-    if songs.lyric_neighbor_max_unit_seconds <= 0:
-        raise ConfigError(
-            "song_identification.lyric_neighbor_max_unit_seconds must be positive"
-        )
+    correction = config.asr_correction
+    if correction.batch_windows < 1:
+        raise ConfigError("asr_correction.batch_windows must be at least 1")
+    if correction.batch_chars < 1:
+        raise ConfigError("asr_correction.batch_chars must be at least 1")
+    if correction.context_before_seconds < 0:
+        raise ConfigError("asr_correction.context_before_seconds cannot be negative")
+    if correction.context_after_seconds < 0:
+        raise ConfigError("asr_correction.context_after_seconds cannot be negative")
+    if correction.context_max_chars < 1:
+        raise ConfigError("asr_correction.context_max_chars must be positive")
     segmentation = config.segmentation
     if segmentation.boundary_score_threshold < 0:
         raise ConfigError("segmentation.boundary_score_threshold cannot be negative")
@@ -678,10 +680,6 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("segmentation.model_window_units must be at least 1")
     if segmentation.model_window_chars < 1:
         raise ConfigError("segmentation.model_window_chars must be at least 1")
-    if segmentation.request_batch_windows < 1:
-        raise ConfigError("segmentation.request_batch_windows must be at least 1")
-    if segmentation.request_batch_chars < 1:
-        raise ConfigError("segmentation.request_batch_chars must be at least 1")
     if segmentation.dialogue_context_before_seconds < 0:
         raise ConfigError(
             "segmentation.dialogue_context_before_seconds cannot be negative"
@@ -692,6 +690,37 @@ def load_config(path: Path) -> AppConfig:
         )
     if segmentation.dialogue_context_max_chars < 1:
         raise ConfigError("segmentation.dialogue_context_max_chars must be at least 1")
+    translation = config.translation
+    if not translation.target_language.strip():
+        raise ConfigError("translation.target_language cannot be empty")
+    if translation.batch_cues < 1:
+        raise ConfigError("translation.batch_cues must be at least 1")
+    if translation.batch_chars < 1:
+        raise ConfigError("translation.batch_chars must be at least 1")
+    if translation.context_before_seconds < 0:
+        raise ConfigError("translation.context_before_seconds cannot be negative")
+    if translation.context_after_seconds < 0:
+        raise ConfigError("translation.context_after_seconds cannot be negative")
+    if translation.context_max_chars < 1:
+        raise ConfigError("translation.context_max_chars must be at least 1")
+    if not translation.local_model.strip():
+        raise ConfigError("translation.local_model cannot be empty")
+    if not translation.local_device.strip():
+        raise ConfigError("translation.local_device cannot be empty")
+    if translation.metadata_description_max_chars < 0:
+        raise ConfigError(
+            "translation.metadata_description_max_chars cannot be negative"
+        )
+    if not 1 <= translation.metadata_tag_count <= 10:
+        raise ConfigError("translation.metadata_tag_count must be between 1 and 10")
+    if translation.metadata_subtitle_max_chars < 0:
+        raise ConfigError("translation.metadata_subtitle_max_chars cannot be negative")
+    if not isinstance(translation.glossary_files, list) or not all(
+        isinstance(path, str) and path.strip() for path in translation.glossary_files
+    ):
+        raise ConfigError(
+            "translation.glossary_files must be a list of non-empty paths"
+        )
     knowledge = config.fan_knowledge
     if not knowledge.database_path.strip():
         raise ConfigError("fan_knowledge.database_path cannot be empty")

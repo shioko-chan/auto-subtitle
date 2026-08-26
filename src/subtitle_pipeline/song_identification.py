@@ -24,7 +24,7 @@ from .prompt_templates import prompt_templates_digest
 from .source_language import language_for_text
 from .subtitles import Cue, TimedTextUnit, cue_from_mapping, text_display_width
 
-_CACHE_VERSION = 13
+_CACHE_VERSION = 14
 _PROMPT_VERSION = 8
 _STABLE_METADATA_KEYS = (
     "id",
@@ -1664,6 +1664,33 @@ def _recover_acoustic_phrase_neighbors(
     return replacements, alignments, audits
 
 
+def _lyric_unit_timeline_errors(
+    units: tuple[TimedTextUnit, ...],
+    *,
+    line_id: int,
+    lyric_text: str,
+) -> list[dict[str, object]]:
+    errors: list[dict[str, object]] = []
+    for unit_index, unit in enumerate(units):
+        duration = unit.end - unit.start
+        if duration > 0:
+            continue
+        errors.append(
+            {
+                "issue": "non_positive_unit_duration",
+                "lyric_line_id": line_id,
+                "lyric_text": lyric_text,
+                "unit_index": unit_index,
+                "unit_text": unit.text,
+                "start": round(unit.start, 6),
+                "end": round(unit.end, 6),
+                "duration_seconds": round(duration, 6),
+                "description": "display unit ends at or before it starts",
+            }
+        )
+    return errors
+
+
 def _align_acoustic_neighbor(
     cue: Cue,
     cue_id: int,
@@ -1772,12 +1799,14 @@ def _align_acoustic_neighbor(
         if start < previous_end - 1e-3 or end <= start or not units:
             audit["reason"] = "pyshiro_timeline_rejected"
             return [], [], audit
-        if any(
-            unit.end <= unit.start
-            or unit.end - unit.start > config.lyric_neighbor_max_unit_seconds
-            for unit in units
-        ):
+        unit_errors = _lyric_unit_timeline_errors(
+            units,
+            line_id=line_id,
+            lyric_text=line.text,
+        )
+        if unit_errors:
             audit["reason"] = "pyshiro_unit_duration_rejected"
+            audit["validation_errors"] = unit_errors
             return [], [], audit
         recovered.append(
             Cue(
@@ -2168,10 +2197,20 @@ def _align_match_with_pyshiro(
             )
             continue
         line_ranges_values = []
-        for line_id, value, unit_values in zip(line_ids, ranges, owned_units):
+        validation_errors: list[dict[str, object]] = []
+        for line_id, line, value, unit_values in zip(
+            line_ids, lines, ranges, owned_units
+        ):
             if not isinstance(unit_values, list) or not unit_values:
-                line_ranges_values = []
-                break
+                validation_errors.append(
+                    {
+                        "issue": "empty_display_units",
+                        "lyric_line_id": line_id,
+                        "lyric_text": line.text,
+                        "description": "pySHIRO returned no display units for the lyric line",
+                    }
+                )
+                continue
             units = tuple(
                 TimedTextUnit(
                     str(unit["text"]),
@@ -2182,18 +2221,37 @@ def _align_match_with_pyshiro(
                 if isinstance(unit, dict)
             )
             if not units:
-                line_ranges_values = []
-                break
-            if any(
-                unit.end <= unit.start
-                or unit.end - unit.start > config.lyric_neighbor_max_unit_seconds
-                for unit in units
-            ):
-                line_ranges_values = []
-                break
+                validation_errors.append(
+                    {
+                        "issue": "empty_display_units",
+                        "lyric_line_id": line_id,
+                        "lyric_text": line.text,
+                        "description": "pySHIRO display units contained no valid objects",
+                    }
+                )
+                continue
+            unit_errors = _lyric_unit_timeline_errors(
+                units,
+                line_id=line_id,
+                lyric_text=line.text,
+            )
+            if unit_errors:
+                validation_errors.extend(unit_errors)
+                continue
             if line_ranges_values and units[0].start < line_ranges_values[-1][2] - 1e-3:
-                line_ranges_values = []
-                break
+                previous_end = line_ranges_values[-1][2]
+                validation_errors.append(
+                    {
+                        "issue": "line_timeline_overlap",
+                        "lyric_line_id": line_id,
+                        "lyric_text": line.text,
+                        "line_start": round(units[0].start, 6),
+                        "previous_line_end": round(previous_end, 6),
+                        "overlap_seconds": round(previous_end - units[0].start, 6),
+                        "description": "lyric line starts before the previous aligned line ends",
+                    }
+                )
+                continue
             line_ranges_values.append(
                 (
                     line_id,
@@ -2202,13 +2260,16 @@ def _align_match_with_pyshiro(
                     units,
                 )
             )
-        if not line_ranges_values:
+        if validation_errors or len(line_ranges_values) != len(line_ids):
             audits.append(
                 {
                     "cue_id": cue_id,
                     "take_index": anchor.take_index,
                     "status": "failed",
                     "reason": "lyric_unit_ranges_invalid",
+                    "lyric_line_ids": line_ids,
+                    "lyric_texts": [line.text for line in lines],
+                    "validation_errors": validation_errors,
                 }
             )
             continue

@@ -79,9 +79,7 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(miyako["canonical"], "藤都子")
         self.assertIn("Fuji Miyako", miyako["aliases"])
-        short_names = {
-            item["source"]: item for item in miyako["short_names"]
-        }
+        short_names = {item["source"]: item for item in miyako["short_names"]}
         self.assertEqual(short_names["Miyako"]["target"], "都子")
         self.assertTrue(short_names["Miyako"]["context_only"])
         self.assertNotIn("Miyako", context["terms"])
@@ -142,9 +140,7 @@ class PipelineTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            context = _translation_context(
-                {"title": "legacy-video"}, [str(path)]
-            )
+            context = _translation_context({"title": "legacy-video"}, [str(path)])
 
         self.assertEqual(context["terms"]["旧名"], "旧译名")
 
@@ -178,9 +174,7 @@ class PipelineTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            context = _translation_context(
-                {"title": "entity-video"}, [str(path)]
-            )
+            context = _translation_context({"title": "entity-video"}, [str(path)])
 
         self.assertEqual(context["characters"][-1]["id"], "example")
         self.assertEqual(context["terms"], {})
@@ -291,9 +285,7 @@ class PipelineTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            context = _translation_context(
-                {"title": "夢限大みゅーたいぷ"}, [str(path)]
-            )
+            context = _translation_context({"title": "夢限大みゅーたいぷ"}, [str(path)])
 
         matches = [
             character
@@ -363,7 +355,7 @@ class PipelineTests(unittest.TestCase):
             )
 
             class FakeTranslator:
-                def __init__(self, config, api_key, *, audit_path=None):
+                def __init__(self, config, translation, api_key, *, audit_path=None):
                     FakeTranslator.audit_path = audit_path
 
                 def plan_and_translate(self, cues, config, **context):
@@ -382,27 +374,30 @@ class PipelineTests(unittest.TestCase):
                 fan_knowledge=FanKnowledgeConfig(enabled=False),
                 upload=UploadConfig(enabled=True),
             )
-            with patch(
-                "subtitle_pipeline.pipeline.download_youtube", return_value=downloaded
-            ), patch(
-                "subtitle_pipeline.pipeline._wait_for_deepseek_task_window"
-            ), patch(
-                "subtitle_pipeline.pipeline.transcribe_with_qwen",
-                return_value=subtitle,
-            ) as asr, patch(
-                "subtitle_pipeline.pipeline.llm_api_key", return_value="secret"
-            ), patch(
-                "subtitle_pipeline.pipeline.OpenAICompatibleTranslator", FakeTranslator
-            ), patch(
-                "subtitle_pipeline.pipeline.subtitle_layout"
-            ) as layout, patch(
-                "subtitle_pipeline.pipeline.render_subtitles",
-                side_effect=lambda _video, _subtitle, output, _config, **kwargs: (
-                    output.write_bytes(b"out") or output
+            with (
+                patch(
+                    "subtitle_pipeline.pipeline.download_youtube",
+                    return_value=downloaded,
                 ),
-            ), patch(
-                "subtitle_pipeline.pipeline.upload_to_bilibili"
-            ) as upload:
+                patch("subtitle_pipeline.pipeline._wait_for_deepseek_task_window"),
+                patch(
+                    "subtitle_pipeline.pipeline.transcribe_with_qwen",
+                    return_value=subtitle,
+                ) as asr,
+                patch("subtitle_pipeline.pipeline.llm_api_key", return_value="secret"),
+                patch(
+                    "subtitle_pipeline.pipeline.OpenAICompatibleTranslator",
+                    FakeTranslator,
+                ),
+                patch("subtitle_pipeline.pipeline.subtitle_layout") as layout,
+                patch(
+                    "subtitle_pipeline.pipeline.render_subtitles",
+                    side_effect=lambda _video, _subtitle, output, _config, **kwargs: (
+                        output.write_bytes(b"out") or output
+                    ),
+                ),
+                patch("subtitle_pipeline.pipeline.upload_to_bilibili") as upload,
+            ):
                 layout.return_value.max_line_units = 12
                 layout.return_value.frame_line_units = 13
                 layout.return_value.font_size = 48
@@ -439,9 +434,7 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("音乐企划", metadata)
             asr.assert_called_once()
             self.assertEqual(asr.call_args.args[5], [])
-            self.assertEqual(
-                FakeTranslator.joint_context["hard_max_line_units"], 26
-            )
+            self.assertEqual(FakeTranslator.joint_context["hard_max_line_units"], 26)
             self.assertEqual(
                 FakeTranslator.joint_context["cache_path"].name,
                 "cue-joint-cache.json",

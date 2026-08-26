@@ -327,27 +327,35 @@ PyTorch、CUDA 和 `libstdc++` 等运行库会由开发环境提供。
 - `audio_analysis.initial_analysis_concurrency`：`1` 为顺序执行 diarization 与原音 AST；
   在显存和实测耗时允许时可设为 `2`。
 - `audio_analysis.debug_audio_artifacts`：仅调试时持久化分离音轨，默认 `false`。
+- `asr_correction.batch_windows` / `batch_chars`：单次 ASR 纠错请求的窗口数和原文字符上限，
+  默认 `6` / `3000`。
+- `asr_correction.max_tokens`：ASR 纠错响应的输出 token 上限，默认 `8192`。
+- `asr_correction.context_before_seconds` / `context_after_seconds` /
+  `context_max_chars`：ASR 纠错的只读前后文范围和字符上限。
 - `segmentation.boundary_score_threshold`：本地候选边界的贪心切分阈值，默认 `3`。
 - `segmentation.local_unit_max_seconds`：本地单元最长目标，默认 `6` 秒；超过时从 2 秒后的
   候选中选择最高分边界。
-- `segmentation.model_window_units` / `model_window_chars`：联合请求的本地单元和源字符上限，
-  默认 `160` / `8000`。
-- `segmentation.request_batch_windows` / `request_batch_chars`：一次 API 请求最多承载的独立
-  窗口数和窗口块总字符数，默认 `32` / `8000`；窗口仍独立校验且不能跨 episode 合并。
-- `segmentation.dialogue_context_seconds` / `dialogue_context_max_chars`：只读对话上下文范围与
-  字符上限，默认 `5` 秒 / `4000` 字符。
-- `llm.max_tokens`：单次 LLM 响应的输出 token 上限，DeepSeek V4 建议设为 `16384`。
+- `segmentation.model_window_units` / `model_window_chars`：划句请求的本地单元和源字符上限，
+  默认 `240` / `3000`。
+- `segmentation.max_tokens`：划句响应的输出 token 上限，默认 `8192`。
+- `segmentation.dialogue_context_before_seconds` / `dialogue_context_after_seconds` /
+  `dialogue_context_max_chars`：划句阶段的只读前后文范围和字符上限。
+- `translation.batch_cues` / `batch_chars`：单次固定 cue 翻译请求的 cue 数和源字符上限，
+  默认 `32` / `3000`。
+- `translation.max_tokens`：翻译、歌词和元数据响应的输出 token 上限，默认 `8192`。
+- `translation.context_before_seconds` / `context_after_seconds` / `context_max_chars`：
+  翻译阶段的只读前后文范围和字符上限。
 - `llm.max_retries`：同一窗口、边界或定点修复请求的重试次数，建议设为 `5`。
 - `llm.max_concurrency`：窗口和边界 LLM 请求的最大并发数，默认 `16`。
-- `llm.local_translation_model` / `local_translation_device`：空译文和残留源文使用的本地
+- `translation.local_model` / `local_device`：空译文和残留源文使用的本地
   后备机翻模型及设备，默认 `facebook/m2m100_418M` / `cpu`，并按 cue 语言选择 `ja`/`en`。
 - `llm.thinking`：DeepSeek V4 的严格 JSON 翻译应设为 `"disabled"`；其他服务不支持该参数时省略。
-- `llm.translate_metadata`：是否翻译 YouTube 标题和简介。
-- `llm.metadata_description_max_chars`：发送给 LLM 的源简介字符上限。
-- `llm.metadata_tag_count`：同一次元数据翻译请求生成的 B 站标签数量。
-- `llm.metadata_subtitle_max_chars`：用于识别内容/IP 的字幕首、中、尾证据字符上限。
-- `llm.ip_aliases_file`：已知 IP 的规范名及中英日别名 JSON 文件。
-- `llm.glossary_files`：附加翻译术语表；后加载的自定义译名覆盖内置译名。
+- `translation.translate_metadata`：是否翻译 YouTube 标题和简介。
+- `translation.metadata_description_max_chars`：发送给 LLM 的源简介字符上限。
+- `translation.metadata_tag_count`：同一次元数据翻译请求生成的 B 站标签数量。
+- `translation.metadata_subtitle_max_chars`：用于识别内容/IP 的字幕首、中、尾证据字符上限。
+- `translation.ip_aliases_file`：已知 IP 的规范名及中英日别名 JSON 文件。
+- `translation.glossary_files`：附加翻译术语表；后加载的自定义译名覆盖内置译名。
 - `render.font_name`：必须是机器上已安装且包含中文字形的字体。
 - `render.font_size_ratio` / `portrait_font_size_ratio`：横屏与竖屏字号相对于视频短边的比例，并受最小/最大字号限制。
 - `render.margin_horizontal_ratio` / `portrait_margin_horizontal_ratio`：横屏与竖屏左右安全边距各自占视频宽度的比例。
@@ -395,7 +403,7 @@ B 站标签目录格式参考 `bilibili-tags.example.json`：
 未命中的普通视频不会收到该术语表。内置资料参考 BanG Dream 官方角色/乐队页面、
 萌娘百科简中条目及 BanG Dream Fandom 角色目录，来源 URL 保存在术语 JSON 中。
 
-可通过 `llm.glossary_files` 添加同格式 JSON；自定义文件在内置术语之后加载，所以
+可通过 `translation.glossary_files` 添加同格式 JSON；自定义文件在内置术语之后加载，所以
 可覆盖有争议或偏好的译名。普通作品名、歌曲名等放在 `terms` 字符串映射中；人物可放在
 `characters` 数组中，以 `id`、`canonical`、`source_name`、`aliases` 和
 `short_names` 描述同一实体。`short_names` 的 `source` 只翻译成对应 `target`，不会扩写

@@ -13,20 +13,20 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
-from .config import LLMConfig, SegmentationConfig
+from .config import LLMConfig, SegmentationConfig, TranslationConfig
 from .local_segmentation import LocalUnit, SpeakerTrack
-from .source_language import (
-    combine_source_languages,
-    join_source_fragments,
-    language_for_text,
-    source_separator,
-)
 from .prompt_templates import (
     prompt_system,
     prompt_templates_digest,
     render_user_prompt,
 )
 from .reference_context import compact_reference_context
+from .source_language import (
+    combine_source_languages,
+    join_source_fragments,
+    language_for_text,
+    source_separator,
+)
 from .subtitles import Cue, TimedTextUnit, text_display_width, timed_text_units
 from .telemetry import stage_metrics
 
@@ -104,6 +104,7 @@ def run_joint_translation(
     tracks: list[SpeakerTrack],
     source_cues: list[Cue],
     segmentation: SegmentationConfig,
+    translation: TranslationConfig,
     llm: LLMConfig,
     request: Callable[[dict[str, object]], dict[str, object]],
     translation_context: dict[str, object],
@@ -130,6 +131,7 @@ def run_joint_translation(
     signature = _signature(
         tracks,
         segmentation,
+        translation,
         llm,
         translation_context,
         maximum_units,
@@ -141,7 +143,10 @@ def run_joint_translation(
     if final is not None:
         try:
             _validate_final_records(
-                final, tracks, llm.target_language, validation_maximum_units
+                final,
+                tracks,
+                translation.target_language,
+                validation_maximum_units,
             )
         except RuntimeError as exc:
             logger.warning("ignoring invalid final joint cache records: %s", exc)
@@ -170,7 +175,7 @@ def run_joint_translation(
                 start,
                 end,
                 validation_maximum_units,
-                llm.target_language,
+                translation.target_language,
                 validate_language=False,
                 reference_replacements=reference_replacements,
                 local_translate=local_translate,
@@ -203,6 +208,7 @@ def run_joint_translation(
             end,
             all_units,
             segmentation,
+            translation,
             llm,
             request,
             translation_context,
@@ -219,7 +225,9 @@ def run_joint_translation(
 
     missing = [item for item in ranges if _range_key(*item) not in windows]
     if missing:
-        groups = _batch_range_groups(missing, track_map, all_units, segmentation)
+        groups = _batch_range_groups(
+            missing, track_map, all_units, segmentation, translation
+        )
         logger.info(
             "jointly segmenting and translating %d/%d speaker-track windows "
             "in %d API request group(s) with concurrency=%d",
@@ -247,6 +255,7 @@ def run_joint_translation(
                     track_map,
                     all_units,
                     segmentation,
+                    translation,
                     llm,
                     request,
                     translation_context,
@@ -279,7 +288,7 @@ def run_joint_translation(
 
     records = [record for item in ranges for record in windows[_range_key(*item)]]
     _validate_final_records(
-        records, tracks, llm.target_language, validation_maximum_units
+        records, tracks, translation.target_language, validation_maximum_units
     )
     _write_cache(cache_path, signature, windows, records)
     return _records_to_result(source_cues, tracks, records)
@@ -290,6 +299,7 @@ def _batch_range_groups(
     track_map: dict[str, SpeakerTrack],
     all_units: list[LocalUnit],
     config: SegmentationConfig,
+    translation: TranslationConfig,
 ) -> list[list[tuple[str, int, int]]]:
     groups: list[list[tuple[str, int, int]]] = []
     current: list[tuple[str, int, int]] = []
@@ -301,8 +311,8 @@ def _batch_range_groups(
         )
         block_chars = len(block)
         if current and (
-            len(current) >= config.request_batch_windows
-            or characters + block_chars > config.request_batch_chars
+            len(current) >= translation.batch_cues
+            or characters + block_chars > translation.batch_chars
         ):
             groups.append(current)
             current = []
@@ -320,6 +330,7 @@ def _process_range_group(
     track_map: dict[str, SpeakerTrack],
     all_units: list[LocalUnit],
     segmentation: SegmentationConfig,
+    translation: TranslationConfig,
     llm: LLMConfig,
     request: Callable[[dict[str, object]], dict[str, object]],
     translation_context: dict[str, object],
@@ -352,6 +363,7 @@ def _process_range_group(
                 track_map,
                 all_units,
                 segmentation,
+                translation,
                 llm,
                 request,
                 translation_context,
@@ -379,6 +391,7 @@ def _request_batch_windows(
     track_map: dict[str, SpeakerTrack],
     all_units: list[LocalUnit],
     segmentation: SegmentationConfig,
+    translation: TranslationConfig,
     llm: LLMConfig,
     request: Callable[[dict[str, object]], dict[str, object]],
     translation_context: dict[str, object],
@@ -405,14 +418,14 @@ def _request_batch_windows(
             segmentation,
             translation_context,
             maximum_units,
-            llm.target_language,
+            translation.target_language,
             honorific_rules,
             previous_error,
         )
         body: dict[str, object] = {
             "model": llm.model,
             "temperature": 0.1,
-            "max_tokens": llm.max_tokens,
+            "max_tokens": translation.max_tokens,
             "messages": [
                 {"role": "system", "content": prompt_system(_BATCH_PROMPT_NAME)},
                 {"role": "user", "content": prompt},
@@ -484,7 +497,7 @@ def _request_batch_windows(
                     start,
                     end,
                     validation_maximum_units,
-                    llm.target_language,
+                    translation.target_language,
                     validate_language=False,
                     reference_replacements=_reference_replacements(translation_context),
                     local_translate=local_translate,
@@ -530,6 +543,7 @@ def _request_resilient(
     end: int,
     all_units: list[LocalUnit],
     segmentation: SegmentationConfig,
+    translation: TranslationConfig,
     llm: LLMConfig,
     request: Callable[[dict[str, object]], dict[str, object]],
     translation_context: dict[str, object],
@@ -553,6 +567,7 @@ def _request_resilient(
             end,
             all_units,
             segmentation,
+            translation,
             llm,
             request,
             translation_context,
@@ -584,6 +599,7 @@ def _request_resilient(
                 exc.patch_end,
                 all_units,
                 segmentation,
+                translation,
                 llm,
                 request,
                 translation_context,
@@ -646,6 +662,7 @@ def _request_resilient(
         split,
         all_units,
         segmentation,
+        translation,
         llm,
         request,
         translation_context,
@@ -665,6 +682,7 @@ def _request_resilient(
         end,
         all_units,
         segmentation,
+        translation,
         llm,
         request,
         translation_context,
@@ -687,6 +705,7 @@ def _request_window(
     end: int,
     all_units: list[LocalUnit],
     segmentation: SegmentationConfig,
+    translation: TranslationConfig,
     llm: LLMConfig,
     request: Callable[[dict[str, object]], dict[str, object]],
     translation_context: dict[str, object],
@@ -714,14 +733,14 @@ def _request_window(
             segmentation,
             translation_context,
             maximum_units,
-            llm.target_language,
+            translation.target_language,
             honorific_rules,
             prompt_error,
         )
         body: dict[str, object] = {
             "model": llm.model,
             "temperature": 0.1,
-            "max_tokens": llm.max_tokens,
+            "max_tokens": translation.max_tokens,
             "messages": [
                 {"role": "system", "content": prompt_system(_PROMPT_NAME)},
                 {"role": "user", "content": prompt},
@@ -745,7 +764,7 @@ def _request_window(
                 start,
                 end,
                 validation_maximum_units,
-                llm.target_language,
+                translation.target_language,
                 validate_language=False,
                 reference_replacements=_reference_replacements(translation_context),
                 local_translate=local_translate,
@@ -1356,6 +1375,7 @@ def _source_timed_units(source: list[Cue]) -> tuple[TimedTextUnit, ...]:
 def _signature(
     tracks: list[SpeakerTrack],
     segmentation: SegmentationConfig,
+    translation: TranslationConfig,
     llm: LLMConfig,
     context: dict[str, object],
     maximum_units: float,
@@ -1373,14 +1393,12 @@ def _signature(
             for track in tracks
         ],
         "segmentation": asdict(segmentation),
+        "translation": asdict(translation),
         "llm": {
             "base_url": llm.base_url,
             "api_style": llm.api_style,
             "model": llm.model,
-            "target_language": llm.target_language,
             "thinking": llm.thinking,
-            "local_translation_model": llm.local_translation_model,
-            "local_translation_device": llm.local_translation_device,
         },
         "context": context,
         "maximum_units": maximum_units,

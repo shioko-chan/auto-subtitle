@@ -4,13 +4,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from subtitle_pipeline.config import LLMConfig, SegmentationConfig
+from subtitle_pipeline.config import LLMConfig, SegmentationConfig, TranslationConfig
 from subtitle_pipeline.joint_translation import (
     CoverageValidationError,
     _dialogue_context,
     _prompt,
-    _reference_text,
     _reference_replacements,
+    _reference_text,
     _request_resilient,
     _validate_records,
     _window_ranges,
@@ -49,6 +49,7 @@ class PromptBudgetTests(unittest.TestCase):
             audit = Path(temporary) / "llm-audit.jsonl"
             translator = OpenAICompatibleTranslator(
                 LLMConfig(local_server_enabled=True, local_server_context_size=16384),
+                TranslationConfig(),
                 "secret",
                 audit_path=audit,
             )
@@ -254,6 +255,7 @@ class JointTranslationTests(unittest.TestCase):
             6,
             list(track.units),
             SegmentationConfig(),
+            TranslationConfig(),
             LLMConfig(),
             request,
             {},
@@ -309,7 +311,9 @@ class JointTranslationTests(unittest.TestCase):
         self.assertNotIn("<3>单元3", target)
 
     def test_each_speaker_uses_an_independent_track_and_cache(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(max_concurrency=2), "secret")
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(max_concurrency=2), TranslationConfig(), "secret"
+        )
         cues = [
             Cue(0.0, 1.0, "おはよう", "A"),
             Cue(0.5, 1.4, "はい", "B"),
@@ -371,7 +375,9 @@ class JointTranslationTests(unittest.TestCase):
                 json.loads(cache.read_text(encoding="utf-8"))["version"], 8
             )
 
-            cached = OpenAICompatibleTranslator(LLMConfig(max_concurrency=2), "secret")
+            cached = OpenAICompatibleTranslator(
+                LLMConfig(max_concurrency=2), TranslationConfig(), "secret"
+            )
             with patch.object(cached, "_request") as cached_request:
                 repeated = cached.plan_and_translate(
                     cues,
@@ -386,7 +392,9 @@ class JointTranslationTests(unittest.TestCase):
         self.assertGreater(result.source_cues[0].end, result.source_cues[1].start)
 
     def test_distant_same_speaker_episodes_share_request_but_not_cue(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(max_concurrency=2), "secret")
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(max_concurrency=2), TranslationConfig(), "secret"
+        )
         cues = [
             Cue(0.0, 0.5, "なんか", "A"),
             Cue(1000.0, 1000.5, "嬉しい", "A"),
@@ -434,7 +442,9 @@ class JointTranslationTests(unittest.TestCase):
         )
 
     def test_missing_batch_window_retries_only_that_window(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(max_concurrency=2), "secret")
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(max_concurrency=2), TranslationConfig(), "secret"
+        )
         cues = [
             Cue(0.0, 0.5, "なんか", "A"),
             Cue(1000.0, 1000.5, "嬉しい", "A"),
@@ -483,7 +493,9 @@ class JointTranslationTests(unittest.TestCase):
         )
 
     def test_verified_lyric_translation_bypasses_general_llm(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(), TranslationConfig(), "secret"
+        )
         cue = Cue(
             1.0,
             3.0,
@@ -508,7 +520,7 @@ class JointTranslationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             audit = Path(temp) / "llm-audit.jsonl"
             translator = OpenAICompatibleTranslator(
-                LLMConfig(), "secret", audit_path=audit
+                LLMConfig(), TranslationConfig(), "secret", audit_path=audit
             )
             invalid = _response(
                 '{"cues":[{"start_id":1,"end_id":2,"text":"错误范围"}]}'
@@ -618,7 +630,9 @@ class JointTranslationTests(unittest.TestCase):
         self.assertEqual(_parse_joint_records(json.dumps(records[0])), records)
 
     def test_content_failure_retries_once_then_shrinks(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(max_retries=5), "secret")
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(max_retries=5), TranslationConfig(), "secret"
+        )
         cues = [Cue(0, 4.1, "行きます", "A"), Cue(4.2, 4.8, "でも", "A")]
         calls = 0
 
@@ -659,7 +673,9 @@ class JointTranslationTests(unittest.TestCase):
         )
 
     def test_kana_result_is_machine_translated_locally_without_retry(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(), TranslationConfig(), "secret"
+        )
         context = {
             "characters": [
                 {
@@ -776,7 +792,9 @@ class JointTranslationTests(unittest.TestCase):
         )
 
     def test_429_exhaustion_does_not_shrink_window(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(max_retries=2), "secret")
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(max_retries=2), TranslationConfig(), "secret"
+        )
         cues = [Cue(0, 0.2, "一", "A"), Cue(0.8, 1.0, "二", "A")]
         with (
             patch.object(
@@ -791,7 +809,9 @@ class JointTranslationTests(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
 
     def test_config_change_invalidates_joint_cache(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(), TranslationConfig(), "secret"
+        )
         response = _response('{"cues":[{"start_id":0,"end_id":0,"text":"中文"}]}')
         with tempfile.TemporaryDirectory() as temp:
             cache = Path(temp) / "cache.json"
@@ -814,7 +834,9 @@ class JointTranslationTests(unittest.TestCase):
 
 class ApiCompatibilityTests(unittest.TestCase):
     def test_lyrics_review_only_applies_explicit_corrections(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(), TranslationConfig(), "secret"
+        )
         response = _response(
             json.dumps(
                 {
@@ -848,7 +870,9 @@ class ApiCompatibilityTests(unittest.TestCase):
         self.assertIn("メタモルフォーゼ", prompt)
 
     def test_lyrics_review_accepts_no_corrections(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(), TranslationConfig(), "secret"
+        )
         response = _response('{"corrections":[]}')
         with patch.object(translator, "_request", return_value=response):
             reviewed = translator.review_lyrics(
@@ -858,7 +882,9 @@ class ApiCompatibilityTests(unittest.TestCase):
         self.assertEqual(reviewed, {0: "正确的歌词"})
 
     def test_lyrics_prompt_excludes_runtime_audit_payloads(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(), TranslationConfig(), "secret"
+        )
         response = _response(
             json.dumps(
                 {"lines": [{"line_id": 0, "text": "准备好去寻找答案"}]},
@@ -890,7 +916,9 @@ class ApiCompatibilityTests(unittest.TestCase):
         self.assertNotIn("large alignment audit", prompt)
 
     def test_metadata_prompt_excludes_large_audit_payloads(self):
-        translator = OpenAICompatibleTranslator(LLMConfig(), "secret")
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(), TranslationConfig(), "secret"
+        )
         response = _response(
             json.dumps(
                 {
