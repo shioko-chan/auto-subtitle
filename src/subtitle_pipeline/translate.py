@@ -297,6 +297,103 @@ class OpenAICompatibleTranslator:
             "machine",
         )
 
+    def review_lyrics(
+        self,
+        title: str,
+        artist: str,
+        lines: list[str],
+        translations: dict[int, str],
+        *,
+        translation_context: dict[str, object] | None = None,
+    ) -> dict[int, str] | None:
+        """Review a complete lyric translation and return the corrected version."""
+        expected_ids = set(range(len(lines)))
+        if (
+            not lines
+            or set(translations) != expected_ids
+            or any(not translations[line_id].strip() for line_id in expected_ids)
+        ):
+            raise ValueError("lyrics review requires a complete draft translation")
+        prompt = render_user_prompt(
+            "lyrics-review.md",
+            SONG_TITLE=title,
+            ARTIST=artist or "(unknown)",
+            REFERENCE_TEXT=json.dumps(
+                compact_lyrics_reference_context(translation_context or {}),
+                ensure_ascii=False,
+            ),
+            LYRICS_TEXT="\n".join(
+                f"<{index}>{line}" for index, line in enumerate(lines)
+            ),
+            TRANSLATION_TEXT="\n".join(
+                f"<{index}>{translations[index]}" for index in range(len(lines))
+            ),
+        )
+        body: dict[str, object] = {
+            "model": self.config.model,
+            "temperature": 0.1,
+            "max_tokens": self.config.max_tokens,
+            "messages": [
+                {"role": "system", "content": prompt_system("lyrics-review.md")},
+                {"role": "user", "content": prompt},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+        if self.config.thinking:
+            body["thinking"] = {"type": self.config.thinking}
+        last_error: Exception | None = None
+        for attempt in range(1, self.config.max_retries + 1):
+            response: object = None
+            content: object = None
+            try:
+                response = self._request(body)
+                content = response["choices"][0]["message"]["content"]
+                parsed = _parse_json_object(content)
+                values = parsed.get("corrections")
+                if not isinstance(values, list):
+                    raise ValueError("lyrics review response requires corrections")
+                corrected = dict(translations)
+                seen: set[int] = set()
+                for value in values:
+                    if not isinstance(value, dict):
+                        raise ValueError("lyrics correction is not an object")
+                    line_id = value.get("line_id")
+                    text = value.get("text")
+                    if isinstance(line_id, str) and line_id.isdigit():
+                        line_id = int(line_id)
+                    if (
+                        not isinstance(line_id, int)
+                        or line_id not in expected_ids
+                        or line_id in seen
+                        or not isinstance(text, str)
+                        or not text.strip()
+                    ):
+                        raise ValueError("invalid lyrics correction line_id or text")
+                    seen.add(line_id)
+                    corrected[line_id] = text.strip()
+                logging.info(
+                    "lyrics review corrected %d/%d lines for %s",
+                    len(seen),
+                    len(lines),
+                    title,
+                )
+                return corrected
+            except Exception as exc:
+                last_error = exc
+                self._log_invalid_response(
+                    "lyrics_review", exc, content, body, response
+                )
+                if _is_nontransient_http_error(exc):
+                    raise
+                delay = _transient_retry_delay(exc, attempt)
+                if delay is not None:
+                    time.sleep(delay)
+        logging.warning(
+            "lyrics review exhausted LLM retries; retaining unreviewed draft: %s",
+            last_error,
+        )
+        return None
+
     def translate_metadata(
         self,
         title: str,

@@ -137,6 +137,8 @@ match_minimum_anchors = 3
 match_minimum_score = 0.48
 match_minimum_margin = 0.05
 pyshiro_worker_project = "tools/pyshiro"
+# Used only after a song is confirmed and a lyric gap has no existing stem.
+vocal_separation_device = "cuda:0"
 # pySHIRO recommends short singing windows and must never receive more than 20s.
 pyshiro_max_window_seconds = 20.0
 lyric_gap_recheck_seconds = 20.0

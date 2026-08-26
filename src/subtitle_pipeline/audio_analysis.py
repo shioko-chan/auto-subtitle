@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # hooks. Keep unrelated model construction out of that process-global context.
 _MODEL_LOAD_LOCK = threading.Lock()
 
-_CACHE_VERSION = 12
+_CACHE_VERSION = 13
 _SINGING_LABELS = {
     "chant",
     "child singing",
@@ -154,12 +154,9 @@ def analyze_audio(
     if raw_candidates:
         with stage_metrics("audio.vocal_separation_and_detection", config.device):
             if audio_pool is not None:
-                separation_candidates = _merge_regions(
-                    raw_candidates, config.singing_asr_max_seconds
-                )
                 vocal_candidates = _separate_vocal_candidates(
                     video,
-                    separation_candidates,
+                    raw_candidates,
                     config.device,
                     audio_pool,
                     # Persist candidate stems for later canonical-lyric alignment.
@@ -186,10 +183,12 @@ def analyze_audio(
                 )
     acoustic_phrases = _build_acoustic_phrases(
         raw_scores,
+        raw_candidates,
         vocal_scores,
         ordinary_diarization,
         vocal_candidates,
         config,
+        allow_unbound_vocal_source=fallback_vocals_path is not None,
     )
     alt_regions = [
         AudioRegion(phrase.start, phrase.end, "singing")
@@ -469,17 +468,19 @@ def _singing_evidence_score(singing_score: float, speech_score: float) -> float:
 
 def _build_acoustic_phrases(
     raw_scores: list[AudioRegion],
+    raw_candidates: list[AudioRegion],
     vocal_scores: list[AudioRegion],
     diarization: list[AudioRegion],
     vocal_candidates: list[tuple[AudioRegion, AudioBuffer]],
     config: AudioAnalysisConfig,
+    *,
+    allow_unbound_vocal_source: bool = False,
 ) -> list[AcousticPhrase]:
-    """Turn overlapping classifier windows into independent ASR routing units."""
-    spans = _merge_regions(raw_scores, config.singing_stride_seconds)
+    """Split selected AST candidate spans into independent ASR routing units."""
     intervals: list[tuple[float, float]] = []
-    for span in spans:
+    for span in raw_candidates:
         duration = span.end - span.start
-        count = max(1, int(math.ceil(duration / config.singing_asr_max_seconds)))
+        count = max(1, math.ceil(duration / config.singing_asr_max_seconds))
         width = duration / count
         intervals.extend(
             (span.start + index * width, span.start + (index + 1) * width)
@@ -529,18 +530,21 @@ def _build_acoustic_phrases(
             diarization_overlap,
             config,
         )
-        source = max(
-            vocal_candidates,
-            key=lambda item: _overlap_duration(
-                AudioRegion(start, end, "singing"), item[0]
+        source = next(
+            (
+                item
+                for item in vocal_candidates
+                if item[0].start <= start + 1e-3 and item[0].end >= end - 1e-3
             ),
-            default=None,
+            None,
         )
-        if (
-            source is not None
-            and _overlap_duration(AudioRegion(start, end, "singing"), source[0]) <= 0
-        ):
-            source = None
+        if route_alt and source is None and not allow_unbound_vocal_source:
+            logger.warning(
+                "dropping ALT route %.3f-%.3fs without complete vocal stem coverage",
+                start,
+                end,
+            )
+            route_alt = False
         phrases.append(
             AcousticPhrase(
                 round(start, 3),
@@ -776,6 +780,7 @@ def _separate_vocal_candidates(
                         "start": candidate.start,
                         "end": candidate.end,
                         "path": f"candidate-{index:04d}.vocals.wav",
+                        "source": "ast_candidate",
                     }
                     for index, candidate in enumerate(candidates)
                 ],
@@ -786,6 +791,46 @@ def _separate_vocal_candidates(
             encoding="utf-8",
         )
     return outputs
+
+
+def separate_vocal_ranges(
+    video: Path,
+    ranges: list[tuple[float, float, Path]],
+    device: str,
+) -> None:
+    """Persist Demucs vocal stems for explicit timeline ranges in one model load."""
+    if not ranges:
+        return
+    try:
+        import soundfile as sf
+        import torchaudio.functional as audio_functional
+        from demucs.api import Separator
+    except ImportError as exc:
+        raise RuntimeError(
+            "vocal separation requires the ASR optional dependencies"
+        ) from exc
+
+    logger.info("separating vocals for %d verified lyric gap ranges", len(ranges))
+    separator = Separator(model="htdemucs", device=device, progress=True)
+    try:
+        for start, end, destination in ranges:
+            if destination.is_file():
+                continue
+            waveform, sample_rate = _decode_stereo_range(
+                video, start, end, separator.samplerate
+            )
+            _origin, stems = separator.separate_tensor(waveform, sr=sample_rate)
+            vocals = stems.get("vocals")
+            if vocals is None:
+                raise RuntimeError("Demucs did not return a vocals stem")
+            mono = vocals.mean(dim=0).detach().cpu()
+            if separator.samplerate != 16000:
+                mono = audio_functional.resample(mono, separator.samplerate, 16000)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            sf.write(destination, mono.numpy(), 16000)
+    finally:
+        del separator
+        _release_cuda()
 
 
 def _decode_stereo_range(

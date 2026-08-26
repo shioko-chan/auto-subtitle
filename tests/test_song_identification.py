@@ -92,11 +92,75 @@ class SongIdentificationTests(unittest.TestCase):
         )
         self.assertEqual(signature_before, signature_after)
 
+    def test_existing_llm_lyrics_are_reviewed_without_retranslation(self):
+        with TemporaryDirectory() as directory:
+            library_path = Path(directory) / "lyrics.sqlite3"
+            library = LyricsLibrary(library_path)
+            try:
+                song = library.store_canonical_song(
+                    title="曲名",
+                    artist="歌手",
+                    aliases=[],
+                    source_url="https://example.com/lyrics",
+                    lines=[
+                        ("前の行", None),
+                        ("メタモルフォーゼ", None),
+                        ("次の行", None),
+                    ],
+                )
+                library.store_translations(
+                    song.song_id,
+                    {0: "前一行", 1: "变形虫", 2: "下一行"},
+                    source="llm",
+                )
+            finally:
+                library.close()
+            result = SongIdentificationResult(
+                [Cue(1, 2, "メタモルフォーゼ", "singer", "singing")],
+                [
+                    {
+                        "song_id": song.song_id,
+                        "search_group": {"start": 1, "end": 2},
+                        "alignments": [
+                            {
+                                "corrected_text": "メタモルフォーゼ",
+                                "lyric_line_ids": [1],
+                            }
+                        ],
+                    }
+                ],
+            )
+
+            translated = translate_aligned_song_lyrics(
+                result,
+                SongIdentificationConfig(
+                    enabled=True, lyrics_library_path=str(library_path)
+                ),
+                lambda *_args, **_kwargs: self.fail(
+                    "complete existing lyrics must not be translated again"
+                ),
+                lyrics_translation_model="test-model",
+                review_lyrics=lambda *_args, **_kwargs: {
+                    0: "前一行",
+                    1: "蜕变",
+                    2: "下一行",
+                },
+            )
+            library = LyricsLibrary(library_path)
+            try:
+                reviewed_song = library.get(song.song_id)
+            finally:
+                library.close()
+
+        self.assertEqual(translated.corrected_cues[0].preferred_translation, "蜕变")
+        assert reviewed_song is not None
+        self.assertEqual(reviewed_song.lines[1].translation_source, "llm_reviewed")
+
     def test_song_cache_accepts_empty_corrected_cues(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "song-cache.json"
             path.write_text(
-                '{"version":12,"signature":"test","reports":[],"corrected_cues":[]}',
+                '{"version":13,"signature":"test","reports":[],"corrected_cues":[]}',
                 encoding="utf-8",
             )
 
@@ -258,6 +322,73 @@ class SongIdentificationTests(unittest.TestCase):
         self.assertEqual([cue.text for cue in replacements[0]], ["漏れた歌詞"])
         self.assertEqual(alignments[0]["lyric_line_ids"], [1])
         self.assertEqual(audit[0]["status"], "gap_recovered")
+
+    @patch("subtitle_pipeline.song_identification._run_pyshiro_lines")
+    @patch(
+        "subtitle_pipeline.song_identification._vocal_active_ratio", return_value=0.5
+    )
+    @patch(
+        "subtitle_pipeline.song_identification._extract_vocal_window",
+        return_value=True,
+    )
+    @patch(
+        "subtitle_pipeline.audio_analysis.separate_vocal_ranges",
+    )
+    @patch("subtitle_pipeline.song_identification.shutil.which", return_value="uv")
+    def test_confirmed_lyric_gap_materializes_missing_vocal_stem(
+        self, _which, separate, _extract, _activity, run_pyshiro
+    ):
+        song = LibrarySong(
+            "song",
+            "title",
+            "artist",
+            (),
+            "https://example.com",
+            "hash",
+            (LyricLine(0, "最初"), LyricLine(1, "欠落"), LyricLine(2, "最後")),
+        )
+        match = SongMatch(
+            song,
+            (LyricAnchor(0, 0, 1, 0.9), LyricAnchor(1, 2, 3, 0.9)),
+            0.9,
+        )
+        run_pyshiro.side_effect = [
+            {"ok": True, "likelihood_per_frame": -20.0},
+            {
+                "ok": True,
+                "likelihood_per_frame": -17.0,
+                "lines": [[0.0, 2.0], [2.0, 4.0], [4.0, 6.0]],
+                "units": [
+                    [{"text": "最初", "start": 0.0, "end": 2.0}],
+                    [{"text": "欠落", "start": 2.0, "end": 4.0}],
+                    [{"text": "最後", "start": 4.0, "end": 6.0}],
+                ],
+            },
+            {"ok": True, "likelihood_per_frame": -22.0},
+            {"ok": True, "likelihood_per_frame": -21.0},
+        ]
+        with TemporaryDirectory() as directory:
+            job_dir = Path(directory)
+            manifest_path = job_dir / "vocal-candidates" / "manifest.json"
+
+            replacements, _alignments, audit = _recover_lyric_gaps(
+                job_dir,
+                [
+                    Cue(100, 108, "最初", "singer", "singing"),
+                    Cue(108, 116, "最後", "singer", "singing"),
+                ],
+                [0, 1],
+                match,
+                SongIdentificationConfig(),
+                video=job_dir / "source.mp4",
+            )
+
+            persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual([cue.text for cue in replacements[0]], ["欠落"])
+        self.assertEqual(audit[0]["status"], "gap_recovered")
+        self.assertEqual(persisted[0]["source"], "verified_lyric_gap")
+        separate.assert_called_once()
 
     def test_gap_recovery_never_bridges_separate_song_takes(self):
         song = LibrarySong(

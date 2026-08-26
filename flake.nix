@@ -82,6 +82,10 @@
         LD_LIBRARY_PATH = "/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath runtimeLibraries}";
 
         shellHook = ''
+          project_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+          if [ -d "$project_root/.venv/bin" ]; then
+            export PATH="$project_root/.venv/bin:$PATH"
+          fi
           echo "subtitle-pipeline CUDA shell: $(python --version 2>&1), CUDA $(nvcc --version | sed -n 's/.*release \([^,]*\).*/\1/p')"
         '';
       };

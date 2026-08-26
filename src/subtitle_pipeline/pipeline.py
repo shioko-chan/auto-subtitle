@@ -327,6 +327,7 @@ def _run_pipeline_stages(
                 translator.translate_lyrics,
                 translation_context,
                 config.llm.model,
+                review_lyrics=translator.review_lyrics,
             )
     song_result = split_aligned_song_cues(song_result, japanese_guidance_units)
     cues = song_result.corrected_cues

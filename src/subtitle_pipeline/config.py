@@ -122,6 +122,7 @@ class SongIdentificationConfig:
     match_minimum_score: float = 0.48
     match_minimum_margin: float = 0.05
     pyshiro_worker_project: str = "tools/pyshiro"
+    vocal_separation_device: str = "cuda:0"
     pyshiro_max_window_seconds: float = 20.0
     lyric_gap_recheck_seconds: float = 20.0
     lyric_gap_vocal_active_ratio: float = 0.08

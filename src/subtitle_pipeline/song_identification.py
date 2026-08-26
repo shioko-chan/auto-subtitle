@@ -24,7 +24,7 @@ from .prompt_templates import prompt_templates_digest
 from .source_language import language_for_text
 from .subtitles import Cue, TimedTextUnit, cue_from_mapping, text_display_width
 
-_CACHE_VERSION = 12
+_CACHE_VERSION = 13
 _PROMPT_VERSION = 8
 _STABLE_METADATA_KEYS = (
     "id",
@@ -228,6 +228,7 @@ def identify_and_align_songs(
                 singing_ids,
                 match,
                 config,
+                video=video,
             )
             for cue_id, values in recovered.items():
                 replacements.setdefault(cue_id, []).extend(values)
@@ -455,6 +456,8 @@ def translate_aligned_song_lyrics(
     translate_lyrics: Callable[..., object],
     translation_context: dict[str, object] | None = None,
     lyrics_translation_model: str | None = None,
+    *,
+    review_lyrics: Callable[..., object] | None = None,
 ) -> SongIdentificationResult:
     if not result.reports:
         return result
@@ -477,6 +480,7 @@ def translate_aligned_song_lyrics(
                 translate_lyrics,
                 translation_context or {},
                 lyrics_translation_model,
+                review_lyrics,
             )
             translations: dict[str, str] = {}
             alignments = report.get("alignments")
@@ -807,35 +811,77 @@ def _ensure_song_translations(
     translate_lyrics: Callable[..., object],
     translation_context: dict[str, object],
     model: str | None,
+    review_lyrics: Callable[..., object] | None,
 ) -> LibrarySong:
-    if all(line.translation for line in song.lines):
+    if all(
+        line.translation
+        and line.translation_source in {"llm_reviewed", "external", "official"}
+        for line in song.lines
+    ):
         return song
-    translated = translate_lyrics(
-        song.title,
-        song.artist,
-        [line.text for line in song.lines],
-        translation_context=translation_context,
+    if not all(line.translation for line in song.lines):
+        translated = translate_lyrics(
+            song.title,
+            song.artist,
+            [line.text for line in song.lines],
+            translation_context=translation_context,
+        )
+        if (
+            isinstance(translated, tuple)
+            and len(translated) == 2
+            and isinstance(translated[0], dict)
+            and translated[1] in {"llm", "machine"}
+        ):
+            translations, source = translated
+        elif isinstance(translated, dict):
+            translations, source = translated, "llm"
+        else:
+            raise TypeError("lyrics translator returned an invalid result")
+        library.store_translations(
+            song.song_id,
+            translations,
+            source=source,
+            model=model if source == "llm" else None,
+            prompt_hash=(
+                prompt_templates_digest("lyrics-translate.md")
+                if source == "llm"
+                else None
+            ),
+        )
+        refreshed = library.get(song.song_id)
+        assert refreshed is not None
+        song = refreshed
+
+    complete_draft = {
+        line.line_no: line.translation
+        for line in song.lines
+        if line.translation is not None
+    }
+    has_reviewable_lines = any(
+        line.translation_source in {"llm", "machine"} for line in song.lines
     )
     if (
-        isinstance(translated, tuple)
-        and len(translated) == 2
-        and isinstance(translated[0], dict)
-        and translated[1] in {"llm", "machine"}
+        review_lyrics is not None
+        and has_reviewable_lines
+        and len(complete_draft) == len(song.lines)
     ):
-        translations, source = translated
-    elif isinstance(translated, dict):
-        translations, source = translated, "llm"
-    else:
-        raise TypeError("lyrics translator returned an invalid result")
-    library.store_translations(
-        song.song_id,
-        translations,
-        source=source,
-        model=model if source == "llm" else None,
-        prompt_hash=(
-            prompt_templates_digest("lyrics-translate.md") if source == "llm" else None
-        ),
-    )
+        reviewed = review_lyrics(
+            song.title,
+            song.artist,
+            [line.text for line in song.lines],
+            complete_draft,
+            translation_context=translation_context,
+        )
+        if isinstance(reviewed, dict):
+            library.store_translations(
+                song.song_id,
+                reviewed,
+                source="llm_reviewed",
+                model=model,
+                prompt_hash=prompt_templates_digest(
+                    "lyrics-translate.md", "lyrics-review.md"
+                ),
+            )
     refreshed = library.get(song.song_id)
     assert refreshed is not None
     return refreshed
@@ -1007,6 +1053,8 @@ def _recover_lyric_gaps(
     singing_ids: list[int],
     match: SongMatch,
     config: SongIdentificationConfig,
+    *,
+    video: Path | None = None,
 ) -> tuple[
     dict[int, list[Cue]],
     list[dict[str, object]],
@@ -1017,9 +1065,13 @@ def _recover_lyric_gaps(
     manifest_path = job_dir / "vocal-candidates" / "manifest.json"
     worker = Path(config.pyshiro_worker_project).resolve() / "worker.py"
     uv = shutil.which("uv")
-    if not manifest_path.is_file() or uv is None or not worker.is_file():
+    if uv is None or not worker.is_file():
         return {}, [], []
-    raw_manifests = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw_manifests = (
+        json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest_path.is_file()
+        else []
+    )
     manifests = [value for value in raw_manifests if isinstance(value, dict)]
     probes: list[dict[str, object]] = []
     ordered = sorted(
@@ -1037,23 +1089,19 @@ def _recover_lyric_gaps(
         right_cue_id = singing_ids[right.cue_index]
         center = (cues[left_cue_id].end + cues[right_cue_id].start) / 2
         half = config.lyric_gap_recheck_seconds / 2
+        start = max(0.0, center - half)
+        end = start + config.lyric_gap_recheck_seconds
         manifest = next(
             (
                 value
                 for value in manifests
-                if float(value.get("start", -1))
-                <= center
-                <= float(value.get("end", -1))
+                if float(value.get("start", -1)) <= start
+                and float(value.get("end", -1)) >= end
             ),
             None,
         )
-        if manifest is None:
+        if manifest is None and video is None:
             continue
-        manifest_start = float(manifest["start"])
-        manifest_end = float(manifest["end"])
-        start = max(manifest_start, center - half)
-        end = min(manifest_end, start + config.lyric_gap_recheck_seconds)
-        start = max(manifest_start, end - config.lyric_gap_recheck_seconds)
         if end - start < 2:
             continue
         probes.append(
@@ -1067,6 +1115,14 @@ def _recover_lyric_gaps(
                 "end": end,
                 "manifest": manifest,
             }
+        )
+    if video is not None:
+        _materialize_gap_vocal_stems(
+            video,
+            probes,
+            manifests,
+            manifest_path,
+            config.vocal_separation_device,
         )
     normalizer = JapaneseNormalizer()
     output_dir = job_dir / "song-alignment" / match.song.song_id / "gap-recheck"
@@ -1091,7 +1147,12 @@ def _recover_lyric_gaps(
             "end": probe["end"],
         }
         manifest = probe["manifest"]
-        assert isinstance(manifest, dict)
+        if not isinstance(manifest, dict):
+            audit["reason"] = "verified_gap_vocal_stem_unavailable"
+            if probe.get("stem_error"):
+                audit["stem_error"] = probe["stem_error"]
+            audits.append(audit)
+            continue
         source = manifest_path.parent / str(manifest["path"])
         wav = output_dir / f"gap-{gap_id:04d}.wav"
         if not _extract_vocal_window(
@@ -1259,6 +1320,70 @@ def _recover_lyric_gaps(
     alignments.extend(phrase_alignments)
     audits.extend(phrase_audits)
     return replacements, alignments, audits
+
+
+def _materialize_gap_vocal_stems(
+    video: Path,
+    probes: list[dict[str, object]],
+    manifests: list[dict[str, object]],
+    manifest_path: Path,
+    device: str,
+) -> None:
+    missing: dict[tuple[float, float], dict[str, object]] = {}
+    for probe in probes:
+        if isinstance(probe.get("manifest"), dict):
+            continue
+        start = round(float(probe["start"]), 3)
+        end = round(float(probe["end"]), 3)
+        key = (start, end)
+        if key in missing:
+            continue
+        digest = hashlib.sha256(f"{start:.3f}:{end:.3f}".encode()).hexdigest()[:12]
+        missing[key] = {
+            "start": start,
+            "end": end,
+            "path": f"verified-gap-{digest}.vocals.wav",
+            "source": "verified_lyric_gap",
+        }
+    if not missing:
+        return
+
+    from .audio_analysis import separate_vocal_ranges
+
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        separate_vocal_ranges(
+            video,
+            [
+                (
+                    start,
+                    end,
+                    manifest_path.parent / str(entry["path"]),
+                )
+                for (start, end), entry in missing.items()
+            ],
+            device,
+        )
+    except Exception as exc:
+        logging.warning("verified lyric gap vocal separation failed: %s", exc)
+        for probe in probes:
+            if not isinstance(probe.get("manifest"), dict):
+                probe["stem_error"] = str(exc)[:500]
+        return
+
+    manifests.extend(missing.values())
+    manifests.sort(key=lambda value: (float(value["start"]), float(value["end"])))
+    temporary = manifest_path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(manifests, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(manifest_path)
+    for probe in probes:
+        if isinstance(probe.get("manifest"), dict):
+            continue
+        key = (round(float(probe["start"]), 3), round(float(probe["end"]), 3))
+        probe["manifest"] = missing.get(key)
 
 
 def _recover_take_neighbor_lyrics(
@@ -1450,7 +1575,9 @@ def _recover_acoustic_phrase_neighbors(
     if not phrases:
         return {}, [], []
 
-    ordered = sorted(match.anchors, key=lambda value: (value.take_index, value.cue_index))
+    ordered = sorted(
+        match.anchors, key=lambda value: (value.take_index, value.cue_index)
+    )
     first = ordered[0]
     last = ordered[-1]
     first_cue_id = singing_ids[first.cue_index]

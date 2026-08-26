@@ -11,6 +11,7 @@ import numpy as np
 from subtitle_pipeline.audio_analysis import (
     AudioRegion,
     _acoustic_phrase_route,
+    _build_acoustic_phrases,
     _clean_speaker_timeline,
     _exclude_timeline_regions,
     _extract_audio,
@@ -39,6 +40,71 @@ from subtitle_pipeline.speakers import (
 
 
 class AudioAnalysisTests(unittest.TestCase):
+    def test_acoustic_phrases_only_cover_selected_ast_candidates(self):
+        config = AudioAnalysisConfig(
+            singing_threshold=0.2,
+            singing_vocal_threshold=0.6,
+            singing_asr_max_seconds=15.0,
+        )
+        raw_scores = [
+            AudioRegion(0, 5, "singing", confidence=0.8),
+            AudioRegion(2.5, 7.5, "singing", confidence=0.8),
+            AudioRegion(7.5, 12.5, "singing", confidence=0.0),
+            AudioRegion(20, 25, "singing", confidence=0.8),
+        ]
+        candidates = [
+            AudioRegion(0, 7.5, "singing", confidence=0.8),
+            AudioRegion(20, 25, "singing", confidence=0.8),
+        ]
+        sources = [
+            (candidates[0], SimpleNamespace(uri="shm://first")),
+            (candidates[1], SimpleNamespace(uri="shm://second")),
+        ]
+
+        phrases = _build_acoustic_phrases(
+            raw_scores,
+            candidates,
+            raw_scores,
+            [],
+            sources,
+            config,
+        )
+
+        self.assertEqual(
+            [(phrase.start, phrase.end) for phrase in phrases],
+            [(0.0, 7.5), (20.0, 25.0)],
+        )
+        self.assertEqual(
+            [phrase.source_path for phrase in phrases],
+            ["shm://first", "shm://second"],
+        )
+
+    def test_acoustic_phrase_rejects_partially_overlapping_stem(self):
+        config = AudioAnalysisConfig(
+            singing_threshold=0.2,
+            singing_vocal_threshold=0.6,
+            singing_asr_max_seconds=15.0,
+        )
+        candidate = AudioRegion(0, 15, "singing", confidence=0.8)
+
+        phrases = _build_acoustic_phrases(
+            [candidate],
+            [candidate],
+            [candidate],
+            [],
+            [
+                (
+                    AudioRegion(10, 15, "singing", confidence=0.8),
+                    SimpleNamespace(uri="shm://partial"),
+                )
+            ],
+            config,
+        )
+
+        self.assertEqual(len(phrases), 1)
+        self.assertFalse(phrases[0].route_alt)
+        self.assertIsNone(phrases[0].source_path)
+
     def test_acoustic_phrase_route_covers_full_singing_speech_matrix(self):
         config = AudioAnalysisConfig(
             singing_threshold=0.2,

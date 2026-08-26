@@ -239,7 +239,7 @@ def _transcribe_analyzed(
     cache_path = destination.parent / "asr-analysis-cache.json"
     signature = {
         **_cache_signature(video, duration, config, japanese_single_word_list),
-        "analysis_version": 12,
+        "analysis_version": 13,
         "analysis_config": asdict(analysis_config),
         "regions": [_analysis_region_signature(region) for region in regions],
     }
