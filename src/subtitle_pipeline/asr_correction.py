@@ -13,6 +13,7 @@ from functools import cache
 from pathlib import Path
 
 from .fan_knowledge import KnowledgeHit
+from .llm_response import parse_json_object
 from .prompt_templates import prompt_system, prompt_templates_digest, render_user_prompt
 
 logger = logging.getLogger(__name__)
@@ -291,7 +292,7 @@ def _parse_response(response: dict[str, object], expected: int) -> list[str]:
     message = choices[0].get("message")
     if not isinstance(message, dict) or not isinstance(message.get("content"), str):
         raise TypeError("ASR correction response has no message content")
-    value = json.loads(message["content"])
+    value = parse_json_object(message["content"])
     windows = value.get("windows") if isinstance(value, dict) else None
     if not isinstance(windows, list) or len(windows) != expected:
         raise ValueError("ASR correction response window count mismatch")

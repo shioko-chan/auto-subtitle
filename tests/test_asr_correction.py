@@ -90,6 +90,34 @@ class ASRCorrectionTests(unittest.TestCase):
 
         self.assertEqual(bodies[0]["max_tokens"], 1234)
 
+    def test_fenced_json_response_is_accepted(self) -> None:
+        response_content = (
+            "```json\n"
+            '{"windows":[{"window_id":0,'
+            '"corrected_text":"等身大フィギュア"}]}\n'
+            "```"
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = correct_asr_windows(
+                [{"text": "透芯材フィギュア", "language": "Japanese"}],
+                entities=[],
+                request=lambda _body: {
+                    "choices": [{"message": {"content": response_content}}]
+                },
+                model="test-model",
+                cache_path=root / "cache.json",
+                audit_path=root / "audit.jsonl",
+            )
+            audit = json.loads(
+                (root / "audit.jsonl").read_text(encoding="utf-8").splitlines()[-1]
+            )
+
+        self.assertEqual(result[0]["text"], "等身大フィギュア")
+        self.assertEqual(result[0]["correction_method"], "llm")
+        self.assertIsNone(audit["error"])
+
     def test_entities_from_context_ignores_translation_terms(self) -> None:
         entities = entities_from_context(
             {

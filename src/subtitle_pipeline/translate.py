@@ -19,6 +19,8 @@ import certifi
 
 from .config import LLMConfig, SegmentationConfig, TranslationConfig
 from .fan_knowledge import KnowledgeHit
+from .llm_response import parse_json_object as _parse_json_object
+from .llm_response import strip_markdown_code_fence
 from .local_segmentation import build_speaker_tracks
 from .local_translation import LocalJapaneseTranslator
 from .prompt_templates import prompt_system, render_user_prompt
@@ -867,26 +869,8 @@ def _is_nontransient_http_error(exc: Exception) -> bool:
     )
 
 
-def _parse_json_object(content: object) -> dict[str, object]:
-    if not isinstance(content, str):
-        raise ValueError("LLM response content is not text")
-    value = content.strip()
-    if value.startswith("```"):
-        value = value.split("\n", 1)[-1]
-        value = value.rsplit("```", 1)[0].strip()
-    parsed = json.loads(value)
-    if not isinstance(parsed, dict):
-        raise ValueError("LLM response must be a JSON object")
-    return parsed
-
-
 def _parse_joint_records(content: object) -> list[object]:
-    if not isinstance(content, str):
-        raise ValueError("LLM response content is not text")
-    value = content.strip()
-    if value.startswith("```"):
-        value = value.split("\n", 1)[-1]
-        value = value.rsplit("```", 1)[0].strip()
+    value = strip_markdown_code_fence(content)
     if not value:
         raise ValueError("empty response")
 
