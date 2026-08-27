@@ -167,22 +167,26 @@ class StagedTranslationTests(unittest.TestCase):
         self.assertEqual([(cue.start, cue.end) for cue in translated], [(0, 1), (1, 2)])
         self.assertEqual([cue.text for cue in translated], ["译文一", "译文二"])
 
-    def test_fixed_translation_retrieves_knowledge_for_each_request_group(self):
-        source = [Cue(0, 1, "本日分の貢ぎ物", "A")]
+    def test_fixed_translation_places_each_cues_knowledge_next_to_its_text(self):
+        source = [
+            Cue(0, 1, "本日分の貢ぎ物", "A"),
+            Cue(1, 2, "等身大フィギュア", "A"),
+        ]
         retrieved: list[list[Cue]] = []
         prompts: list[str] = []
 
         def retrieve(cues, _chat_text):
             retrieved.append(cues)
+            text = cues[0].text
             return [
                 KnowledgeHit(
-                    "knowledge:ty",
+                    f"knowledge:{text}",
                     "catchphrase",
-                    "TY",
-                    "TY在这里表示Thank You。",
+                    text,
+                    f"{text}的专属知识。",
                     None,
                     KnowledgeScore(1, 0, 0, 1, 1, 0, 1, 5),
-                    ("TY",),
+                    (text,),
                 )
             ]
 
@@ -193,7 +197,12 @@ class StagedTranslationTests(unittest.TestCase):
                     {
                         "message": {
                             "content": json.dumps(
-                                {"cues": [{"cue_id": 0, "text": "今日的礼物"}]},
+                                {
+                                    "cues": [
+                                        {"cue_id": 0, "text": "今日的礼物"},
+                                        {"cue_id": 1, "text": "等身大手办"},
+                                    ]
+                                },
                                 ensure_ascii=False,
                             )
                         }
@@ -220,9 +229,17 @@ class StagedTranslationTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            [[cue.text for cue in group] for group in retrieved], [["本日分の貢ぎ物"]]
+            [[cue.text for cue in group] for group in retrieved],
+            [["本日分の貢ぎ物"], ["等身大フィギュア"]],
         )
-        self.assertIn("TY在这里表示Thank You", prompts[0])
+        first = prompts[0].index('<CUE id="0"')
+        first_end = prompts[0].index("</CUE>", first)
+        second = prompts[0].index('<CUE id="1"')
+        second_end = prompts[0].index("</CUE>", second)
+        self.assertIn("本日分の貢ぎ物的专属知识", prompts[0][first:first_end])
+        self.assertNotIn("等身大フィギュア的专属知识", prompts[0][first:first_end])
+        self.assertIn("等身大フィギュア的专属知识", prompts[0][second:second_end])
+        self.assertNotIn("本日分の貢ぎ物的专属知识", prompts[0][second:second_end])
 
     def test_fixed_translation_retrieves_chat_once_for_request_group(self):
         source = [Cue(10, 11, "これ", "A"), Cue(11, 12, "それ", "A")]

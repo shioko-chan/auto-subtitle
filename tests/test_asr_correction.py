@@ -15,56 +15,41 @@ from subtitle_pipeline.fan_knowledge import KnowledgeHit, KnowledgeScore
 
 
 class ASRCorrectionTests(unittest.TestCase):
-    def test_neighboring_asr_windows_are_read_only_context(self) -> None:
+    def test_prompt_requests_active_phonetic_and_lexical_correction(self) -> None:
         prompts: list[str] = []
 
-        def request(body):
-            prompts.append(body["messages"][1]["content"])
-            target = body["messages"][1]["content"].split("TARGET:\n", 1)[1]
-            text = target.split(">", 1)[1]
+        def request(body: dict[str, object]) -> dict[str, object]:
+            prompts.append(body["messages"][0]["content"])
             return {
                 "choices": [
                     {
                         "message": {
-                            "content": json.dumps(
-                                {"windows": [{"window_id": 0, "corrected_text": text}]},
-                                ensure_ascii=False,
-                            )
+                            "content": '{"windows":[{"window_id":0,"corrected_text":"等身大フィギュア"}]}'
                         }
                     }
                 ]
             }
 
-        records = [
-            {
-                "window_id": index,
-                "text": text,
-                "language": "Japanese",
-                "core_start": index * 10.0,
-                "core_end": index * 10.0 + 5.0,
-            }
-            for index, text in enumerate(("前の発言", "対象の発言", "後の発言"))
-        ]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             correct_asr_windows(
-                records,
+                [{"text": "透芯材フィギュア", "language": "Japanese"}],
                 entities=[],
                 request=request,
                 model="test",
                 cache_path=root / "cache.json",
                 audit_path=root / "audit.jsonl",
-                batch_windows=1,
-                context_before_seconds=20,
-                context_after_seconds=10,
             )
 
-        self.assertIn("READ_ONLY_CONTEXT:\n", prompts[1])
-        self.assertIn("前の発言", prompts[1])
-        self.assertIn("後の発言", prompts[1])
-        target = prompts[1].split("TARGET:\n", 1)[1]
-        self.assertNotIn("前の発言", target)
-        self.assertNotIn("後の発言", target)
+        prompt = " ".join(prompts[0].split())
+        self.assertIn("phonetic near miss", prompt)
+        self.assertIn("does not require an entity candidate", prompt)
+        self.assertIn("ordinary collocation", prompt)
+        self.assertIn("Do not limit corrections to character-level edits", prompt)
+        self.assertIn("The correct wording may use completely different kanji", prompt)
+        self.assertIn("Consider nearby pronunciations", prompt)
+        self.assertIn("Faithfulness means faithfulness to the likely spoken audio", prompt)
+        self.assertIn("not to the literal ASR characters", prompt)
 
     def test_batches_respect_window_and_character_limits(self) -> None:
         pending = [
@@ -175,7 +160,7 @@ class ASRCorrectionTests(unittest.TestCase):
         )
         prompt = requests[0]["messages"][1]["content"]
         self.assertIn(
-            "<0 candidates=夢限大みゅーたいぷ｜仲町あられ>",
+            '<WINDOW id="0" candidates="夢限大みゅーたいぷ｜仲町あられ">',
             prompt,
         )
         self.assertIn("<仲町あられ>", prompt)
@@ -296,11 +281,20 @@ class ASRCorrectionTests(unittest.TestCase):
 
         prompt = requests[0]["messages"][1]["content"]
         self.assertIn(
-            "<0>\nFAN_KNOWLEDGE:\n(none)\nCURRENT_VIDEO_CHAT:\n第一窗口聊天", prompt
+            '<WINDOW id="0" candidates="(none)">\n'
+            "FAN_KNOWLEDGE:\n(none)\nCURRENT_VIDEO_CHAT:\n第一窗口聊天\n"
+            "ASR_TEXT:\n一\n</WINDOW>",
+            prompt,
         )
         self.assertIn(
-            "<1>\nFAN_KNOWLEDGE:\n(none)\nCURRENT_VIDEO_CHAT:\n第二窗口聊天", prompt
+            '<WINDOW id="1" candidates="(none)">\n'
+            "FAN_KNOWLEDGE:\n(none)\nCURRENT_VIDEO_CHAT:\n第二窗口聊天\n"
+            "ASR_TEXT:\n二\n</WINDOW>",
+            prompt,
         )
+        first_end = prompt.index("</WINDOW>")
+        second_start = prompt.index('<WINDOW id="1"')
+        self.assertLess(first_end, second_start)
 
     def test_asr_cache_does_not_depend_on_retrieved_knowledge(self) -> None:
         hit = KnowledgeHit(

@@ -172,7 +172,6 @@ def _run_pipeline_stages(
                     lookahead_seconds=(
                         config.fan_knowledge.current_video_chat_lookahead_seconds
                     ),
-                    maximum_chars=config.fan_knowledge.current_video_chat_max_chars,
                     audit_path=job_dir / "current-video-chat-audit.jsonl",
                 )
                 logging.info(
@@ -235,9 +234,6 @@ def _run_pipeline_stages(
                 batch_windows=config.asr_correction.batch_windows,
                 batch_chars=config.asr_correction.batch_chars,
                 max_tokens=config.asr_correction.max_tokens,
-                context_before_seconds=config.asr_correction.context_before_seconds,
-                context_after_seconds=config.asr_correction.context_after_seconds,
-                context_max_chars=config.asr_correction.context_max_chars,
                 retrieve_knowledge=(
                     lambda record, text: (
                         fan_knowledge.retrieve(

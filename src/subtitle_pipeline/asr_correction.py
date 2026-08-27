@@ -70,9 +70,6 @@ def correct_asr_windows(
     batch_windows: int = 6,
     batch_chars: int = 3000,
     max_tokens: int = 8192,
-    context_before_seconds: float = 20.0,
-    context_after_seconds: float = 10.0,
-    context_max_chars: int = 2000,
     retrieve_knowledge: Callable[[dict[str, object], str], list[KnowledgeHit]]
     | None = None,
 ) -> list[dict[str, object]]:
@@ -87,9 +84,6 @@ def correct_asr_windows(
         "batch_windows": batch_windows,
         "batch_chars": batch_chars,
         "max_tokens": max_tokens,
-        "context_before_seconds": context_before_seconds,
-        "context_after_seconds": context_after_seconds,
-        "context_max_chars": context_max_chars,
     }
     for index, record in enumerate(records):
         text = str(record.get("text") or "")
@@ -131,27 +125,7 @@ def correct_asr_windows(
                     "content": render_user_prompt(
                         _PROMPT,
                         ENTITY_REFERENCE=_format_entities(entity_union),
-                        WINDOW_EVIDENCE=_format_window_evidence(
-                            batch, knowledge_by_index
-                        ),
-                        READ_ONLY_CONTEXT=_format_read_only_context(
-                            records,
-                            batch,
-                            before_seconds=context_before_seconds,
-                            after_seconds=context_after_seconds,
-                            maximum_chars=context_max_chars,
-                        ),
-                        TARGET="\n".join(
-                            f"<{position} candidates="
-                            f"{'｜'.join(entity.surface for entity in candidates) or '(none)'}>"
-                            f"{deterministic}"
-                            for position, (
-                                _,
-                                _,
-                                deterministic,
-                                candidates,
-                            ) in enumerate(batch)
-                        ),
+                        TARGET=_format_target_windows(batch, knowledge_by_index),
                     ),
                 },
             ],
@@ -356,12 +330,12 @@ def _format_entities(entities: list[ASREntity]) -> str:
     )
 
 
-def _format_window_evidence(
+def _format_target_windows(
     batch: list[tuple[int, dict[str, object], str, list[ASREntity]]],
     knowledge_by_index: dict[int, list[KnowledgeHit]],
 ) -> str:
     values: list[str] = []
-    for position, (index, record, _text, _candidates) in enumerate(batch):
+    for position, (index, record, text, candidates) in enumerate(batch):
         knowledge = knowledge_by_index[index][:3]
         knowledge_text = (
             "\n".join(
@@ -370,64 +344,15 @@ def _format_window_evidence(
             or "(none)"
         )
         chat_text = str(record.get("chat_text") or "").strip() or "(none)"
+        candidate_text = "｜".join(entity.surface for entity in candidates) or "(none)"
         values.append(
-            f"<{position}>\nFAN_KNOWLEDGE:\n{knowledge_text}\n"
-            f"CURRENT_VIDEO_CHAT:\n{chat_text}"
+            f'<WINDOW id="{position}" candidates="{candidate_text}">\n'
+            f"FAN_KNOWLEDGE:\n{knowledge_text}\n"
+            f"CURRENT_VIDEO_CHAT:\n{chat_text}\n"
+            f"ASR_TEXT:\n{text}\n"
+            "</WINDOW>"
         )
     return "\n\n".join(values) or "(none)"
-
-
-def _format_read_only_context(
-    records: list[dict[str, object]],
-    batch: list[tuple[int, dict[str, object], str, list[ASREntity]]],
-    *,
-    before_seconds: float,
-    after_seconds: float,
-    maximum_chars: int,
-) -> str:
-    selected_indexes = {index for index, _record, _text, _entities in batch}
-    starts = [float(record.get("core_start") or 0.0) for _, record, _, _ in batch]
-    ends = [float(record.get("core_end") or 0.0) for _, record, _, _ in batch]
-    lower = min(starts) - before_seconds
-    upper = max(ends) + after_seconds
-    center = (min(starts) + max(ends)) / 2
-    candidates = [
-        (index, record)
-        for index, record in enumerate(records)
-        if index not in selected_indexes
-        and float(record.get("core_end") or 0.0) >= lower
-        and float(record.get("core_start") or 0.0) <= upper
-    ]
-    candidates.sort(
-        key=lambda value: abs(
-            (
-                float(value[1].get("core_start") or 0.0)
-                + float(value[1].get("core_end") or 0.0)
-            )
-            / 2
-            - center
-        )
-    )
-    kept: list[tuple[int, dict[str, object]]] = []
-    used = 0
-    for index, record in candidates:
-        text = str(record.get("text") or "").strip()
-        line_chars = len(text) + 32
-        if not text or used + line_chars > maximum_chars:
-            continue
-        kept.append((index, record))
-        used += line_chars
-    kept.sort(key=lambda value: float(value[1].get("core_start") or 0.0))
-    return (
-        "\n".join(
-            f"<window={record.get('window_id', index)} "
-            f"time={float(record.get('core_start') or 0.0):.3f}-"
-            f"{float(record.get('core_end') or 0.0):.3f}>"
-            f"{str(record.get('text') or '').strip()}"
-            for index, record in kept
-        )
-        or "(none)"
-    )
 
 
 def _unique_knowledge(values: object) -> list[KnowledgeHit]:

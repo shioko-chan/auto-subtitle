@@ -12,7 +12,7 @@ from subtitle_pipeline.chat_context import (
 
 
 class CurrentVideoChatIndexTests(unittest.TestCase):
-    def test_retrieves_repeated_time_local_terms_and_audits_selection(self) -> None:
+    def test_includes_all_useful_time_local_messages_and_audits_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             audit = Path(temporary) / "audit.jsonl"
             index = CurrentVideoChatIndex(
@@ -35,12 +35,16 @@ class CurrentVideoChatIndexTests(unittest.TestCase):
 
             event = json.loads(audit.read_text(encoding="utf-8"))
 
-        self.assertIn("アクスタ (3 viewers)", evidence)
-        self.assertNotIn("別の話題", evidence)
-        self.assertEqual(event["stage"], "translation")
-        self.assertEqual(event["target_id"], 7)
+            self.assertIn("[chat] アクスタの話？", evidence)
+            self.assertIn("[chat] アクスタは罠", evidence)
+            self.assertIn("[chat] アクスタ高い", evidence)
+            self.assertNotIn("別の話題", evidence)
+            self.assertEqual(event["stage"], "translation")
+            self.assertEqual(event["target_id"], 7)
+            self.assertEqual(event["candidate_count"], 3)
+            self.assertEqual(event["selected_count"], 3)
 
-    def test_irrelevant_single_messages_are_not_injected(self) -> None:
+    def test_query_does_not_filter_time_local_messages(self) -> None:
         index = CurrentVideoChatIndex(
             [YouTubeChatMessage(10, "a", "今日の晩ご飯は何？")]
         )
@@ -53,7 +57,7 @@ class CurrentVideoChatIndexTests(unittest.TestCase):
             target_id=0,
         )
 
-        self.assertEqual(evidence, "")
+        self.assertEqual(evidence, "[chat] 今日の晩ご飯は何？")
 
     def test_message_ids_remove_download_duplicates_but_preserve_viewer_repeats(self):
         index = CurrentVideoChatIndex(
@@ -73,8 +77,50 @@ class CurrentVideoChatIndexTests(unittest.TestCase):
             target_id="window",
         )
 
-        self.assertIn("×3 viewers", evidence)
-        self.assertNotIn("×4 viewers", evidence)
+        self.assertIn("[chat ×3] アクスタ", evidence)
+        self.assertNotIn("×4", evidence)
+
+    def test_repeated_text_is_only_grouped_within_ten_seconds(self) -> None:
+        index = CurrentVideoChatIndex(
+            [
+                YouTubeChatMessage(10, "a", "等身大フィギュア", message_id="1"),
+                YouTubeChatMessage(14, "b", "等身大フィギュア", message_id="2"),
+                YouTubeChatMessage(30, "c", "等身大フィギュア", message_id="3"),
+            ]
+        )
+
+        evidence = index.evidence(
+            10,
+            30,
+            "透芯材フィギュア",
+            stage="asr_correction",
+            target_id=4,
+        )
+
+        self.assertEqual(
+            evidence,
+            "[chat ×2] 等身大フィギュア\n[chat] 等身大フィギュア",
+        )
+
+    def test_filters_reaction_only_spam_and_omits_timestamps(self) -> None:
+        index = CurrentVideoChatIndex(
+            [
+                YouTubeChatMessage(10, "a", "ｗｗｗｗ"),
+                YouTubeChatMessage(11, "b", "👏👏👏"),
+                YouTubeChatMessage(12, "c", "TY!"),
+            ]
+        )
+
+        evidence = index.evidence(
+            10,
+            12,
+            "ありがとう",
+            stage="asr_correction",
+            target_id=0,
+        )
+
+        self.assertEqual(evidence, "[chat] TY!")
+        self.assertNotIn("s chat", evidence)
 
 
 if __name__ == "__main__":

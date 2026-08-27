@@ -137,9 +137,6 @@ class ASRCorrectionConfig:
     batch_windows: int = 6
     batch_chars: int = 3000
     max_tokens: int = 8192
-    context_before_seconds: float = 20.0
-    context_after_seconds: float = 10.0
-    context_max_chars: int = 2000
 
 
 @dataclass(frozen=True)
@@ -188,7 +185,6 @@ class FanKnowledgeConfig:
     include_regular_chat: bool = False
     current_video_chat_lookback_seconds: float = 30.0
     current_video_chat_lookahead_seconds: float = 15.0
-    current_video_chat_max_chars: int = 900
     top_k_asr: int = 6
     top_k_translation: int = 12
     translation_query_chars: int = 12000
@@ -653,12 +649,6 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("asr_correction.batch_windows must be at least 1")
     if correction.batch_chars < 1:
         raise ConfigError("asr_correction.batch_chars must be at least 1")
-    if correction.context_before_seconds < 0:
-        raise ConfigError("asr_correction.context_before_seconds cannot be negative")
-    if correction.context_after_seconds < 0:
-        raise ConfigError("asr_correction.context_after_seconds cannot be negative")
-    if correction.context_max_chars < 1:
-        raise ConfigError("asr_correction.context_max_chars must be positive")
     segmentation = config.segmentation
     if segmentation.boundary_score_threshold < 0:
         raise ConfigError("segmentation.boundary_score_threshold cannot be negative")
@@ -737,10 +727,6 @@ def load_config(path: Path) -> AppConfig:
     if knowledge.current_video_chat_lookahead_seconds < 0:
         raise ConfigError(
             "fan_knowledge.current_video_chat_lookahead_seconds cannot be negative"
-        )
-    if knowledge.current_video_chat_max_chars < 100:
-        raise ConfigError(
-            "fan_knowledge.current_video_chat_max_chars must be at least 100"
         )
     if not knowledge.youtube_subtitle_languages or not all(
         isinstance(value, str) and value.strip()

@@ -27,6 +27,7 @@ from .joint_translation import (
 )
 from .local_segmentation import LocalUnit, SpeakerTrack
 from .prompt_templates import prompt_system, prompt_templates_digest, render_user_prompt
+from .reference_context import compact_translation_reference_context
 from .source_language import (
     combine_source_languages,
     join_source_fragments,
@@ -471,14 +472,10 @@ def _translate_resilient(
 ) -> dict[int, str]:
     selected = [cues[cue_id] for cue_id in ids]
     chat_evidence = retrieve_chat(selected) if retrieve_chat else ""
-    context = base_context
+    knowledge_by_id: dict[int, list[KnowledgeHit]] = {}
     if retrieve_knowledge is not None:
-        hits = retrieve_knowledge(selected, chat_evidence)
-        if hits:
-            context = {
-                **base_context,
-                "fan_knowledge": [hit.prompt_value() for hit in hits],
-            }
+        for cue_id, cue in zip(ids, selected):
+            knowledge_by_id[cue_id] = retrieve_knowledge([cue], chat_evidence)[:3]
     try:
         return _request_translation(
             ids,
@@ -491,7 +488,8 @@ def _translate_resilient(
             is_nontransient,
             log_invalid_response,
             local_translate,
-            context,
+            base_context,
+            knowledge_by_id,
             replacements,
             maximum_units,
             honorific_rules,
@@ -570,6 +568,7 @@ def _request_translation(
     ],
     local_translate: Callable[[str], str],
     context: dict[str, object],
+    knowledge_by_id: dict[int, list[KnowledgeHit]],
     replacements: tuple[tuple[str, str], ...],
     maximum_units: float,
     honorific_rules: str,
@@ -586,21 +585,35 @@ def _request_translation(
         dialogue = _translation_dialogue_context(
             cues, selected, start, end, translation
         )
+        evidence_text = "\n".join(
+            [
+                *(cue.text for cue in selected),
+                *(cue.text for cue in dialogue),
+                chat_evidence,
+                *(
+                    hit.body
+                    for cue_id in ids
+                    for hit in knowledge_by_id.get(cue_id, [])
+                ),
+            ]
+        )
+        reference = compact_translation_reference_context(
+            context,
+            evidence_text=evidence_text,
+            speakers={cue.speaker for cue in selected if cue.speaker},
+        )
         prompt = render_user_prompt(
             _TRANSLATE_PROMPT,
             TARGET_LANGUAGE=translation.target_language,
             MAXIMUM_UNITS=f"{maximum_units:.3f}",
             HONORIFIC_TRANSLATION_RULES=honorific_rules,
-            REFERENCE_TEXT=_reference_text(context),
+            REFERENCE_TEXT=_reference_text(reference),
             CHAT_EVIDENCE=chat_evidence or "(none)",
             DIALOGUE_CONTEXT="\n".join(
                 f"<{cue.speaker or 'unknown'}>{_escape(cue.text)}" for cue in dialogue
             )
             or "(none)",
-            SOURCE_TEXT="\n".join(
-                f"<{local_id}>[{language_for_text(cue.text, cue.language)}] {_escape(cue.text)}"
-                for local_id, cue in enumerate(selected)
-            ),
+            SOURCE_TEXT=_format_translation_cues(ids, cues, knowledge_by_id),
             RETRY_SECTION=""
             if previous_error is None
             else f"\n\nPREVIOUS_RESPONSE_ERROR: {previous_error}",
@@ -677,6 +690,31 @@ def _request_translation(
             if content_attempt + 1 >= min(_CONTENT_ATTEMPTS, llm.max_retries):
                 raise
     raise RuntimeError("fixed translation exhausted retries")
+
+
+def _format_translation_cues(
+    ids: list[int],
+    cues: list[Cue],
+    knowledge_by_id: dict[int, list[KnowledgeHit]],
+) -> str:
+    values: list[str] = []
+    for local_id, cue_id in enumerate(ids):
+        cue = cues[cue_id]
+        knowledge = knowledge_by_id.get(cue_id, [])
+        knowledge_text = (
+            "\n".join(
+                f"- <{hit.kind}:{hit.title}> {hit.body[:180]}" for hit in knowledge
+            )
+            or "(none)"
+        )
+        values.append(
+            f'<CUE id="{local_id}" '
+            f'language="{language_for_text(cue.text, cue.language)}">\n'
+            f"FAN_KNOWLEDGE:\n{knowledge_text}\n"
+            f"ASR_TEXT:\n{_escape(cue.text)}\n"
+            "</CUE>"
+        )
+    return "\n\n".join(values)
 
 
 def _records_to_source_cues(

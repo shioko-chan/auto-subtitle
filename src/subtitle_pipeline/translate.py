@@ -1007,8 +1007,6 @@ def _estimate_tokens(text: str) -> int:
 def _prompt_section_sizes(prompt: str) -> dict[str, dict[str, int]]:
     marker_names = {
         "ENTITY_REFERENCE:": "entity_reference",
-        "WINDOW_EVIDENCE:": "window_evidence",
-        "READ_ONLY_CONTEXT:": "read_only_context",
         "REFERENCE:": "reference",
         "CURRENT_VIDEO_CHAT:": "current_video_chat",
         "DIALOGUE_CONTEXT:": "dialogue_context",
