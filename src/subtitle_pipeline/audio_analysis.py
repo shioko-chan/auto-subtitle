@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import math
 import subprocess
 import threading
 import warnings
@@ -23,7 +22,7 @@ logger = logging.getLogger(__name__)
 # hooks. Keep unrelated model construction out of that process-global context.
 _MODEL_LOAD_LOCK = threading.Lock()
 
-_CACHE_VERSION = 13
+_CACHE_VERSION = 14
 _SINGING_LABELS = {
     "chant",
     "child singing",
@@ -152,11 +151,16 @@ def analyze_audio(
     vocal_scores: list[AudioRegion] = []
     fallback_vocals_path: Path | None = None
     if raw_candidates:
+        phrase_candidates = _smart_acoustic_phrase_regions(
+            raw_candidates,
+            audio_pool.main() if audio_pool is not None else None,
+            config,
+        )
         with stage_metrics("audio.vocal_separation_and_detection", config.device):
             if audio_pool is not None:
                 vocal_candidates = _separate_vocal_candidates(
                     video,
-                    raw_candidates,
+                    phrase_candidates,
                     config.device,
                     audio_pool,
                     # Persist candidate stems for later canonical-lyric alignment.
@@ -183,7 +187,7 @@ def analyze_audio(
                 )
     acoustic_phrases = _build_acoustic_phrases(
         raw_scores,
-        raw_candidates,
+        phrase_candidates if raw_candidates else [],
         vocal_scores,
         ordinary_diarization,
         vocal_candidates,
@@ -477,15 +481,7 @@ def _build_acoustic_phrases(
     allow_unbound_vocal_source: bool = False,
 ) -> list[AcousticPhrase]:
     """Split selected AST candidate spans into independent ASR routing units."""
-    intervals: list[tuple[float, float]] = []
-    for span in raw_candidates:
-        duration = span.end - span.start
-        count = max(1, math.ceil(duration / config.singing_asr_max_seconds))
-        width = duration / count
-        intervals.extend(
-            (span.start + index * width, span.start + (index + 1) * width)
-            for index in range(count)
-        )
+    intervals = [(span.start, span.end) for span in raw_candidates]
 
     phrases: list[AcousticPhrase] = []
     for start, end in intervals:
@@ -563,6 +559,101 @@ def _build_acoustic_phrases(
             )
         )
     return phrases
+
+
+def _smart_acoustic_phrase_regions(
+    candidates: list[AudioRegion],
+    audio: AudioBuffer | None,
+    config: AudioAnalysisConfig,
+) -> list[AudioRegion]:
+    """Cut AST ranges once, before Demucs and ALT, at stable acoustic valleys."""
+    result: list[AudioRegion] = []
+    for candidate in candidates:
+        if candidate.end - candidate.start <= config.singing_asr_max_seconds:
+            result.append(candidate)
+            continue
+        cut_points = _acoustic_cut_points(candidate, audio, config)
+        cursor = candidate.start
+        while candidate.end - cursor > config.singing_asr_max_seconds:
+            minimum = cursor + config.singing_asr_min_seconds
+            maximum = min(cursor + config.singing_asr_max_seconds, candidate.end)
+            desired = min(cursor + config.singing_asr_target_seconds, maximum)
+            search_start = max(minimum, desired - config.singing_asr_search_seconds)
+            search_end = min(maximum, desired + config.singing_asr_search_seconds)
+            options = [
+                value for value in cut_points if search_start <= value[0] <= search_end
+            ]
+            cut = (
+                min(options, key=lambda value: (value[1], abs(value[0] - desired)))[0]
+                if options
+                else desired
+            )
+            if candidate.end - cut < config.singing_asr_min_seconds:
+                cut = max(minimum, candidate.end - config.singing_asr_min_seconds)
+            result.append(AudioRegion(round(cursor, 3), round(cut, 3), "singing"))
+            cursor = cut
+        if candidate.end - cursor > 1e-3:
+            result.append(
+                AudioRegion(round(cursor, 3), round(candidate.end, 3), "singing")
+            )
+    return result
+
+
+def _acoustic_cut_points(
+    candidate: AudioRegion,
+    audio: AudioBuffer | None,
+    config: AudioAnalysisConfig,
+) -> list[tuple[float, int]]:
+    if audio is None:
+        return []
+    import numpy as np
+
+    samples = np.asarray(audio.slice(candidate.start, candidate.end), dtype=np.float32)
+    if not len(samples):
+        return []
+    sample_rate = audio.sample_rate
+    frame_length = min(max(1, round(0.05 * sample_rate)), len(samples))
+    hop_length = min(max(1, round(0.025 * sample_rate)), frame_length)
+    starts = np.arange(0, len(samples), hop_length)
+    ends = np.minimum(starts + frame_length, len(samples))
+    prefix = np.concatenate(([0.0], np.cumsum(np.square(samples), dtype=np.float64)))
+    rms = np.sqrt((prefix[ends] - prefix[starts]) / np.maximum(1, ends - starts))
+    peak = max(float(rms.max()), 1e-9)
+    low = rms <= peak * (10 ** (-35 / 20))
+    points: list[tuple[float, int]] = []
+    run_start: int | None = None
+    for index in range(len(low) + 1):
+        is_low = index < len(low) and bool(low[index])
+        if is_low and run_start is None:
+            run_start = index
+        elif not is_low and run_start is not None:
+            gap_start = starts[run_start] / sample_rate
+            gap_end = min(len(samples), starts[index - 1] + frame_length) / sample_rate
+            duration = gap_end - gap_start
+            if duration >= config.singing_phrase_silence_seconds:
+                priority = (
+                    0
+                    if duration >= max(0.8, config.singing_phrase_silence_seconds)
+                    else 2
+                )
+                points.append((candidate.start + (gap_start + gap_end) / 2, priority))
+            run_start = None
+    if len(rms) >= 3:
+        width = max(1, round(0.4 * sample_rate / hop_length))
+        smoothed = np.convolve(rms, np.ones(width) / width, mode="same")
+        for index in range(1, len(smoothed) - 1):
+            if (
+                smoothed[index] <= smoothed[index - 1]
+                and smoothed[index] < smoothed[index + 1]
+            ):
+                points.append(
+                    (
+                        candidate.start
+                        + (starts[index] + frame_length / 2) / sample_rate,
+                        1,
+                    )
+                )
+    return points
 
 
 def _acoustic_phrase_route(

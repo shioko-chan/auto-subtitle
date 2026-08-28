@@ -5,16 +5,15 @@ import json
 import logging
 import re
 import subprocess
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
 
 from .chat_context import (
     YouTubeChatMessage,
     read_youtube_live_chat,
-    remove_youtube_chat_files,
 )
 from .commands import require_command
 from .config import DownloadConfig
@@ -264,9 +263,10 @@ def download_youtube_subtitles(
     batch_size: int = 10,
     batch_workers: int = 4,
     after_batch: Callable[[tuple[str, ...]], None] | None = None,
-) -> None:
+    known_video_ids: set[str] | None = None,
+) -> tuple[str, ...]:
     if not urls:
-        return
+        return ()
     yt_dlp = require_command("yt-dlp")
     cache_dir.mkdir(parents=True, exist_ok=True)
     common = [
@@ -285,21 +285,25 @@ def download_youtube_subtitles(
     if download.cookies_file:
         common.extend(["--cookies", download.cookies_file])
 
-    listing = subprocess.run(
-        [
-            *common,
-            "--flat-playlist",
-            "--dump-json",
-            "--playlist-end",
-            str(playlist_end),
-            *urls,
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    listing_command = [
+        *common,
+        "--flat-playlist",
+        "--dump-json",
+        "--playlist-end",
+        str(playlist_end),
+        *urls,
+    ]
+    if known_video_ids is None:
+        listing_lines = subprocess.run(
+            listing_command,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+    else:
+        listing_lines = _incremental_youtube_listing(listing_command, known_video_ids)
     video_urls: list[str] = []
-    for line in listing.stdout.splitlines():
+    for line in listing_lines:
         try:
             item = json.loads(line)
         except json.JSONDecodeError:
@@ -309,10 +313,13 @@ def download_youtube_subtitles(
         video_id = str(item.get("id") or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
             continue
-        if item.get("live_status") not in (None, "was_live"):
+        if item.get("live_status") not in (None, "not_live", "was_live"):
             continue
         if item.get("availability") not in (None, "public", "unlisted"):
             continue
+        if known_video_ids is not None and video_id in known_video_ids:
+            logger.info("reached previously ingested YouTube video %s", video_id)
+            break
         video_urls.append(f"https://www.youtube.com/watch?v={video_id}")
     video_urls = list(dict.fromkeys(video_urls))
     logger.info(
@@ -355,9 +362,39 @@ def download_youtube_subtitles(
         for future in as_completed(futures):
             future.result()
             if after_batch is not None:
-                after_batch(
-                    tuple(url.rsplit("=", 1)[-1] for url in futures[future])
-                )
+                after_batch(tuple(url.rsplit("=", 1)[-1] for url in futures[future]))
+    return tuple(url.rsplit("=", 1)[-1] for url in video_urls)
+
+
+def _incremental_youtube_listing(
+    command: list[str], known_video_ids: set[str]
+) -> list[str]:
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    lines: list[str] = []
+    reached_known = False
+    for line in process.stdout:
+        lines.append(line)
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if str(value.get("id") or "") in known_video_ids:
+            reached_known = True
+            process.terminate()
+            break
+    _stdout, stderr = process.communicate()
+    if not reached_known and process.returncode:
+        raise RuntimeError(
+            f"incremental YouTube listing failed ({process.returncode}): "
+            f"{(stderr or '').strip()[-500:]}"
+        )
+    return lines
 
 
 def ingest_youtube_cache(

@@ -25,7 +25,6 @@ from subtitle_pipeline.pipeline import (
 )
 from subtitle_pipeline.reference_context import compact_reference_context
 from subtitle_pipeline.subtitles import Cue, write_srt
-from subtitle_pipeline.translate import CueTranslationResult
 
 
 class PipelineTests(unittest.TestCase):
@@ -358,12 +357,19 @@ class PipelineTests(unittest.TestCase):
                 def __init__(self, config, translation, api_key, *, audit_path=None):
                     FakeTranslator.audit_path = audit_path
 
-                def plan_and_translate(self, cues, config, **context):
-                    FakeTranslator.joint_context = context
-                    return CueTranslationResult(
-                        cues,
-                        [Cue(cue.start, cue.end, "你好") for cue in cues],
-                    )
+                def segment_cues(self, cues, config, **context):
+                    FakeTranslator.segmentation_context = context
+                    return cues
+
+                def translate_segmented_cues(self, cues, **context):
+                    FakeTranslator.translation_context = context
+                    return [Cue(cue.start, cue.end, "你好") for cue in cues]
+
+                def review_translated_cues(
+                    self, source_cues, translated_cues, **context
+                ):
+                    FakeTranslator.review_context = context
+                    return translated_cues
 
                 def translate_metadata(self, title, description, **context):
                     self.context = context
@@ -414,6 +420,10 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertTrue((result.job_dir / "manifest.json").is_file())
             self.assertTrue((result.job_dir / "source.semantic.srt").is_file())
+            self.assertIn(
+                "job directory:",
+                (result.job_dir / "run.log").read_text(encoding="utf-8"),
+            )
             performance = json.loads(
                 (result.job_dir / "performance.json").read_text(encoding="utf-8")
             )
@@ -421,9 +431,9 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(performance["summary"]["pipeline.total"]["calls"], 1)
             self.assertIn("pipeline.download", performance["summary"])
             self.assertIn("pipeline.audio_and_asr", performance["summary"])
-            self.assertIn(
-                "pipeline.joint_segmentation_translation", performance["summary"]
-            )
+            self.assertIn("pipeline.llm_cue_segmentation", performance["summary"])
+            self.assertIn("pipeline.llm_cue_translation", performance["summary"])
+            self.assertIn("pipeline.llm_translation_review", performance["summary"])
             self.assertIn("pipeline.metadata_translation", performance["summary"])
             self.assertIn("pipeline.render", performance["summary"])
             self.assertNotIn("pipeline.upload", performance["summary"])
@@ -434,14 +444,21 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("音乐企划", metadata)
             asr.assert_called_once()
             self.assertEqual(asr.call_args.args[5], [])
-            self.assertEqual(FakeTranslator.joint_context["hard_max_line_units"], 26)
             self.assertEqual(
-                FakeTranslator.joint_context["cache_path"].name,
-                "cue-joint-cache.json",
+                FakeTranslator.segmentation_context["cache_path"].name,
+                "cue-segmentation-cache.json",
             )
             self.assertEqual(
-                FakeTranslator.joint_context["audit_path"].name,
+                FakeTranslator.segmentation_context["audit_path"].name,
                 "local-segmentation.json",
+            )
+            self.assertEqual(
+                FakeTranslator.translation_context["cache_path"].name,
+                "cue-translation-cache.json",
+            )
+            self.assertEqual(
+                FakeTranslator.review_context["cache_path"].name,
+                "cue-translation-review-cache.json",
             )
             self.assertEqual(FakeTranslator.audit_path.name, "llm-audit.jsonl")
             upload.assert_not_called()

@@ -8,18 +8,18 @@ import warnings
 from dataclasses import replace
 from pathlib import Path
 
-from .config import AppConfig, ConfigError, load_config
 from .chat_context import remove_youtube_chat_files
+from .config import AppConfig, ConfigError, load_config
 from .fan_knowledge import FanKnowledgeRetriever
+from .knowledge_collection import collect_official_documents, collect_sns_documents
 from .knowledge_ingestion import (
     IngestionSummary,
     download_youtube_subtitles,
-    ingest_jsonl,
     ingest_document_mapping,
+    ingest_jsonl,
     ingest_work_directory,
     ingest_youtube_cache,
 )
-from .knowledge_collection import collect_official_documents, collect_sns_documents
 from .pipeline import run_pipeline
 
 
@@ -114,7 +114,12 @@ def main(argv: list[str] | None = None) -> int:
 
 def _knowledge(config: AppConfig, args: argparse.Namespace) -> int:
     knowledge = config.fan_knowledge
-    with FanKnowledgeRetriever(Path(knowledge.database_path).expanduser()) as retriever:
+    with FanKnowledgeRetriever(
+        Path(knowledge.database_path).expanduser(),
+        embedding_model=knowledge.embedding_model,
+        vector_index_path=Path(knowledge.vector_index_path).expanduser(),
+        vector_minimum_score=knowledge.vector_minimum_score,
+    ) as retriever:
         command = args.knowledge_command
         if command == "stats":
             logging.info(
@@ -210,6 +215,12 @@ def _knowledge(config: AppConfig, args: argparse.Namespace) -> int:
         else:
             raise ValueError(f"unknown knowledge command: {command}")
         _log_ingestion_summary(summary)
+        added_vectors, removed_vectors = retriever.sync_vector_index()
+        logging.info(
+            "knowledge vector index: added=%d removed=%d",
+            added_vectors,
+            removed_vectors,
+        )
     return 0
 
 

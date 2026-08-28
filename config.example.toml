@@ -205,6 +205,44 @@ current_video_chat_lookahead_seconds = 15.0
 top_k_asr = 6
 top_k_translation = 12
 translation_query_chars = 12000
+auto_update_enabled = true
+update_interval_hours = 24
+youtube_playlist_limit = 10000
+youtube_sources = [
+  "https://www.youtube.com/@arale_yumemita/videos",
+  "https://www.youtube.com/@nonoka_yumemita/videos",
+  "https://www.youtube.com/@ritsu_yumemita/videos",
+  "https://www.youtube.com/@miyako_yumemita/videos",
+  "https://www.youtube.com/@yuno_yumemita/videos",
+  "https://www.youtube.com/@BDP_yumemita/videos",
+  "https://www.youtube.com/@arale_yumemita/streams",
+  "https://www.youtube.com/@nonoka_yumemita/streams",
+  "https://www.youtube.com/@ritsu_yumemita/streams",
+  "https://www.youtube.com/@miyako_yumemita/streams",
+  "https://www.youtube.com/@yuno_yumemita/streams",
+  "https://www.youtube.com/@BDP_yumemita/streams",
+]
+official_sources = [
+  "https://bang-dream.com/news/",
+  "https://bang-dream.com/events/",
+  "https://bushiroad-music.com/artists/yumemita/",
+]
+sns_sources = [
+  "https://x.com/BDP_yumemita",
+  "https://x.com/arale_yumemita",
+  "https://x.com/nonoka_yumemita",
+  "https://x.com/ritsu_yumemita",
+  "https://x.com/miyako_yumemita",
+  "https://x.com/yuno_yumemita",
+  "https://www.instagram.com/arale_yumemita/",
+  "https://www.instagram.com/nonochantime_yumemita/",
+  "https://www.instagram.com/ritsu_mgmg/",
+  "https://www.instagram.com/38_385_popo/",
+  "https://www.instagram.com/yunoch1/",
+]
+embedding_model = "intfloat/multilingual-e5-base"
+vector_index_path = "databases/fan-knowledge.faiss"
+vector_minimum_score = 0.62
 
 [llm]
 base_url = "http://127.0.0.1:8080/v1"
@@ -215,8 +253,8 @@ model = "Qwen3.8-27B"
 timeout_seconds = 120
 max_retries = 5
 max_concurrency = 3
-# llama.cpp starts after ASR and stops before rendering, so the 22 GB GPU does
-# not need to hold both model families. The first run downloads the 16.5 GB GGUF.
+# llama.cpp starts after ALT/song verification for ASR correction and remains
+# loaded while the forced aligner and later language stages run.
 local_server_enabled = true
 local_server_command = "llama-server"
 local_server_hf_repo = "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M"
@@ -225,7 +263,7 @@ local_server_hf_repo = "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M"
 local_server_host = "127.0.0.1"
 local_server_port = 8080
 local_server_context_size = 16384
-local_server_gpu_layers = 99
+local_server_gpu_layers = 56
 local_server_parallel = 3
 local_server_reasoning = "off"
 local_server_startup_timeout_seconds = 1800

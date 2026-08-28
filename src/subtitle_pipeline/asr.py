@@ -22,7 +22,7 @@ from .source_language import language_for_text, normalize_source_language
 from .subtitles import Cue, write_srt
 from .telemetry import stage_metrics
 
-_CACHE_VERSION = 10
+_CACHE_VERSION = 11
 _CUE_SIDECAR_VERSION = 7
 _MIN_RETRY_CHUNK_SECONDS = 15.0
 _MIN_SONG_RETRY_CHUNK_SECONDS = 8.0
@@ -32,8 +32,10 @@ _MIN_ASR_GENERATION_TOKENS = 128
 _ASR_GENERATION_TOKENS_PER_SECOND = 32
 _ASR_GENERATION_TOKEN_OVERHEAD = 32
 _MIN_SPEAKER_CUE_COVERAGE = 0.30
+_MAX_ZERO_DURATION_ALIGNMENT_GAP_SECONDS = 2.0
 
 ASRTextCorrector = Callable[[list[dict[str, object]]], list[dict[str, object]]]
+SongCueProcessor = Callable[[list[Cue]], list[Cue]]
 
 
 class _StaleRuntimeAudio(RuntimeError):
@@ -63,6 +65,7 @@ def transcribe_with_qwen(
     metadata: dict[str, object] | None = None,
     japanese_single_word_list: list[str] | None = None,
     asr_text_corrector: ASRTextCorrector | None = None,
+    song_cue_processor: SongCueProcessor | None = None,
 ) -> Path:
     japanese_single_word_list = sorted(set(japanese_single_word_list or []))
     duration = _media_duration(video)
@@ -87,6 +90,7 @@ def transcribe_with_qwen(
                         audio_pool,
                         japanese_single_word_list,
                         asr_text_corrector,
+                        song_cue_processor,
                     )
             except _StaleRuntimeAudio:
                 logging.info(
@@ -112,6 +116,7 @@ def transcribe_with_qwen(
                         audio_pool,
                         japanese_single_word_list,
                         asr_text_corrector,
+                        song_cue_processor,
                     )
         with stage_metrics("asr.transcription_total", config.device):
             return _transcribe_unanalyzed(
@@ -227,6 +232,7 @@ def _transcribe_analyzed(
     audio_pool: AudioBufferPool,
     japanese_single_word_list: list[str] | None = None,
     asr_text_corrector: ASRTextCorrector | None = None,
+    song_cue_processor: SongCueProcessor | None = None,
 ) -> Path:
     speech_windows = _speech_asr_windows(analysis, config)
     routed_regions = [
@@ -239,7 +245,7 @@ def _transcribe_analyzed(
     cache_path = destination.parent / "asr-analysis-cache.json"
     signature = {
         **_cache_signature(video, duration, config, japanese_single_word_list),
-        "analysis_version": 13,
+        "analysis_version": 14,
         "analysis_config": asdict(analysis_config),
         "regions": [_analysis_region_signature(region) for region in regions],
     }
@@ -270,6 +276,59 @@ def _transcribe_analyzed(
     ):
         raise _StaleRuntimeAudio("missing ephemeral source audio")
     speaker_timeline = _speaker_assignment_timeline(analysis)
+
+    # Finish ALT and lyric verification before starting the local correction LLM.
+    # This keeps all song discovery and acoustic work in the GPU-ASR phase.
+    singing_missing = [index for index in missing if regions[index].kind == "singing"]
+    singing_model = _load_heart_transcriptor(config) if singing_missing else None
+    try:
+        for index in singing_missing:
+            region = regions[index]
+            assert singing_model is not None
+            record = _transcribe_song_range(
+                singing_model,
+                Path(region.source_path) if region.source_path else video,
+                None,
+                config,
+                region,
+                label=f"{index:05d}",
+                window_config=analysis_config,
+                audio_buffer=_region_audio_buffer(region, video, audio_pool),
+            )
+            record["singing_asr_model"] = config.singing_model
+            cached[str(index)] = record
+            _write_cache(cache_path, cache)
+            logging.info(
+                "cached HeartTranscriptor region %d/%d speaker=%s cues=%d",
+                index + 1,
+                len(regions),
+                region.speaker or "unknown",
+                len(record["cues"]),
+            )
+    finally:
+        if singing_model is not None:
+            singing_model.close()
+            del singing_model
+            _release_cuda()
+
+    singing_cues: list[Cue] = []
+    for index, region in enumerate(regions):
+        if region.kind != "singing":
+            continue
+        record = cached.get(str(index))
+        if not isinstance(record, dict) or not isinstance(record.get("cues"), list):
+            raise RuntimeError(f"analyzed ASR cache is missing singing region {index}")
+        singing_cues.extend(
+            _decode_cached_cues(
+                record["cues"], index, raw_text=str(record.get("text") or "")
+            )
+        )
+    processed_singing_cues = (
+        song_cue_processor(singing_cues)
+        if song_cue_processor is not None
+        else singing_cues
+    )
+
     speech_missing = [index for index in missing if regions[index].kind == "speech"]
     if speech_missing:
         raw_cache_path = destination.parent / "asr-raw-speech-cache.json"
@@ -378,44 +437,10 @@ def _transcribe_analyzed(
                 len(record["cues"]),
             )
 
-    singing_missing = [
-        index for index in missing if regions[index].kind == "singing"
-    ]
-    singing_model = (
-        _load_heart_transcriptor(config) if singing_missing else None
-    )
-    try:
-        for index in singing_missing:
-            region = regions[index]
-            assert singing_model is not None
-            record = _transcribe_song_range(
-                singing_model,
-                Path(region.source_path) if region.source_path else video,
-                None,
-                config,
-                region,
-                label=f"{index:05d}",
-                window_config=analysis_config,
-                audio_buffer=_region_audio_buffer(region, video, audio_pool),
-            )
-            record["singing_asr_model"] = config.singing_model
-            cached[str(index)] = record
-            _write_cache(cache_path, cache)
-            logging.info(
-                "cached HeartTranscriptor region %d/%d speaker=%s cues=%d",
-                index + 1,
-                len(regions),
-                region.speaker or "unknown",
-                len(record["cues"]),
-            )
-    finally:
-        if singing_model is not None:
-            singing_model.close()
-            del singing_model
-            _release_cuda()
-
-    cues: list[Cue] = []
+    cues: list[Cue] = list(processed_singing_cues)
     for index in range(len(regions)):
+        if regions[index].kind == "singing":
+            continue
         record = cached.get(str(index))
         if not isinstance(record, dict) or not isinstance(record.get("cues"), list):
             raise RuntimeError(f"analyzed ASR cache is missing region {index}")
@@ -869,9 +894,7 @@ def _transcribe_song_range(
         start: float, end: float, window_label: str
     ) -> list[tuple[float, float, str, str]]:
         chunk_path = (
-            chunk_dir / f"song-{window_label}.wav"
-            if chunk_dir is not None
-            else None
+            chunk_dir / f"song-{window_label}.wav" if chunk_dir is not None else None
         )
         if audio_buffer is not None:
             local_start = start - region.source_offset
@@ -951,9 +974,7 @@ def _transcribe_song_range(
         if not text:
             continue
         owned_start = (
-            region.start
-            if index == 0
-            else (resolved_windows[index - 1][1] + start) / 2
+            region.start if index == 0 else (resolved_windows[index - 1][1] + start) / 2
         )
         owned_end = (
             region.end
@@ -1685,11 +1706,15 @@ def _align_speech_records(
     media_duration: float,
 ) -> dict[int, dict[str, object]]:
     output: dict[int, dict[str, object]] = {}
-    for batch_start in range(0, len(corrected_records), config.max_inference_batch_size):
+    for batch_start in range(
+        0, len(corrected_records), config.max_inference_batch_size
+    ):
         batch = corrected_records[
             batch_start : batch_start + config.max_inference_batch_size
         ]
-        empty = [record for record in batch if not str(record.get("text") or "").strip()]
+        empty = [
+            record for record in batch if not str(record.get("text") or "").strip()
+        ]
         for record in empty:
             index = int(record["window_id"])
             output[index] = {**record, "text": "", "cues": [], "skipped_empty": True}
@@ -2088,28 +2113,108 @@ def _result_to_cues(
 ) -> list[Cue]:
     text = str(getattr(result, "text", "")).strip()
     alignment = getattr(result, "time_stamps", None)
-    detected_language = normalize_source_language(
-        str(getattr(result, "language", ""))
-    )
+    detected_language = normalize_source_language(str(getattr(result, "language", "")))
     items = list(getattr(alignment, "items", []) or [])
     if text and not items:
         raise RuntimeError(
             "Qwen3 forced aligner returned no timestamps for non-empty text"
         )
     cues: list[Cue] = []
+    pending_prefix = ""
     previous_start = -1.0
-    for item in items:
+    index = 0
+    while index < len(items):
+        item = items[index]
         fragment = str(item.text)
         start = round(float(item.start_time) + offset, 3)
         end = round(float(item.end_time) + offset, 3)
         if start < previous_start:
             raise RuntimeError("Qwen3 forced aligner returned non-monotonic timestamps")
         previous_start = start
+        if fragment.strip() and end <= start:
+            fragments = [fragment.strip()]
+            positions = [getattr(item, "pos", None)]
+            next_index = index + 1
+            while next_index < len(items):
+                following = items[next_index]
+                following_fragment = str(following.text).strip()
+                following_start = round(
+                    float(following.start_time) + offset,
+                    3,
+                )
+                following_end = round(float(following.end_time) + offset, 3)
+                if not following_fragment:
+                    next_index += 1
+                    continue
+                if following_end > following_start:
+                    break
+                fragments.append(following_fragment)
+                positions.append(getattr(following, "pos", None))
+                next_index += 1
+
+            merged_fragment = "".join(fragments)
+            in_owned_range = start >= keep_start and (
+                start < keep_end or (final_chunk and start <= keep_end)
+            )
+            following_start = None
+            if next_index < len(items):
+                following_start = round(
+                    float(items[next_index].start_time) + offset,
+                    3,
+                )
+            available_gap = (
+                following_start - start if following_start is not None else 0.0
+            )
+            assigned_end = (
+                min(following_start, keep_end)
+                if following_start is not None
+                else start
+            )
+            if (
+                in_owned_range
+                and 0 < available_gap <= _MAX_ZERO_DURATION_ALIGNMENT_GAP_SECONDS
+                and assigned_end > start
+            ):
+                cues.append(
+                    Cue(
+                        start,
+                        assigned_end,
+                        merged_fragment,
+                        pos=(
+                            str(positions[0])
+                            if len(positions) == 1 and positions[0] is not None
+                            else None
+                        ),
+                        language=language_for_text(
+                            merged_fragment,
+                            detected_language,
+                        ),
+                    )
+                )
+            elif in_owned_range and cues:
+                previous = cues[-1]
+                cues[-1] = replace(
+                    previous,
+                    text=previous.text + merged_fragment,
+                    pos=None,
+                    language=language_for_text(
+                        previous.text + merged_fragment,
+                        detected_language,
+                    ),
+                )
+            elif in_owned_range:
+                pending_prefix += merged_fragment
+            index = next_index
+            continue
+
         midpoint = (start + end) / 2
         in_owned_range = midpoint >= keep_start and (
             midpoint < keep_end or (final_chunk and midpoint <= keep_end)
         )
         if in_owned_range and fragment.strip():
+            if pending_prefix:
+                fragment = pending_prefix + fragment.strip()
+                pending_prefix = ""
             owned_start = max(start, keep_start)
             owned_end = min(end, keep_end)
             if owned_end > owned_start:
@@ -2126,6 +2231,7 @@ def _result_to_cues(
                         language=language_for_text(fragment, detected_language),
                     )
                 )
+        index += 1
     return cues
 
 

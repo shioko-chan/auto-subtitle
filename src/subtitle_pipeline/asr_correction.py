@@ -13,8 +13,13 @@ from functools import cache
 from pathlib import Path
 
 from .fan_knowledge import KnowledgeHit
-from .llm_response import parse_json_object
-from .prompt_templates import prompt_system, prompt_templates_digest, render_user_prompt
+from .llm_response import (
+    finish_reason,
+    parse_json_object,
+    structured_request_body,
+    structured_response_content,
+)
+from .prompt_templates import prompt_templates_digest, render_user_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -116,28 +121,27 @@ def correct_asr_windows(
         knowledge_union = _unique_knowledge(
             hit for index, _, _, _ in batch for hit in knowledge_by_index[index]
         )
-        body = {
-            "model": model,
-            "max_tokens": max_tokens,
-            "messages": [
-                {"role": "system", "content": prompt_system(_PROMPT)},
-                {
-                    "role": "user",
-                    "content": render_user_prompt(
-                        _PROMPT,
-                        ENTITY_REFERENCE=_format_entities(entity_union),
-                        TARGET=_format_target_windows(batch, knowledge_by_index),
-                    ),
-                },
-            ],
-            "response_format": {"type": "json_object"},
-            "temperature": 0,
-        }
+        body = structured_request_body(
+            model=model,
+            prompt_name=_PROMPT,
+            prompt=render_user_prompt(
+                _PROMPT,
+                ENTITY_REFERENCE=_format_entities(entity_union),
+                TARGET=_format_target_windows(batch, knowledge_by_index),
+            ),
+            max_tokens=max_tokens,
+            temperature=0,
+            json_mode=True,
+            thinking=None,
+        )
         response: dict[str, object] | None = None
         batch_error: str | None = None
         try:
             response = request(body)
-            parsed = _parse_response(response, len(batch))
+            content = structured_response_content(
+                response, finish_reason=finish_reason
+            )
+            parsed = _parse_response(content, len(batch))
         except Exception as exc:  # noqa: BLE001 - API and validation failures fail open.
             logger.warning(
                 "ASR correction downgraded %d windows to rule-normalized text: %s",
@@ -285,14 +289,8 @@ def _best_window_ratio(text: str, target: str) -> float:
     )
 
 
-def _parse_response(response: dict[str, object], expected: int) -> list[str]:
-    choices = response.get("choices")
-    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        raise ValueError("ASR correction response has no choices")
-    message = choices[0].get("message")
-    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
-        raise TypeError("ASR correction response has no message content")
-    value = parse_json_object(message["content"])
+def _parse_response(content: object, expected: int) -> list[str]:
+    value = parse_json_object(content)
     windows = value.get("windows") if isinstance(value, dict) else None
     if not isinstance(windows, list) or len(windows) != expected:
         raise ValueError("ASR correction response window count mismatch")

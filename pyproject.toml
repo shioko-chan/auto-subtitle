@@ -11,7 +11,9 @@ requires-python = ">=3.11"
 dependencies = [
     "certifi>=2025.1.31",
     "gallery-dl>=1.30,<2",
+    "faiss-cpu>=1.12,<2",
     "phonemizer>=3.3,<4",
+    "sentence-transformers>=5,<6",
     "ja-ginza>=5.2,<6",
     "SudachiDict-core>=20250515",
     "SudachiPy>=0.6.10",

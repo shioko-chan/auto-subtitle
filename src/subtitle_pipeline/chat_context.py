@@ -228,9 +228,13 @@ def _format_selected_messages(messages: list[YouTubeChatMessage]) -> list[str]:
         first = values[0]
         text = _clean_text(first.text)
         amount = first.amount
-        kind = f"SC {amount}" if amount else "chat"
         authors = {value.author or value.message_id or "anonymous" for value in values}
         count = f" ×{len(authors)}" if len(authors) > 1 else ""
+        if amount:
+            author_text = ", ".join(sorted(authors))
+            kind = f"SC {amount} author={author_text}"
+        else:
+            kind = "chat"
         lines.append((first.offset_seconds, f"[{kind}{count}] {text}"))
     return [line for _offset, line in sorted(lines)]
 

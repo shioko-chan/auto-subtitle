@@ -11,8 +11,10 @@ from subtitle_pipeline.song_identification import (
     split_aligned_song_cues,
 )
 from subtitle_pipeline.staged_translation import (
+    _topic_request_groups,
     run_fixed_translation,
     run_segmentation,
+    run_translation_review,
 )
 from subtitle_pipeline.subtitles import Cue, TimedTextUnit, text_display_width
 
@@ -38,12 +40,14 @@ def ignore_audit(*_args):
 
 
 class StagedTranslationTests(unittest.TestCase):
-    def test_short_cues_use_the_expanded_request_group_limit(self):
+    def test_short_cues_are_bounded_by_topic_size(self):
         source = [Cue(i, i + 1, f"短句{i}", "A") for i in range(20)]
         prompts: list[str] = []
 
         def request(body):
-            prompts.append(body["messages"][1]["content"])
+            prompt = body["messages"][1]["content"]
+            prompts.append(prompt)
+            cue_count = prompt.count('<CUE id="')
             return {
                 "choices": [
                     {
@@ -52,7 +56,7 @@ class StagedTranslationTests(unittest.TestCase):
                                 {
                                     "cues": [
                                         {"cue_id": i, "text": f"译文{i}"}
-                                        for i in range(20)
+                                        for i in range(cue_count)
                                     ]
                                 },
                                 ensure_ascii=False,
@@ -74,12 +78,11 @@ class StagedTranslationTests(unittest.TestCase):
             log_invalid_response=ignore_audit,
             local_translate=lambda text: text,
             translation_context={},
-            maximum_units=20.0,
             honorific_rules="",
             cache_path=None,
         )
 
-        self.assertEqual(len(prompts), 1)
+        self.assertEqual([prompt.count('<CUE id="') for prompt in prompts], [16, 4])
         self.assertEqual(len(result), 20)
 
     def test_segmentation_retries_an_overwide_source_group(self):
@@ -159,7 +162,6 @@ class StagedTranslationTests(unittest.TestCase):
             log_invalid_response=ignore_audit,
             local_translate=lambda text: f"MT:{text}",
             translation_context={},
-            maximum_units=20.0,
             honorific_rules="",
             cache_path=None,
         )
@@ -167,17 +169,16 @@ class StagedTranslationTests(unittest.TestCase):
         self.assertEqual([(cue.start, cue.end) for cue in translated], [(0, 1), (1, 2)])
         self.assertEqual([cue.text for cue in translated], ["译文一", "译文二"])
 
-    def test_fixed_translation_places_each_cues_knowledge_next_to_its_text(self):
+    def test_fixed_translation_shares_topic_knowledge_across_speakers(self):
         source = [
             Cue(0, 1, "本日分の貢ぎ物", "A"),
-            Cue(1, 2, "等身大フィギュア", "A"),
+            Cue(1, 2, "等身大フィギュア", "B"),
         ]
         retrieved: list[list[Cue]] = []
         prompts: list[str] = []
 
         def retrieve(cues, _chat_text):
             retrieved.append(cues)
-            text = cues[0].text
             return [
                 KnowledgeHit(
                     f"knowledge:{text}",
@@ -188,6 +189,7 @@ class StagedTranslationTests(unittest.TestCase):
                     KnowledgeScore(1, 0, 0, 1, 1, 0, 1, 5),
                     (text,),
                 )
+                for text in (cue.text for cue in cues)
             ]
 
         def request(body):
@@ -222,7 +224,6 @@ class StagedTranslationTests(unittest.TestCase):
             log_invalid_response=ignore_audit,
             local_translate=lambda text: f"MT:{text}",
             translation_context={},
-            maximum_units=20.0,
             honorific_rules="",
             cache_path=None,
             retrieve_knowledge=retrieve,
@@ -230,16 +231,126 @@ class StagedTranslationTests(unittest.TestCase):
 
         self.assertEqual(
             [[cue.text for cue in group] for group in retrieved],
-            [["本日分の貢ぎ物"], ["等身大フィギュア"]],
+            [["本日分の貢ぎ物", "等身大フィギュア"]],
         )
+        topic = prompts[0].index("<TOPIC_BLOCK>")
         first = prompts[0].index('<CUE id="0"')
-        first_end = prompts[0].index("</CUE>", first)
         second = prompts[0].index('<CUE id="1"')
-        second_end = prompts[0].index("</CUE>", second)
-        self.assertIn("本日分の貢ぎ物的专属知识", prompts[0][first:first_end])
-        self.assertNotIn("等身大フィギュア的专属知识", prompts[0][first:first_end])
-        self.assertIn("等身大フィギュア的专属知识", prompts[0][second:second_end])
-        self.assertNotIn("本日分の貢ぎ物的专属知识", prompts[0][second:second_end])
+        self.assertLess(topic, first)
+        self.assertLess(first, second)
+        self.assertEqual(prompts[0].count("本日分の貢ぎ物的专属知识"), 1)
+        self.assertEqual(prompts[0].count("等身大フィギュア的专属知识"), 1)
+
+    def test_topic_groups_cross_speakers_but_not_verified_lyrics(self):
+        cues = [
+            Cue(0, 1, "質問", "A"),
+            Cue(1, 2, "返事", "B"),
+            Cue(2, 3, "歌詞", "A", "singing", preferred_translation="歌词"),
+            Cue(3, 4, "歌の後", "B"),
+        ]
+
+        groups = _topic_request_groups(cues, [0, 1, 3], TranslationConfig())
+
+        self.assertEqual(groups, [[0, 1], [3]])
+
+    def test_local_prompt_budget_splits_an_oversized_topic(self):
+        source = [Cue(i, i + 1, "長い字幕" * 180, "A") for i in range(4)]
+        request_sizes: list[int] = []
+
+        def request(body):
+            prompt = body["messages"][1]["content"]
+            cue_count = prompt.count('<CUE id="')
+            request_sizes.append(cue_count)
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "cues": [
+                                        {"cue_id": i, "text": f"译文{i}"}
+                                        for i in range(cue_count)
+                                    ]
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+        result = run_fixed_translation(
+            source_cues=source,
+            llm=LLMConfig(
+                local_server_enabled=True,
+                local_server_context_size=7200,
+            ),
+            translation=TranslationConfig(max_tokens=4096),
+            request=request,
+            parse_content=parse_cues,
+            finish_reason=finish_reason,
+            retry_delay=no_delay,
+            is_nontransient=not_nontransient,
+            log_invalid_response=ignore_audit,
+            local_translate=lambda text: f"MT:{text}",
+            translation_context={},
+            honorific_rules="",
+            cache_path=None,
+        )
+
+        self.assertGreater(len(request_sizes), 1)
+        self.assertEqual(len(result), 4)
+
+    def test_local_prompt_budget_reduces_evidence_before_splitting_topic(self):
+        source = [Cue(i, i + 1, f"短句{i}", "A") for i in range(4)]
+        prompts: list[str] = []
+
+        def request(body):
+            prompt = body["messages"][1]["content"]
+            prompts.append(prompt)
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "cues": [
+                                        {"cue_id": i, "text": f"译文{i}"}
+                                        for i in range(4)
+                                    ]
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+        chat = "\n".join(f"[chat] 普通聊天消息{i}" for i in range(500))
+        result = run_fixed_translation(
+            source_cues=source,
+            llm=LLMConfig(
+                local_server_enabled=True,
+                local_server_context_size=7200,
+            ),
+            translation=TranslationConfig(max_tokens=4096),
+            request=request,
+            parse_content=parse_cues,
+            finish_reason=finish_reason,
+            retry_delay=no_delay,
+            is_nontransient=not_nontransient,
+            log_invalid_response=ignore_audit,
+            local_translate=lambda text: f"MT:{text}",
+            translation_context={},
+            honorific_rules="",
+            cache_path=None,
+            retrieve_chat=lambda _cues: chat,
+        )
+
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(prompts[0].count('<CUE id="'), 4)
+        self.assertLess(prompts[0].count("普通聊天消息"), 500)
+        self.assertEqual(len(result), 4)
 
     def test_fixed_translation_retrieves_chat_once_for_request_group(self):
         source = [Cue(10, 11, "これ", "A"), Cue(11, 12, "それ", "A")]
@@ -277,7 +388,6 @@ class StagedTranslationTests(unittest.TestCase):
             log_invalid_response=ignore_audit,
             local_translate=lambda text: text,
             translation_context={},
-            maximum_units=20.0,
             honorific_rules="",
             cache_path=None,
             retrieve_chat=lambda cues: (
@@ -325,7 +435,6 @@ class StagedTranslationTests(unittest.TestCase):
             log_invalid_response=ignore_audit,
             local_translate=lambda text: text,
             translation_context={},
-            maximum_units=20.0,
             honorific_rules="",
             cache_path=None,
             retrieve_chat=lambda _cue: "[+1.0s chat] 共同证据",
@@ -364,7 +473,6 @@ class StagedTranslationTests(unittest.TestCase):
                 "log_invalid_response": ignore_audit,
                 "local_translate": lambda text: f"MT:{text}",
                 "translation_context": {},
-                "maximum_units": 20.0,
                 "honorific_rules": "",
                 "cache_path": cache,
             }
@@ -385,6 +493,181 @@ class StagedTranslationTests(unittest.TestCase):
             )
 
         self.assertEqual(first, second)
+
+    def test_fixed_translation_audits_llm_downgrade_and_cache_sources(self):
+        source = [Cue(0, 1, "原文一", "A"), Cue(1, 2, "原文二", "A")]
+
+        def request(_body):
+            return {
+                "_audit_request_id": "request-1",
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "cues": [
+                                        {"cue_id": 0, "text": "译文一"},
+                                        {"cue_id": 1, "text": ""},
+                                    ]
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ],
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / "translation.json"
+            audit = root / "translation-audit.jsonl"
+            arguments = {
+                "source_cues": source,
+                "llm": LLMConfig(),
+                "translation": TranslationConfig(),
+                "parse_content": parse_cues,
+                "finish_reason": finish_reason,
+                "retry_delay": no_delay,
+                "is_nontransient": not_nontransient,
+                "log_invalid_response": ignore_audit,
+                "local_translate": lambda text: f"MT:{text}",
+                "translation_context": {},
+                "honorific_rules": "",
+                "cache_path": cache,
+                "audit_path": audit,
+            }
+            run_fixed_translation(**arguments, request=request)
+            run_fixed_translation(
+                **arguments,
+                request=lambda _body: self.fail("cache hit should skip LLM"),
+            )
+            events = [json.loads(line) for line in audit.read_text().splitlines()]
+
+        self.assertEqual(
+            [event["translation_source"] for event in events],
+            ["llm", "local_mt", "cache", "cache"],
+        )
+        self.assertEqual(events[0]["request_id"], "request-1")
+        self.assertEqual(events[1]["downgrade_reason"], "empty_translation")
+        self.assertEqual(events[1]["source_text"], "原文二")
+        self.assertEqual(events[1]["final_text"], "MT:原文二")
+
+    def test_translation_review_corrects_and_harmonizes_draft_once(self):
+        source = [Cue(0, 1, "ふざけんな、この野郎", "A")]
+        draft = [Cue(0, 1, "你他妈少胡闹了，混蛋东西", "A", source_text=source[0].text)]
+        prompts: list[str] = []
+
+        def request(body):
+            prompts.append(body["messages"][1]["content"])
+            return {
+                "_audit_request_id": "review-1",
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "corrections": [
+                                        {"cue_id": 0, "text": "别闹了，你这家伙"}
+                                    ]
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ],
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = Path(temporary) / "translation-audit.jsonl"
+            result = run_translation_review(
+                source_cues=source,
+                translated_cues=draft,
+                llm=LLMConfig(),
+                translation=TranslationConfig(),
+                request=request,
+                finish_reason=finish_reason,
+                log_invalid_response=ignore_audit,
+                translation_context={},
+                maximum_units=8.0,
+                honorific_rules="",
+                cache_path=None,
+                audit_path=audit,
+            )
+            events = [json.loads(line) for line in audit.read_text().splitlines()]
+
+        self.assertEqual([cue.text for cue in result], ["别闹了，你这家伙"])
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("soft target", prompts[0])
+        self.assertIn("general video platform", prompts[0])
+        self.assertIn("你他妈少胡闹了，混蛋东西", prompts[0])
+        self.assertTrue(events[0]["changed"])
+        self.assertEqual(events[0]["request_id"], "review-1")
+
+    def test_translation_review_accepts_overwide_result_without_retry(self):
+        source = [Cue(0, 1, "これは必要な説明です", "A")]
+        draft = [Cue(0, 1, "这是不能省略的必要说明", "A", source_text=source[0].text)]
+        requests = 0
+
+        def request(_body):
+            nonlocal requests
+            requests += 1
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"corrections": []}, ensure_ascii=False
+                            )
+                        }
+                    }
+                ]
+            }
+
+        result = run_translation_review(
+            source_cues=source,
+            translated_cues=draft,
+            llm=LLMConfig(max_retries=5),
+            translation=TranslationConfig(),
+            request=request,
+            finish_reason=finish_reason,
+            log_invalid_response=ignore_audit,
+            translation_context={},
+            maximum_units=4.0,
+            honorific_rules="",
+            cache_path=None,
+        )
+
+        self.assertEqual(result, draft)
+        self.assertEqual(requests, 1)
+
+    def test_translation_review_failure_preserves_draft_without_retry(self):
+        source = [Cue(0, 1, "原文", "A")]
+        draft = [Cue(0, 1, "译文", "A", source_text=source[0].text)]
+        requests = 0
+        failures: list[Exception] = []
+
+        def request(_body):
+            nonlocal requests
+            requests += 1
+            return {"choices": [{"message": {"content": "not json"}}]}
+
+        result = run_translation_review(
+            source_cues=source,
+            translated_cues=draft,
+            llm=LLMConfig(max_retries=5),
+            translation=TranslationConfig(),
+            request=request,
+            finish_reason=finish_reason,
+            log_invalid_response=lambda _stage, error, *_args: failures.append(error),
+            translation_context={},
+            maximum_units=20.0,
+            honorific_rules="",
+            cache_path=None,
+        )
+
+        self.assertEqual(result, draft)
+        self.assertEqual(requests, 1)
+        self.assertEqual(len(failures), 1)
 
     def test_song_line_splits_on_pyshiro_units_at_japanese_limit(self):
         units = tuple(

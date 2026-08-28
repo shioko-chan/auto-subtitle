@@ -5,6 +5,8 @@ import json
 import logging
 import re
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from importlib import resources
@@ -26,10 +28,12 @@ from .fan_knowledge import (
     KnowledgeQuery,
     video_date_from_metadata,
 )
+from .knowledge_update import update_knowledge_if_stale
 from .local_llm_server import LocalLLMServer
 from .media import download_youtube, render_subtitles, subtitle_layout
 from .song_identification import (
     SongIdentificationResult,
+    arbitrate_verified_lyrics,
     identify_and_align_songs,
     split_aligned_song_cues,
     translate_aligned_song_lyrics,
@@ -75,39 +79,65 @@ def run_pipeline(
     *,
     upload_override: bool | None = None,
 ) -> PipelineResult:
-    _wait_for_deepseek_task_window(config.llm)
     url = normalize_youtube_url(url)
     job_id = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
     job_dir = config.work_dir.resolve() / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    logging.info("job directory: %s", job_dir)
-    local_llm_server = LocalLLMServer(config.llm, job_dir / "local-llm-server.log")
-    fan_knowledge = (
-        FanKnowledgeRetriever(
-            Path(config.fan_knowledge.database_path).expanduser(),
-            audit_path=job_dir / "fan-knowledge-audit.jsonl",
+    with _job_log(job_dir / "run.log"):
+        logging.info("job directory: %s", job_dir)
+        _wait_for_deepseek_task_window(config.llm)
+        local_llm_server = LocalLLMServer(
+            config.llm, job_dir / "local-llm-server.log"
         )
-        if config.fan_knowledge.enabled
-        else None
-    )
-
-    try:
-        with (
-            pipeline_metrics(job_dir / "performance.json"),
-            stage_metrics("pipeline.total"),
-        ):
-            return _run_pipeline_stages(
-                url,
-                config,
-                job_dir,
-                upload_override=upload_override,
-                local_llm_server=local_llm_server,
-                fan_knowledge=fan_knowledge,
+        fan_knowledge = (
+            FanKnowledgeRetriever(
+                Path(config.fan_knowledge.database_path).expanduser(),
+                audit_path=job_dir / "fan-knowledge-audit.jsonl",
+                embedding_model=config.fan_knowledge.embedding_model,
+                vector_index_path=Path(
+                    config.fan_knowledge.vector_index_path
+                ).expanduser(),
+                vector_minimum_score=config.fan_knowledge.vector_minimum_score,
             )
+            if config.fan_knowledge.enabled
+            else None
+        )
+
+        try:
+            with (
+                pipeline_metrics(job_dir / "performance.json"),
+                stage_metrics("pipeline.total"),
+            ):
+                return _run_pipeline_stages(
+                    url,
+                    config,
+                    job_dir,
+                    upload_override=upload_override,
+                    local_llm_server=local_llm_server,
+                    fan_knowledge=fan_knowledge,
+                )
+        finally:
+            local_llm_server.stop()
+            if fan_knowledge is not None:
+                fan_knowledge.close()
+
+
+@contextmanager
+def _job_log(path: Path) -> Iterator[None]:
+    handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    root = logging.getLogger()
+    previous_level = root.level
+    if previous_level > logging.INFO:
+        root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    try:
+        yield
     finally:
-        local_llm_server.stop()
-        if fan_knowledge is not None:
-            fan_knowledge.close()
+        root.removeHandler(handler)
+        root.setLevel(previous_level)
+        handler.close()
 
 
 def _deepseek_task_delay(config: LLMConfig, now: datetime) -> float:
@@ -157,6 +187,9 @@ def _run_pipeline_stages(
     local_llm_server: LocalLLMServer,
     fan_knowledge: FanKnowledgeRetriever | None,
 ) -> PipelineResult:
+    if fan_knowledge is not None:
+        with stage_metrics("pipeline.knowledge_update"):
+            update_knowledge_if_stale(config, fan_knowledge)
     with stage_metrics("pipeline.download"):
         downloaded = download_youtube(url, job_dir, config.download)
 
@@ -204,6 +237,25 @@ def _run_pipeline_stages(
         audit_path=job_dir / "llm-audit.jsonl",
     )
     asr_entities = entities_from_context(translation_context)
+    layout = subtitle_layout(downloaded.video, config.render)
+    japanese_guidance_units = layout.max_line_units * 1.25
+    early_song_result = SongIdentificationResult([], [])
+
+    def process_song_cues(singing_cues: list[Cue]) -> list[Cue]:
+        nonlocal early_song_result
+        with stage_metrics("pipeline.song_identification"):
+            if config.song_identification.enabled:
+                early_song_result = identify_and_align_songs(
+                    downloaded.video,
+                    singing_cues,
+                    downloaded.metadata,
+                    job_dir,
+                    config.song_identification,
+                    source_maximum_units=japanese_guidance_units,
+                )
+            else:
+                early_song_result = SongIdentificationResult(singing_cues, [])
+        return early_song_result.corrected_cues
 
     def correct_asr_text(records: list[dict[str, object]]) -> list[dict[str, object]]:
         if current_chat:
@@ -223,38 +275,34 @@ def _run_pipeline_stages(
         if config.llm.local_server_enabled:
             with stage_metrics("pipeline.local_llm_asr_correction_startup"):
                 local_llm_server.start()
-        try:
-            return correct_asr_windows(
-                records,
-                entities=asr_entities,
-                request=translator.request,
-                model=config.llm.model,
-                cache_path=job_dir / "asr-correction-cache.json",
-                audit_path=job_dir / "asr-correction-audit.jsonl",
-                batch_windows=config.asr_correction.batch_windows,
-                batch_chars=config.asr_correction.batch_chars,
-                max_tokens=config.asr_correction.max_tokens,
-                retrieve_knowledge=(
-                    lambda record, text: (
-                        fan_knowledge.retrieve(
-                            KnowledgeQuery(
-                                text=text,
-                                speaker=str(record.get("speaker") or "") or None,
-                                video_date=video_date,
-                                ocr_text=str(record.get("ocr_text") or ""),
-                                chat_text=str(record.get("chat_text") or ""),
-                                exclude_video_id=current_video_id,
-                                top_k=config.fan_knowledge.top_k_asr,
-                            )
+        return correct_asr_windows(
+            records,
+            entities=asr_entities,
+            request=translator.request,
+            model=config.llm.model,
+            cache_path=job_dir / "asr-correction-cache.json",
+            audit_path=job_dir / "asr-correction-audit.jsonl",
+            batch_windows=config.asr_correction.batch_windows,
+            batch_chars=config.asr_correction.batch_chars,
+            max_tokens=config.asr_correction.max_tokens,
+            retrieve_knowledge=(
+                lambda record, text: (
+                    fan_knowledge.retrieve(
+                        KnowledgeQuery(
+                            text=text,
+                            speaker=str(record.get("speaker") or "") or None,
+                            video_date=video_date,
+                            ocr_text=str(record.get("ocr_text") or ""),
+                            chat_text=str(record.get("chat_text") or ""),
+                            exclude_video_id=current_video_id,
+                            top_k=config.fan_knowledge.top_k_asr,
                         )
-                        if fan_knowledge is not None
-                        else None
                     )
-                ),
-            )
-        finally:
-            if config.llm.local_server_enabled:
-                local_llm_server.stop()
+                    if fan_knowledge is not None
+                    else None
+                )
+            ),
+        )
 
     with stage_metrics("pipeline.audio_and_asr"):
         source_subtitle = transcribe_with_qwen(
@@ -265,6 +313,7 @@ def _run_pipeline_stages(
             downloaded.metadata,
             japanese_single_word_list,
             correct_asr_text,
+            process_song_cues,
         )
 
     sidecar = source_subtitle.with_suffix(".cues.json")
@@ -276,6 +325,9 @@ def _run_pipeline_stages(
     asr_evidence = read_cue_evidence(sidecar) if sidecar.is_file() else []
     original_cue_count = len(cues)
     cues = clean_non_speech_markers(cues)
+    cues, song_arbitration = arbitrate_verified_lyrics(
+        cues, list(early_song_result.verified_lyric_spans)
+    )
     logging.info(
         "non-speech marker cleanup: %d source cues -> %d spoken cues",
         original_cue_count,
@@ -296,20 +348,14 @@ def _run_pipeline_stages(
             if isinstance(item, dict) and isinstance(item.get("name"), str)
         ]
         logging.info("using translation glossary: %s", ", ".join(names))
-    layout = subtitle_layout(downloaded.video, config.render)
-    japanese_guidance_units = layout.max_line_units * 1.25
-    with stage_metrics("pipeline.song_identification"):
-        if config.song_identification.enabled:
-            song_result = identify_and_align_songs(
-                downloaded.video,
-                cues,
-                downloaded.metadata,
-                job_dir,
-                config.song_identification,
-                source_maximum_units=japanese_guidance_units,
-            )
-        else:
-            song_result = SongIdentificationResult(cues, [])
+    song_result = SongIdentificationResult(
+        cues,
+        [
+            {**report, "post_asr_arbitration": song_arbitration}
+            for report in early_song_result.reports
+        ],
+        early_song_result.verified_lyric_spans,
+    )
     if config.llm.local_server_enabled:
         with stage_metrics("pipeline.local_llm_startup"):
             local_llm_server.start()
@@ -337,68 +383,63 @@ def _run_pipeline_stages(
             "song identification produced %d search-group reports",
             len(song_result.reports),
         )
-    if hasattr(translator, "segment_cues") and hasattr(
-        translator, "translate_segmented_cues"
-    ):
-        with stage_metrics("pipeline.llm_cue_segmentation"):
-            segmented = translator.segment_cues(
-                cues,
-                config.segmentation,
-                max_line_units=layout.max_line_units,
-                cache_path=job_dir / "cue-segmentation-cache.json",
-                audit_path=job_dir / "local-segmentation.json",
+    with stage_metrics("pipeline.llm_cue_segmentation"):
+        segmented = translator.segment_cues(
+            cues,
+            config.segmentation,
+            max_line_units=layout.max_line_units,
+            cache_path=job_dir / "cue-segmentation-cache.json",
+            audit_path=job_dir / "local-segmentation.json",
+        )
+    retrieve_translation_knowledge = None
+    if fan_knowledge is not None:
+
+        def retrieve_translation_knowledge(selected, chat_text):
+            return _retrieve_translation_knowledge(
+                fan_knowledge,
+                selected,
+                video_date=video_date,
+                top_k=config.fan_knowledge.top_k_translation,
+                query_chars=config.fan_knowledge.translation_query_chars,
+                exclude_video_id=current_video_id,
+                chat_text=chat_text,
             )
-        with stage_metrics("pipeline.llm_cue_translation"):
-            translated = translator.translate_segmented_cues(
-                segmented,
-                translation_context=translation_context,
-                max_line_units=layout.max_line_units,
-                cache_path=job_dir / "cue-translation-cache.json",
-                retrieve_knowledge=(
-                    lambda selected, chat_text: (
-                        _retrieve_translation_knowledge(
-                            fan_knowledge,
-                            selected,
-                            video_date=video_date,
-                            top_k=config.fan_knowledge.top_k_translation,
-                            query_chars=config.fan_knowledge.translation_query_chars,
-                            exclude_video_id=current_video_id,
-                            chat_text=chat_text,
-                        )
-                        if fan_knowledge is not None
-                        else None
-                    )
-                ),
-                retrieve_chat=(
-                    (
-                        lambda selected: current_chat.evidence(
-                            min(cue.start for cue in selected),
-                            max(cue.end for cue in selected),
-                            "\n".join(cue.text for cue in selected),
-                            stage="translation",
-                            target_id=(
-                                f"{min(cue.start for cue in selected):.3f}-"
-                                f"{max(cue.end for cue in selected):.3f}"
-                            ),
-                        )
-                    )
-                    if current_chat
-                    else None
+    retrieve_translation_chat = (
+        (
+            lambda selected: current_chat.evidence(
+                min(cue.start for cue in selected),
+                max(cue.end for cue in selected),
+                "\n".join(cue.text for cue in selected),
+                stage="translation",
+                target_id=(
+                    f"{min(cue.start for cue in selected):.3f}-"
+                    f"{max(cue.end for cue in selected):.3f}"
                 ),
             )
-    else:  # Compatibility for embedders implementing the former translator API.
-        with stage_metrics("pipeline.joint_segmentation_translation"):
-            joint = translator.plan_and_translate(
-                cues,
-                config.segmentation,
-                translation_context=translation_context,
-                max_line_units=layout.max_line_units,
-                hard_max_line_units=layout.frame_line_units * 2,
-                cache_path=job_dir / "cue-joint-cache.json",
-                audit_path=job_dir / "local-segmentation.json",
-            )
-        segmented = joint.source_cues
-        translated = joint.translated_cues
+        )
+        if current_chat
+        else None
+    )
+    with stage_metrics("pipeline.llm_cue_translation"):
+        translated = translator.translate_segmented_cues(
+            segmented,
+            translation_context=translation_context,
+            cache_path=job_dir / "cue-translation-cache.json",
+            audit_path=job_dir / "translation-audit.jsonl",
+            retrieve_knowledge=retrieve_translation_knowledge,
+            retrieve_chat=retrieve_translation_chat,
+        )
+    with stage_metrics("pipeline.llm_translation_review"):
+        translated = translator.review_translated_cues(
+            segmented,
+            translated,
+            translation_context=translation_context,
+            max_line_units=layout.max_line_units,
+            cache_path=job_dir / "cue-translation-review-cache.json",
+            audit_path=job_dir / "translation-audit.jsonl",
+            retrieve_knowledge=retrieve_translation_knowledge,
+            retrieve_chat=retrieve_translation_chat,
+        )
     logging.info(
         "staged cue segmentation and ASR-aware translation: "
         "%d aligned cues -> %d subtitle cues",

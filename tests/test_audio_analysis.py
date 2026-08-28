@@ -20,6 +20,7 @@ from subtitle_pipeline.audio_analysis import (
     _run_initial_audio_analysis,
     _singing_evidence_score,
     _singing_regions_from_scores,
+    _smart_acoustic_phrase_regions,
 )
 from subtitle_pipeline.config import AudioAnalysisConfig
 from subtitle_pipeline.speakers import (
@@ -40,6 +41,34 @@ from subtitle_pipeline.speakers import (
 
 
 class AudioAnalysisTests(unittest.TestCase):
+    def test_smart_acoustic_phrases_cut_at_silence_before_demucs(self):
+        sample_rate = 100
+        samples = np.ones(3000, dtype=np.float32)
+        samples[950:1050] = 0
+        samples[1950:2050] = 0
+        audio = SimpleNamespace(
+            sample_rate=sample_rate,
+            slice=lambda start, end: samples[
+                round(start * sample_rate) : round(end * sample_rate)
+            ],
+        )
+
+        phrases = _smart_acoustic_phrase_regions(
+            [AudioRegion(0, 30, "singing")],
+            audio,
+            AudioAnalysisConfig(
+                singing_asr_target_seconds=10,
+                singing_asr_min_seconds=6,
+                singing_asr_max_seconds=15,
+                singing_asr_search_seconds=4,
+            ),
+        )
+
+        self.assertEqual(len(phrases), 3)
+        self.assertTrue(all(6 <= item.end - item.start <= 15 for item in phrases))
+        self.assertAlmostEqual(phrases[0].end, 10.0, delta=0.2)
+        self.assertAlmostEqual(phrases[1].end, 20.0, delta=0.2)
+
     def test_acoustic_phrases_only_cover_selected_ast_candidates(self):
         config = AudioAnalysisConfig(
             singing_threshold=0.2,

@@ -102,6 +102,32 @@ class CurrentVideoChatIndexTests(unittest.TestCase):
             "[chat ×2] 等身大フィギュア\n[chat] 等身大フィギュア",
         )
 
+    def test_super_chat_evidence_includes_author_name(self) -> None:
+        index = CurrentVideoChatIndex(
+            [
+                YouTubeChatMessage(
+                    10,
+                    "視聴者TY",
+                    "本日分の貢ぎ物です",
+                    amount="¥2,000",
+                    message_id="paid-1",
+                )
+            ]
+        )
+
+        evidence = index.evidence(
+            10,
+            12,
+            "スーパーチャットありがとうございます",
+            stage="asr_correction",
+            target_id=0,
+        )
+
+        self.assertEqual(
+            evidence,
+            "[SC ¥2,000 author=視聴者TY] 本日分の貢ぎ物です",
+        )
+
     def test_filters_reaction_only_spam_and_omits_timestamps(self) -> None:
         index = CurrentVideoChatIndex(
             [

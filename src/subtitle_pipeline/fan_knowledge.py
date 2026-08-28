@@ -2,20 +2,30 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import threading
 import unicodedata
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 from typing import Self
 
+from .vector_index import LocalVectorIndex
+
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_+.-]*|[\u3040-\u30ff\u3400-\u9fff]+")
 _JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
+_LEXICAL_CANDIDATES = 40
+_VECTOR_CANDIDATES = 40
+_FUSION_CANDIDATES = 30
+_RRF_K = 60
+_RRF_WEIGHTS = {"fts": 1.0, "vector": 1.0, "entity": 2.0}
+_MAX_RESULTS_PER_SOURCE = 2
 
 
 @dataclass(frozen=True)
@@ -89,6 +99,12 @@ class KnowledgeScore:
     cross_evidence: float
     reliability: float
     total: float
+    rrf: float = 0.0
+    bm25: float = 0.0
+    entity: float = 0.0
+    idf: float = 0.0
+    lexical_terms: int = 0
+    specificity: int = 0
 
 
 @dataclass(frozen=True)
@@ -100,6 +116,7 @@ class KnowledgeHit:
     source_url: str | None
     score: KnowledgeScore
     matched_terms: tuple[str, ...]
+    retrieval_ranks: dict[str, int] = field(default_factory=dict)
 
     def prompt_value(self, maximum_body_chars: int = 360) -> dict[str, object]:
         return {
@@ -116,11 +133,26 @@ class KnowledgeHit:
 class RetrievalWeights:
     keyword: float = 3.0
     kana: float = 2.0
-    vector: float = 0.0
+    vector: float = 2.0
     speaker: float = 1.25
     date: float = 0.75
     cross_evidence: float = 1.5
     reliability: float = 0.75
+    rrf: float = 2.0
+
+
+@dataclass
+class _Candidate:
+    row: sqlite3.Row
+    ranks: dict[str, int]
+    raw_bm25: float | None = None
+
+
+@dataclass(frozen=True)
+class _NormalizedQuery:
+    text: str
+    reading: str
+    fts_terms: tuple[str, ...]
 
 
 class FanKnowledgeRetriever:
@@ -132,11 +164,20 @@ class FanKnowledgeRetriever:
         *,
         audit_path: Path | None = None,
         weights: RetrievalWeights | None = None,
+        embedding_model: str | None = None,
+        vector_index_path: Path | None = None,
+        vector_minimum_score: float = 0.62,
     ) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._database_path = database_path
         self._audit_path = audit_path
         self._weights = weights or RetrievalWeights()
+        self._vector_minimum_score = vector_minimum_score
+        self._vector_index = (
+            LocalVectorIndex(vector_index_path, embedding_model)
+            if embedding_model and vector_index_path is not None
+            else None
+        )
         self._lock = threading.Lock()
         self._database = sqlite3.connect(database_path, check_same_thread=False)
         self._database.row_factory = sqlite3.Row
@@ -306,19 +347,83 @@ class FanKnowledgeRetriever:
         ).fetchone()
         return int(row["value"])
 
+    def metadata(self, key: str) -> str | None:
+        row = self._database.execute(
+            "SELECT value FROM knowledge_meta WHERE key = ?", (key,)
+        ).fetchone()
+        return str(row["value"]) if row is not None else None
+
+    def set_metadata(self, key: str, value: str) -> None:
+        with self._lock, self._database:
+            self._database.execute(
+                "INSERT OR REPLACE INTO knowledge_meta(key, value) VALUES(?, ?)",
+                (key, value),
+            )
+
+    def external_ids(self, source_types: tuple[str, ...]) -> set[str]:
+        if not source_types:
+            return set()
+        placeholders = ",".join("?" for _ in source_types)
+        rows = self._database.execute(
+            f"SELECT external_id FROM knowledge_documents "
+            f"WHERE source_type IN ({placeholders})",
+            source_types,
+        ).fetchall()
+        return {str(row["external_id"]) for row in rows}
+
+    def source_urls(self, source_types: tuple[str, ...]) -> set[str]:
+        if not source_types:
+            return set()
+        placeholders = ",".join("?" for _ in source_types)
+        rows = self._database.execute(
+            f"SELECT source_url FROM knowledge_documents "
+            f"WHERE source_type IN ({placeholders}) AND source_url IS NOT NULL",
+            source_types,
+        ).fetchall()
+        return {str(row["source_url"]) for row in rows}
+
     def retrieve(self, query: KnowledgeQuery) -> list[KnowledgeHit]:
         if query.top_k < 1 or not query.text.strip():
             return []
+        normalized = _normalize_query(query.text)
+        vector_scores = (
+            self._vector_index.search(normalized.text, _VECTOR_CANDIDATES)
+            if self._vector_index is not None
+            else {}
+        )
         with self._lock:
-            rows = self._candidate_rows(query)
-        hits = [self._score(row, query) for row in rows]
-        hits = [hit for hit in hits if hit.score.total > 0]
-        weak_count = sum(not _has_substantive_relevance(hit) for hit in hits)
-        hits = [hit for hit in hits if _has_substantive_relevance(hit)]
+            candidates = self._candidates(query, normalized, vector_scores)
+            idf = self._idf_scores(normalized.fts_terms)
+        fused = sorted(
+            candidates.values(),
+            key=lambda candidate: (-_rrf_score(candidate.ranks), _candidate_id(candidate)),
+        )[:_FUSION_CANDIDATES]
+        hits = [
+            self._score(candidate, query, normalized, vector_scores, idf)
+            for candidate in fused
+        ]
+        rejected = [hit for hit in hits if not _passes_relevance_gate(hit)]
+        hits = [hit for hit in hits if _passes_relevance_gate(hit)]
         hits.sort(key=lambda hit: (-hit.score.total, hit.record_id))
-        selected = hits[: query.top_k]
-        self._audit(query, selected, len(rows), weak_count)
+        selected = _diversify_hits(hits, query.top_k)
+        self._audit(query, selected, rejected, len(candidates))
         return selected
+
+    def sync_vector_index(self) -> tuple[int, int]:
+        if self._vector_index is None:
+            return 0, 0
+        rows = self._database.execute(
+            """
+            SELECT chunks.chunk_id, documents.title, chunks.text
+            FROM knowledge_document_chunks AS chunks
+            JOIN knowledge_documents AS documents
+              ON documents.document_id = chunks.document_id
+            ORDER BY chunks.chunk_id
+            """
+        ).fetchall()
+        return self._vector_index.sync(
+            [(str(row["chunk_id"]), f"{row['title']}\n{row['text']}") for row in rows]
+        )
 
     def _initialize(self) -> None:
         with self._database:
@@ -350,6 +455,8 @@ class FanKnowledgeRetriever:
                     content_rowid='rowid',
                     tokenize='unicode61 remove_diacritics 2'
                 );
+                CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts_vocab
+                    USING fts5vocab(knowledge_fts, 'row');
                 CREATE TABLE IF NOT EXISTS knowledge_documents (
                     document_id TEXT PRIMARY KEY,
                     source_type TEXT NOT NULL,
@@ -390,6 +497,8 @@ class FanKnowledgeRetriever:
                         content_rowid='rowid',
                         tokenize='unicode61 remove_diacritics 2'
                     );
+                CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts_vocab
+                    USING fts5vocab(knowledge_document_chunks_fts, 'row');
                 CREATE TRIGGER IF NOT EXISTS knowledge_chunks_ai AFTER INSERT
                     ON knowledge_document_chunks BEGIN
                     INSERT INTO knowledge_document_chunks_fts(rowid, search_text)
@@ -418,9 +527,34 @@ class FanKnowledgeRetriever:
                 (str(_SCHEMA_VERSION),),
             )
 
-    def _candidate_rows(self, query: KnowledgeQuery) -> list[sqlite3.Row]:
-        rows: dict[str, sqlite3.Row] = {}
-        tokens = _fts_query_terms(query.text)
+    def _candidates(
+        self,
+        query: KnowledgeQuery,
+        normalized: _NormalizedQuery,
+        vector_scores: dict[str, float],
+    ) -> dict[str, _Candidate]:
+        candidates: dict[str, _Candidate] = {}
+
+        def add(
+            row: sqlite3.Row,
+            channel: str,
+            rank: int,
+            raw_bm25: float | None = None,
+        ) -> None:
+            record_id = str(row["record_id"])
+            candidate = candidates.get(record_id)
+            if candidate is None:
+                candidates[record_id] = _Candidate(
+                    row, {channel: rank}, raw_bm25
+                )
+                return
+            candidate.ranks[channel] = min(rank, candidate.ranks.get(channel, rank))
+            if raw_bm25 is not None and (
+                candidate.raw_bm25 is None or raw_bm25 < candidate.raw_bm25
+            ):
+                candidate.raw_bm25 = raw_bm25
+
+        tokens = normalized.fts_terms
         if tokens:
             expression = " OR ".join(
                 f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens
@@ -434,13 +568,12 @@ class FanKnowledgeRetriever:
                       ON records.rowid = knowledge_fts.rowid
                     WHERE knowledge_fts MATCH ?
                     ORDER BY fts_rank
-                    LIMIT 64
+                    LIMIT 20
                     """,
                     (expression,),
                 ).fetchall()
             except sqlite3.OperationalError:
                 matches = []
-            rows.update({str(row["record_id"]): row for row in matches})
             try:
                 exclusion = ""
                 parameters: list[object] = [expression]
@@ -482,42 +615,141 @@ class FanKnowledgeRetriever:
                     WHERE knowledge_document_chunks_fts MATCH ?
                     {exclusion}
                     ORDER BY fts_rank
-                    LIMIT 64
+                    LIMIT 20
                     """,
                     parameters,
                 ).fetchall()
             except sqlite3.OperationalError:
                 chunk_matches = []
-            rows.update({str(row["record_id"]): row for row in chunk_matches})
+            lexical_rows = _interleave(matches, chunk_matches)[:_LEXICAL_CANDIDATES]
+            for rank, row in enumerate(lexical_rows, 1):
+                add(row, "fts", rank, float(row["fts_rank"]))
 
-        # Alias and kana matching are deliberately evaluated outside FTS because
-        # Japanese compounds are not reliably segmented by unicode61.
+        if vector_scores:
+            vector_rank = {
+                chunk_id: rank
+                for rank, (chunk_id, _score) in enumerate(
+                    sorted(vector_scores.items(), key=lambda value: -value[1]), 1
+                )
+            }
+            values = list(vector_rank)
+            for offset in range(0, len(values), 500):
+                batch = values[offset : offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                parameters: list[object] = [*batch]
+                exclusion = ""
+                if query.exclude_video_id:
+                    exclusion = (
+                        "AND documents.external_id != ? "
+                        "AND substr(documents.external_id, 1, length(?) + 1) != ? || ':'"
+                    )
+                    parameters.extend(
+                        [
+                            query.exclude_video_id,
+                            query.exclude_video_id,
+                            query.exclude_video_id,
+                        ]
+                    )
+                matches = self._database.execute(
+                    f"""
+                    SELECT
+                        'chunk:' || chunks.chunk_id AS record_id,
+                        'document_chunk' AS kind,
+                        documents.title AS title,
+                        chunks.text AS body,
+                        '[]' AS aliases, '' AS reading, '[]' AS keywords,
+                        chunks.speaker AS speaker,
+                        substr(documents.published_at, 1, 10) AS valid_from,
+                        NULL AS valid_to, documents.source_url AS source_url,
+                        documents.source_type AS source_type,
+                        documents.reliability AS reliability,
+                        chunks.search_text AS search_text,
+                        NULL AS fts_rank
+                    FROM knowledge_document_chunks AS chunks
+                    JOIN knowledge_documents AS documents
+                      ON documents.document_id = chunks.document_id
+                    WHERE chunks.chunk_id IN ({placeholders}) {exclusion}
+                    """,
+                    parameters,
+                ).fetchall()
+                for row in matches:
+                    chunk_id = str(row["record_id"]).removeprefix("chunk:")
+                    add(row, "vector", vector_rank[chunk_id])
+
+        entity_rows: list[tuple[int, sqlite3.Row]] = []
         for row in self._database.execute(
             "SELECT *, NULL AS fts_rank FROM knowledge_records"
         ).fetchall():
             forms = _row_forms(row)
-            if _lexical_matches(query.text, forms):
-                rows.setdefault(str(row["record_id"]), row)
-        return list(rows.values())
+            matched = _exact_entity_matches(normalized, forms)
+            if matched:
+                entity_rows.append((max(len(_compact(value)) for value in matched), row))
+        entity_rows.sort(key=lambda value: (-value[0], str(value[1]["record_id"])))
+        for rank, (_length, row) in enumerate(entity_rows, 1):
+            add(row, "entity", rank)
+        return candidates
 
-    def _score(self, row: sqlite3.Row, query: KnowledgeQuery) -> KnowledgeHit:
+    def _idf_scores(self, terms: tuple[str, ...]) -> dict[str, float]:
+        if not terms:
+            return {}
+        total = self._database.execute(
+            "SELECT "
+            "(SELECT COUNT(*) FROM knowledge_records) + "
+            "(SELECT COUNT(*) FROM knowledge_document_chunks) AS value"
+        ).fetchone()["value"]
+        if not total:
+            return {}
+        values: dict[str, int] = {}
+        for table in ("knowledge_fts_vocab", "knowledge_chunks_fts_vocab"):
+            for offset in range(0, len(terms), 400):
+                batch = terms[offset : offset + 400]
+                placeholders = ",".join("?" for _ in batch)
+                rows = self._database.execute(
+                    f"SELECT term, doc FROM {table} "
+                    f"WHERE term IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                for row in rows:
+                    term = str(row["term"])
+                    values[term] = values.get(term, 0) + int(row["doc"])
+        denominator = math.log(float(total) + 1.0) + 1.0
+        return {
+            term: (math.log((float(total) + 1.0) / (count + 1.0)) + 1.0)
+            / denominator
+            for term, count in values.items()
+        }
+
+    def _score(
+        self,
+        candidate: _Candidate,
+        query: KnowledgeQuery,
+        normalized: _NormalizedQuery,
+        vector_scores: dict[str, float],
+        idf_scores: dict[str, float],
+    ) -> KnowledgeHit:
+        row = candidate.row
         forms = _row_forms(row)
-        matched = tuple(form for form in forms if _contains_form(query.text, form))
-        query_tokens = set(_query_tokens(query.text))
-        query_lexemes = query_tokens | set(_cjk_ngrams(query.text))
+        matched = _exact_entity_matches(normalized, forms)
+        query_lexemes = set(normalized.fts_terms)
         score_forms = [*forms, str(row["body"])]
         form_tokens = set(_query_tokens(" ".join(score_forms)))
         form_lexemes = form_tokens | set(_cjk_ngrams(" ".join(score_forms)))
-        token_overlap = len(query_lexemes & form_lexemes) / max(1, len(query_lexemes))
-        fts_rank = row["fts_rank"]
-        # FTS5's raw BM25 values are tiny negative numbers whose scale depends on
-        # corpus size. Treat a hit as lexical evidence here; exact/token overlap
-        # remains the stronger, directly explainable signal.
-        fts_score = 0.0 if fts_rank is None else 0.35
+        overlap = query_lexemes & form_lexemes
+        overlap_weight = sum(idf_scores.get(value, 0.0) for value in overlap)
+        query_weight = sum(idf_scores.get(value, 0.0) for value in query_lexemes)
+        token_overlap = overlap_weight / max(1.0, query_weight)
+        bm25 = (
+            1.0 / math.log2(candidate.ranks["fts"] + 1.0)
+            if "fts" in candidate.ranks
+            else 0.0
+        )
         exact_score = min(1.0, 0.5 * len(matched))
-        keyword = max(token_overlap, fts_score, exact_score)
+        keyword = max(token_overlap, exact_score)
+        entity = 1.0 if matched else 0.0
+        idf = max((idf_scores.get(value, 0.0) for value in overlap), default=0.0)
+        specificity = max((len(_compact(value)) for value in overlap), default=0)
 
-        query_kana = _kana(query.text)
+        query_kana = normalized.reading
         kana = max(
             (_best_window_ratio(query_kana, _kana(form)) for form in score_forms),
             default=0.0,
@@ -543,7 +775,10 @@ class FanKnowledgeRetriever:
             _evidence_score(query.chat_text, forms),
         )
         reliability = float(row["reliability"])
-        vector = 0.0
+        record_id = str(row["record_id"])
+        vector = vector_scores.get(record_id.removeprefix("chunk:"), 0.0)
+        if vector < self._vector_minimum_score:
+            vector = 0.0
         weights = self._weights
         total = (
             weights.keyword * keyword
@@ -553,6 +788,7 @@ class FanKnowledgeRetriever:
             + weights.date * date_score
             + weights.cross_evidence * cross
             + weights.reliability * reliability
+            + weights.rrf * _normalized_rrf_score(candidate.ranks)
         )
         score = KnowledgeScore(
             keyword=keyword,
@@ -563,23 +799,30 @@ class FanKnowledgeRetriever:
             cross_evidence=cross,
             reliability=reliability,
             total=total,
+            rrf=_normalized_rrf_score(candidate.ranks),
+            bm25=bm25,
+            entity=entity,
+            idf=idf,
+            lexical_terms=len(overlap),
+            specificity=specificity,
         )
         return KnowledgeHit(
-            record_id=str(row["record_id"]),
+            record_id=record_id,
             kind=str(row["kind"]),
             title=str(row["title"]),
             body=str(row["body"]),
             source_url=row["source_url"],
             score=score,
             matched_terms=matched,
+            retrieval_ranks=dict(candidate.ranks),
         )
 
     def _audit(
         self,
         query: KnowledgeQuery,
         hits: list[KnowledgeHit],
+        rejected: list[KnowledgeHit],
         candidate_count: int,
-        weak_candidate_count: int,
     ) -> None:
         if self._audit_path is None:
             return
@@ -587,14 +830,25 @@ class FanKnowledgeRetriever:
             "event": "fan_knowledge_retrieval",
             "query": asdict(query),
             "candidate_count": candidate_count,
-            "weak_candidate_count": weak_candidate_count,
+            "weak_candidate_count": len(rejected),
             "hits": [
                 {
                     **hit.prompt_value(),
                     "source_url": hit.source_url,
+                    "retrieval_ranks": hit.retrieval_ranks,
                     "score_components": asdict(hit.score),
+                    "gate_evidence": list(_relevance_evidence(hit)),
                 }
                 for hit in hits
+            ],
+            "rejected": [
+                {
+                    **hit.prompt_value(),
+                    "retrieval_ranks": hit.retrieval_ranks,
+                    "score_components": asdict(hit.score),
+                    "gate_reason": "no substantive lexical, semantic, entity, or cross evidence",
+                }
+                for hit in rejected[:10]
             ],
         }
         self._audit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -602,14 +856,71 @@ class FanKnowledgeRetriever:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def _has_substantive_relevance(hit: KnowledgeHit) -> bool:
+def _passes_relevance_gate(hit: KnowledgeHit) -> bool:
+    return bool(_relevance_evidence(hit))
+
+
+def _relevance_evidence(hit: KnowledgeHit) -> tuple[str, ...]:
     score = hit.score
-    return bool(
-        hit.matched_terms
-        or score.keyword > 0.35
-        or score.kana > 0
-        or score.cross_evidence > 0
+    values: list[str] = []
+    if score.entity > 0:
+        values.append("exact_entity_or_alias")
+    if score.vector > 0:
+        values.append("vector_above_absolute_threshold")
+    if (
+            score.bm25 >= 0.2
+            and score.idf >= 0.35
+            and (score.lexical_terms >= 2 or score.specificity >= 4)
+    ):
+        values.append("strong_bm25_with_informative_terms")
+    if score.cross_evidence > 0 and (score.keyword > 0 or score.kana >= 0.72):
+        values.append("ocr_or_chat_corroboration")
+    return tuple(values)
+
+
+def _candidate_id(candidate: _Candidate) -> str:
+    return str(candidate.row["record_id"])
+
+
+def _rrf_score(ranks: dict[str, int]) -> float:
+    return sum(
+        _RRF_WEIGHTS[channel] / (_RRF_K + rank)
+        for channel, rank in ranks.items()
     )
+
+
+def _normalized_rrf_score(ranks: dict[str, int]) -> float:
+    maximum = sum(weight / (_RRF_K + 1) for weight in _RRF_WEIGHTS.values())
+    return _rrf_score(ranks) / maximum
+
+
+def _interleave(*groups: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    values: list[sqlite3.Row] = []
+    for index in range(max((len(group) for group in groups), default=0)):
+        values.extend(group[index] for group in groups if index < len(group))
+    return values
+
+
+def _diversify_hits(hits: list[KnowledgeHit], limit: int) -> list[KnowledgeHit]:
+    selected: list[KnowledgeHit] = []
+    source_counts: dict[str, int] = {}
+    bodies: list[str] = []
+    for hit in hits:
+        body = _compact(hit.body)
+        if body in bodies or any(
+            SequenceMatcher(None, body, existing).ratio() >= 0.92
+            for existing in bodies
+        ):
+            continue
+        source = hit.source_url or f"record:{hit.record_id}"
+        if source_counts.get(source, 0) >= _MAX_RESULTS_PER_SOURCE:
+            continue
+        selected.append(hit)
+        bodies.append(body)
+        source_counts[source] = source_counts.get(source, 0) + 1
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def records_from_translation_context(
@@ -804,8 +1115,61 @@ def _fts_search_text(values: Iterable[str]) -> str:
     return " ".join(dict.fromkeys((text, *_cjk_ngrams(text))))
 
 
-def _fts_query_terms(text: str) -> list[str]:
-    return list(dict.fromkeys((*_query_tokens(text), *_cjk_ngrams(text))))
+def _normalize_query(text: str) -> _NormalizedQuery:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    lexical: list[str] = []
+    readings: list[str] = []
+    if _JAPANESE_RE.search(normalized):
+        try:
+            from sudachipy import tokenizer
+
+            morphemes = _sudachi_tokenizer().tokenize(
+                normalized, tokenizer.Tokenizer.SplitMode.A
+            )
+            for morpheme in morphemes:
+                part = morpheme.part_of_speech()[0]
+                surface = morpheme.surface().strip().casefold()
+                if part not in {"助詞", "助動詞", "補助記号", "空白"}:
+                    dictionary_form = morpheme.dictionary_form().strip().casefold()
+                    lexical.extend(value for value in (surface, dictionary_form) if value)
+                reading = morpheme.reading_form()
+                if reading and reading != "*":
+                    readings.append(_kana(reading))
+        except (ImportError, OSError):
+            lexical.extend(_query_tokens(normalized))
+    else:
+        lexical.extend(_query_tokens(normalized))
+    lexical.extend(_query_tokens(normalized))
+    content_terms = list(dict.fromkeys(value for value in lexical if value))
+    ngrams = [
+        ngram
+        for value in content_terms
+        for ngram in _cjk_ngrams(value)
+    ]
+    terms = sorted(
+        dict.fromkeys((*content_terms, *ngrams)),
+        key=lambda value: (-len(_compact(value)), value),
+    )[:64]
+    reading = "".join(readings) or _kana(normalized)
+    return _NormalizedQuery(normalized, reading, tuple(terms))
+
+
+@lru_cache(maxsize=1)
+def _sudachi_tokenizer() -> object:
+    from sudachipy import dictionary
+
+    return dictionary.Dictionary().create()
+
+
+def _exact_entity_matches(
+    query: _NormalizedQuery, forms: list[str]
+) -> tuple[str, ...]:
+    return tuple(
+        form
+        for form in forms
+        if _contains_form(query.text, form)
+        or _contains_form(query.reading, _kana(form))
+    )
 
 
 def _cjk_ngrams(text: str) -> list[str]:

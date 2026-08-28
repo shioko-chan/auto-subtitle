@@ -174,6 +174,97 @@ class QwenASRTests(unittest.TestCase):
 
         self.assertEqual([cue.language for cue in cues], ["English", "English"])
 
+    def test_zero_duration_aligner_unit_uses_short_following_gap(self):
+        result = SimpleNamespace(
+            text="何話そうね",
+            language="Japanese",
+            time_stamps=SimpleNamespace(
+                items=[
+                    SimpleNamespace(text="話", start_time=0.0, end_time=0.4),
+                    SimpleNamespace(text="そう", start_time=0.4, end_time=0.4),
+                    SimpleNamespace(text="ね", start_time=0.56, end_time=0.72),
+                ]
+            ),
+        )
+
+        cues = _result_to_cues(
+            result,
+            offset=445.18,
+            keep_start=445.18,
+            keep_end=446.0,
+            final_chunk=True,
+        )
+
+        self.assertEqual(
+            [(cue.start, cue.end, cue.text) for cue in cues],
+            [
+                (445.18, 445.58, "話"),
+                (445.58, 445.74, "そう"),
+                (445.74, 445.9, "ね"),
+            ],
+        )
+
+    def test_consecutive_zero_duration_units_merge_into_following_gap(self):
+        result = SimpleNamespace(
+            text="話そうかな",
+            language="Japanese",
+            time_stamps=SimpleNamespace(
+                items=[
+                    SimpleNamespace(text="話", start_time=0.0, end_time=0.4),
+                    SimpleNamespace(text="そう", start_time=0.4, end_time=0.4),
+                    SimpleNamespace(text="か", start_time=0.4, end_time=0.4),
+                    SimpleNamespace(text="な", start_time=0.8, end_time=1.0),
+                ]
+            ),
+        )
+
+        cues = _result_to_cues(
+            result,
+            offset=0,
+            keep_start=0,
+            keep_end=1,
+            final_chunk=True,
+        )
+
+        self.assertEqual(
+            [(cue.start, cue.end, cue.text) for cue in cues],
+            [(0.0, 0.4, "話"), (0.4, 0.8, "そうか"), (0.8, 1.0, "な")],
+        )
+
+    def test_zero_duration_unit_without_short_gap_attaches_to_previous_unit(self):
+        for following_start in (0.4, 3.0):
+            with self.subTest(following_start=following_start):
+                result = SimpleNamespace(
+                    text="話そうね",
+                    language="Japanese",
+                    time_stamps=SimpleNamespace(
+                        items=[
+                            SimpleNamespace(
+                                text="話", start_time=0.0, end_time=0.4
+                            ),
+                            SimpleNamespace(
+                                text="そう", start_time=0.4, end_time=0.4
+                            ),
+                            SimpleNamespace(
+                                text="ね",
+                                start_time=following_start,
+                                end_time=following_start + 0.2,
+                            ),
+                        ]
+                    ),
+                )
+
+                cues = _result_to_cues(
+                    result,
+                    offset=0,
+                    keep_start=0,
+                    keep_end=4,
+                    final_chunk=True,
+                )
+
+                self.assertEqual(cues[0].text, "話そう")
+                self.assertEqual((cues[0].start, cues[0].end), (0.0, 0.4))
+
     def test_single_word_list_participates_in_asr_cache_signature(self):
         with tempfile.TemporaryDirectory() as temp:
             video = Path(temp) / "source.mp4"
@@ -373,7 +464,7 @@ class QwenASRTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "cache.json"
             path.write_text(
-                '{"version":10,"signature":{"speakers":["A","B"]},'
+                '{"version":11,"signature":{"speakers":["A","B"]},'
                 '"chunks":{"0":{"text":"x","cues":[]}}}',
                 encoding="utf-8",
             )

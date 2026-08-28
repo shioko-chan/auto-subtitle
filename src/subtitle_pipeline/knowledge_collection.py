@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import urljoin, urlsplit
 
 import certifi
@@ -29,6 +30,10 @@ def collect_official_documents(
     maximum_documents: int = 1000,
     required_terms: tuple[str, ...] = (),
     maximum_depth: int | None = None,
+    strict_errors: bool = False,
+    known_source_urls: set[str] | None = None,
+    conditional_headers: dict[str, dict[str, str]] | None = None,
+    response_validators: dict[str, dict[str, str]] | None = None,
 ) -> list[dict[str, object]]:
     documents: list[dict[str, object]] = []
     queue = [(url, 0) for url in dict.fromkeys(urls)]
@@ -41,8 +46,22 @@ def collect_official_documents(
             continue
         seen.add(url)
         try:
-            body, content_type = _download(url, timeout_seconds)
+            if conditional_headers is not None and url in conditional_headers:
+                downloaded = _download_conditional(
+                    url, timeout_seconds, conditional_headers[url]
+                )
+                if downloaded is None:
+                    continue
+                body, content_type, validators = downloaded
+                if response_validators is not None and validators:
+                    response_validators[url] = validators
+            else:
+                body, content_type = _download(url, timeout_seconds)
         except OSError as exc:
+            if strict_errors:
+                raise RuntimeError(
+                    f"official page collection failed: {url}: {exc}"
+                ) from exc
             logger.warning("skipping unavailable official page %s: %s", url, exc)
             continue
         if "xml" in content_type or body.lstrip().startswith(
@@ -59,6 +78,8 @@ def collect_official_documents(
                 if not link or urlsplit(link).netloc not in allowed_hosts:
                     continue
                 if pattern is not None and pattern.search(link) is None:
+                    continue
+                if known_source_urls is not None and link in known_source_urls:
                     continue
                 if link not in seen:
                     queue.append((link, depth + 1))
@@ -80,6 +101,7 @@ def collect_sns_documents(
     urls: list[str],
     *,
     cookies_from_browser: str | None = None,
+    known_external_ids: set[str] | None = None,
 ) -> list[dict[str, object]]:
     if not urls:
         return []
@@ -100,20 +122,25 @@ def collect_sns_documents(
     if cookies_from_browser:
         command.extend(["--cookies-from-browser", cookies_from_browser])
     command.extend(urls)
-    try:
-        result = subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or "").strip()[-500:]
-        raise RuntimeError(
-            f"gallery-dl metadata collection failed ({exc.returncode}): {detail}"
-        ) from exc
+    if known_external_ids is None:
+        try:
+            output_lines = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            ).stdout.splitlines()
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or "").strip()[-500:]
+            raise RuntimeError(
+                f"gallery-dl metadata collection failed ({exc.returncode}): {detail}"
+            ) from exc
+    else:
+        output_lines = _incremental_sns_listing(command, known_external_ids)
     documents: dict[tuple[str, str], dict[str, object]] = {}
-    for line in result.stdout.splitlines():
+    for line in output_lines:
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
@@ -126,6 +153,40 @@ def collect_sns_documents(
         key = (str(document["source_type"]), str(document["external_id"]))
         documents[key] = document
     return list(documents.values())
+
+
+def _incremental_sns_listing(
+    command: list[str], known_external_ids: set[str]
+) -> list[str]:
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert process.stdout is not None
+    lines: list[str] = []
+    reached_known = False
+    for line in process.stdout:
+        lines.append(line)
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        external_id = _first(value, "tweet_id", "post_id", "shortcode", "id")
+        if external_id in known_external_ids:
+            reached_known = True
+            process.terminate()
+            break
+    _stdout, stderr = process.communicate()
+    if not reached_known and process.returncode:
+        raise RuntimeError(
+            f"incremental SNS collection failed ({process.returncode}): "
+            f"{(stderr or '').strip()[-500:]}"
+        )
+    return lines
 
 
 def normalize_sns_metadata(value: dict[str, object]) -> dict[str, object] | None:
@@ -258,6 +319,41 @@ def _download(url: str, timeout_seconds: int) -> tuple[str, str]:
         content_type = response.headers.get_content_type()
         charset = response.headers.get_content_charset() or "utf-8"
         return response.read().decode(charset, errors="replace"), content_type
+
+
+def _download_conditional(
+    url: str, timeout_seconds: int, validators: dict[str, str]
+) -> tuple[str, str, dict[str, str]] | None:
+    headers = {"User-Agent": "auto-subtitle-knowledge/1.0"}
+    if validators.get("etag"):
+        headers["If-None-Match"] = validators["etag"]
+    if validators.get("last_modified"):
+        headers["If-Modified-Since"] = validators["last_modified"]
+    request = urllib.request.Request(url, headers=headers)
+    context = ssl.create_default_context(cafile=certifi.where())
+    try:
+        response = urllib.request.urlopen(
+            request, timeout=timeout_seconds, context=context
+        )
+    except HTTPError as exc:
+        if exc.code == 304:
+            return None
+        raise
+    with response:
+        content_type = response.headers.get_content_type()
+        charset = response.headers.get_content_charset() or "utf-8"
+        return (
+            response.read().decode(charset, errors="replace"),
+            content_type,
+            {
+                key: value
+                for key, value in {
+                    "etag": response.headers.get("ETag"),
+                    "last_modified": response.headers.get("Last-Modified"),
+                }.items()
+                if value
+            },
+        )
 
 
 def _html_document(body: str, url: str, source_type: str) -> dict[str, object]:

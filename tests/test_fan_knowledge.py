@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from subtitle_pipeline.fan_knowledge import (
     FanKnowledgeRetriever,
     KnowledgeChunk,
@@ -16,6 +18,50 @@ from subtitle_pipeline.fan_knowledge import (
 
 
 class FanKnowledgeRetrieverTests(unittest.TestCase):
+    def test_vector_search_recalls_semantic_hit_without_lexical_overlap(self) -> None:
+        class FakeEmbeddingModel:
+            def get_embedding_dimension(self) -> int:
+                return 2
+
+            def encode(self, values, **_kwargs):
+                return np.asarray(
+                    [
+                        [1.0, 0.0]
+                        if "雕像" in value or "expensive figure" in value
+                        else [0.0, 1.0]
+                        for value in values
+                    ],
+                    dtype=np.float32,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            retriever = FanKnowledgeRetriever(
+                root / "knowledge.sqlite3",
+                embedding_model="fake-model",
+                vector_index_path=root / "knowledge.faiss",
+            )
+            retriever.upsert_document(
+                KnowledgeDocument(
+                    "document:figure",
+                    "official_news",
+                    "figure",
+                    "商品新闻",
+                    "四十万日元的等身大雕像手办正式发售",
+                ),
+                [KnowledgeChunk(0, "四十万日元的等身大雕像手办正式发售")],
+            )
+            assert retriever._vector_index is not None
+            retriever._vector_index._model = FakeEmbeddingModel()
+            retriever.sync_vector_index()
+
+            hits = retriever.retrieve(KnowledgeQuery("expensive figure"))
+            retriever.close()
+
+        self.assertEqual(hits[0].kind, "document_chunk")
+        self.assertGreaterEqual(hits[0].score.vector, 0.99)
+        self.assertIn("vector", hits[0].retrieval_ranks)
+
     def test_context_records_preserve_entities_aliases_and_fixed_translation(
         self,
     ) -> None:
@@ -160,6 +206,59 @@ class FanKnowledgeRetrieverTests(unittest.TestCase):
 
         self.assertEqual(hits, [])
         self.assertGreater(audit["weak_candidate_count"], 0)
+        self.assertEqual(
+            audit["rejected"][0]["gate_reason"],
+            "no substantive lexical, semantic, entity, or cross evidence",
+        )
+
+    def test_results_are_diversified_across_source_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
+            retriever.upsert_document(
+                KnowledgeDocument(
+                    "document:one",
+                    "youtube_auto_subtitle",
+                    "video-one:ja",
+                    "第一场直播",
+                    "特製限定アクリルスタンド販売情報",
+                    source_url="https://youtube.example/watch?v=one",
+                ),
+                [
+                    KnowledgeChunk(
+                        index,
+                        f"特製限定アクリルスタンド販売情報 {suffix}",
+                    )
+                    for index, suffix in enumerate(
+                        ("価格について詳しく話した", "予約期間を案内した", "商品写真を紹介した")
+                    )
+                ],
+            )
+            retriever.upsert_document(
+                KnowledgeDocument(
+                    "document:two",
+                    "official_news",
+                    "news-two",
+                    "公式商品公告",
+                    "特製限定アクリルスタンド販売情報",
+                    source_url="https://official.example/news/two",
+                ),
+                [KnowledgeChunk(0, "特製限定アクリルスタンド販売情報 公式発表")],
+            )
+
+            hits = retriever.retrieve(
+                KnowledgeQuery("特製限定アクリルスタンド販売情報", top_k=4)
+            )
+            retriever.close()
+
+        first_source = [
+            hit
+            for hit in hits
+            if hit.source_url == "https://youtube.example/watch?v=one"
+        ]
+        self.assertLessEqual(len(first_source), 2)
+        self.assertTrue(
+            any(hit.source_url == "https://official.example/news/two" for hit in hits)
+        )
 
     def test_document_chunks_are_incremental_and_searchable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

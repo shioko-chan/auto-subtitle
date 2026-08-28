@@ -188,6 +188,15 @@ class FanKnowledgeConfig:
     top_k_asr: int = 6
     top_k_translation: int = 12
     translation_query_chars: int = 12000
+    auto_update_enabled: bool = True
+    update_interval_hours: float = 24.0
+    youtube_sources: list[str] = field(default_factory=list)
+    youtube_playlist_limit: int = 10000
+    official_sources: list[str] = field(default_factory=list)
+    sns_sources: list[str] = field(default_factory=list)
+    embedding_model: str | None = "intfloat/multilingual-e5-base"
+    vector_index_path: str = "databases/fan-knowledge.faiss"
+    vector_minimum_score: float = 0.62
 
 
 @dataclass(frozen=True)
@@ -377,6 +386,13 @@ def load_config(path: Path) -> AppConfig:
             )
     if config.llm.api_style not in {"chat_completions", "responses"}:
         raise ConfigError("llm.api_style must be 'chat_completions' or 'responses'")
+    knowledge = config.fan_knowledge
+    if knowledge.update_interval_hours <= 0:
+        raise ConfigError("fan_knowledge.update_interval_hours must be positive")
+    if knowledge.youtube_playlist_limit < 1:
+        raise ConfigError("fan_knowledge.youtube_playlist_limit must be positive")
+    if not 0 <= knowledge.vector_minimum_score <= 1:
+        raise ConfigError("fan_knowledge.vector_minimum_score must be between 0 and 1")
     if config.llm.thinking not in (None, "enabled", "disabled"):
         raise ConfigError("llm.thinking must be 'enabled' or 'disabled'")
     if config.llm.reasoning_effort not in (
