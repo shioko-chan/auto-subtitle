@@ -24,7 +24,7 @@ from .prompt_templates import prompt_templates_digest
 from .source_language import language_for_text
 from .subtitles import Cue, TimedTextUnit, cue_from_mapping, text_display_width
 
-_CACHE_VERSION = 14
+_CACHE_VERSION = 17
 _PROMPT_VERSION = 8
 _STABLE_METADATA_KEYS = (
     "id",
@@ -815,7 +815,7 @@ def _ensure_song_translations(
 ) -> LibrarySong:
     if all(
         line.translation
-        and line.translation_source in {"llm_reviewed", "external", "official"}
+        and line.translation_source in {"llm_reviewed", "official"}
         for line in song.lines
     ):
         return song
@@ -830,7 +830,7 @@ def _ensure_song_translations(
             isinstance(translated, tuple)
             and len(translated) == 2
             and isinstance(translated[0], dict)
-            and translated[1] in {"llm", "machine"}
+            and translated[1] == "llm"
         ):
             translations, source = translated
         elif isinstance(translated, dict):
@@ -841,12 +841,8 @@ def _ensure_song_translations(
             song.song_id,
             translations,
             source=source,
-            model=model if source == "llm" else None,
-            prompt_hash=(
-                prompt_templates_digest("lyrics-translate.md")
-                if source == "llm"
-                else None
-            ),
+            model=model,
+            prompt_hash=prompt_templates_digest("lyrics-translate.md"),
         )
         refreshed = library.get(song.song_id)
         assert refreshed is not None
@@ -857,12 +853,14 @@ def _ensure_song_translations(
         for line in song.lines
         if line.translation is not None
     }
-    has_reviewable_lines = any(
-        line.translation_source in {"llm", "machine"} for line in song.lines
-    )
+    reviewable_ids = {
+        line.line_no
+        for line in song.lines
+        if line.translation_source in {"llm", "machine", "external"}
+    }
     if (
         review_lyrics is not None
-        and has_reviewable_lines
+        and reviewable_ids
         and len(complete_draft) == len(song.lines)
     ):
         reviewed = review_lyrics(
@@ -875,7 +873,11 @@ def _ensure_song_translations(
         if isinstance(reviewed, dict):
             library.store_translations(
                 song.song_id,
-                reviewed,
+                {
+                    line_id: reviewed[line_id]
+                    for line_id in reviewable_ids
+                    if line_id in reviewed
+                },
                 source="llm_reviewed",
                 model=model,
                 prompt_hash=prompt_templates_digest(
@@ -1175,30 +1177,64 @@ def _recover_lyric_gaps(
             match.song.lines[right.line_start],
         ]
         expanded = [adjacent[0], *missing_lines, adjacent[1]]
-        baseline = _run_pyshiro_lines(uv, worker, wav, adjacent, normalizer)
-        aligned = _run_pyshiro_lines(uv, worker, wav, expanded, normalizer)
+        baseline_failure: dict[str, object] = {}
+        aligned_failure: dict[str, object] = {}
+        baseline = _run_pyshiro_lines(
+            uv,
+            worker,
+            wav,
+            adjacent,
+            normalizer,
+            failure_audit=baseline_failure,
+        )
+        aligned = _run_pyshiro_lines(
+            uv,
+            worker,
+            wav,
+            expanded,
+            normalizer,
+            failure_audit=aligned_failure,
+        )
         if baseline is None or aligned is None:
             audit["reason"] = "pyshiro_recheck_failed"
+            audit["pyshiro_failures"] = {
+                "baseline": baseline_failure if baseline is None else None,
+                "expanded": aligned_failure if aligned is None else None,
+            }
             audits.append(audit)
             continue
         competitors = [baseline]
-        for alternative in _competing_line_sets(match.song, missing_ids):
+        competitor_failures: list[dict[str, object]] = []
+        for alternative in _competing_line_sets(
+            match.song, missing_ids, normalizer=normalizer
+        ):
+            failure: dict[str, object] = {}
             response = _run_pyshiro_lines(
                 uv,
                 worker,
                 wav,
                 [adjacent[0], *alternative, adjacent[1]],
                 normalizer,
+                failure_audit=failure,
             )
             if response is not None:
                 competitors.append(response)
+            else:
+                competitor_failures.append(failure)
+        if competitor_failures:
+            audit["competitor_failures"] = competitor_failures
         accepted, aligned_score, best_competing = _pyshiro_likelihood_wins(
-            aligned, competitors, config
+            aligned,
+            competitors,
+            config,
+            margin=config.pyshiro_gap_likelihood_margin,
         )
         baseline_score = float(baseline.get("likelihood_per_frame", -1e9))
         audit["baseline_likelihood_per_frame"] = baseline_score
         audit["expanded_likelihood_per_frame"] = aligned_score
         audit["best_competing_likelihood_per_frame"] = best_competing
+        audit["validation_policy"] = "between_anchors_continuous_block"
+        audit["required_likelihood_margin"] = config.pyshiro_gap_likelihood_margin
         if not accepted:
             audit["reason"] = "pyshiro_candidate_not_preferred"
             audits.append(audit)
@@ -1746,21 +1782,46 @@ def _align_acoustic_neighbor(
         audit["reason"] = "insufficient_vocal_activity"
         return [], [], audit
     lines = [match.song.lines[line_id] for line_id in line_ids]
-    response = _run_pyshiro_lines(uv, worker, wav, lines, normalizer)
+    candidate_failure: dict[str, object] = {}
+    response = _run_pyshiro_lines(
+        uv,
+        worker,
+        wav,
+        lines,
+        normalizer,
+        failure_audit=candidate_failure,
+    )
     if response is None:
         audit["reason"] = "pyshiro_neighbor_failed"
+        audit["pyshiro_failure"] = candidate_failure
         return [], [], audit
-    alternatives = [
-        value
-        for lines_value in _competing_line_sets(match.song, line_ids)
-        if (value := _run_pyshiro_lines(uv, worker, wav, lines_value, normalizer))
-        is not None
-    ]
+    alternatives: list[dict[str, object]] = []
+    alternative_failures: list[dict[str, object]] = []
+    for lines_value in _competing_line_sets(
+        match.song, line_ids, normalizer=normalizer
+    ):
+        failure: dict[str, object] = {}
+        value = _run_pyshiro_lines(
+            uv,
+            worker,
+            wav,
+            lines_value,
+            normalizer,
+            failure_audit=failure,
+        )
+        if value is not None:
+            alternatives.append(value)
+        else:
+            alternative_failures.append(failure)
+    if alternative_failures:
+        audit["competitor_failures"] = alternative_failures
     accepted, likelihood, best_alternative = _pyshiro_likelihood_wins(
         response, alternatives, config
     )
     audit["likelihood_per_frame"] = likelihood
     audit["best_competing_likelihood_per_frame"] = best_alternative
+    audit["validation_policy"] = "one_sided_neighbor_extension"
+    audit["required_likelihood_margin"] = config.pyshiro_likelihood_margin
     if not accepted:
         audit["reason"] = "pyshiro_candidate_not_preferred"
         return [], [], audit
@@ -1897,11 +1958,34 @@ def _run_pyshiro_lines(
     wav: Path,
     lines: list[LyricLine],
     normalizer: JapaneseNormalizer,
+    *,
+    failure_audit: dict[str, object] | None = None,
 ) -> dict[str, object] | None:
     display_units = [
         normalizer.display_units(line.text, line.reading) for line in lines
     ]
+    request_summary = {
+        "wav": str(wav.resolve()),
+        "worker": str(worker.resolve()),
+        "lyric_line_count": len(lines),
+        "lyrics": [
+            {
+                "text": line.text,
+                "reading": line.reading,
+                "display_unit_count": len(units),
+            }
+            for line, units in zip(lines, display_units)
+        ],
+    }
     if any(not values for values in display_units):
+        if failure_audit is not None:
+            failure_audit.update(
+                {
+                    "reason": "lyric_display_units_empty",
+                    "failure_stage": "request_normalization",
+                    "request": request_summary,
+                }
+            )
         return None
     request = {
         "wav": str(wav.resolve()),
@@ -1913,54 +1997,163 @@ def _run_pyshiro_lines(
             for values in display_units
         ],
     }
-    result = subprocess.run(
-        [uv, "run", "--project", str(worker.parent), "python", str(worker)],
-        input=json.dumps(request, ensure_ascii=False),
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=120,
-    )
-    if result.returncode:
+    try:
+        result = subprocess.run(
+            [uv, "run", "--project", str(worker.parent), "python", str(worker)],
+            input=json.dumps(request, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:
+        if failure_audit is not None:
+            failure_audit.update(
+                {
+                    "reason": "pyshiro_worker_timeout",
+                    "failure_stage": "worker_execution",
+                    "timeout_seconds": 120,
+                    "stdout_tail": _stream_tail(exc.stdout),
+                    "stderr_tail": _stream_tail(exc.stderr),
+                    "request": request_summary,
+                }
+            )
         return None
-    response = _parse_worker_json_output(result.stdout)
-    return response if response.get("ok") is True else None
+    except OSError as exc:
+        if failure_audit is not None:
+            failure_audit.update(
+                {
+                    "reason": "pyshiro_worker_start_failed",
+                    "failure_stage": "worker_start",
+                    "exception_type": type(exc).__name__,
+                    "error": str(exc),
+                    "request": request_summary,
+                }
+            )
+        return None
+    try:
+        response = _parse_worker_json_output(result.stdout)
+    except ValueError as exc:
+        if failure_audit is not None:
+            failure_audit.update(
+                {
+                    "reason": "pyshiro_worker_output_invalid",
+                    "failure_stage": "worker_response_parse",
+                    "worker_returncode": result.returncode,
+                    "error": str(exc),
+                    "stdout_tail": _stream_tail(result.stdout),
+                    "stderr_tail": _stream_tail(result.stderr),
+                    "request": request_summary,
+                }
+            )
+        return None
+    if result.returncode or response.get("ok") is not True:
+        if failure_audit is not None:
+            failure_audit.update(
+                {
+                    "reason": "pyshiro_worker_failed",
+                    "failure_stage": "worker_execution",
+                    "worker_returncode": result.returncode,
+                    "worker_error_type": response.get("error_type"),
+                    "worker_error": response.get("error"),
+                    "worker_traceback": response.get("traceback"),
+                    "stdout_tail": _stream_tail(result.stdout),
+                    "stderr_tail": _stream_tail(result.stderr),
+                    "request": request_summary,
+                }
+            )
+        return None
+    return response
+
+
+def _stream_tail(value: object, limit: int = 1000) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value)
+    return text[-limit:]
 
 
 def _pyshiro_likelihood_wins(
     candidate: dict[str, object],
     alternatives: list[dict[str, object]],
     config: SongIdentificationConfig,
+    *,
+    margin: float | None = None,
+    require_preference: bool = True,
 ) -> tuple[bool, float, float | None]:
+    required_margin = config.pyshiro_likelihood_margin if margin is None else margin
     score = float(candidate.get("likelihood_per_frame", -1e9))
     alternative_scores = [
         float(value.get("likelihood_per_frame", -1e9)) for value in alternatives
     ]
     best_alternative = max(alternative_scores) if alternative_scores else None
     accepted = score >= config.pyshiro_likelihood_floor and (
-        best_alternative is None
-        or score >= best_alternative + config.pyshiro_likelihood_margin
+        not require_preference
+        or best_alternative is None
+        or score >= best_alternative + required_margin
     )
     return accepted, score, best_alternative
 
 
 def _competing_line_sets(
-    song: LibrarySong, line_ids: list[int], *, minimum: int = 2
+    song: LibrarySong,
+    line_ids: list[int],
+    *,
+    normalizer: JapaneseNormalizer,
+    minimum: int = 2,
 ) -> list[list[LyricLine]]:
     width = len(line_ids)
     if width <= 0:
         return []
     candidates: list[tuple[int, list[LyricLine]]] = []
     target_start = line_ids[0]
+    target_key = _lyric_lines_reading_key(
+        [song.lines[index] for index in line_ids], normalizer
+    )
+    seen = {target_key}
     for start in range(0, len(song.lines) - width + 1):
         ids = list(range(start, start + width))
         if ids == line_ids:
             continue
-        candidates.append(
-            (abs(start - target_start), list(song.lines[start : start + width]))
-        )
+        lines = list(song.lines[start : start + width])
+        key = _lyric_lines_reading_key(lines, normalizer)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append((abs(start - target_start), lines))
     candidates.sort(key=lambda item: item[0])
     return [lines for _distance, lines in candidates[:minimum]]
+
+
+def _lyric_lines_reading_key(
+    lines: list[LyricLine], normalizer: JapaneseNormalizer
+) -> str:
+    return normalizer("".join(line.reading or line.text for line in lines))
+
+
+def _anchor_has_continuous_support(
+    anchor: LyricAnchor, anchors: tuple[LyricAnchor, ...]
+) -> bool:
+    if anchor.line_end - anchor.line_start >= 2:
+        return True
+    return any(
+        other.take_index == anchor.take_index
+        and (
+            (
+                other.cue_index == anchor.cue_index - 1
+                and other.line_end == anchor.line_start
+            )
+            or (
+                other.cue_index == anchor.cue_index + 1
+                and anchor.line_end == other.line_start
+            )
+        )
+        for other in anchors
+        if other != anchor
+    )
 
 
 def _parse_worker_json_output(output: str) -> dict[str, object]:
@@ -2099,75 +2292,72 @@ def _align_match_with_pyshiro(
         display_units = [
             normalizer.display_units(line.text, line.reading) for line in lines
         ]
-        if any(not units for units in display_units):
-            audits.append(
-                {
-                    "cue_id": cue_id,
-                    "take_index": anchor.take_index,
-                    "status": "failed",
-                    "reason": "lyric_display_units_empty",
-                }
-            )
-            continue
-        request = {
-            "wav": str(wav.resolve()),
-            "readings": [
-                "".join(reading for _text, reading in units) for units in display_units
-            ],
-            "display_units": [
-                [{"text": text, "reading": reading} for text, reading in units]
-                for units in display_units
-            ],
-        }
-        result = subprocess.run(
-            [uv, "run", "--project", str(worker.parent), "python", str(worker)],
-            input=json.dumps(request, ensure_ascii=False),
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=120,
+        failure_audit: dict[str, object] = {}
+        response = _run_pyshiro_lines(
+            uv,
+            worker,
+            wav,
+            lines,
+            normalizer,
+            failure_audit=failure_audit,
         )
-        if result.returncode:
-            audits.append(
-                {
-                    "cue_id": cue_id,
-                    "status": "failed",
-                    "reason": result.stderr[-300:] or result.stdout[-300:],
-                }
-            )
-            continue
-        try:
-            response = _parse_worker_json_output(result.stdout)
-        except ValueError as exc:
+        if response is None:
             audits.append(
                 {
                     "cue_id": cue_id,
                     "take_index": anchor.take_index,
                     "status": "failed",
-                    "reason": str(exc),
+                    **failure_audit,
                 }
             )
             continue
-        competing = [
-            value
-            for lines_value in _competing_line_sets(match.song, line_ids)
-            if (value := _run_pyshiro_lines(uv, worker, wav, lines_value, normalizer))
-            is not None
-        ]
+        strong_anchor = _anchor_has_continuous_support(anchor, match.anchors)
+        competing: list[dict[str, object]] = []
+        competing_failures: list[dict[str, object]] = []
+        if not strong_anchor:
+            for lines_value in _competing_line_sets(
+                match.song, line_ids, normalizer=normalizer
+            ):
+                competing_failure: dict[str, object] = {}
+                value = _run_pyshiro_lines(
+                    uv,
+                    worker,
+                    wav,
+                    lines_value,
+                    normalizer,
+                    failure_audit=competing_failure,
+                )
+                if value is not None:
+                    competing.append(value)
+                else:
+                    competing_failures.append(competing_failure)
+        required_margin = 0.0 if strong_anchor else config.pyshiro_likelihood_margin
         accepted, likelihood, best_competing = _pyshiro_likelihood_wins(
-            response, competing, config
+            response,
+            competing,
+            config,
+            margin=required_margin,
+            require_preference=not strong_anchor,
         )
         if not accepted:
-            audits.append(
-                {
-                    "cue_id": cue_id,
-                    "take_index": anchor.take_index,
-                    "status": "rejected",
-                    "reason": "pyshiro_candidate_not_preferred",
-                    "likelihood_per_frame": likelihood,
-                    "best_competing_likelihood_per_frame": best_competing,
-                }
-            )
+            audit = {
+                "cue_id": cue_id,
+                "take_index": anchor.take_index,
+                "status": "rejected",
+                "reason": "pyshiro_candidate_not_preferred",
+                "likelihood_per_frame": likelihood,
+                "best_competing_likelihood_per_frame": best_competing,
+                "validation_policy": (
+                    "strong_continuous_alt_anchor"
+                    if strong_anchor
+                    else "isolated_single_line_alt_anchor"
+                ),
+                "required_likelihood_margin": required_margin,
+                "requires_competitor_preference": not strong_anchor,
+            }
+            if competing_failures:
+                audit["competitor_failures"] = competing_failures
+            audits.append(audit)
             continue
         ranges = response.get("lines")
         owned_units = response.get("units")
@@ -2301,6 +2491,13 @@ def _align_match_with_pyshiro(
                 ],
                 "likelihood_per_frame": likelihood,
                 "best_competing_likelihood_per_frame": best_competing,
+                "validation_policy": (
+                    "strong_continuous_alt_anchor"
+                    if strong_anchor
+                    else "isolated_single_line_alt_anchor"
+                ),
+                "required_likelihood_margin": required_margin,
+                "requires_competitor_preference": not strong_anchor,
                 "vocal_active_ratio": round(active_ratio, 6),
                 "phonemes": response.get("phonemes"),
             }
@@ -2623,6 +2820,8 @@ class _WebTools:
         if url not in self.allowed_urls or not _supported_lyrics_url(url):
             return None
         response = self._worker({"action": "fetch_lyrics", "url": url})
+        if response.get("error"):
+            raise RuntimeError(str(response["error"])[:500])
         title = response.get("title")
         artist = response.get("artist")
         lines = response.get("lines")

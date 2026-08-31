@@ -8,7 +8,7 @@
 subtitle-pipeline --config config.toml knowledge ingest-work
 ```
 
-该命令读取每个任务的 YouTube metadata、讲话 ASR 和 SC。普通观众 chat 默认不写入长期知识库；重复运行时根据内容哈希跳过未变化文档。
+该命令读取每个任务的 YouTube metadata 和 SC，不导入本项目生成的 ASR 或字幕正文。普通观众 chat 默认不写入长期知识库；重复运行时根据内容哈希跳过未变化文档。
 
 ## 获取历史直播字幕
 
@@ -67,10 +67,30 @@ subtitle-pipeline --config config.toml knowledge ingest-jsonl \
 
 推荐 `source_type`：`x_post`、`instagram_post`、`official_news`、`official_event`、`concert`、`promotion`。网页抓取器只负责取得原始资料和出处；切块、去重、FTS 索引及检索审计由知识库统一处理。
 
+## 萃取术语
+
+新增或变化的文档会进入术语萃取队列：
+
+```bash
+subtitle-pipeline --config config.toml knowledge extract-terms
+```
+
+程序先使用 Sudachi、GiNZA、引号、标签及片假名/英文/混合文字模式，从全部待处理文档中提取原样候选。候选在调用 LLM 前按规范化词形跨文档累计，汇总出现次数、文档数、来源分布和最多 8 条代表性上下文。SC 用户名会在本地提取前移除。
+
+LLM 只能筛选程序给出的候选，不能自行新增或改写词形。它为保留项返回稳定中文译法，并选择 `accept` 或 `search`：证据充分的 `accept` 直接入库；只有 `search` 才使用模型给出的查询词联网，最多保留 4 条标题、摘要和 URL，再针对单个候选做一次确认。未返回的候选视为拒绝。首轮不推断 alias 或 ASR 误听关系；别名只来自人工词表或后续有可靠书面证据的独立处理。
+
+自动 term 只是 ASR 纠错和翻译 LLM 的检索参考，不是强制替换规则。人工 JSON 词表对应 `verified`，冲突时始终优先；LLM 复核通过的自动 term 为 `active`。最终是否进入某个提示词仍由窗口级 RAG 相关度决定。
+
+每个候选给 LLM 的内容为：原样候选、出现次数、文档数、来源计数，以及候选附近的代表性文本。上下文优先采用官网、视频 metadata、X/Instagram 和人工字幕，再补充自动字幕与 SC。提示词不包含 document ID、chunk ID 或精确时间；数据库内部仍保留命中 chunk，用于来源追溯。
+
+DeepSeek 默认使用 262144 token 总上下文、220000 token 目标输入和 16384 token 最大输出；本地模型自动受 llama-server context 上限约束。候选记录达到输入预算时按完整候选切批，不拆开单个候选。首轮不限制 term 数量，但要求严格排除普通词、临时称呼、偶然提及和证据不足的候选。
+
+本地候选出现记录会跨增量运行保留。某个候选今天只出现一次时不会调用 LLM；以后在另一个逻辑文档中再次出现后，程序会合并历史上下文再筛选。搜索查询、结果、错误和最终确认结果写入 `knowledge-term-extraction-audit.jsonl`。不存在对所有 active term 再统一搜索的第二遍流程。
+
 ## 查看状态
 
 ```bash
 subtitle-pipeline --config config.toml knowledge stats
 ```
 
-字幕流水线不会自动联网扩充知识库。它只读取已经入库的资料，并将每次召回及各项分数记录到任务目录的 `fan-knowledge-audit.jsonl`。
+完整字幕流水线会按配置执行增量资料更新和待处理 term 萃取；已经处理且内容未变化的资料不会重复抓取。每次召回及各项分数记录到任务目录的 `fan-knowledge-audit.jsonl`。

@@ -144,6 +144,7 @@ pyshiro_max_window_seconds = 20.0
 lyric_gap_recheck_seconds = 20.0
 lyric_gap_vocal_active_ratio = 0.08
 pyshiro_likelihood_floor = -30.0
+pyshiro_gap_likelihood_margin = 0.1
 pyshiro_likelihood_margin = 0.2
 lyric_neighbor_max_lines = 12
 lyric_neighbor_min_coverage = 0.45
@@ -243,6 +244,12 @@ sns_sources = [
 embedding_model = "intfloat/multilingual-e5-base"
 vector_index_path = "databases/fan-knowledge.faiss"
 vector_minimum_score = 0.62
+reranker_model = "BAAI/bge-reranker-v2-m3"
+reranker_minimum_score = 0.05
+# DeepSeek term extraction uses larger timeline batches than translation.
+term_extraction_context_size = 262144
+term_extraction_target_input_tokens = 220000
+term_extraction_max_output_tokens = 16384
 
 [llm]
 base_url = "http://127.0.0.1:8080/v1"

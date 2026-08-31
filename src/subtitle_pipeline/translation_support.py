@@ -53,12 +53,6 @@ def best_split(units: tuple[LocalUnit, ...], start: int, end: int) -> int:
     )
 
 
-def contains_kana(text: str, target_language: str) -> bool:
-    return target_language in {"简体中文", "繁體中文", "Chinese"} and any(
-        "\u3040" <= character <= "\u30ff" for character in text
-    )
-
-
 def dialogue_context(
     all_units: list[LocalUnit],
     selected: tuple[LocalUnit, ...],
@@ -128,23 +122,6 @@ def machine_translate_with_protected_terms(
         else remainder
     )
     return "".join(pieces)
-
-
-def normalize_residual_japanese(
-    text: str,
-    replacements: tuple[tuple[str, str], ...],
-    local_translate: Callable[[str], str] | None = None,
-    source_language: str | None = None,
-) -> str:
-    if not _KANA_FRAGMENT_RE.search(text):
-        return text
-    return machine_translate_with_protected_terms(
-        text,
-        replacements,
-        local_translate,
-        force=False,
-        source_language=source_language,
-    )
 
 
 def reference_replacements(

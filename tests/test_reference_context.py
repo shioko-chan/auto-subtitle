@@ -24,7 +24,7 @@ class ReferenceContextTests(unittest.TestCase):
         self.assertEqual(compact["video"], {"title": "直播标题", "channel": "频道"})
         self.assertEqual(compact["terms"], {"原词": "译词"})
 
-    def test_translation_reference_keeps_only_batch_relevant_entries(self) -> None:
+    def test_translation_reference_excludes_terms_owned_by_rag(self) -> None:
         compact = compact_translation_reference_context(
             {
                 "video": {
@@ -49,18 +49,14 @@ class ReferenceContextTests(unittest.TestCase):
                 "terms": {"アクスタ": "亚克力立牌", "無関係": "无关"},
                 "asr_entities": [{"surface": "不应注入"}],
                 "fan_knowledge": [{"body": "不应重复注入"}],
-            },
-            evidence_text="アクスタの話",
-            speakers={"speaker_a"},
+            }
         )
 
         self.assertEqual(
             compact["video"], {"title": "直播标题", "channel": "频道"}
         )
-        self.assertEqual(
-            [value["id"] for value in compact["characters"]], ["speaker_a"]
-        )
-        self.assertEqual(compact["terms"], {"アクスタ": "亚克力立牌"})
+        self.assertNotIn("characters", compact)
+        self.assertNotIn("terms", compact)
         self.assertNotIn("asr_entities", compact)
         self.assertNotIn("fan_knowledge", compact)
 

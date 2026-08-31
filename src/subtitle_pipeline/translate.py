@@ -57,11 +57,23 @@ class LocalLLMError(TranslationError):
     pass
 
 
+def is_llm_quota_exhausted(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, LLMHTTPError) and current.status == 402:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 _HONORIFIC_TRANSLATION_RULES = (
-    "Apply these Japanese-honorific rules when translating into Chinese. Usually omit さん; "
-    "translate it as 先生, 女士, or 老师 only in a formal context and according to the "
-    "person's role. Translate ちゃん as 酱, 小 followed by the name, or another natural "
-    "affectionate form. Usually omit くん; use 君 or 同学 only when context requires it. "
+    "Apply these Japanese-honorific rules when translating into Chinese. さん may be "
+    "rendered as 桑 in fan dialogue or a stable affectionate nickname; otherwise usually "
+    "omit it or translate it as 先生, 女士, or 老师 according to the person's role. "
+    "Translate ちゃん as 酱, 小 followed by the name, or another natural affectionate "
+    "form. Usually omit くん; use 君 or 同学 only when context requires it. "
     "Translate さま or 様 as 大人, 阁下, 先生, or another status-appropriate form. "
     "Translate 先生 as 老师, 医生, or 先生 according to the person's actual role. An explicit "
     "REFERENCE mapping for a complete name-plus-honorific form overrides these defaults. "
@@ -264,7 +276,7 @@ class OpenAICompatibleTranslator:
                 ):
                     raise ValueError("lyrics translation did not cover every line")
                 return translated, "llm"
-            except Exception as exc:  # noqa: BLE001 - established API retry policy
+            except Exception as exc:
                 last_error = exc
                 self._log_invalid_response(
                     "lyrics_translation", exc, content, body, response
@@ -274,17 +286,7 @@ class OpenAICompatibleTranslator:
                 delay = _transient_retry_delay(exc, attempt)
                 if delay is not None:
                     time.sleep(delay)
-        logging.warning(
-            "lyrics translation exhausted LLM retries; using local machine translation: %s",
-            last_error,
-        )
-        return (
-            {
-                line_id: self.local_translator.translate(line).strip()
-                for line_id, line in enumerate(lines)
-            },
-            "machine",
-        )
+        raise RuntimeError("lyrics translation exhausted LLM retries") from last_error
 
     def review_lyrics(
         self,
@@ -874,8 +876,10 @@ def _parse_retry_after(
 
 
 def _is_nontransient_http_error(exc: Exception) -> bool:
-    return isinstance(exc, LocalLLMError) or isinstance(exc, LLMHTTPError) and not (
-        exc.status == 429 or 500 <= exc.status < 600
+    return (
+        isinstance(exc, LocalLLMError)
+        or isinstance(exc, LLMHTTPError)
+        and not (exc.status == 429 or 500 <= exc.status < 600)
     )
 
 

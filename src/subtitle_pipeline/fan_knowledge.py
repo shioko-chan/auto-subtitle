@@ -8,24 +8,27 @@ import sqlite3
 import threading
 import unicodedata
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime
 from difflib import SequenceMatcher
-from functools import lru_cache
 from pathlib import Path
 from typing import Self
 
+from .cross_encoder import LocalCrossEncoderReranker
 from .vector_index import LocalVectorIndex
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_+.-]*|[\u3040-\u30ff\u3400-\u9fff]+")
 _JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 7
 _LEXICAL_CANDIDATES = 40
 _VECTOR_CANDIDATES = 40
 _FUSION_CANDIDATES = 30
 _RRF_K = 60
 _RRF_WEIGHTS = {"fts": 1.0, "vector": 1.0, "entity": 2.0}
 _MAX_RESULTS_PER_SOURCE = 2
+_TERM_REFERENCE_KINDS = frozenset({"term", "character", "entity"})
+_SUDACHI_LOCAL = threading.local()
+_CURATED_TRANSLATION_RE = re.compile(r"固定中文(?:名|译法)为(.+?)。$")
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,87 @@ class DocumentUpsertResult:
 
 
 @dataclass(frozen=True)
+class TermExtractionChunk:
+    chunk_id: str
+    text: str
+    start_seconds: float | None = None
+    end_seconds: float | None = None
+    speaker: str | None = None
+    language: str | None = None
+    document_id: str = ""
+    source_type: str = ""
+    sender: str | None = None
+    published_at: str | None = None
+    document_title: str = ""
+    source_url: str | None = None
+    relation: str | None = None
+    related_post_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PendingTermDocument:
+    document_id: str
+    source_type: str
+    title: str
+    source_url: str | None
+    reliability: float
+    content_hash: str
+    chunks: tuple[TermExtractionChunk, ...]
+    backfill: bool = False
+    external_id: str = ""
+    author: str | None = None
+    published_at: str | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TermCandidateOccurrence:
+    normalized_form: str
+    surface: str
+    document_id: str
+    logical_document_id: str
+    chunk_id: str
+    context: str
+    source_type: str
+    reliability: float
+    strong_name_evidence: bool
+    occurrence_count: int = 1
+
+
+@dataclass(frozen=True)
+class ExtractedTerm:
+    surface: str
+    canonical_zh: str
+    aliases: tuple[str, ...]
+    reading: str
+    relation: str
+    evidence_chunk_ids: tuple[str, ...]
+    confidence: float
+    asr_aliases: tuple[str, ...] = ()
+    reviewed_conflict: bool = False
+    description_zh: str = ""
+    source_urls: tuple[str, ...] = ()
+    enrichment_reviewed: bool = False
+
+
+@dataclass(frozen=True)
+class CuratedTermMapping:
+    canonical_zh: str
+    record_id: str
+
+
+@dataclass(frozen=True)
+class KnownTermMapping:
+    surface: str
+    canonical_zh: str
+    aliases: tuple[str, ...]
+    asr_aliases: tuple[str, ...]
+    reading: str
+    confidence: float
+    curated: bool = False
+
+
+@dataclass(frozen=True)
 class KnowledgeQuery:
     text: str
     speaker: str | None = None
@@ -105,6 +189,7 @@ class KnowledgeScore:
     idf: float = 0.0
     lexical_terms: int = 0
     specificity: int = 0
+    reranker: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -167,16 +252,22 @@ class FanKnowledgeRetriever:
         embedding_model: str | None = None,
         vector_index_path: Path | None = None,
         vector_minimum_score: float = 0.62,
+        reranker_model: str | None = None,
+        reranker_minimum_score: float = 0.05,
     ) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         self._database_path = database_path
         self._audit_path = audit_path
         self._weights = weights or RetrievalWeights()
         self._vector_minimum_score = vector_minimum_score
+        self._reranker_minimum_score = reranker_minimum_score
         self._vector_index = (
             LocalVectorIndex(vector_index_path, embedding_model)
             if embedding_model and vector_index_path is not None
             else None
+        )
+        self._reranker = (
+            LocalCrossEncoderReranker(reranker_model) if reranker_model else None
         )
         self._lock = threading.Lock()
         self._database = sqlite3.connect(database_path, check_same_thread=False)
@@ -333,7 +424,744 @@ class FanKnowledgeRetriever:
                         _fts_search_text((document.title, chunk.text.strip())),
                     ),
                 )
+            self._database.execute(
+                """
+                INSERT INTO knowledge_term_extraction_queue (
+                    document_id, content_hash, queued_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(document_id) DO UPDATE SET
+                    content_hash=excluded.content_hash,
+                    queued_at=excluded.queued_at
+                """,
+                (document.document_id, content_hash, _utc_now()),
+            )
         return DocumentUpsertResult(document.document_id, True, len(chunk_values))
+
+    def queue_all_documents_for_term_extraction(self) -> int:
+        with self._lock, self._database:
+            before = self._database.total_changes
+            self._database.execute(
+                """
+                INSERT INTO knowledge_term_backfill_queue (
+                    document_id, content_hash, queued_at
+                )
+                SELECT document_id, content_hash, ? FROM knowledge_documents
+                WHERE TRUE
+                ON CONFLICT(document_id) DO UPDATE SET
+                    content_hash=excluded.content_hash,
+                    queued_at=excluded.queued_at
+                """,
+                (_utc_now(),),
+            )
+            return self._database.total_changes - before
+
+    def pending_term_documents(
+        self,
+        maximum_documents: int | None = None,
+        *,
+        include_backfill: bool = False,
+    ) -> list[PendingTermDocument]:
+        queue_table = (
+            "knowledge_term_backfill_queue"
+            if include_backfill
+            else "knowledge_term_extraction_queue"
+        )
+        limit = "" if maximum_documents is None else "LIMIT ?"
+        parameters: tuple[object, ...] = (
+            () if maximum_documents is None else (maximum_documents,)
+        )
+        rows = self._database.execute(
+            f"""
+            SELECT documents.document_id, documents.source_type,
+                   documents.external_id, documents.title, documents.source_url,
+                   documents.author, documents.published_at,
+                   documents.metadata_json, documents.reliability,
+                   documents.content_hash
+            FROM {queue_table} AS queue
+            JOIN knowledge_documents AS documents
+              ON documents.document_id = queue.document_id
+            WHERE queue.content_hash = documents.content_hash
+            ORDER BY queue.queued_at, documents.document_id
+            {limit}
+            """,
+            parameters,
+        ).fetchall()
+        return self._pending_term_documents_from_rows(rows, backfill=include_backfill)
+
+    def _pending_term_documents_from_rows(
+        self, rows: Iterable[sqlite3.Row], *, backfill: bool
+    ) -> list[PendingTermDocument]:
+        pending: list[PendingTermDocument] = []
+        for row in rows:
+            chunk_rows = self._database.execute(
+                """
+                SELECT chunk_id, text, start_seconds, end_seconds,
+                       speaker, language
+                FROM knowledge_document_chunks
+                WHERE document_id = ?
+                ORDER BY ordinal
+                """,
+                (row["document_id"],),
+            ).fetchall()
+            pending.append(
+                PendingTermDocument(
+                    document_id=str(row["document_id"]),
+                    source_type=str(row["source_type"]),
+                    title=str(row["title"]),
+                    source_url=(
+                        str(row["source_url"])
+                        if row["source_url"] is not None
+                        else None
+                    ),
+                    reliability=float(row["reliability"]),
+                    content_hash=str(row["content_hash"]),
+                    chunks=tuple(
+                        TermExtractionChunk(
+                            str(chunk["chunk_id"]),
+                            str(chunk["text"]),
+                            (
+                                float(chunk["start_seconds"])
+                                if chunk["start_seconds"] is not None
+                                else None
+                            ),
+                            (
+                                float(chunk["end_seconds"])
+                                if chunk["end_seconds"] is not None
+                                else None
+                            ),
+                            (
+                                str(chunk["speaker"])
+                                if chunk["speaker"] is not None
+                                else None
+                            ),
+                            (
+                                str(chunk["language"])
+                                if chunk["language"] is not None
+                                else None
+                            ),
+                            str(row["document_id"]),
+                            str(row["source_type"]),
+                            (str(row["author"]) if row["author"] is not None else None),
+                            (
+                                str(row["published_at"])
+                                if row["published_at"] is not None
+                                else None
+                            ),
+                            str(row["title"]),
+                            (
+                                str(row["source_url"])
+                                if row["source_url"] is not None
+                                else None
+                            ),
+                        )
+                        for chunk in chunk_rows
+                    ),
+                    backfill=backfill,
+                    external_id=str(row["external_id"]),
+                    author=(str(row["author"]) if row["author"] is not None else None),
+                    published_at=(
+                        str(row["published_at"])
+                        if row["published_at"] is not None
+                        else None
+                    ),
+                    metadata=json.loads(str(row["metadata_json"])),
+                )
+            )
+        return pending
+
+    def replace_term_candidate_occurrences(
+        self,
+        document_ids: Iterable[str],
+        occurrences: Iterable[TermCandidateOccurrence],
+    ) -> None:
+        ids = tuple(dict.fromkeys(value for value in document_ids if value))
+        values = tuple(occurrences)
+        allowed_ids = set(ids)
+        if any(value.document_id not in allowed_ids for value in values):
+            raise ValueError("term candidate occurrence belongs to an unknown document")
+        with self._lock, self._database:
+            for start in range(0, len(ids), 500):
+                batch = ids[start : start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                self._database.execute(
+                    "DELETE FROM knowledge_term_candidate_occurrences "
+                    f"WHERE document_id IN ({placeholders})",
+                    batch,
+                )
+
+            self._database.executemany(
+                """
+                INSERT INTO knowledge_term_candidate_occurrences (
+                    normalized_form, surface, document_id, logical_document_id,
+                    chunk_id, context, source_type, reliability,
+                    strong_name_evidence, occurrence_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(normalized_form, chunk_id, context) DO UPDATE SET
+                    occurrence_count=(
+                        knowledge_term_candidate_occurrences.occurrence_count
+                        + excluded.occurrence_count
+                    ),
+                    strong_name_evidence=MAX(
+                        knowledge_term_candidate_occurrences.strong_name_evidence,
+                        excluded.strong_name_evidence
+                    )
+                """,
+                [
+                    (
+                        value.normalized_form,
+                        value.surface,
+                        value.document_id,
+                        value.logical_document_id,
+                        value.chunk_id,
+                        value.context,
+                        value.source_type,
+                        value.reliability,
+                        int(value.strong_name_evidence),
+                        value.occurrence_count,
+                    )
+                    for value in values
+                ],
+            )
+
+    def term_candidate_forms_for_documents(
+        self, document_ids: Iterable[str]
+    ) -> set[str]:
+        ids = tuple(dict.fromkeys(value for value in document_ids if value))
+        forms: set[str] = set()
+        for start in range(0, len(ids), 500):
+            batch = ids[start : start + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._database.execute(
+                f"SELECT DISTINCT normalized_form "
+                f"FROM knowledge_term_candidate_occurrences "
+                f"WHERE document_id IN ({placeholders})",
+                batch,
+            ).fetchall()
+            forms.update(str(row["normalized_form"]) for row in rows)
+        return forms
+
+    def term_candidate_occurrences(
+        self, normalized_forms: Iterable[str]
+    ) -> list[TermCandidateOccurrence]:
+        forms = tuple(dict.fromkeys(value for value in normalized_forms if value))
+        if not forms:
+            return []
+        rows: list[sqlite3.Row] = []
+        for start in range(0, len(forms), 500):
+            batch = forms[start : start + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows.extend(
+                self._database.execute(
+                    f"""
+                    SELECT normalized_form, surface, document_id,
+                           logical_document_id, chunk_id, context, source_type,
+                           reliability, strong_name_evidence, occurrence_count
+                    FROM knowledge_term_candidate_occurrences
+                    WHERE normalized_form IN ({placeholders})
+                    ORDER BY normalized_form, document_id, chunk_id
+                    """,
+                    batch,
+                ).fetchall()
+            )
+        return [
+            TermCandidateOccurrence(
+                normalized_form=str(row["normalized_form"]),
+                surface=str(row["surface"]),
+                document_id=str(row["document_id"]),
+                logical_document_id=str(row["logical_document_id"]),
+                chunk_id=str(row["chunk_id"]),
+                context=str(row["context"]),
+                source_type=str(row["source_type"]),
+                reliability=float(row["reliability"]),
+                strong_name_evidence=bool(row["strong_name_evidence"]),
+                occurrence_count=int(row["occurrence_count"]),
+            )
+            for row in rows
+        ]
+
+    def finish_term_preparation(
+        self,
+        documents: Iterable[PendingTermDocument],
+        *,
+        touched_forms: Iterable[str],
+        pending_review_forms: Iterable[str],
+        backfill: bool,
+    ) -> None:
+        document_values = tuple(documents)
+        touched = tuple(dict.fromkeys(value for value in touched_forms if value))
+        pending = tuple(dict.fromkeys(value for value in pending_review_forms if value))
+        with self._lock, self._database:
+            for document in document_values:
+                for queue_table in (
+                    "knowledge_term_extraction_queue",
+                    "knowledge_term_backfill_queue",
+                ):
+                    self._database.execute(
+                        f"DELETE FROM {queue_table} "
+                        "WHERE document_id = ? AND content_hash = ?",
+                        (document.document_id, document.content_hash),
+                    )
+            for start in range(0, len(touched), 500):
+                batch = touched[start : start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                self._database.execute(
+                    f"DELETE FROM knowledge_term_review_queue "
+                    f"WHERE normalized_form IN ({placeholders})",
+                    batch,
+                )
+            self._database.executemany(
+                """
+                INSERT INTO knowledge_term_review_queue (
+                    normalized_form, queued_at, backfill
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(normalized_form) DO UPDATE SET
+                    queued_at=excluded.queued_at,
+                    backfill=MIN(knowledge_term_review_queue.backfill,
+                                 excluded.backfill)
+                """,
+                [(value, _utc_now(), int(backfill)) for value in pending],
+            )
+
+    def pending_term_review_forms(
+        self,
+        maximum_candidates: int | None = None,
+        *,
+        include_backfill: bool = False,
+    ) -> list[str]:
+        limit = "" if maximum_candidates is None else "LIMIT ?"
+        parameters: tuple[object, ...] = (
+            () if maximum_candidates is None else (maximum_candidates,)
+        )
+        rows = self._database.execute(
+            f"""
+            SELECT normalized_form
+            FROM knowledge_term_review_queue
+            WHERE backfill = 0 OR ?
+            ORDER BY queued_at, normalized_form
+            {limit}
+            """,
+            (int(include_backfill), *parameters),
+        ).fetchall()
+        return [str(row["normalized_form"]) for row in rows]
+
+    def complete_term_reviews(self, normalized_forms: Iterable[str]) -> None:
+        forms = tuple(dict.fromkeys(value for value in normalized_forms if value))
+        if not forms:
+            return
+        with self._lock, self._database:
+            for start in range(0, len(forms), 500):
+                batch = forms[start : start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                self._database.execute(
+                    f"DELETE FROM knowledge_term_review_queue "
+                    f"WHERE normalized_form IN ({placeholders})",
+                    batch,
+                )
+
+    def term_documents(self, document_ids: Iterable[str]) -> list[PendingTermDocument]:
+        ids = tuple(dict.fromkeys(value for value in document_ids if value))
+        if not ids:
+            return []
+        rows: list[sqlite3.Row] = []
+        for start in range(0, len(ids), 500):
+            batch = ids[start : start + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows.extend(
+                self._database.execute(
+                    f"""
+                    SELECT document_id, source_type, external_id, title, source_url,
+                           author, published_at, metadata_json, reliability,
+                           content_hash
+                    FROM knowledge_documents
+                    WHERE document_id IN ({placeholders})
+                    ORDER BY document_id
+                    """,
+                    batch,
+                ).fetchall()
+            )
+        return self._pending_term_documents_from_rows(rows, backfill=False)
+
+    def store_extracted_terms(
+        self,
+        document: PendingTermDocument,
+        terms: Iterable[ExtractedTerm],
+    ) -> tuple[int, int]:
+        valid_chunk_ids = {chunk.chunk_id for chunk in document.chunks}
+        stored = 0
+        published = 0
+        with self._lock, self._database:
+            for term in terms:
+                evidence_ids = tuple(
+                    value
+                    for value in term.evidence_chunk_ids
+                    if value in valid_chunk_ids
+                )
+                if not evidence_ids:
+                    continue
+                term_id = self._resolve_extracted_term_id(
+                    term.surface, (*term.aliases, *term.asr_aliases)
+                )
+                term_id = term_id or _extracted_term_id(term.surface)
+                curated = self._curated_term_mapping(term.surface, term.aliases)
+                existing = self._database.execute(
+                    "SELECT * FROM knowledge_extracted_terms WHERE term_id = ?",
+                    (term_id,),
+                ).fetchone()
+                stored_surface = (
+                    str(existing["surface"])
+                    if existing is not None
+                    else term.surface.strip()
+                )
+                new_aliases = tuple(
+                    dict.fromkeys(
+                        value.strip()
+                        for value in (term.surface, *term.aliases)
+                        if value.strip() and value.strip() != stored_surface
+                    )
+                )
+                old_aliases = (
+                    tuple(json.loads(str(existing["aliases_json"])))
+                    if existing is not None
+                    else ()
+                )
+                aliases = tuple(dict.fromkeys((*old_aliases, *new_aliases)))
+                old_asr_aliases = (
+                    tuple(json.loads(str(existing["asr_aliases_json"])))
+                    if existing is not None
+                    else ()
+                )
+                asr_aliases = tuple(
+                    dict.fromkeys(
+                        value.strip()
+                        for value in (*old_asr_aliases, *term.asr_aliases)
+                        if value.strip()
+                        and value.strip() != stored_surface
+                        and value.strip() not in aliases
+                    )
+                )
+                status = "verified" if curated is not None else "active"
+                preserve_existing = existing is not None and (
+                    str(existing["status"]) == "verified"
+                    or (
+                        str(existing["status"]) == "active"
+                        and not term.reviewed_conflict
+                        and str(existing["canonical_zh"]) != term.canonical_zh.strip()
+                    )
+                )
+                canonical_zh = (
+                    curated.canonical_zh
+                    if curated is not None
+                    else (
+                        str(existing["canonical_zh"])
+                        if preserve_existing
+                        else term.canonical_zh.strip()
+                    )
+                )
+                stored_status = str(existing["status"]) if preserve_existing else status
+                confidence = (
+                    float(existing["confidence"])
+                    if preserve_existing
+                    else term.confidence
+                )
+                self._database.execute(
+                    """
+                    INSERT INTO knowledge_extracted_terms (
+                        term_id, surface, canonical_zh, aliases_json,
+                        asr_aliases_json,
+                        reading, status, confidence, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(term_id) DO UPDATE SET
+                        canonical_zh=excluded.canonical_zh,
+                        aliases_json=excluded.aliases_json,
+                        asr_aliases_json=excluded.asr_aliases_json,
+                        reading=excluded.reading,
+                        status=excluded.status,
+                        confidence=MAX(knowledge_extracted_terms.confidence,
+                                       excluded.confidence),
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        term_id,
+                        stored_surface,
+                        canonical_zh,
+                        json.dumps(aliases, ensure_ascii=False),
+                        json.dumps(asr_aliases, ensure_ascii=False),
+                        term.reading.strip(),
+                        stored_status,
+                        confidence,
+                        _utc_now(),
+                    ),
+                )
+                self._replace_term_forms(
+                    term_id, stored_surface, (*aliases, *asr_aliases)
+                )
+                if term.enrichment_reviewed:
+                    self._database.execute(
+                        """
+                        INSERT INTO knowledge_extracted_term_details (
+                            term_id, description_zh, source_urls_json, updated_at
+                        ) VALUES (?, ?, ?, ?)
+                        ON CONFLICT(term_id) DO UPDATE SET
+                            description_zh=excluded.description_zh,
+                            source_urls_json=excluded.source_urls_json,
+                            updated_at=excluded.updated_at
+                        """,
+                        (
+                            term_id,
+                            term.description_zh.strip(),
+                            json.dumps(term.source_urls, ensure_ascii=False),
+                            _utc_now(),
+                        ),
+                    )
+                for chunk_id in evidence_ids:
+                    chunk = next(
+                        value for value in document.chunks if value.chunk_id == chunk_id
+                    )
+                    self._database.execute(
+                        """
+                        INSERT OR REPLACE INTO knowledge_term_evidence (
+                            term_id, chunk_id, document_id, relation,
+                            canonical_zh, evidence_text, source_type, confidence
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            term_id,
+                            chunk_id,
+                            document.document_id,
+                            term.relation,
+                            term.canonical_zh.strip(),
+                            chunk.text,
+                            document.source_type,
+                            term.confidence,
+                        ),
+                    )
+                stored += 1
+                if stored_status in {"active", "verified"} and curated is None:
+                    self._publish_extracted_term(term_id)
+                    published += 1
+            if published:
+                self._database.execute(
+                    "INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild')"
+                )
+        return stored, published
+
+    def known_term_mapping(
+        self, surface: str, aliases: Iterable[str]
+    ) -> KnownTermMapping | None:
+        alias_values = tuple(value.strip() for value in aliases if value.strip())
+        with self._lock:
+            curated = self._curated_term_mapping(surface, alias_values)
+            if curated is not None:
+                return KnownTermMapping(
+                    surface.strip(),
+                    curated.canonical_zh,
+                    alias_values,
+                    (),
+                    "",
+                    1.0,
+                    True,
+                )
+            term_id = self._resolve_extracted_term_id(surface, alias_values)
+            if term_id is None:
+                return None
+            row = self._database.execute(
+                "SELECT * FROM knowledge_extracted_terms WHERE term_id = ?", (term_id,)
+            ).fetchone()
+            if row is None or str(row["status"]) not in {"active", "verified"}:
+                return None
+            return KnownTermMapping(
+                str(row["surface"]),
+                str(row["canonical_zh"]),
+                tuple(json.loads(str(row["aliases_json"]))),
+                tuple(json.loads(str(row["asr_aliases_json"]))),
+                str(row["reading"]),
+                float(row["confidence"]),
+            )
+
+    def _resolve_extracted_term_id(
+        self, surface: str, aliases: Iterable[str]
+    ) -> str | None:
+        normalized_forms = tuple(
+            dict.fromkeys(
+                _normalize_term_form(value)
+                for value in (surface, *aliases)
+                if value.strip()
+            )
+        )
+        if not normalized_forms:
+            return None
+        placeholders = ",".join("?" for _ in normalized_forms)
+        rows = self._database.execute(
+            f"SELECT DISTINCT forms.term_id "
+            f"FROM knowledge_term_forms AS forms "
+            f"JOIN knowledge_extracted_terms AS terms "
+            f"ON terms.term_id = forms.term_id "
+            f"WHERE forms.normalized_form IN ({placeholders})",
+            normalized_forms,
+        ).fetchall()
+        term_ids = {str(row["term_id"]) for row in rows}
+        if len(term_ids) == 1:
+            return next(iter(term_ids))
+        surface_id = _extracted_term_id(surface)
+        return surface_id if surface_id in term_ids else None
+
+    def _replace_term_forms(
+        self, term_id: str, surface: str, aliases: Iterable[str]
+    ) -> None:
+        forms: dict[str, str] = {}
+        for value in (surface, *aliases):
+            form = value.strip()
+            normalized = _normalize_term_form(form)
+            if normalized:
+                forms.setdefault(normalized, form)
+        self._database.execute(
+            "DELETE FROM knowledge_term_forms WHERE term_id = ?", (term_id,)
+        )
+        self._database.executemany(
+            "INSERT INTO knowledge_term_forms(term_id, normalized_form, form) "
+            "VALUES(?, ?, ?)",
+            [(term_id, normalized, form) for normalized, form in forms.items()],
+        )
+
+    def reconcile_extracted_terms_with_curated(self) -> int:
+        rows = self._database.execute(
+            "SELECT term_id, surface, aliases_json, asr_aliases_json "
+            "FROM knowledge_extracted_terms"
+        ).fetchall()
+        updates: list[tuple[str, str]] = []
+        for row in rows:
+            aliases = (
+                *json.loads(str(row["aliases_json"])),
+                *json.loads(str(row["asr_aliases_json"])),
+            )
+            curated = self._curated_term_mapping(str(row["surface"]), aliases)
+            if curated is not None:
+                updates.append((curated.canonical_zh, str(row["term_id"])))
+        with self._lock, self._database:
+            self._database.executemany(
+                "UPDATE knowledge_extracted_terms SET canonical_zh = ?, "
+                "status = 'verified', updated_at = ? WHERE term_id = ?",
+                [
+                    (canonical_zh, _utc_now(), term_id)
+                    for canonical_zh, term_id in updates
+                ],
+            )
+            self._database.executemany(
+                "DELETE FROM knowledge_records WHERE record_id = ?",
+                [(f"extracted:{term_id}",) for _target, term_id in updates],
+            )
+            if updates:
+                self._database.execute(
+                    "INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild')"
+                )
+            self._sync_term_forms()
+        return len(updates)
+
+    def _sync_term_forms(self) -> None:
+        rows = self._database.execute(
+            "SELECT term_id, surface, aliases_json, asr_aliases_json "
+            "FROM knowledge_extracted_terms"
+        ).fetchall()
+        for row in rows:
+            self._replace_term_forms(
+                str(row["term_id"]),
+                str(row["surface"]),
+                (
+                    *json.loads(str(row["aliases_json"])),
+                    *json.loads(str(row["asr_aliases_json"])),
+                ),
+            )
+
+    def _curated_term_mapping(
+        self, surface: str, aliases: Iterable[str]
+    ) -> CuratedTermMapping | None:
+        forms = {
+            surface.strip(),
+            *(value.strip() for value in aliases if value.strip()),
+        }
+        rows = self._database.execute(
+            """
+            SELECT record_id, title, body, aliases
+            FROM knowledge_records
+            WHERE source_type = 'curated_glossary'
+              AND kind IN ('term', 'character')
+            ORDER BY reliability DESC, record_id
+            """
+        ).fetchall()
+        for row in rows:
+            record_forms = {str(row["title"]), *json.loads(str(row["aliases"]))}
+            if not forms & record_forms:
+                continue
+            match = _CURATED_TRANSLATION_RE.search(str(row["body"]))
+            if match is None:
+                continue
+            return CuratedTermMapping(
+                canonical_zh=match.group(1).strip(),
+                record_id=str(row["record_id"]),
+            )
+        return None
+
+    def _publish_extracted_term(self, term_id: str) -> None:
+        row = self._database.execute(
+            """
+            SELECT terms.*, details.description_zh, details.source_urls_json
+            FROM knowledge_extracted_terms AS terms
+            LEFT JOIN knowledge_extracted_term_details AS details
+              ON details.term_id = terms.term_id
+            WHERE terms.term_id = ?
+            """,
+            (term_id,),
+        ).fetchone()
+        if row is None:
+            return
+        aliases = tuple(json.loads(str(row["aliases_json"])))
+        asr_aliases = tuple(json.loads(str(row["asr_aliases_json"])))
+        body = f"{row['surface']}的参考中文译名为{row['canonical_zh']}。"
+        if asr_aliases:
+            body += (
+                f"{'、'.join(asr_aliases)}是自动语音识别中出现过的误听形式，"
+                "仅用于检索和纠错，不是正式别名。"
+            )
+        description = str(row["description_zh"] or "").strip()
+        if description:
+            body += f"{description}"
+        source_urls = tuple(json.loads(str(row["source_urls_json"] or "[]")))
+        source_url = source_urls[0] if source_urls else None
+        search_text = _fts_search_text(
+            (
+                str(row["surface"]),
+                body,
+                str(row["reading"]),
+                *aliases,
+                *asr_aliases,
+            )
+        )
+        self._database.execute(
+            """
+            INSERT INTO knowledge_records (
+                record_id, kind, title, body, aliases, reading, keywords,
+                speaker, valid_from, valid_to, source_url, source_type,
+                reliability, search_text
+            ) VALUES (?, 'term', ?, ?, ?, ?, '[]', NULL, NULL, NULL,
+                      ?, 'auto_extracted', ?, ?)
+            ON CONFLICT(record_id) DO UPDATE SET
+                kind=excluded.kind, title=excluded.title, body=excluded.body,
+                aliases=excluded.aliases, reading=excluded.reading,
+                source_type=excluded.source_type,
+                source_url=excluded.source_url,
+                reliability=excluded.reliability, search_text=excluded.search_text
+            """,
+            (
+                f"extracted:{term_id}",
+                row["surface"],
+                body,
+                json.dumps((*aliases, *asr_aliases), ensure_ascii=False),
+                row["reading"],
+                source_url,
+                row["confidence"],
+                search_text,
+            ),
+        )
 
     def document_count(self) -> int:
         row = self._database.execute(
@@ -383,6 +1211,14 @@ class FanKnowledgeRetriever:
         return {str(row["source_url"]) for row in rows}
 
     def retrieve(self, query: KnowledgeQuery) -> list[KnowledgeHit]:
+        return self._retrieve(query, include_term_records=True)
+
+    def retrieve_background(self, query: KnowledgeQuery) -> list[KnowledgeHit]:
+        return self._retrieve(query, include_term_records=False)
+
+    def _retrieve(
+        self, query: KnowledgeQuery, *, include_term_records: bool
+    ) -> list[KnowledgeHit]:
         if query.top_k < 1 or not query.text.strip():
             return []
         normalized = _normalize_query(query.text)
@@ -392,22 +1228,141 @@ class FanKnowledgeRetriever:
             else {}
         )
         with self._lock:
-            candidates = self._candidates(query, normalized, vector_scores)
+            candidates = self._candidates(
+                query,
+                normalized,
+                vector_scores,
+                include_term_records=include_term_records,
+            )
             idf = self._idf_scores(normalized.fts_terms)
         fused = sorted(
             candidates.values(),
-            key=lambda candidate: (-_rrf_score(candidate.ranks), _candidate_id(candidate)),
+            key=lambda candidate: (
+                -_rrf_score(candidate.ranks),
+                _candidate_id(candidate),
+            ),
         )[:_FUSION_CANDIDATES]
         hits = [
             self._score(candidate, query, normalized, vector_scores, idf)
             for candidate in fused
         ]
-        rejected = [hit for hit in hits if not _passes_relevance_gate(hit)]
-        hits = [hit for hit in hits if _passes_relevance_gate(hit)]
-        hits.sort(key=lambda hit: (-hit.score.total, hit.record_id))
+        if self._reranker is not None:
+            reranker_scores = self._reranker.score(
+                normalized.text,
+                [hit.body for hit in hits],
+            )
+            hits = [
+                replace(
+                    hit,
+                    score=replace(hit.score, reranker=reranker_score),
+                )
+                for hit, reranker_score in zip(hits, reranker_scores, strict=True)
+            ]
+        accepted = [
+            hit
+            for hit in hits
+            if _passes_relevance_gate(hit)
+            and (
+                self._reranker is None
+                or hit.score.reranker >= self._reranker_minimum_score
+            )
+        ]
+        rejected = [hit for hit in hits if hit not in accepted]
+        hits = accepted
+        hits.sort(
+            key=lambda hit: (
+                -hit.score.reranker if self._reranker is not None else 0.0,
+                -hit.score.total,
+                hit.record_id,
+            )
+        )
         selected = _diversify_hits(hits, query.top_k)
-        self._audit(query, selected, rejected, len(candidates))
+        self._audit(
+            query,
+            selected,
+            rejected,
+            len(candidates),
+            event=(
+                "fan_knowledge_retrieval"
+                if include_term_records
+                else "fan_background_knowledge_retrieval"
+            ),
+        )
         return selected
+
+    def retrieve_term_references(self, query: KnowledgeQuery) -> list[KnowledgeHit]:
+        """Return deterministic terminology matches outside background ranking."""
+        normalized = _normalize_query(query.text)
+        with self._lock:
+            rows = self._database.execute(
+                "SELECT *, NULL AS fts_rank FROM knowledge_records"
+            ).fetchall()
+            matched_rows: list[tuple[int, int, sqlite3.Row, tuple[str, ...]]] = []
+            for row in rows:
+                if str(row["kind"]) not in _TERM_REFERENCE_KINDS:
+                    continue
+                matched = _exact_entity_matches(normalized, _row_forms(row))
+                speaker_match = bool(
+                    query.speaker
+                    and row["speaker"]
+                    and query.speaker == str(row["speaker"])
+                )
+                if not matched and not speaker_match:
+                    continue
+                matched_rows.append(
+                    (
+                        1 if speaker_match else 0,
+                        max((len(_compact(value)) for value in matched), default=0),
+                        row,
+                        matched,
+                    )
+                )
+
+            matched_rows.sort(
+                key=lambda value: (
+                    -value[0],
+                    -value[1],
+                    str(value[2]["record_id"]),
+                )
+            )
+            hits: list[KnowledgeHit] = []
+            for rank, (_speaker, _length, row, matched) in enumerate(
+                matched_rows[: query.top_k], 1
+            ):
+                reliability = float(row["reliability"])
+                hits.append(
+                    KnowledgeHit(
+                        record_id=str(row["record_id"]),
+                        kind=str(row["kind"]),
+                        title=str(row["title"]),
+                        body=str(row["body"]),
+                        source_url=row["source_url"],
+                        score=KnowledgeScore(
+                            keyword=1.0 if matched else 0.0,
+                            kana=0.0,
+                            vector=0.0,
+                            speaker=1.0 if _speaker else 0.0,
+                            date=0.0,
+                            cross_evidence=0.0,
+                            reliability=reliability,
+                            total=(2.0 if matched else 0.0)
+                            + (1.0 if _speaker else 0.0)
+                            + reliability,
+                            entity=1.0 if matched else 0.0,
+                            specificity=_length,
+                        ),
+                        matched_terms=matched,
+                        retrieval_ranks={"term_reference": rank},
+                    )
+                )
+        self._audit(
+            query,
+            hits,
+            [],
+            len(matched_rows),
+            event="fan_term_reference_retrieval",
+        )
+        return hits
 
     def sync_vector_index(self) -> tuple[int, int]:
         if self._vector_index is None:
@@ -486,6 +1441,83 @@ class FanKnowledgeRetriever:
                     search_text TEXT NOT NULL,
                     UNIQUE(document_id, ordinal)
                 );
+                CREATE TABLE IF NOT EXISTS knowledge_term_extraction_queue (
+                    document_id TEXT PRIMARY KEY
+                        REFERENCES knowledge_documents(document_id) ON DELETE CASCADE,
+                    content_hash TEXT NOT NULL,
+                    queued_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS knowledge_term_backfill_queue (
+                    document_id TEXT PRIMARY KEY
+                        REFERENCES knowledge_documents(document_id) ON DELETE CASCADE,
+                    content_hash TEXT NOT NULL,
+                    queued_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS knowledge_term_candidate_occurrences (
+                    normalized_form TEXT NOT NULL,
+                    surface TEXT NOT NULL,
+                    document_id TEXT NOT NULL
+                        REFERENCES knowledge_documents(document_id) ON DELETE CASCADE,
+                    logical_document_id TEXT NOT NULL,
+                    chunk_id TEXT NOT NULL
+                        REFERENCES knowledge_document_chunks(chunk_id) ON DELETE CASCADE,
+                    context TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    reliability REAL NOT NULL,
+                    strong_name_evidence INTEGER NOT NULL,
+                    occurrence_count INTEGER NOT NULL,
+                    PRIMARY KEY(normalized_form, chunk_id, context)
+                );
+                CREATE INDEX IF NOT EXISTS knowledge_term_candidates_form
+                    ON knowledge_term_candidate_occurrences(normalized_form);
+                CREATE TABLE IF NOT EXISTS knowledge_term_review_queue (
+                    normalized_form TEXT PRIMARY KEY,
+                    queued_at TEXT NOT NULL,
+                    backfill INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS knowledge_extracted_terms (
+                    term_id TEXT PRIMARY KEY,
+                    surface TEXT NOT NULL,
+                    canonical_zh TEXT NOT NULL,
+                    aliases_json TEXT NOT NULL,
+                    asr_aliases_json TEXT NOT NULL,
+                    reading TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS knowledge_term_forms (
+                    term_id TEXT NOT NULL
+                        REFERENCES knowledge_extracted_terms(term_id) ON DELETE CASCADE,
+                    normalized_form TEXT NOT NULL,
+                    form TEXT NOT NULL,
+                    PRIMARY KEY(term_id, normalized_form)
+                );
+                CREATE INDEX IF NOT EXISTS knowledge_term_forms_normalized
+                    ON knowledge_term_forms(normalized_form);
+                CREATE TABLE IF NOT EXISTS knowledge_extracted_term_details (
+                    term_id TEXT PRIMARY KEY
+                        REFERENCES knowledge_extracted_terms(term_id) ON DELETE CASCADE,
+                    description_zh TEXT NOT NULL,
+                    source_urls_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS knowledge_term_evidence (
+                    term_id TEXT NOT NULL
+                        REFERENCES knowledge_extracted_terms(term_id) ON DELETE CASCADE,
+                    chunk_id TEXT NOT NULL
+                        REFERENCES knowledge_document_chunks(chunk_id) ON DELETE CASCADE,
+                    document_id TEXT NOT NULL
+                        REFERENCES knowledge_documents(document_id) ON DELETE CASCADE,
+                    relation TEXT NOT NULL,
+                    canonical_zh TEXT NOT NULL,
+                    evidence_text TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    PRIMARY KEY(term_id, chunk_id)
+                );
+                CREATE INDEX IF NOT EXISTS knowledge_term_evidence_document
+                    ON knowledge_term_evidence(document_id);
                 CREATE INDEX IF NOT EXISTS knowledge_chunks_document
                     ON knowledge_document_chunks(document_id, ordinal);
                 CREATE INDEX IF NOT EXISTS knowledge_documents_published
@@ -526,12 +1558,30 @@ class FanKnowledgeRetriever:
                 "VALUES('schema_version', ?)",
                 (str(_SCHEMA_VERSION),),
             )
+            self._sync_term_forms()
+            provisional = self._database.execute(
+                "SELECT term_id FROM knowledge_extracted_terms "
+                "WHERE status = 'provisional'"
+            ).fetchall()
+            if provisional:
+                self._database.execute(
+                    "UPDATE knowledge_extracted_terms SET status = 'active', "
+                    "updated_at = ? WHERE status = 'provisional'",
+                    (_utc_now(),),
+                )
+                for row in provisional:
+                    self._publish_extracted_term(str(row["term_id"]))
+                self._database.execute(
+                    "INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild')"
+                )
 
     def _candidates(
         self,
         query: KnowledgeQuery,
         normalized: _NormalizedQuery,
         vector_scores: dict[str, float],
+        *,
+        include_term_records: bool,
     ) -> dict[str, _Candidate]:
         candidates: dict[str, _Candidate] = {}
 
@@ -544,9 +1594,7 @@ class FanKnowledgeRetriever:
             record_id = str(row["record_id"])
             candidate = candidates.get(record_id)
             if candidate is None:
-                candidates[record_id] = _Candidate(
-                    row, {channel: rank}, raw_bm25
-                )
+                candidates[record_id] = _Candidate(row, {channel: rank}, raw_bm25)
                 return
             candidate.ranks[channel] = min(rank, candidate.ranks.get(channel, rank))
             if raw_bm25 is not None and (
@@ -559,14 +1607,20 @@ class FanKnowledgeRetriever:
             expression = " OR ".join(
                 f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens
             )
+            record_filter = (
+                ""
+                if include_term_records
+                else "AND records.kind NOT IN ('term', 'character', 'entity')"
+            )
             try:
                 matches = self._database.execute(
-                    """
+                    f"""
                     SELECT records.*, bm25(knowledge_fts) AS fts_rank
                     FROM knowledge_fts
                     JOIN knowledge_records AS records
                       ON records.rowid = knowledge_fts.rowid
                     WHERE knowledge_fts MATCH ?
+                    {record_filter}
                     ORDER BY fts_rank
                     LIMIT 20
                     """,
@@ -680,10 +1734,14 @@ class FanKnowledgeRetriever:
         for row in self._database.execute(
             "SELECT *, NULL AS fts_rank FROM knowledge_records"
         ).fetchall():
+            if not include_term_records and str(row["kind"]) in _TERM_REFERENCE_KINDS:
+                continue
             forms = _row_forms(row)
             matched = _exact_entity_matches(normalized, forms)
             if matched:
-                entity_rows.append((max(len(_compact(value)) for value in matched), row))
+                entity_rows.append(
+                    (max(len(_compact(value)) for value in matched), row)
+                )
         entity_rows.sort(key=lambda value: (-value[0], str(value[1]["record_id"])))
         for rank, (_length, row) in enumerate(entity_rows, 1):
             add(row, "entity", rank)
@@ -705,8 +1763,7 @@ class FanKnowledgeRetriever:
                 batch = terms[offset : offset + 400]
                 placeholders = ",".join("?" for _ in batch)
                 rows = self._database.execute(
-                    f"SELECT term, doc FROM {table} "
-                    f"WHERE term IN ({placeholders})",
+                    f"SELECT term, doc FROM {table} WHERE term IN ({placeholders})",
                     batch,
                 ).fetchall()
                 for row in rows:
@@ -714,8 +1771,7 @@ class FanKnowledgeRetriever:
                     values[term] = values.get(term, 0) + int(row["doc"])
         denominator = math.log(float(total) + 1.0) + 1.0
         return {
-            term: (math.log((float(total) + 1.0) / (count + 1.0)) + 1.0)
-            / denominator
+            term: (math.log((float(total) + 1.0) / (count + 1.0)) + 1.0) / denominator
             for term, count in values.items()
         }
 
@@ -823,11 +1879,13 @@ class FanKnowledgeRetriever:
         hits: list[KnowledgeHit],
         rejected: list[KnowledgeHit],
         candidate_count: int,
+        *,
+        event: str = "fan_knowledge_retrieval",
     ) -> None:
         if self._audit_path is None:
             return
         payload = {
-            "event": "fan_knowledge_retrieval",
+            "event": event,
             "query": asdict(query),
             "candidate_count": candidate_count,
             "weak_candidate_count": len(rejected),
@@ -846,7 +1904,12 @@ class FanKnowledgeRetriever:
                     **hit.prompt_value(),
                     "retrieval_ranks": hit.retrieval_ranks,
                     "score_components": asdict(hit.score),
-                    "gate_reason": "no substantive lexical, semantic, entity, or cross evidence",
+                    "gate_reason": (
+                        "cross_encoder_below_absolute_threshold"
+                        if self._reranker is not None
+                        and hit.score.reranker < self._reranker_minimum_score
+                        else "no substantive lexical, semantic, entity, or cross evidence"
+                    ),
                 }
                 for hit in rejected[:10]
             ],
@@ -868,9 +1931,9 @@ def _relevance_evidence(hit: KnowledgeHit) -> tuple[str, ...]:
     if score.vector > 0:
         values.append("vector_above_absolute_threshold")
     if (
-            score.bm25 >= 0.2
-            and score.idf >= 0.35
-            and (score.lexical_terms >= 2 or score.specificity >= 4)
+        score.bm25 >= 0.2
+        and score.idf >= 0.35
+        and (score.lexical_terms >= 2 or score.specificity >= 4)
     ):
         values.append("strong_bm25_with_informative_terms")
     if score.cross_evidence > 0 and (score.keyword > 0 or score.kana >= 0.72):
@@ -884,8 +1947,7 @@ def _candidate_id(candidate: _Candidate) -> str:
 
 def _rrf_score(ranks: dict[str, int]) -> float:
     return sum(
-        _RRF_WEIGHTS[channel] / (_RRF_K + rank)
-        for channel, rank in ranks.items()
+        _RRF_WEIGHTS[channel] / (_RRF_K + rank) for channel, rank in ranks.items()
     )
 
 
@@ -908,8 +1970,7 @@ def _diversify_hits(hits: list[KnowledgeHit], limit: int) -> list[KnowledgeHit]:
     for hit in hits:
         body = _compact(hit.body)
         if body in bodies or any(
-            SequenceMatcher(None, body, existing).ratio() >= 0.92
-            for existing in bodies
+            SequenceMatcher(None, body, existing).ratio() >= 0.92 for existing in bodies
         ):
             continue
         source = hit.source_url or f"record:{hit.record_id}"
@@ -1110,6 +2171,19 @@ def _chunk_id(document_id: str, chunk: KnowledgeChunk) -> str:
     ]
 
 
+def _extracted_term_id(surface: str) -> str:
+    normalized = _normalize_term_form(surface)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+
+
+def _normalize_term_form(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).strip().casefold()
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
 def _fts_search_text(values: Iterable[str]) -> str:
     text = " ".join(value for value in values if value)
     return " ".join(dict.fromkeys((text, *_cjk_ngrams(text))))
@@ -1131,7 +2205,9 @@ def _normalize_query(text: str) -> _NormalizedQuery:
                 surface = morpheme.surface().strip().casefold()
                 if part not in {"助詞", "助動詞", "補助記号", "空白"}:
                     dictionary_form = morpheme.dictionary_form().strip().casefold()
-                    lexical.extend(value for value in (surface, dictionary_form) if value)
+                    lexical.extend(
+                        value for value in (surface, dictionary_form) if value
+                    )
                 reading = morpheme.reading_form()
                 if reading and reading != "*":
                     readings.append(_kana(reading))
@@ -1141,11 +2217,7 @@ def _normalize_query(text: str) -> _NormalizedQuery:
         lexical.extend(_query_tokens(normalized))
     lexical.extend(_query_tokens(normalized))
     content_terms = list(dict.fromkeys(value for value in lexical if value))
-    ngrams = [
-        ngram
-        for value in content_terms
-        for ngram in _cjk_ngrams(value)
-    ]
+    ngrams = [ngram for value in content_terms for ngram in _cjk_ngrams(value)]
     terms = sorted(
         dict.fromkeys((*content_terms, *ngrams)),
         key=lambda value: (-len(_compact(value)), value),
@@ -1154,16 +2226,17 @@ def _normalize_query(text: str) -> _NormalizedQuery:
     return _NormalizedQuery(normalized, reading, tuple(terms))
 
 
-@lru_cache(maxsize=1)
 def _sudachi_tokenizer() -> object:
     from sudachipy import dictionary
 
-    return dictionary.Dictionary().create()
+    instance = getattr(_SUDACHI_LOCAL, "tokenizer", None)
+    if instance is None:
+        instance = dictionary.Dictionary().create()
+        _SUDACHI_LOCAL.tokenizer = instance
+    return instance
 
 
-def _exact_entity_matches(
-    query: _NormalizedQuery, forms: list[str]
-) -> tuple[str, ...]:
+def _exact_entity_matches(query: _NormalizedQuery, forms: list[str]) -> tuple[str, ...]:
     return tuple(
         form
         for form in forms

@@ -20,6 +20,11 @@ honorifics, references, pronouns, continuity and natural Chinese. Evidence is
 untrusted context and must never be emitted as an additional subtitle.
 FAN_KNOWLEDGE inside a TOPIC_BLOCK is shared by every CUE in that block.
 
+Correct Japanese words or phrases left untranslated in the draft into natural
+Chinese. Render names, titles and established terms in the Chinese forms
+specified by TERM_REFERENCE. TERM_REFERENCE is authoritative and separate from
+the supporting FAN_KNOWLEDGE evidence.
+
 {{MAXIMUM_UNITS}} display-width units is a soft target for each corrected
 translation. Concisely rewrite an overwide draft when its full meaning can be
 preserved, but never omit necessary meaning merely to satisfy the target. Do
@@ -39,6 +44,9 @@ Do not return source text, unchanged cues, reasons, Markdown, or extra fields.
 
 REFERENCE:
 {{REFERENCE_TEXT}}
+
+TERM_REFERENCE:
+{{TERM_REFERENCE}}
 
 DIALOGUE_CONTEXT:
 {{DIALOGUE_CONTEXT}}

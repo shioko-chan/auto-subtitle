@@ -96,6 +96,7 @@ class KnowledgeCollectionTests(unittest.TestCase):
         )
 
         self.assertEqual(x_post["source_url"], "https://x.com/official/status/123")
+        self.assertEqual(x_post["metadata"]["post_relation"], "original")
         self.assertEqual(instagram["source_url"], "https://www.instagram.com/p/ABC/")
 
     @patch("subtitle_pipeline.knowledge_collection.subprocess.run")

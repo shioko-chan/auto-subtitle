@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import re
 import subprocess
 import unicodedata
 from collections.abc import Callable
@@ -18,16 +17,15 @@ from .audio_analysis import AudioAnalysis, AudioRegion, analyze_audio
 from .audio_buffer import AudioBuffer, AudioBufferPool, is_shared_audio_uri
 from .commands import require_command, run
 from .config import ASRConfig, AudioAnalysisConfig
+from .repetition import find_repetition_loop
 from .source_language import language_for_text, normalize_source_language
 from .subtitles import Cue, write_srt
 from .telemetry import stage_metrics
 
-_CACHE_VERSION = 11
+_CACHE_VERSION = 13
 _CUE_SIDECAR_VERSION = 7
 _MIN_RETRY_CHUNK_SECONDS = 15.0
 _MIN_SONG_RETRY_CHUNK_SECONDS = 8.0
-_MIN_REPETITION_SPAN_CHARACTERS = 160
-_REPETITION_RE = re.compile(r"(.{12,200}?)\1{3,}", re.DOTALL)
 _MIN_ASR_GENERATION_TOKENS = 128
 _ASR_GENERATION_TOKENS_PER_SECOND = 32
 _ASR_GENERATION_TOKEN_OVERHEAD = 32
@@ -196,6 +194,7 @@ def _transcribe_unanalyzed(
             empty_speech_audit_path=(
                 destination.parent / "asr-empty-speech-audit.jsonl"
             ),
+            repetition_audit_path=(destination.parent / "asr-repetition-audit.jsonl"),
         )
         cached_chunks[str(index)] = record
         _write_cache(cache_path, cache)
@@ -245,7 +244,7 @@ def _transcribe_analyzed(
     cache_path = destination.parent / "asr-analysis-cache.json"
     signature = {
         **_cache_signature(video, duration, config, japanese_single_word_list),
-        "analysis_version": 14,
+        "analysis_version": 15,
         "analysis_config": asdict(analysis_config),
         "regions": [_analysis_region_signature(region) for region in regions],
     }
@@ -294,6 +293,9 @@ def _transcribe_analyzed(
                 label=f"{index:05d}",
                 window_config=analysis_config,
                 audio_buffer=_region_audio_buffer(region, video, audio_pool),
+                repetition_audit_path=(
+                    destination.parent / "asr-repetition-audit.jsonl"
+                ),
             )
             record["singing_asr_model"] = config.singing_model
             cached[str(index)] = record
@@ -334,7 +336,7 @@ def _transcribe_analyzed(
         raw_cache_path = destination.parent / "asr-raw-speech-cache.json"
         raw_signature = {
             **_cache_signature(video, duration, config, japanese_single_word_list),
-            "raw_speech_version": 1,
+            "raw_speech_version": 2,
             "regions": [
                 _analysis_region_signature(regions[index]) for index in speech_missing
             ],
@@ -367,6 +369,9 @@ def _transcribe_analyzed(
                     [(index, regions[index]) for index in uncached],
                     media_duration=duration,
                     audio_buffer=audio_pool.main(),
+                    repetition_audit_path=(
+                        destination.parent / "asr-repetition-audit.jsonl"
+                    ),
                 )
                 for index, record in records.items():
                     raw_chunks[str(index)] = record
@@ -411,6 +416,7 @@ def _transcribe_analyzed(
                 audio_pool.main(),
                 config,
                 duration,
+                destination.parent / "asr-speech-quality-audit.jsonl",
             )
         finally:
             del aligner
@@ -738,8 +744,10 @@ def _analysis_regions(analysis: AudioAnalysis) -> list[AudioRegion]:
             phrase.start,
             phrase.end,
             "speech",
-            confidence=phrase.speech_score,
+            confidence=phrase.singing_score,
             asr_route="song_speech_fallback",
+            speech_confidence=phrase.speech_score,
+            music_confidence=phrase.music_score,
         )
         for phrase in analysis.acoustic_phrases
         if phrase.route_speech and phrase.diarization_overlap_seconds < 0.08
@@ -861,6 +869,45 @@ def _write_empty_speech_audit(
     )
 
 
+def _write_repetition_discard_audit(
+    path: Path | None,
+    *,
+    kind: str,
+    start: float,
+    end: float,
+    pattern: str,
+    repeats: int,
+) -> dict[str, object]:
+    event: dict[str, object] = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "reason": "repetition_loop_at_minimum_window",
+        "kind": kind,
+        "start": round(start, 3),
+        "end": round(end, 3),
+        "duration": round(end - start, 3),
+        "pattern": pattern[:200],
+        "repeats": repeats,
+        "minimal_reproducer": True,
+        "action": "discard",
+    }
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+            handle.write("\n")
+    logging.warning(
+        "discarded minimum %s repetition window %.3f-%.3fs: "
+        "pattern=%r repeats=%d audit=%s",
+        kind,
+        start,
+        end,
+        pattern[:80],
+        repeats,
+        path or "record-only",
+    )
+    return event
+
+
 def _transcribe_song_range(
     model: Any,
     video: Path,
@@ -871,6 +918,7 @@ def _transcribe_song_range(
     label: str,
     window_config: AudioAnalysisConfig,
     audio_buffer: AudioBuffer | None = None,
+    repetition_audit_path: Path | None = None,
 ) -> dict[str, object]:
     candidates = _song_cut_candidates(region, audio_buffer, window_config)
     window_audit: list[dict[str, object]] = []
@@ -938,23 +986,48 @@ def _transcribe_song_range(
                 repeats,
             )
             if child_duration < _MIN_SONG_RETRY_CHUNK_SECONDS:
-                raise RuntimeError(
-                    "Qwen3-ASR repetition loop remains at minimum singing retry "
-                    f"window {start:.3f}-{end:.3f}s"
+                diagnostic = _write_repetition_discard_audit(
+                    repetition_audit_path,
+                    kind="singing_alt",
+                    start=start,
+                    end=end,
+                    pattern=pattern,
+                    repeats=repeats,
                 )
+                diagnostic["cut_reason"] = "repetition_discard"
+                window_audit.append(diagnostic)
+                return []
             midpoint = start + child_duration
-            window_audit.append(
-                {
-                    "start": round(start, 3),
-                    "end": round(end, 3),
-                    "cut_reason": "repetition_retry",
-                    "retry_at": round(midpoint, 3),
-                }
-            )
-            return [
+            diagnostic: dict[str, object] = {
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "cut_reason": "repetition_retry",
+                "retry_at": round(midpoint, 3),
+                "pattern": pattern[:200],
+                "repeats": repeats,
+            }
+            window_audit.append(diagnostic)
+            child_audit_start = len(window_audit)
+            children = [
                 *transcribe_window(start, midpoint, f"{window_label}-0"),
                 *transcribe_window(midpoint, end, f"{window_label}-1"),
             ]
+            nested = [
+                item
+                for item in window_audit[child_audit_start:]
+                if str(item.get("cut_reason", "")).startswith("repetition_")
+            ]
+            diagnostic["minimal_reproducer"] = not nested
+            diagnostic["resolved_children"] = [
+                {
+                    "start": round(child_start, 3),
+                    "end": round(child_end, 3),
+                    "text_preview": child_text[:160],
+                    "language": child_language,
+                }
+                for child_start, child_end, child_text, child_language in children
+            ]
+            return children
         return [(start, end, text, detected_language)]
 
     resolved: list[tuple[float, float, str, str]] = []
@@ -1196,6 +1269,7 @@ def _transcribe_range(
     completed_ranges: dict[str, object] | None = None,
     completed_range_callback: Callable[[], None] | None = None,
     empty_speech_audit_path: Path | None = None,
+    repetition_audit_path: Path | None = None,
 ) -> dict[str, object]:
     range_key = _completed_range_key(core_start, core_end, final_chunk)
     if completed_ranges is not None:
@@ -1269,10 +1343,31 @@ def _transcribe_range(
                 repeats,
             )
             if child_duration < _MIN_RETRY_CHUNK_SECONDS:
-                raise RuntimeError(
-                    "Qwen3-ASR repetition loop remains at minimum retry chunk "
-                    f"{core_start:.3f}-{core_end:.3f}s"
+                diagnostic = _write_repetition_discard_audit(
+                    repetition_audit_path,
+                    kind="forced_aligned_speech",
+                    start=core_start,
+                    end=core_end,
+                    pattern=pattern,
+                    repeats=repeats,
                 )
+                record = {
+                    "core_start": core_start,
+                    "core_end": core_end,
+                    "language": str(getattr(result, "language", "")),
+                    "text": "",
+                    "cues": [],
+                    "skipped_empty": True,
+                    "discarded_repetition": True,
+                    "repetition_diagnostics": [diagnostic],
+                }
+                _store_completed_range(
+                    completed_ranges,
+                    range_key,
+                    record,
+                    completed_range_callback,
+                )
+                return record
             midpoint = core_start + child_duration
             left = _transcribe_range(
                 model,
@@ -1289,6 +1384,7 @@ def _transcribe_range(
                 completed_ranges=completed_ranges,
                 completed_range_callback=completed_range_callback,
                 empty_speech_audit_path=empty_speech_audit_path,
+                repetition_audit_path=repetition_audit_path,
             )
             right = _transcribe_range(
                 model,
@@ -1305,6 +1401,7 @@ def _transcribe_range(
                 completed_ranges=completed_ranges,
                 completed_range_callback=completed_range_callback,
                 empty_speech_audit_path=empty_speech_audit_path,
+                repetition_audit_path=repetition_audit_path,
             )
             recovered = {
                 "core_start": core_start,
@@ -1314,6 +1411,22 @@ def _transcribe_range(
                 "cues": [*left["cues"], *right["cues"]],
                 "recovered_from_repetition": True,
             }
+            child_diagnostics = [
+                *list(left.get("repetition_diagnostics", [])),
+                *list(right.get("repetition_diagnostics", [])),
+            ]
+            recovered["repetition_diagnostics"] = [
+                {
+                    "kind": "forced_aligned_speech",
+                    "start": round(core_start, 3),
+                    "end": round(core_end, 3),
+                    "pattern": pattern[:200],
+                    "repeats": repeats,
+                    "retry_at": round(midpoint, 3),
+                    "minimal_reproducer": not child_diagnostics,
+                },
+                *child_diagnostics,
+            ]
             _store_completed_range(
                 completed_ranges,
                 range_key,
@@ -1385,6 +1498,7 @@ def _transcribe_range(
                 completed_ranges=completed_ranges,
                 completed_range_callback=completed_range_callback,
                 empty_speech_audit_path=empty_speech_audit_path,
+                repetition_audit_path=repetition_audit_path,
             )
             right = _transcribe_range(
                 model,
@@ -1401,6 +1515,7 @@ def _transcribe_range(
                 completed_ranges=completed_ranges,
                 completed_range_callback=completed_range_callback,
                 empty_speech_audit_path=empty_speech_audit_path,
+                repetition_audit_path=repetition_audit_path,
             )
             recovered = {
                 "core_start": core_start,
@@ -1554,6 +1669,7 @@ def _transcribe_raw_speech_batch(
     *,
     media_duration: float,
     audio_buffer: AudioBuffer,
+    repetition_audit_path: Path | None = None,
 ) -> dict[int, dict[str, object]]:
     audio_inputs: list[object] = []
     extract_ranges: list[tuple[float, float]] = []
@@ -1612,6 +1728,7 @@ def _transcribe_raw_speech_batch(
                 region.end,
                 media_duration,
                 audio_buffer,
+                repetition_audit_path,
             )
             continue
         records[index] = {
@@ -1620,6 +1737,7 @@ def _transcribe_raw_speech_batch(
             "extract_start": extract_ranges[position][0],
             "extract_end": extract_ranges[position][1],
             "language": str(getattr(result, "language", "")),
+            "detected_languages": [str(getattr(result, "language", ""))],
             "text": text,
             "generation_token_limit": token_limits[position],
         }
@@ -1633,6 +1751,7 @@ def _transcribe_raw_range(
     core_end: float,
     media_duration: float,
     audio_buffer: AudioBuffer,
+    repetition_audit_path: Path | None = None,
 ) -> dict[str, object]:
     extract_start = max(0.0, core_start - config.chunk_context_seconds)
     extract_end = min(media_duration, core_end + config.chunk_context_seconds)
@@ -1661,30 +1780,80 @@ def _transcribe_raw_range(
     text = str(getattr(result, "text", "")).strip()
     repetition = _repetition_hallucination(text)
     if repetition is not None:
+        pattern, repeats = repetition
         duration = core_end - core_start
         if duration / 2 < _MIN_RETRY_CHUNK_SECONDS:
-            pattern, repeats = repetition
-            raise RuntimeError(
-                "Qwen3-ASR raw speech repetition remains at minimum window "
-                f"{core_start:.3f}-{core_end:.3f}s: "
-                f"pattern={pattern[:80]!r} repeats={repeats}"
+            diagnostic = _write_repetition_discard_audit(
+                repetition_audit_path,
+                kind="raw_speech",
+                start=core_start,
+                end=core_end,
+                pattern=pattern,
+                repeats=repeats,
             )
+            return {
+                "core_start": core_start,
+                "core_end": core_end,
+                "extract_start": extract_start,
+                "extract_end": extract_end,
+                "language": str(getattr(result, "language", "")),
+                "detected_languages": [str(getattr(result, "language", ""))],
+                "text": "",
+                "generation_token_limit": token_limit,
+                "discarded_repetition": True,
+                "repetition_diagnostics": [diagnostic],
+            }
         midpoint = (core_start + core_end) / 2
         left = _transcribe_raw_range(
-            model, config, core_start, midpoint, media_duration, audio_buffer
+            model,
+            config,
+            core_start,
+            midpoint,
+            media_duration,
+            audio_buffer,
+            repetition_audit_path,
         )
         right = _transcribe_raw_range(
-            model, config, midpoint, core_end, media_duration, audio_buffer
+            model,
+            config,
+            midpoint,
+            core_end,
+            media_duration,
+            audio_buffer,
+            repetition_audit_path,
         )
+        child_diagnostics = [
+            *list(left.get("repetition_diagnostics", [])),
+            *list(right.get("repetition_diagnostics", [])),
+        ]
+        detected_languages = [
+            str(language)
+            for child in (left, right)
+            for language in child.get("detected_languages", [child.get("language")])
+            if language
+        ]
         return {
             "core_start": core_start,
             "core_end": core_end,
             "extract_start": extract_start,
             "extract_end": extract_end,
             "language": right.get("language") or left.get("language") or "",
+            "detected_languages": detected_languages,
             "text": f"{left.get('text', '')}\n{right.get('text', '')}".strip(),
             "generation_token_limit": token_limit,
             "recovered_from_repetition": True,
+            "repetition_diagnostics": [
+                {
+                    "kind": "raw_speech",
+                    "start": round(core_start, 3),
+                    "end": round(core_end, 3),
+                    "pattern": pattern[:200],
+                    "repeats": repeats,
+                    "retry_at": round(midpoint, 3),
+                    "minimal_reproducer": not child_diagnostics,
+                },
+                *child_diagnostics,
+            ],
         }
     return {
         "core_start": core_start,
@@ -1692,9 +1861,116 @@ def _transcribe_raw_range(
         "extract_start": extract_start,
         "extract_end": extract_end,
         "language": str(getattr(result, "language", "")),
+        "detected_languages": [str(getattr(result, "language", ""))],
         "text": text,
         "generation_token_limit": token_limit,
     }
+
+
+def _speech_candidate_quality(
+    record: dict[str, object], region: AudioRegion
+) -> dict[str, object]:
+    text = str(record.get("text") or "").strip()
+    duration = max(region.end - region.start, 1e-6)
+    compact = "".join(character for character in text if not character.isspace())
+    japanese = sum(
+        "\u3040" <= character <= "\u30ff"
+        or "\u3400" <= character <= "\u9fff"
+        for character in compact
+    )
+    hangul = sum("\uac00" <= character <= "\ud7af" for character in compact)
+    latin = sum(character.isascii() and character.isalpha() for character in compact)
+    scripted = japanese + hangul + latin
+    language_values = record.get("detected_languages", [record.get("language")])
+    if not isinstance(language_values, list):
+        language_values = [language_values]
+    languages = sorted(
+        {
+            normalized.lower()
+            for value in language_values
+            if (normalized := str(value or "").strip())
+        }
+    )
+    cues = record.get("cues")
+    intervals: list[tuple[float, float]] = []
+    if isinstance(cues, list):
+        for cue in cues:
+            if not isinstance(cue, dict):
+                continue
+            try:
+                start = max(region.start, float(cue["start"]))
+                end = min(region.end, float(cue["end"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if end > start:
+                intervals.append((start, end))
+    intervals.sort()
+    merged: list[list[float]] = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    aligned_seconds = sum(end - start for start, end in merged)
+    reasons: list[str] = []
+    if _repetition_hallucination(text) is not None:
+        reasons.append("repetition_loop")
+    if text and not _record_timeline_is_healthy(record, region):
+        reasons.append("forced_alignment_unhealthy")
+    density = len(compact) / duration
+    if len(compact) >= 80 and density > 15:
+        reasons.append("excessive_text_density")
+    if hangul >= 4 and hangul / max(1, scripted) >= 0.08 and japanese + latin >= 4:
+        reasons.append("unexpected_hangul_mixed_script")
+    language_keys = {
+        "korean" if value in {"ko", "kor", "korean", "한국어"} else value
+        for value in languages
+    }
+    if record.get("recovered_from_repetition") and (
+        len(language_keys) >= 3
+        or ("korean" in language_keys and len(language_keys) >= 2)
+    ):
+        reasons.append("unstable_split_languages")
+    return {
+        "accepted": not reasons,
+        "reasons": reasons,
+        "metrics": {
+            "duration_seconds": round(duration, 6),
+            "compact_characters": len(compact),
+            "characters_per_second": round(density, 6),
+            "aligned_coverage": round(aligned_seconds / duration, 6),
+            "japanese_characters": japanese,
+            "hangul_characters": hangul,
+            "latin_characters": latin,
+            "detected_languages": languages,
+            "singing_score": region.confidence,
+            "speech_score": region.speech_confidence,
+            "music_score": region.music_confidence,
+        },
+    }
+
+
+def _write_speech_quality_audit(
+    path: Path | None,
+    record: dict[str, object],
+    region: AudioRegion,
+    quality: dict[str, object],
+) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    event = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "kind": "song_speech_fallback_quality",
+        "start": round(region.start, 3),
+        "end": round(region.end, 3),
+        "action": "keep" if quality["accepted"] else "discard",
+        "text": str(record.get("text") or ""),
+        **quality,
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+        handle.write("\n")
 
 
 def _align_speech_records(
@@ -1704,6 +1980,7 @@ def _align_speech_records(
     audio_buffer: AudioBuffer,
     config: ASRConfig,
     media_duration: float,
+    speech_quality_audit_path: Path | None = None,
 ) -> dict[int, dict[str, object]]:
     output: dict[int, dict[str, object]] = {}
     for batch_start in range(
@@ -1813,6 +2090,29 @@ def _align_speech_records(
                         "correction_method": "alignment_unusable_discarded",
                         "alignment_error": "corrected_and_original_timeline_invalid",
                     }
+            if (
+                region.asr_route == "song_speech_fallback"
+                and str(aligned.get("text") or "").strip()
+            ):
+                quality = _speech_candidate_quality(aligned, region)
+                _write_speech_quality_audit(
+                    speech_quality_audit_path, aligned, region, quality
+                )
+                aligned["speech_quality"] = quality
+                if not quality["accepted"]:
+                    logging.warning(
+                        "discarding low-quality song speech candidate %.3f-%.3fs: %s",
+                        region.start,
+                        region.end,
+                        ",".join(str(value) for value in quality["reasons"]),
+                    )
+                    aligned = {
+                        **aligned,
+                        "text": "",
+                        "cues": [],
+                        "skipped_empty": True,
+                        "correction_method": "speech_quality_gate_discarded",
+                    }
             output[index] = aligned
     return output
 
@@ -1892,18 +2192,8 @@ def _region_audio_buffer(
 
 
 def _repetition_hallucination(text: str) -> tuple[str, int] | None:
-    normalized = "".join(text.split())
-    candidates = [
-        match
-        for match in _REPETITION_RE.finditer(normalized)
-        if match.end() - match.start() >= _MIN_REPETITION_SPAN_CHARACTERS
-    ]
-    if candidates:
-        match = max(candidates, key=lambda item: item.end() - item.start())
-        pattern = match.group(1)
-        repeats = (match.end() - match.start()) // len(pattern)
-        return pattern, repeats
-    return None
+    match = find_repetition_loop(text)
+    return (match.pattern, match.repeats) if match is not None else None
 
 
 def _load_qwen_model(

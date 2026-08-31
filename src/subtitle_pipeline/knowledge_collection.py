@@ -216,6 +216,19 @@ def normalize_sns_metadata(value: dict[str, object]) -> dict[str, object] | None
         return None
     if not external_id or not text.strip():
         return None
+    reply_id = _first(value, "reply_id", "in_reply_to_status_id")
+    quote_id = _first(value, "quote_id", "quoted_status_id")
+    repost_id = _first(value, "retweet_id", "repost_id", "retweeted_status_id")
+    relation = (
+        "repost"
+        if repost_id
+        else "quote"
+        if quote_id
+        else "reply"
+        if reply_id and reply_id != "0"
+        else "original"
+    )
+    related_post_id = repost_id or quote_id or reply_id
     return {
         "source_type": source_type,
         "external_id": external_id,
@@ -228,8 +241,10 @@ def normalize_sns_metadata(value: dict[str, object]) -> dict[str, object] | None
         "reliability": 0.8,
         "metadata": {
             "username": username or None,
-            "reply_id": value.get("reply_id"),
+            "reply_id": reply_id or None,
             "conversation_id": value.get("conversation_id"),
+            "post_relation": relation,
+            "related_post_id": related_post_id or None,
         },
     }
 

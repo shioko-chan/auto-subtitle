@@ -4,7 +4,9 @@ import html
 import ipaddress
 import json
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -78,16 +80,12 @@ def search(query: str, limit: int) -> dict[str, object]:
 def fetch_lyrics(url: str) -> dict[str, object]:
     if not public_http_url(url):
         return {"error": "URL is not public"}
-    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    opener = urllib.request.build_opener(SafeRedirectHandler())
-    with opener.open(request, timeout=15) as response:
-        raw = response.read(2_000_000)
-        charset = response.headers.get_content_charset() or "utf-8"
-    try:
-        document = raw.decode(charset, errors="replace")
-    except LookupError:
-        document = raw.decode("utf-8", errors="replace")
     hostname = (urlsplit(url).hostname or "").casefold()
+    try:
+        raw, charset = _fetch_document(url, hostname)
+    except (OSError, subprocess.SubprocessError, urllib.error.URLError) as exc:
+        return {"error": f"fetch failed: {exc}"}
+    document = _decode_document(raw, charset)
     parsers = []
     if hostname.endswith("utaten.com"):
         parsers.append(_parse_utaten)
@@ -106,6 +104,56 @@ def fetch_lyrics(url: str) -> dict[str, object]:
     if values is None:
         return {"error": "page has no supported structured canonical lyrics"}
     return values
+
+
+def _fetch_document(url: str, hostname: str) -> tuple[bytes, str]:
+    if hostname.endswith("uta-net.com"):
+        curl = shutil.which("curl")
+        if curl is None:
+            raise OSError("curl is required to fetch uta-net.com")
+        completed = subprocess.run(
+            [
+                curl,
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--max-time",
+                "15",
+                "--max-filesize",
+                "2000000",
+                "--proto",
+                "=http,https",
+                "--max-redirs",
+                "0",
+                "--user-agent",
+                (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                url,
+            ],
+            capture_output=True,
+            check=False,
+            timeout=20,
+        )
+        if completed.returncode:
+            message = completed.stderr.decode("utf-8", errors="replace").strip()
+            raise OSError(message or f"curl exited with status {completed.returncode}")
+        return completed.stdout, "utf-8"
+
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    opener = urllib.request.build_opener(SafeRedirectHandler())
+    with opener.open(request, timeout=15) as response:
+        raw = response.read(2_000_000)
+        charset = response.headers.get_content_charset() or "utf-8"
+    return raw, charset
+
+
+def _decode_document(raw: bytes, charset: str) -> str:
+    try:
+        return raw.decode(charset, errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
 
 
 def _parse_utaten(document: str) -> dict[str, object] | None:
@@ -206,6 +254,22 @@ def _parse_awa(document: str) -> dict[str, object] | None:
 
 def _parse_utanet(document: str) -> dict[str, object] | None:
     title, artist = _json_ld_song_identity(document)
+    if not title:
+        title_match = re.search(
+            r'<h2[^>]+class=["\'][^"\']*kashi-title[^"\']*["\'][^>]*>(.*?)</h2>',
+            document,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if title_match is not None:
+            title = _plain_html_text(title_match.group(1))
+    if not artist:
+        artist_match = re.search(
+            r'<span[^>]+itemprop=["\']byArtist name["\'][^>]*>(.*?)</span>',
+            document,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if artist_match is not None:
+            artist = _plain_html_text(artist_match.group(1))
     match = re.search(
         r'<div[^>]+(?:id|class)=["\'][^"\']*kashi_area[^"\']*["\'][^>]*>(.*?)</div>',
         document,

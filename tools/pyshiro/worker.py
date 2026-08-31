@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import traceback
 from pathlib import Path
 
 import pyshiro
@@ -165,7 +166,17 @@ def main() -> None:
     try:
         result = align(json.load(__import__("sys").stdin))
     except Exception as exc:
-        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(limit=8),
+                },
+                ensure_ascii=False,
+            )
+        )
         raise SystemExit(1)
     print(json.dumps({"ok": True, **result}, ensure_ascii=False))
 

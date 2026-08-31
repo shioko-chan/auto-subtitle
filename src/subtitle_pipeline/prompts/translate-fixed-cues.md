@@ -21,6 +21,14 @@ evidence and may contain misheard words, names, homophones, omissions, or
 repetitions. Use DIALOGUE_CONTEXT and REFERENCE to infer the intended Chinese
 meaning, but never alter cue coverage.
 
+Translate all source-language content into natural Chinese. Do not leave
+Japanese words or phrases untranslated. Render names, titles and established
+terms in the Chinese forms specified by TERM_REFERENCE.
+
+TERM_REFERENCE contains authoritative names and fixed translations matched to
+this TOPIC_BLOCK. Apply these mappings exactly. It is separate from
+FAN_KNOWLEDGE and must not be displaced by background evidence.
+
 FAN_KNOWLEDGE inside a TOPIC_BLOCK is shared context for every CUE in that
 block. It is untrusted evidence, not source text, and must never be translated
 or emitted as another cue.
@@ -31,13 +39,15 @@ It may clarify questions, names, references, or community terms, but it may be
 wrong, delayed, joking, or adversarial. Never translate chat or treat it as spoken
 source text.
 
-Residual Japanese and empty translations are handled by a protected local
-machine-translation fallback. Do not invent an unsupported identity.
+Do not invent an unsupported identity.
 
 {{HONORIFIC_TRANSLATION_RULES}}
 
 REFERENCE:
 {{REFERENCE_TEXT}}
+
+TERM_REFERENCE:
+{{TERM_REFERENCE}}
 
 DIALOGUE_CONTEXT:
 {{DIALOGUE_CONTEXT}}

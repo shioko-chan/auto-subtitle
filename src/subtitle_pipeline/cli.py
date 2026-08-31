@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .chat_context import remove_youtube_chat_files
-from .config import AppConfig, ConfigError, load_config
+from .config import AppConfig, ConfigError, llm_api_key, load_config
 from .fan_knowledge import FanKnowledgeRetriever
 from .knowledge_collection import collect_official_documents, collect_sns_documents
 from .knowledge_ingestion import (
@@ -20,7 +20,11 @@ from .knowledge_ingestion import (
     ingest_work_directory,
     ingest_youtube_cache,
 )
+from .local_llm_server import LocalLLMServer
 from .pipeline import run_pipeline
+from .term_extraction import extract_pending_terms, prepare_pending_terms
+from .term_web_search import TermWebSearcher
+from .translate import OpenAICompatibleTranslator
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="knowledge_command", required=True
     )
     work_parser = knowledge_commands.add_parser(
-        "ingest-work", help="import existing pipeline ASR and metadata"
+        "ingest-work", help="import existing pipeline metadata and super chats"
     )
     work_parser.add_argument("--path", type=Path)
 
@@ -85,6 +89,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sns_parser.add_argument("urls", nargs="+")
     sns_parser.add_argument("--browser")
+    extraction_parser = knowledge_commands.add_parser(
+        "extract-terms", help="extract and review terminology from changed documents"
+    )
+    extraction_parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="queue every existing document before extraction",
+    )
+    extraction_parser.add_argument("--limit", type=int)
+    extraction_parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="extract and accumulate local candidates without starting an LLM",
+    )
     knowledge_commands.add_parser("stats", help="show knowledge database counts")
     return parser
 
@@ -119,6 +137,8 @@ def _knowledge(config: AppConfig, args: argparse.Namespace) -> int:
         embedding_model=knowledge.embedding_model,
         vector_index_path=Path(knowledge.vector_index_path).expanduser(),
         vector_minimum_score=knowledge.vector_minimum_score,
+        reranker_model=knowledge.reranker_model,
+        reranker_minimum_score=knowledge.reranker_minimum_score,
     ) as retriever:
         command = args.knowledge_command
         if command == "stats":
@@ -128,11 +148,99 @@ def _knowledge(config: AppConfig, args: argparse.Namespace) -> int:
                 retriever.chunk_count(),
             )
             return 0
+        if command == "extract-terms":
+            if args.limit is not None and args.limit < 1:
+                raise ValueError("--limit must be at least 1")
+            if args.backfill:
+                queued = retriever.queue_all_documents_for_term_extraction()
+                logging.info("queued %d documents for term extraction", queued)
+            if args.prepare_only:
+                summary = prepare_pending_terms(
+                    retriever,
+                    maximum_documents=args.limit,
+                    include_backfill=args.backfill,
+                )
+                logging.info(
+                    "term preparation: documents=%d local_candidates=%d "
+                    "screenable=%d known=%d pending=%d",
+                    summary.documents,
+                    summary.local_candidates,
+                    summary.screenable_candidates,
+                    summary.known_candidates,
+                    summary.pending_candidates,
+                )
+                return 0
+            server = LocalLLMServer(
+                config.llm, config.work_dir / "knowledge-term-llm-server.log"
+            )
+            translator = OpenAICompatibleTranslator(
+                config.llm,
+                config.translation,
+                llm_api_key(config.llm),
+                audit_path=config.work_dir / "knowledge-term-llm-audit.jsonl",
+            )
+            try:
+                server.start()
+                term_context_size = (
+                    min(
+                        config.fan_knowledge.term_extraction_context_size,
+                        config.llm.local_server_context_size,
+                    )
+                    if config.llm.local_server_enabled
+                    else config.fan_knowledge.term_extraction_context_size
+                )
+                term_max_output_tokens = min(
+                    config.fan_knowledge.term_extraction_max_output_tokens,
+                    max(256, term_context_size // 4),
+                )
+                term_target_input_tokens = min(
+                    config.fan_knowledge.term_extraction_target_input_tokens,
+                    term_context_size - term_max_output_tokens,
+                )
+                term_concurrency = min(
+                    config.llm.max_concurrency,
+                    (
+                        config.llm.local_server_parallel
+                        if config.llm.local_server_enabled
+                        else config.llm.max_concurrency
+                    ),
+                )
+                searcher = TermWebSearcher(
+                    Path(config.song_identification.search_worker_project)
+                )
+                summary = extract_pending_terms(
+                    retriever,
+                    request=translator.request,
+                    model=config.llm.model,
+                    max_tokens=term_max_output_tokens,
+                    thinking=config.llm.thinking,
+                    max_retries=config.llm.max_retries,
+                    maximum_documents=args.limit,
+                    include_backfill=args.backfill,
+                    max_concurrency=term_concurrency,
+                    audit_path=(
+                        config.work_dir / "knowledge-term-extraction-audit.jsonl"
+                    ),
+                    search_web=searcher.search,
+                    context_size=term_context_size,
+                    target_input_tokens=term_target_input_tokens,
+                )
+            finally:
+                server.stop()
+            logging.info(
+                "term extraction: documents=%d batches=%d candidates=%d "
+                "stored=%d published=%d",
+                summary.documents,
+                summary.batches,
+                summary.candidates,
+                summary.stored,
+                summary.published,
+            )
+            return 0
         if command == "ingest-work":
             summary = ingest_work_directory(
                 retriever,
                 args.path or config.work_dir,
-                target_seconds=knowledge.chunk_target_seconds,
                 maximum_chars=knowledge.chunk_max_chars,
                 include_regular_chat=knowledge.include_regular_chat,
             )

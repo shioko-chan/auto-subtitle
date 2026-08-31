@@ -71,6 +71,27 @@ class SongSearchWorkerTests(unittest.TestCase):
         self.assertEqual(value["artist"], "うらたぬき")
         self.assertEqual(len(value["lines"]), 3)
 
+    def test_parses_current_utanet_lyrics_markup(self):
+        worker = _worker_module()
+        document = """
+        <script type="application/ld+json">
+        {"@type":"WebPage","name":"大森靖子 あれそれ 歌詞 - 歌ネット"}
+        </script>
+        <h2 class="ms-2 kashi-title">あれそれ</h2>
+        <a itemprop="byArtist"><span itemprop="byArtist name">大森靖子</span></a>
+        <div id="kashi_area" itemprop="text">
+          ママの会社がつぶれて後始末<br>
+          爪をパチッと切ったらとんでった<br>
+          暮らしの残骸を食らいに来いよほら
+        </div>
+        """
+
+        value = worker._parse_utanet(document)
+
+        self.assertEqual(value["title"], "あれそれ")
+        self.assertEqual(value["artist"], "大森靖子")
+        self.assertEqual(len(value["lines"]), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

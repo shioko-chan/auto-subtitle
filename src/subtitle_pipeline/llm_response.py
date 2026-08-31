@@ -4,6 +4,7 @@ import json
 from collections.abc import Callable
 
 from .prompt_templates import prompt_system
+from .repetition import RepetitionLoopError, find_repetition_loop
 
 
 def strip_markdown_code_fence(content: object) -> str:
@@ -61,6 +62,10 @@ def structured_response_content(
     if not isinstance(message, dict) or "content" not in message:
         raise ValueError("LLM response has no message content")
     content = message["content"]
+    if isinstance(content, str):
+        repetition = find_repetition_loop(content)
+        if repetition is not None:
+            raise RepetitionLoopError(repetition)
     reason = finish_reason(response)
     if reason not in (None, "stop"):
         raise RuntimeError(f"finish_reason={reason}")

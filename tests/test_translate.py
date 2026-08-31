@@ -14,10 +14,19 @@ from subtitle_pipeline.translate import (
     _parse_json_object,
     _prompt_section_sizes,
     _transient_retry_delay,
+    is_llm_quota_exhausted,
 )
 
 
 class PromptBudgetTests(unittest.TestCase):
+    def test_only_http_402_is_balance_exhaustion(self) -> None:
+        quota = LLMHTTPError(402, "insufficient balance")
+        wrapped = RuntimeError("term extraction failed")
+        wrapped.__cause__ = quota
+
+        self.assertTrue(is_llm_quota_exhausted(wrapped))
+        self.assertFalse(is_llm_quota_exhausted(LLMHTTPError(429, "rate limit")))
+
     @patch("subtitle_pipeline.translate.urllib.request.urlopen")
     def test_local_request_has_no_network_timeout(self, urlopen) -> None:
         response = urlopen.return_value.__enter__.return_value
@@ -195,6 +204,21 @@ class ApiCompatibilityTests(unittest.TestCase):
         self.assertNotIn("large video context", prompt)
         self.assertNotIn("large ASR audit", prompt)
         self.assertNotIn("large alignment audit", prompt)
+
+    def test_lyrics_failure_does_not_fall_back_to_machine_translation(self):
+        translator = OpenAICompatibleTranslator(
+            LLMConfig(max_retries=1), TranslationConfig(), "secret"
+        )
+        with (
+            patch.object(translator, "_request", side_effect=ValueError("invalid")),
+            patch.object(
+                translator.local_translator,
+                "translate",
+                side_effect=AssertionError("machine translation must not run"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "lyrics translation exhausted"),
+        ):
+            translator.translate_lyrics("Song", "Artist", ["歌詞"])
 
     def test_metadata_prompt_excludes_large_audit_payloads(self):
         translator = OpenAICompatibleTranslator(

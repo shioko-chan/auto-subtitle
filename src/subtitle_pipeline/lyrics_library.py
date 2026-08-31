@@ -252,7 +252,7 @@ def _translation_priority(source: str | None) -> int:
         None: 0,
         "machine": 1,
         "llm": 2,
-        "llm_reviewed": 3,
-        "external": 4,
+        "external": 3,
+        "llm_reviewed": 4,
         "official": 5,
     }.get(source, 0)

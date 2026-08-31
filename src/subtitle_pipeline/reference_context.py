@@ -23,11 +23,8 @@ def compact_reference_context(context: dict[str, object]) -> dict[str, object]:
 
 def compact_translation_reference_context(
     context: dict[str, object],
-    *,
-    evidence_text: str,
-    speakers: set[str],
 ) -> dict[str, object]:
-    """Keep only reference entries that can help the current translation batch."""
+    """Keep non-terminology metadata needed by translation prompts."""
     reference: dict[str, object] = {}
     video = context.get("video")
     if isinstance(video, dict):
@@ -50,51 +47,7 @@ def compact_translation_reference_context(
     if isinstance(franchises, list) and franchises:
         reference["franchises"] = franchises
 
-    folded = evidence_text.casefold()
-    characters = context.get("characters")
-    if isinstance(characters, list):
-        matched_characters = [
-            character
-            for character in characters
-            if isinstance(character, dict)
-            and (
-                str(character.get("id") or "") in speakers
-                or any(
-                    form.casefold() in folded
-                    for form in _character_source_forms(character)
-                )
-            )
-        ]
-        if matched_characters:
-            reference["characters"] = matched_characters
-
-    terms = context.get("terms")
-    if isinstance(terms, dict):
-        matched_terms = {
-            source: target
-            for source, target in terms.items()
-            if isinstance(source, str)
-            and source
-            and source.casefold() in folded
-        }
-        if matched_terms:
-            reference["terms"] = matched_terms
     return reference
-
-
-def _character_source_forms(character: dict[str, object]) -> list[str]:
-    values = [character.get("source_name"), character.get("canonical")]
-    aliases = character.get("aliases")
-    if isinstance(aliases, list):
-        values.extend(aliases)
-    short_names = character.get("short_names")
-    if isinstance(short_names, list):
-        values.extend(
-            value.get("source")
-            for value in short_names
-            if isinstance(value, dict)
-        )
-    return [value for value in values if isinstance(value, str) and value]
 
 
 def compact_lyrics_reference_context(

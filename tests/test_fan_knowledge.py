@@ -2,22 +2,489 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
 from subtitle_pipeline.fan_knowledge import (
+    ExtractedTerm,
     FanKnowledgeRetriever,
     KnowledgeChunk,
     KnowledgeDocument,
     KnowledgeQuery,
     KnowledgeRecord,
+    _sudachi_tokenizer,
     records_from_translation_context,
 )
 
 
 class FanKnowledgeRetrieverTests(unittest.TestCase):
+    def test_changed_documents_are_queued_for_term_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
+            document = KnowledgeDocument(
+                "document:term-source",
+                "youtube_metadata",
+                "term-source",
+                "すやバラ配信",
+                "すやバラは、すやすやバラード歌枠の略です。",
+            )
+            chunks = [KnowledgeChunk(0, "すやバラは、すやすやバラード歌枠の略です。")]
+
+            first = retriever.upsert_document(document, chunks)
+            second = retriever.upsert_document(document, chunks)
+            pending = retriever.pending_term_documents()
+
+            self.assertTrue(first.changed)
+            self.assertFalse(second.changed)
+            self.assertEqual(
+                [value.document_id for value in pending], [document.document_id]
+            )
+            self.assertEqual(len(pending[0].chunks), 1)
+            retriever.close()
+
+    def test_existing_documents_can_be_queued_for_backfill(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
+            retriever.upsert_document(
+                KnowledgeDocument(
+                    "document:backfill",
+                    "official_news",
+                    "backfill",
+                    "既存資料",
+                    "既存資料の本文です。",
+                ),
+                [KnowledgeChunk(0, "既存資料の本文です。")],
+            )
+            pending = retriever.pending_term_documents()[0]
+            retriever.store_extracted_terms(pending, [])
+            retriever.finish_term_preparation(
+                [pending],
+                touched_forms=(),
+                pending_review_forms=(),
+                backfill=False,
+            )
+            self.assertEqual(retriever.pending_term_documents(), [])
+
+            queued = retriever.queue_all_documents_for_term_extraction()
+
+            self.assertEqual(queued, 1)
+            self.assertEqual(
+                [
+                    value.document_id
+                    for value in retriever.pending_term_documents(include_backfill=True)
+                ],
+                ["document:backfill"],
+            )
+            retriever.close()
+
+    def test_reviewed_terms_are_published_as_references(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
+            retriever.upsert_document(
+                KnowledgeDocument(
+                    "document:term-source",
+                    "youtube_metadata",
+                    "term-source",
+                    "すやバラ配信",
+                    "すやバラは、すやすやバラード歌枠の略です。",
+                    reliability=0.95,
+                ),
+                [KnowledgeChunk(0, "すやバラは、すやすやバラード歌枠の略です。")],
+            )
+            document = retriever.pending_term_documents()[0]
+            stored, published = retriever.store_extracted_terms(
+                document,
+                [
+                    ExtractedTerm(
+                        "すやバラ",
+                        "助眠抒情歌回",
+                        ("すやすやバラード歌枠",),
+                        "すやばら",
+                        "definition",
+                        (document.chunks[0].chunk_id,),
+                        0.94,
+                    )
+                ],
+            )
+            retriever.finish_term_preparation(
+                [document],
+                touched_forms=(),
+                pending_review_forms=(),
+                backfill=False,
+            )
+
+            hits = retriever.retrieve_term_references(
+                KnowledgeQuery("すやバラ", top_k=4)
+            )
+            self.assertEqual((stored, published), (1, 1))
+            self.assertEqual(hits[0].title, "すやバラ")
+            self.assertIn("助眠抒情歌回", hits[0].body)
+            self.assertEqual(retriever.pending_term_documents(), [])
+            retriever.close()
+
+    def test_term_forms_are_deduplicated_after_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
+            retriever.upsert_document(
+                KnowledgeDocument(
+                    "document:term-forms",
+                    "youtube_metadata",
+                    "term-forms",
+                    "USJ",
+                    "USJについて話します。",
+                ),
+                [KnowledgeChunk(0, "USJについて話します。")],
+            )
+            document = retriever.pending_term_documents()[0]
+            retriever.store_extracted_terms(
+                document,
+                [
+                    ExtractedTerm(
+                        "USJ",
+                        "日本环球影城",
+                        ("usj", "ＵＳＪ"),
+                        "",
+                        "name",
+                        (document.chunks[0].chunk_id,),
+                        0.9,
+                    )
+                ],
+            )
+            rows = retriever._database.execute(
+                "SELECT normalized_form, form FROM knowledge_term_forms"
+            ).fetchall()
+            retriever.close()
+
+        self.assertEqual(
+            [dict(row) for row in rows],
+            [{"normalized_form": "usj", "form": "USJ"}],
+        )
+
+    def test_extracted_term_schema_has_no_entity_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
+            columns = {
+                str(row["name"])
+                for row in retriever._database.execute(
+                    "PRAGMA table_info(knowledge_extracted_terms)"
+                ).fetchall()
+            }
+            retriever.close()
+
+        self.assertNotIn("kind", columns)
+
+    def test_reviewed_term_from_weak_source_is_still_a_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
+            retriever.upsert_document(
+                KnowledgeDocument(
+                    "document:sc",
+                    "youtube_superchat",
+                    "sc",
+                    "SC",
+                    "すやバラは助眠抒情歌回です。",
+                    reliability=0.5,
+                ),
+                [KnowledgeChunk(0, "すやバラは助眠抒情歌回です。")],
+            )
+            document = retriever.pending_term_documents()[0]
+            stored, published = retriever.store_extracted_terms(
+                document,
+                [
+                    ExtractedTerm(
+                        "すやバラ",
+                        "助眠抒情歌回",
+                        (),
+                        "",
+                        "definition",
+                        (document.chunks[0].chunk_id,),
+                        0.99,
+                    )
+                ],
+            )
+
+            self.assertEqual((stored, published), (1, 1))
+            hits = retriever.retrieve_term_references(KnowledgeQuery("すやバラ"))
+            self.assertEqual(len(hits), 1)
+            self.assertIn("助眠抒情歌回", hits[0].body)
+            retriever.close()
+
+    def test_existing_provisional_terms_are_activated_on_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database_path = Path(temporary) / "knowledge.sqlite3"
+            retriever = FanKnowledgeRetriever(database_path)
+            retriever.upsert_document(
+                KnowledgeDocument(
+                    "document:term-source",
+                    "youtube_metadata",
+                    "term-source",
+                    "企画名",
+                    "ミライは企画名です。",
+                ),
+                [KnowledgeChunk(0, "ミライは企画名です。")],
+            )
+            document = retriever.pending_term_documents()[0]
+            retriever.store_extracted_terms(
+                document,
+                [
+                    ExtractedTerm(
+                        "ミライ",
+                        "未来企划",
+                        (),
+                        "みらい",
+                        "name",
+                        (document.chunks[0].chunk_id,),
+                        0.8,
+                    )
+                ],
+            )
+            retriever._database.execute(
+                "UPDATE knowledge_extracted_terms SET status = 'provisional'"
+            )
+            retriever._database.execute(
+                "DELETE FROM knowledge_records WHERE record_id LIKE 'extracted:%'"
+            )
+            retriever._database.commit()
+            retriever.close()
+
+            reopened = FanKnowledgeRetriever(database_path)
+            row = reopened._database.execute(
+                "SELECT status FROM knowledge_extracted_terms"
+            ).fetchone()
+            hits = reopened.retrieve_term_references(KnowledgeQuery("ミライ"))
+            reopened.close()
+
+        self.assertEqual(row["status"], "active")
+        self.assertEqual(len(hits), 1)
+
+    def test_conflicting_sources_do_not_replace_an_active_translation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
+            for document_id, source_type, translation in (
+                ("official", "official_news", "助眠抒情歌回"),
+                ("subtitle", "youtube_auto_subtitle", "睡觉芭乐"),
+            ):
+                retriever.upsert_document(
+                    KnowledgeDocument(
+                        f"document:{document_id}",
+                        source_type,
+                        document_id,
+                        "すやバラ",
+                        "すやバラは配信企画名です。",
+                        reliability=0.95,
+                    ),
+                    [KnowledgeChunk(0, "すやバラは配信企画名です。")],
+                )
+                document = next(
+                    value
+                    for value in retriever.pending_term_documents()
+                    if value.document_id == f"document:{document_id}"
+                )
+                retriever.store_extracted_terms(
+                    document,
+                    [
+                        ExtractedTerm(
+                            "すやバラ",
+                            translation,
+                            (),
+                            "",
+                            "definition",
+                            (document.chunks[0].chunk_id,),
+                            0.95,
+                        )
+                    ],
+                )
+
+            hits = retriever.retrieve_term_references(
+                KnowledgeQuery("すやバラ", top_k=4)
+            )
+            retriever.close()
+
+        self.assertEqual(len(hits), 1)
+        self.assertIn("助眠抒情歌回", hits[0].body)
+        self.assertNotIn("睡觉芭乐", hits[0].body)
+
+    def test_curated_mapping_overrides_extracted_translation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
+            retriever.upsert(
+                [
+                    KnowledgeRecord(
+                        "term:yumemita",
+                        "term",
+                        "ゆめみた",
+                        "ゆめみた的固定中文译法为梦限大MewType。",
+                        source_type="curated_glossary",
+                        reliability=0.99,
+                    )
+                ]
+            )
+            retriever.upsert_document(
+                KnowledgeDocument(
+                    "document:yumemita",
+                    "youtube_auto_subtitle",
+                    "yumemita",
+                    "ゆめみた配信",
+                    "ゆめみたの配信です。",
+                ),
+                [KnowledgeChunk(0, "ゆめみたの配信です。")],
+            )
+            document = retriever.pending_term_documents()[0]
+
+            stored, published = retriever.store_extracted_terms(
+                document,
+                [
+                    ExtractedTerm(
+                        "ゆめみた",
+                        "梦见",
+                        (),
+                        "",
+                        "name",
+                        (document.chunks[0].chunk_id,),
+                        0.95,
+                    )
+                ],
+            )
+            row = retriever._database.execute(
+                "SELECT canonical_zh, status FROM knowledge_extracted_terms"
+            ).fetchone()
+            retriever.close()
+
+        self.assertEqual((stored, published), (1, 0))
+        self.assertEqual(
+            dict(row),
+            {
+                "canonical_zh": "梦限大MewType",
+                "status": "verified",
+            },
+        )
+
+    def test_term_references_are_retrieved_by_alias_and_speaker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
+            retriever.upsert(
+                [
+                    KnowledgeRecord(
+                        "term:suyabara",
+                        "term",
+                        "すやバラ",
+                        "すやバラ的固定中文译法为助眠抒情歌回。",
+                        aliases=("スヤバラ",),
+                        reliability=0.98,
+                    ),
+                    KnowledgeRecord(
+                        "character:arale",
+                        "character",
+                        "仲町あられ",
+                        "仲町あられ的固定中文名为仲町阿拉蕾。",
+                        speaker="nakamachi_arale",
+                        reliability=0.98,
+                    ),
+                    KnowledgeRecord(
+                        "note:background",
+                        "note",
+                        "背景",
+                        "普通背景资料不属于术语引用。",
+                    ),
+                ]
+            )
+            retriever.upsert_document(
+                KnowledgeDocument(
+                    "document:suyabara",
+                    "youtube_metadata",
+                    "suyabara",
+                    "スヤバラ配信",
+                    "スヤバラは安眠向けの歌枠です。",
+                ),
+                [KnowledgeChunk(0, "スヤバラは安眠向けの歌枠です。")],
+            )
+
+            query = KnowledgeQuery(
+                "スヤバラについて話す",
+                speaker="nakamachi_arale",
+                top_k=8,
+            )
+            hits = retriever.retrieve_term_references(query)
+            background = retriever.retrieve_background(query)
+            retriever.close()
+
+        self.assertEqual(
+            {hit.record_id for hit in hits},
+            {"term:suyabara", "character:arale"},
+        )
+        self.assertTrue(all("term_reference" in hit.retrieval_ranks for hit in hits))
+        self.assertTrue(background)
+        self.assertTrue(
+            all(hit.kind not in {"term", "character", "entity"} for hit in background)
+        )
+
+    def test_cross_encoder_reranks_body_and_rejects_title_only_match(self) -> None:
+        class FakeCrossEncoder:
+            def predict(self, pairs, **_kwargs):
+                return np.asarray(
+                    [
+                        0.9 if "すやすやバラード" in passage else 0.001
+                        for _query, passage in pairs
+                    ],
+                    dtype=np.float32,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            retriever = FanKnowledgeRetriever(
+                root / "knowledge.sqlite3",
+                reranker_model="fake-reranker",
+                reranker_minimum_score=0.05,
+            )
+            retriever.upsert_document(
+                KnowledgeDocument(
+                    "document:useful",
+                    "youtube_auto_subtitle",
+                    "useful",
+                    "すやバラ",
+                    "すやバラは、すやすやバラードを略した配信名です。",
+                ),
+                [KnowledgeChunk(0, "すやバラは、すやすやバラードを略した配信名です。")],
+            )
+            retriever.upsert_document(
+                KnowledgeDocument(
+                    "document:title-only",
+                    "youtube_auto_subtitle",
+                    "title-only",
+                    "すやバラ",
+                    "今日は全く別の商品について話しています。",
+                ),
+                [KnowledgeChunk(0, "今日は全く別の商品について話しています。")],
+            )
+            assert retriever._reranker is not None
+            retriever._reranker._model = FakeCrossEncoder()
+
+            hits = retriever.retrieve(KnowledgeQuery("すやバラ", top_k=4))
+            retriever.close()
+
+        self.assertEqual(len(hits), 1)
+        self.assertIn("すやすやバラード", hits[0].body)
+        self.assertGreater(hits[0].score.reranker, 0.8)
+
+    def test_sudachi_tokenizer_is_thread_local(self) -> None:
+        workers = 4
+        barrier = threading.Barrier(workers)
+
+        def tokenizer_pair() -> tuple[object, object]:
+            first = _sudachi_tokenizer()
+            barrier.wait()
+            return first, _sudachi_tokenizer()
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            pairs = list(executor.map(lambda _index: tokenizer_pair(), range(workers)))
+
+        self.assertTrue(all(first is second for first, second in pairs))
+        self.assertEqual(len({id(first) for first, _second in pairs}), workers)
+
     def test_vector_search_recalls_semantic_hit_without_lexical_overlap(self) -> None:
         class FakeEmbeddingModel:
             def get_embedding_dimension(self) -> int:
@@ -229,7 +696,11 @@ class FanKnowledgeRetrieverTests(unittest.TestCase):
                         f"特製限定アクリルスタンド販売情報 {suffix}",
                     )
                     for index, suffix in enumerate(
-                        ("価格について詳しく話した", "予約期間を案内した", "商品写真を紹介した")
+                        (
+                            "価格について詳しく話した",
+                            "予約期間を案内した",
+                            "商品写真を紹介した",
+                        )
                     )
                 ],
             )

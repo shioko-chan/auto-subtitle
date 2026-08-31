@@ -23,6 +23,7 @@ from .llm_response import (
 from .local_segmentation import LocalUnit, SpeakerTrack
 from .prompt_templates import prompt_templates_digest, render_user_prompt
 from .reference_context import compact_translation_reference_context
+from .repetition import RepetitionLoopError
 from .source_language import (
     combine_source_languages,
     join_source_fragments,
@@ -32,11 +33,9 @@ from .subtitles import Cue, cue_from_mapping, text_display_width
 from .telemetry import stage_metrics
 from .translation_support import (
     best_split,
-    contains_kana,
     dialogue_context,
     escape_prompt_text,
     machine_translate_with_protected_terms,
-    normalize_residual_japanese,
     reference_replacements,
     reference_text,
     source_timed_units,
@@ -75,6 +74,13 @@ class TranslationOutcome:
     llm_text: str | None = None
     downgrade_reason: str | None = None
     request_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _TopicEvidence:
+    term_references: list[KnowledgeHit]
+    knowledge: list[KnowledgeHit]
+    chat: str
 
 
 class PromptBudgetExceeded(RuntimeError):
@@ -260,7 +266,16 @@ def run_fixed_translation(
 
     audit_outcomes(translations)
 
+    evidence_by_group = _prepare_topic_evidence(
+        groups,
+        source_cues,
+        retrieve_knowledge,
+        retrieve_chat,
+        metric_name="rag.fixed_translation",
+    )
+
     def process(ids: list[int]) -> dict[int, TranslationOutcome]:
+        evidence = evidence_by_group[tuple(ids)]
         return _translate_resilient(
             ids,
             source_cues,
@@ -276,8 +291,7 @@ def run_fixed_translation(
             replacements,
             honorific_rules,
             translation,
-            retrieve_knowledge,
-            retrieve_chat,
+            evidence,
         )
 
     if groups:
@@ -374,40 +388,33 @@ def run_translation_review(
     ]
     groups = _topic_request_groups(source_cues, pending, translation)
     audit_lock = threading.Lock()
+    evidence_by_group = _prepare_topic_evidence(
+        groups,
+        source_cues,
+        retrieve_knowledge,
+        retrieve_chat,
+        metric_name="rag.fixed_translation_review",
+    )
 
     def process(ids: list[int]) -> tuple[dict[int, Cue], list[dict[str, object]]]:
         selected = [source_cues[cue_id] for cue_id in ids]
-        chat_evidence = retrieve_chat(selected) if retrieve_chat else ""
-        knowledge = _topic_knowledge(
-            retrieve_knowledge(selected, chat_evidence)
-            if retrieve_knowledge is not None
-            else []
-        )
+        evidence = evidence_by_group[tuple(ids)]
+        chat_evidence = evidence.chat
+        knowledge = evidence.knowledge
+        term_references = evidence.term_references
         start = min(cue.start for cue in selected)
         end = max(cue.end for cue in selected)
         dialogue = _translation_dialogue_context(
             source_cues, selected, start, end, translation
         )
         source_index = {id(cue): cue_id for cue_id, cue in enumerate(source_cues)}
-        evidence_text = "\n".join(
-            [
-                *(cue.text for cue in selected),
-                *(translated_cues[cue_id].text for cue_id in ids),
-                *(cue.text for cue in dialogue),
-                chat_evidence,
-                *(hit.body for hit in knowledge),
-            ]
-        )
-        reference = compact_translation_reference_context(
-            translation_context,
-            evidence_text=evidence_text,
-            speakers={cue.speaker for cue in selected if cue.speaker},
-        )
+        reference = compact_translation_reference_context(translation_context)
         prompt = render_user_prompt(
             _REVIEW_PROMPT,
             MAXIMUM_UNITS=f"{maximum_units:.3f}",
             HONORIFIC_TRANSLATION_RULES=honorific_rules,
             REFERENCE_TEXT=reference_text(reference),
+            TERM_REFERENCE=_format_term_references(term_references),
             CHAT_EVIDENCE=chat_evidence or "(none)",
             DIALOGUE_CONTEXT="\n".join(
                 _format_review_context_cue(
@@ -467,10 +474,6 @@ def run_translation_review(
                         f"translation review cue {position} text is not non-empty text"
                     )
                 text = text.strip()
-                if contains_kana(text, translation.target_language):
-                    raise RuntimeError(
-                        f"translation review cue {position} contains residual Japanese"
-                    )
                 seen.add(local_id)
                 global_id = local_to_global[local_id]
                 reviewed[global_id] = replace(translated_cues[global_id], text=text)
@@ -758,18 +761,10 @@ def _translate_resilient(
     replacements: tuple[tuple[str, str], ...],
     honorific_rules: str,
     translation: TranslationConfig,
-    retrieve_knowledge: Callable[[list[Cue], str], list[KnowledgeHit]] | None,
-    retrieve_chat: Callable[[list[Cue]], str] | None,
+    evidence: _TopicEvidence,
     context_excluded_ids: frozenset[int] | None = None,
 ) -> dict[int, TranslationOutcome]:
     excluded_ids = context_excluded_ids or frozenset(ids)
-    selected = [cues[cue_id] for cue_id in ids]
-    chat_evidence = retrieve_chat(selected) if retrieve_chat else ""
-    knowledge = _topic_knowledge(
-        retrieve_knowledge(selected, chat_evidence)
-        if retrieve_knowledge is not None
-        else []
-    )
     try:
         return _request_translation(
             ids,
@@ -783,29 +778,16 @@ def _translate_resilient(
             log_invalid_response,
             local_translate,
             base_context,
-            knowledge,
+            evidence,
             replacements,
             honorific_rules,
             translation,
-            chat_evidence,
             excluded_ids,
         )
     except Exception as exc:
         if isinstance(exc, PromptBudgetExceeded):
             if len(ids) == 1:
-                cue_id = ids[0]
-                logger.warning(
-                    "translation prompt exceeds local context for one cue; "
-                    "using local machine translation cue_id=%d",
-                    cue_id,
-                )
-                return {
-                    cue_id: TranslationOutcome(
-                        _fallback(cues[cue_id], replacements, local_translate),
-                        "local_mt",
-                        downgrade_reason="prompt_budget_exceeded",
-                    )
-                }
+                raise
             middle = len(ids) // 2
             logger.warning(
                 "splitting fixed-translation topic size=%d to satisfy token budget",
@@ -816,32 +798,124 @@ def _translate_resilient(
                     ids[:middle], cues, llm, request, parse_content, finish_reason,
                     retry_delay, is_nontransient, log_invalid_response,
                     local_translate, base_context, replacements, honorific_rules,
-                    translation, retrieve_knowledge, retrieve_chat, excluded_ids,
+                    translation, evidence, excluded_ids,
                 ),
                 **_translate_resilient(
                     ids[middle:], cues, llm, request, parse_content, finish_reason,
                     retry_delay, is_nontransient, log_invalid_response,
                     local_translate, base_context, replacements, honorific_rules,
-                    translation, retrieve_knowledge, retrieve_chat, excluded_ids,
+                    translation, evidence, excluded_ids,
                 ),
             }
         if is_nontransient(exc) or retry_delay(exc, 1) is not None:
             raise
         if len(ids) == 1:
             cue_id = ids[0]
-            logger.warning(
-                "LLM translation downgrade reason=%s fallback=local_machine_translation cue_id=%d original_text=%r",
-                type(exc).__name__,
-                cue_id,
-                cues[cue_id].text,
-            )
-            return {
-                cue_id: TranslationOutcome(
-                    _fallback(cues[cue_id], replacements, local_translate),
-                    "local_mt",
-                    downgrade_reason=type(exc).__name__,
+            if isinstance(exc, RepetitionLoopError):
+                no_evidence, no_evidence_error = _probe_repetition_translation(
+                    ids,
+                    cues,
+                    llm,
+                    request,
+                    parse_content,
+                    finish_reason,
+                    retry_delay,
+                    is_nontransient,
+                    log_invalid_response,
+                    local_translate,
+                    base_context,
+                    _TopicEvidence([], [], ""),
+                    replacements,
+                    honorific_rules,
+                    translation,
+                    excluded_ids,
                 )
-            }
+                trigger = "target"
+                recovered = no_evidence
+                if no_evidence is not None:
+                    trigger = (
+                        "chat"
+                        if evidence.chat and not (
+                            evidence.term_references or evidence.knowledge
+                        )
+                        else "knowledge"
+                        if (evidence.term_references or evidence.knowledge)
+                        and not evidence.chat
+                        else "chat_or_knowledge"
+                    )
+                    if evidence.term_references or evidence.knowledge:
+                        knowledge_only, knowledge_error = (
+                            _probe_repetition_translation(
+                                ids,
+                                cues,
+                                llm,
+                                request,
+                                parse_content,
+                                finish_reason,
+                                retry_delay,
+                                is_nontransient,
+                                log_invalid_response,
+                                local_translate,
+                                base_context,
+                                _TopicEvidence(
+                                    evidence.term_references,
+                                    evidence.knowledge,
+                                    "",
+                                ),
+                                replacements,
+                                honorific_rules,
+                                translation,
+                                excluded_ids,
+                            )
+                        )
+                        if isinstance(knowledge_error, RepetitionLoopError):
+                            trigger = "knowledge"
+                        elif knowledge_only is not None:
+                            trigger = "chat" if evidence.chat else "interaction"
+                            recovered = knowledge_only
+                        else:
+                            trigger = "evidence_interaction"
+                elif not isinstance(no_evidence_error, RepetitionLoopError):
+                    trigger = "undetermined"
+                diagnosis = {
+                    "trigger": trigger,
+                    "cue_ids": ids,
+                    "source_texts": [cues[value].text for value in ids],
+                    "knowledge_ids": [
+                        hit.record_id
+                        for hit in [
+                            *evidence.term_references,
+                            *evidence.knowledge,
+                        ]
+                    ],
+                    "chat_lines": len(evidence.chat.splitlines()),
+                    "pattern": exc.match.pattern[:200],
+                    "repeats": exc.match.repeats,
+                    "minimal_reproducer": trigger == "target",
+                }
+                log_invalid_response(
+                    "repetition minimizer",
+                    exc,
+                    diagnosis,
+                    None,
+                    None,
+                )
+                if recovered is not None:
+                    return recovered
+                logger.warning(
+                    "LLM translation downgrade reason=repetition_loop "
+                    "fallback=local_machine_translation cue_id=%d original_text=%r",
+                    cue_id,
+                    cues[cue_id].text,
+                )
+                return {
+                    cue_id: TranslationOutcome(
+                        _fallback(cues[cue_id], replacements, local_translate),
+                        "local_mt",
+                        downgrade_reason="repetition_loop",
+                    )
+                }
+            raise
         middle = len(ids) // 2
         logger.warning(
             "shrinking failed fixed-translation batch size=%d: %s", len(ids), exc
@@ -862,8 +936,7 @@ def _translate_resilient(
                 replacements,
                 honorific_rules,
                 translation,
-                retrieve_knowledge,
-                retrieve_chat,
+                evidence,
                 excluded_ids,
             ),
             **_translate_resilient(
@@ -881,8 +954,7 @@ def _translate_resilient(
                 replacements,
                 honorific_rules,
                 translation,
-                retrieve_knowledge,
-                retrieve_chat,
+                evidence,
                 excluded_ids,
             ),
         }
@@ -902,16 +974,16 @@ def _request_translation(
     ],
     local_translate: Callable[[str], str],
     context: dict[str, object],
-    knowledge: list[KnowledgeHit],
+    evidence: _TopicEvidence,
     replacements: tuple[tuple[str, str], ...],
     honorific_rules: str,
     translation: TranslationConfig,
-    chat_evidence: str,
     context_excluded_ids: frozenset[int],
+    content_attempts: int = _CONTENT_ATTEMPTS,
 ) -> dict[int, TranslationOutcome]:
     previous_error: Exception | None = None
     transient_attempts = 0
-    for content_attempt in range(_CONTENT_ATTEMPTS):
+    for content_attempt in range(content_attempts):
         local_to_global = dict(enumerate(ids))
         selected = [cues[value] for value in ids]
         start = min(cue.start for cue in selected)
@@ -928,8 +1000,7 @@ def _request_translation(
             cues=cues,
             selected=selected,
             dialogue=dialogue,
-            knowledge=knowledge,
-            chat_evidence=chat_evidence,
+            evidence=evidence,
             context=context,
             llm=llm,
             translation=translation,
@@ -986,21 +1057,6 @@ def _request_translation(
                         downgrade_reason="empty_translation",
                         request_id=(request_id if isinstance(request_id, str) else None),
                     )
-                elif contains_kana(text, translation.target_language):
-                    logger.warning(
-                        "LLM translation downgrade reason=residual_japanese fallback=protected_machine_translation cue_id=%d text=%r",
-                        global_id,
-                        text,
-                    )
-                    result[global_id] = TranslationOutcome(
-                        normalize_residual_japanese(
-                            text, replacements, local_translate, cue.language
-                        ),
-                        "protected_local_mt",
-                        llm_text=text,
-                        downgrade_reason="residual_japanese",
-                        request_id=(request_id if isinstance(request_id, str) else None),
-                    )
                 else:
                     result[global_id] = TranslationOutcome(
                         text,
@@ -1013,6 +1069,8 @@ def _request_translation(
             return result
         except Exception as exc:
             log_invalid_response("fixed cue translation", exc, content, body, response)
+            if isinstance(exc, RepetitionLoopError):
+                raise
             if is_nontransient(exc):
                 raise
             delay = retry_delay(exc, transient_attempts + 1)
@@ -1023,9 +1081,56 @@ def _request_translation(
                 time.sleep(delay)
                 continue
             previous_error = exc
-            if content_attempt + 1 >= min(_CONTENT_ATTEMPTS, llm.max_retries):
+            if content_attempt + 1 >= min(content_attempts, llm.max_retries):
                 raise
     raise RuntimeError("fixed translation exhausted retries")
+
+
+def _probe_repetition_translation(
+    ids: list[int],
+    cues: list[Cue],
+    llm: LLMConfig,
+    request: Callable[[dict[str, object]], dict[str, object]],
+    parse_content: Callable[[object], list[object]],
+    finish_reason: Callable[[object], str | None],
+    retry_delay: Callable[[Exception, int], float | None],
+    is_nontransient: Callable[[Exception], bool],
+    log_invalid_response: Callable[
+        [str, Exception, object, dict[str, object] | None, object], None
+    ],
+    local_translate: Callable[[str], str],
+    context: dict[str, object],
+    evidence: _TopicEvidence,
+    replacements: tuple[tuple[str, str], ...],
+    honorific_rules: str,
+    translation: TranslationConfig,
+    context_excluded_ids: frozenset[int],
+) -> tuple[dict[int, TranslationOutcome] | None, Exception | None]:
+    try:
+        return (
+            _request_translation(
+                ids,
+                cues,
+                llm,
+                request,
+                parse_content,
+                finish_reason,
+                retry_delay,
+                is_nontransient,
+                log_invalid_response,
+                local_translate,
+                context,
+                evidence,
+                replacements,
+                honorific_rules,
+                translation,
+                context_excluded_ids,
+                content_attempts=1,
+            ),
+            None,
+        )
+    except Exception as exc:  # noqa: BLE001 - probes classify every request failure
+        return None, exc
 
 
 def _format_translation_cues(
@@ -1086,16 +1191,15 @@ def _fit_translation_prompt(
     cues: list[Cue],
     selected: list[Cue],
     dialogue: list[Cue],
-    knowledge: list[KnowledgeHit],
-    chat_evidence: str,
+    evidence: _TopicEvidence,
     context: dict[str, object],
     llm: LLMConfig,
     translation: TranslationConfig,
     honorific_rules: str,
     previous_error: Exception | None,
 ) -> str:
-    active_knowledge = list(knowledge)
-    active_chat = chat_evidence.splitlines()
+    active_knowledge = list(evidence.knowledge)
+    active_chat = evidence.chat.splitlines()
     active_dialogue = list(dialogue)
     original_counts = (
         len(active_knowledge),
@@ -1105,24 +1209,13 @@ def _fit_translation_prompt(
 
     while True:
         chat_text = "\n".join(active_chat)
-        evidence_text = "\n".join(
-            [
-                *(cue.text for cue in selected),
-                *(cue.text for cue in active_dialogue),
-                chat_text,
-                *(hit.body for hit in active_knowledge),
-            ]
-        )
-        reference = compact_translation_reference_context(
-            context,
-            evidence_text=evidence_text,
-            speakers={cue.speaker for cue in selected if cue.speaker},
-        )
+        reference = compact_translation_reference_context(context)
         prompt = render_user_prompt(
             _TRANSLATE_PROMPT,
             TARGET_LANGUAGE=translation.target_language,
             HONORIFIC_TRANSLATION_RULES=honorific_rules,
             REFERENCE_TEXT=reference_text(reference),
+            TERM_REFERENCE=_format_term_references(evidence.term_references),
             CHAT_EVIDENCE=chat_text or "(none)",
             DIALOGUE_CONTEXT="\n".join(
                 f"<{cue.speaker or 'unknown'}>{escape_prompt_text(cue.text)}"
@@ -1249,6 +1342,53 @@ def _topic_request_groups(
     return groups
 
 
+def _prepare_topic_evidence(
+    groups: list[list[int]],
+    cues: list[Cue],
+    retrieve_knowledge: Callable[[list[Cue], str], list[KnowledgeHit]] | None,
+    retrieve_chat: Callable[[list[Cue]], str] | None,
+    *,
+    metric_name: str,
+) -> dict[tuple[int, ...], _TopicEvidence]:
+    prepared: dict[tuple[int, ...], _TopicEvidence] = {}
+    if not groups:
+        return prepared
+    with stage_metrics(metric_name):
+        for ids in groups:
+            selected = [cues[cue_id] for cue_id in ids]
+            try:
+                chat = retrieve_chat(selected) if retrieve_chat else ""
+            except Exception as exc:  # noqa: BLE001 - optional evidence fails open.
+                logger.warning("topic chat retrieval failed ids=%s: %s", ids, exc)
+                chat = ""
+            try:
+                hits = (
+                    retrieve_knowledge(selected, chat)
+                    if retrieve_knowledge is not None
+                    else []
+                )
+                term_references = [
+                    hit for hit in hits if "term_reference" in hit.retrieval_ranks
+                ]
+                knowledge = _topic_knowledge(
+                    [
+                        hit
+                        for hit in hits
+                        if "term_reference" not in hit.retrieval_ranks
+                    ]
+                )
+            except Exception as exc:  # noqa: BLE001 - optional evidence fails open.
+                logger.warning(
+                    "topic knowledge retrieval failed ids=%s: %s", ids, exc
+                )
+                term_references = []
+                knowledge = []
+            prepared[tuple(ids)] = _TopicEvidence(
+                term_references, knowledge, chat
+            )
+    return prepared
+
+
 def _topic_knowledge(hits: list[KnowledgeHit]) -> list[KnowledgeHit]:
     selected: list[KnowledgeHit] = []
     seen: set[str] = set()
@@ -1272,6 +1412,15 @@ def _format_topic_knowledge(knowledge: list[KnowledgeHit]) -> str:
     return (
         "\n".join(
             f"- <{hit.kind}:{hit.title}> {hit.body[:180]}" for hit in knowledge
+        )
+        or "(none)"
+    )
+
+
+def _format_term_references(references: list[KnowledgeHit]) -> str:
+    return (
+        "\n".join(
+            f"- <{hit.kind}:{hit.title}> {hit.body}" for hit in references
         )
         or "(none)"
     )

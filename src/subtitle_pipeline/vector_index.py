@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 
@@ -13,8 +14,13 @@ class LocalVectorIndex:
         self._device = "cpu"
         self._index = None
         self._ids: dict[str, int] = {}
+        self._lock = threading.Lock()
 
     def sync(self, values: list[tuple[str, str]]) -> tuple[int, int]:
+        with self._lock:
+            return self._sync(values)
+
+    def _sync(self, values: list[tuple[str, str]]) -> tuple[int, int]:
         import faiss
         import numpy as np
 
@@ -56,6 +62,10 @@ class LocalVectorIndex:
     def search(self, text: str, limit: int) -> dict[str, float]:
         if limit < 1 or not text.strip():
             return {}
+        with self._lock:
+            return self._search(text, limit)
+
+    def _search(self, text: str, limit: int) -> dict[str, float]:
         self._load_index()
         if self._index is None or not self._ids:
             return {}

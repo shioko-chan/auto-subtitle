@@ -26,9 +26,11 @@ from subtitle_pipeline.asr import (
     _speaker_assignment_for_aligned_cue,
     _speaker_assignment_timeline,
     _speaker_for_aligned_cue,
+    _speech_candidate_quality,
     _speech_asr_windows,
     _timeline_retry_split,
     _transcribe_analyzed,
+    _transcribe_raw_range,
     _transcribe_range,
     _transcribe_song_range,
     _transcribe_speech_batch,
@@ -42,6 +44,106 @@ from subtitle_pipeline.subtitles import Cue
 
 
 class QwenASRTests(unittest.TestCase):
+    def test_song_speech_quality_rejects_mixed_hangul_and_unstable_languages(self):
+        record = {
+            "text": "これは歌です 안녕하세요 this is not stable",
+            "language": "Japanese",
+            "detected_languages": ["Japanese", "Korean", "English"],
+            "recovered_from_repetition": True,
+            "cues": [{"start": 10.0, "end": 18.0, "text": "mixed"}],
+        }
+
+        quality = _speech_candidate_quality(
+            record,
+            AudioRegion(
+                10,
+                20,
+                "speech",
+                confidence=0.8,
+                asr_route="song_speech_fallback",
+                speech_confidence=0.6,
+                music_confidence=0.9,
+            ),
+        )
+
+        self.assertFalse(quality["accepted"])
+        self.assertIn("unexpected_hangul_mixed_script", quality["reasons"])
+        self.assertIn("unstable_split_languages", quality["reasons"])
+
+    def test_song_speech_quality_keeps_japanese_with_english_phrase(self):
+        record = {
+            "text": "今日はready setの意味について話します",
+            "language": "mixed",
+            "detected_languages": ["Japanese", "English"],
+            "cues": [{"start": 10.0, "end": 18.0, "text": "speech"}],
+        }
+
+        quality = _speech_candidate_quality(
+            record,
+            AudioRegion(
+                10,
+                20,
+                "speech",
+                confidence=0.8,
+                asr_route="song_speech_fallback",
+                speech_confidence=0.7,
+                music_confidence=0.9,
+            ),
+        )
+
+        self.assertTrue(quality["accepted"])
+        self.assertEqual(quality["reasons"], [])
+
+    def test_song_speech_quality_gate_discards_and_audits_before_arbitration(self):
+        aligner = Mock()
+        aligner.align.return_value = [object()]
+        text = "これは歌です 안녕하세요 this is not stable"
+        record = {
+            "window_id": 0,
+            "core_start": 10.0,
+            "core_end": 20.0,
+            "language": "Japanese",
+            "detected_languages": ["Japanese", "Korean", "English"],
+            "recovered_from_repetition": True,
+            "text": text,
+        }
+        region = AudioRegion(
+            10,
+            20,
+            "speech",
+            confidence=0.8,
+            asr_route="song_speech_fallback",
+            speech_confidence=0.6,
+            music_confidence=0.9,
+        )
+        audio_buffer = SimpleNamespace(
+            sample_rate=16000,
+            slice=Mock(return_value=np.zeros(16000, dtype=np.float32)),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            audit_path = Path(temp) / "speech-quality.jsonl"
+            with patch(
+                "subtitle_pipeline.asr._result_to_cues",
+                return_value=[Cue(10, 18, text)],
+            ):
+                result = _align_speech_records(
+                    aligner,
+                    [record],
+                    [region],
+                    audio_buffer,
+                    ASRConfig(max_inference_batch_size=1),
+                    30,
+                    audit_path,
+                )[0]
+            audit = json.loads(audit_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["text"], "")
+        self.assertEqual(result["cues"], [])
+        self.assertEqual(result["correction_method"], "speech_quality_gate_discarded")
+        self.assertEqual(audit["action"], "discard")
+        self.assertEqual(audit["text"], text)
+        self.assertIn("unexpected_hangul_mixed_script", audit["reasons"])
+
     def test_corrected_and_original_unalignable_speech_is_discarded(self):
         aligner = Mock()
         aligner.align.side_effect = [[object()], [object()]]
@@ -464,7 +566,7 @@ class QwenASRTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "cache.json"
             path.write_text(
-                '{"version":11,"signature":{"speakers":["A","B"]},'
+                '{"version":13,"signature":{"speakers":["A","B"]},'
                 '"chunks":{"0":{"text":"x","cues":[]}}}',
                 encoding="utf-8",
             )
@@ -1121,6 +1223,92 @@ class QwenASRTests(unittest.TestCase):
                 for item in record["singing_windows"]
             )
         )
+        diagnostic = next(
+            item
+            for item in record["singing_windows"]
+            if item.get("cut_reason") == "repetition_retry"
+        )
+        self.assertTrue(diagnostic["minimal_reproducer"])
+        self.assertEqual(len(diagnostic["resolved_children"]), 2)
+        self.assertGreaterEqual(diagnostic["repeats"], 4)
+
+    def test_singing_asr_discards_minimum_repetition_with_audit(self):
+        repeated = "同じ長い歌詞を繰り返してしまう" * 12
+        model = SimpleNamespace(
+            transcribe=Mock(
+                return_value=[SimpleNamespace(text=repeated, language="Japanese")]
+            )
+        )
+        audio = SimpleNamespace(
+            sample_rate=16000,
+            slice=lambda *_args, **_kwargs: np.zeros(160000, dtype=np.float32),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            audit_path = Path(temp) / "repetition.jsonl"
+
+            record = _transcribe_song_range(
+                model,
+                Path("source.mp4"),
+                None,
+                ASRConfig(),
+                AudioRegion(0, 10, "singing"),
+                label="song",
+                window_config=AudioAnalysisConfig(
+                    singing_asr_target_seconds=30,
+                    singing_asr_min_seconds=20,
+                    singing_asr_max_seconds=38,
+                    singing_asr_overlap_seconds=2,
+                ),
+                audio_buffer=audio,
+                repetition_audit_path=audit_path,
+            )
+            audit = json.loads(audit_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(record["text"], "")
+        self.assertEqual(record["cues"], [])
+        self.assertEqual(audit["kind"], "singing_alt")
+        self.assertEqual(audit["action"], "discard")
+        self.assertTrue(audit["minimal_reproducer"])
+        discard = next(
+            item
+            for item in record["singing_windows"]
+            if item.get("cut_reason") == "repetition_discard"
+        )
+        self.assertTrue(discard["minimal_reproducer"])
+
+    def test_raw_speech_discards_minimum_repetition_with_audit(self):
+        repeated = "私が食べてるのでちょっとこっちに移動します" * 10
+        model = SimpleNamespace(
+            max_new_tokens=128,
+            transcribe=Mock(
+                return_value=[SimpleNamespace(text=repeated, language="Japanese")]
+            ),
+        )
+        audio = SimpleNamespace(
+            sample_rate=16000,
+            slice=lambda *_args, **_kwargs: np.zeros(160000, dtype=np.float32),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            audit_path = Path(temp) / "repetition.jsonl"
+
+            record = _transcribe_raw_range(
+                model,
+                ASRConfig(),
+                0,
+                20,
+                20,
+                audio,
+                audit_path,
+            )
+            audit = json.loads(audit_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(record["text"], "")
+        self.assertTrue(record["discarded_repetition"])
+        self.assertEqual(audit["kind"], "raw_speech")
+        self.assertEqual(audit["action"], "discard")
+        self.assertEqual(
+            record["repetition_diagnostics"][0]["reason"], audit["reason"]
+        )
 
     def test_removes_repeated_text_from_overlapping_song_window(self):
         self.assertEqual(
@@ -1286,6 +1474,10 @@ class QwenASRTests(unittest.TestCase):
                 (root / "asr-cache.json").read_text(encoding="utf-8")
             )
             self.assertTrue(cache["chunks"]["0"]["recovered_from_repetition"])
+            diagnostics = cache["chunks"]["0"]["repetition_diagnostics"]
+            self.assertTrue(diagnostics[0]["minimal_reproducer"])
+            self.assertEqual(diagnostics[0]["start"], 0)
+            self.assertEqual(diagnostics[0]["end"], 40)
 
 
 if __name__ == "__main__":

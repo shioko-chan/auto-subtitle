@@ -48,6 +48,8 @@ from .subtitles import (
     write_srt,
 )
 from .telemetry import pipeline_metrics, stage_metrics
+from .term_extraction import extract_pending_terms
+from .term_web_search import TermWebSearcher
 from .translate import OpenAICompatibleTranslator
 from .upload import upload_to_bilibili
 
@@ -86,9 +88,7 @@ def run_pipeline(
     with _job_log(job_dir / "run.log"):
         logging.info("job directory: %s", job_dir)
         _wait_for_deepseek_task_window(config.llm)
-        local_llm_server = LocalLLMServer(
-            config.llm, job_dir / "local-llm-server.log"
-        )
+        local_llm_server = LocalLLMServer(config.llm, job_dir / "local-llm-server.log")
         fan_knowledge = (
             FanKnowledgeRetriever(
                 Path(config.fan_knowledge.database_path).expanduser(),
@@ -98,6 +98,8 @@ def run_pipeline(
                     config.fan_knowledge.vector_index_path
                 ).expanduser(),
                 vector_minimum_score=config.fan_knowledge.vector_minimum_score,
+                reranker_model=config.fan_knowledge.reranker_model,
+                reranker_minimum_score=(config.fan_knowledge.reranker_minimum_score),
             )
             if config.fan_knowledge.enabled
             else None
@@ -361,6 +363,57 @@ def _run_pipeline_stages(
             local_llm_server.start()
     else:
         local_llm_server.start()
+    if fan_knowledge is not None:
+        with stage_metrics("pipeline.term_extraction"):
+            term_context_size = (
+                min(
+                    config.fan_knowledge.term_extraction_context_size,
+                    config.llm.local_server_context_size,
+                )
+                if config.llm.local_server_enabled
+                else config.fan_knowledge.term_extraction_context_size
+            )
+            term_max_output_tokens = min(
+                config.fan_knowledge.term_extraction_max_output_tokens,
+                max(256, term_context_size // 4),
+            )
+            term_target_input_tokens = min(
+                config.fan_knowledge.term_extraction_target_input_tokens,
+                term_context_size - term_max_output_tokens,
+            )
+            term_concurrency = min(
+                config.llm.max_concurrency,
+                (
+                    config.llm.local_server_parallel
+                    if config.llm.local_server_enabled
+                    else config.llm.max_concurrency
+                ),
+            )
+            term_searcher = TermWebSearcher(
+                Path(config.song_identification.search_worker_project)
+            )
+            term_summary = extract_pending_terms(
+                fan_knowledge,
+                request=translator.request,
+                model=config.llm.model,
+                max_tokens=term_max_output_tokens,
+                thinking=config.llm.thinking,
+                max_retries=config.llm.max_retries,
+                max_concurrency=term_concurrency,
+                audit_path=job_dir / "term-extraction-audit.jsonl",
+                search_web=term_searcher.search,
+                context_size=term_context_size,
+                target_input_tokens=term_target_input_tokens,
+            )
+        logging.info(
+            "term extraction: documents=%d batches=%d candidates=%d "
+            "stored=%d published=%d",
+            term_summary.documents,
+            term_summary.batches,
+            term_summary.candidates,
+            term_summary.stored,
+            term_summary.published,
+        )
     with stage_metrics("pipeline.song_lyrics_translation"):
         if song_result.reports:
             song_result = translate_aligned_song_lyrics(
@@ -404,6 +457,7 @@ def _run_pipeline_stages(
                 exclude_video_id=current_video_id,
                 chat_text=chat_text,
             )
+
     retrieve_translation_chat = (
         (
             lambda selected: current_chat.evidence(
@@ -675,6 +729,7 @@ def _retrieve_translation_knowledge(
     chat_text: str,
 ) -> list[KnowledgeHit]:
     hits_by_id: dict[str, KnowledgeHit] = {}
+    term_hits_by_id: dict[str, KnowledgeHit] = {}
     remaining = query_chars
     chunk: list[str] = []
     chunk_chars = 0
@@ -684,16 +739,19 @@ def _retrieve_translation_knowledge(
         nonlocal chunk, chunk_chars, chunk_speaker
         if not chunk:
             return
-        for hit in retriever.retrieve(
-            KnowledgeQuery(
-                text="\n".join(chunk),
-                speaker=chunk_speaker,
-                video_date=video_date,
-                chat_text=chat_text,
-                exclude_video_id=exclude_video_id,
-                top_k=top_k,
-            )
-        ):
+        query = KnowledgeQuery(
+            text="\n".join(chunk),
+            speaker=chunk_speaker,
+            video_date=video_date,
+            chat_text=chat_text,
+            exclude_video_id=exclude_video_id,
+            top_k=top_k,
+        )
+        for hit in retriever.retrieve_term_references(query):
+            previous = term_hits_by_id.get(hit.record_id)
+            if previous is None or hit.score.total > previous.score.total:
+                term_hits_by_id[hit.record_id] = hit
+        for hit in retriever.retrieve_background(query):
             previous = hits_by_id.get(hit.record_id)
             if previous is None or hit.score.total > previous.score.total:
                 hits_by_id[hit.record_id] = hit
@@ -715,10 +773,19 @@ def _retrieve_translation_knowledge(
         chunk_chars += len(text)
         remaining -= len(text)
     flush()
-    return sorted(
-        hits_by_id.values(),
+    terms = sorted(
+        term_hits_by_id.values(),
         key=lambda hit: (-hit.score.total, hit.record_id),
     )[:top_k]
+    background = sorted(
+        (
+            hit
+            for record_id, hit in hits_by_id.items()
+            if record_id not in term_hits_by_id
+        ),
+        key=lambda hit: (-hit.score.total, hit.record_id),
+    )[:top_k]
+    return [*terms, *background]
 
 
 def _load_optional_json_object(path_value: str | None, label: str) -> dict[str, object]:

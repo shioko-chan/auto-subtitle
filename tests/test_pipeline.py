@@ -11,12 +11,14 @@ from subtitle_pipeline.config import (
     LLMConfig,
     UploadConfig,
 )
+from subtitle_pipeline.fan_knowledge import KnowledgeHit, KnowledgeScore
 from subtitle_pipeline.media import DownloadResult
 from subtitle_pipeline.pipeline import (
     _canonicalize_catalog_tags,
     _deepseek_task_delay,
     _japanese_single_word_list,
     _merge_tags,
+    _retrieve_translation_knowledge,
     _subtitle_evidence,
     _translation_context,
     _youtube_metadata_context,
@@ -28,6 +30,46 @@ from subtitle_pipeline.subtitles import Cue, write_srt
 
 
 class PipelineTests(unittest.TestCase):
+    def test_translation_terms_do_not_consume_background_top_k(self):
+        term = KnowledgeHit(
+            "term:suyabara",
+            "term",
+            "すやバラ",
+            "固定中文译法为助眠抒情歌回。",
+            None,
+            KnowledgeScore(1, 0, 0, 0, 0, 0, 1, 3),
+            ("すやバラ",),
+            {"term_reference": 1},
+        )
+        background = KnowledgeHit(
+            "chunk:history",
+            "document_chunk",
+            "历史直播",
+            "历史背景。",
+            None,
+            KnowledgeScore(1, 0, 0, 0, 0, 0, 1, 2),
+            ("すやバラ",),
+        )
+
+        class Retriever:
+            def retrieve_term_references(self, _query):
+                return [term]
+
+            def retrieve_background(self, _query):
+                return [background]
+
+        hits = _retrieve_translation_knowledge(
+            Retriever(),
+            [Cue(0, 1, "すやバラです", "nakamachi_arale")],
+            video_date=None,
+            top_k=1,
+            query_chars=100,
+            exclude_video_id=None,
+            chat_text="",
+        )
+
+        self.assertEqual([hit.record_id for hit in hits], [term.record_id, background.record_id])
+
     def test_deepseek_task_delay_uses_beijing_weekday_windows(self):
         config = LLMConfig(base_url="https://api.deepseek.com")
 

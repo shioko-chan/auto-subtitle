@@ -4,8 +4,6 @@ from subtitle_pipeline.config import SegmentationConfig
 from subtitle_pipeline.local_segmentation import LocalUnit
 from subtitle_pipeline.translation_support import (
     dialogue_context,
-    normalize_residual_japanese,
-    reference_replacements,
     window_ranges,
 )
 
@@ -60,19 +58,6 @@ class TranslationSupportTests(unittest.TestCase):
 
         self.assertLess(context.index("前"), context.index("後"))
         self.assertNotIn("対象", context)
-
-    def test_residual_japanese_protects_reference_terms(self) -> None:
-        context = {"terms": {"みゅーたいぷ": "MyGO企划"}}
-        replacements = reference_replacements(context)
-
-        result = normalize_residual_japanese(
-            "みゅーたいぷです",
-            replacements,
-            lambda text: f"MT:{text}",
-        )
-
-        self.assertEqual(result, "MyGO企划MT:です")
-
 
 if __name__ == "__main__":
     unittest.main()

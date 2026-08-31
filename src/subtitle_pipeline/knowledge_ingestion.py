@@ -23,7 +23,7 @@ from .fan_knowledge import (
     KnowledgeChunk,
     KnowledgeDocument,
 )
-from .subtitles import Cue, cue_from_mapping, read_subtitles
+from .subtitles import Cue, read_subtitles
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +72,6 @@ def ingest_work_directory(
     retriever: FanKnowledgeRetriever,
     work_dir: Path,
     *,
-    target_seconds: float = 45.0,
     maximum_chars: int = 1400,
     include_regular_chat: bool = False,
 ) -> IngestionSummary:
@@ -118,29 +117,6 @@ def ingest_work_directory(
                 )
             )
 
-        cues = _work_cues(job_dir)
-        if cues:
-            text = "\n".join(cue.text.strip() for cue in cues if cue.text.strip())
-            document = KnowledgeDocument(
-                document_id=_document_id("pipeline_asr", video_id),
-                source_type="pipeline_asr",
-                external_id=video_id,
-                title=title,
-                text=text,
-                source_url=source_url,
-                author=author or None,
-                published_at=published_at,
-                fetched_at=_now(),
-                language=_cue_language(cues),
-                metadata={"job_dir": job_dir.name},
-                reliability=0.82,
-            )
-            chunks = chunk_timed_cues(
-                cues,
-                target_seconds=target_seconds,
-                maximum_chars=maximum_chars,
-            )
-            summary = summary.add(retriever.upsert_document(document, chunks))
         summary = summary.merge(
             _ingest_youtube_chat(
                 retriever,
@@ -683,29 +659,6 @@ def chunk_plain_text(text: str, *, maximum_chars: int = 1400) -> list[KnowledgeC
     return chunks
 
 
-def _work_cues(job_dir: Path) -> list[Cue]:
-    sidecar = job_dir / "source.qwen3-asr.cues.json"
-    if sidecar.is_file():
-        value = _read_json_object(sidecar)
-        raw_cues = value.get("cues")
-        if isinstance(raw_cues, list):
-            return [
-                cue_from_mapping(item) for item in raw_cues if isinstance(item, dict)
-            ]
-    for name in (
-        "source.semantic.srt",
-        "source.lyrics-corrected.srt",
-        "source.qwen3-asr.srt",
-    ):
-        path = job_dir / name
-        if path.is_file():
-            try:
-                return read_subtitles(path)
-            except ValueError:
-                continue
-    return []
-
-
 def _select_youtube_subtitle(
     directory: Path,
     metadata: dict[str, object],
@@ -754,13 +707,6 @@ def _deduplicate_caption_cues(cues: list[Cue]) -> list[Cue]:
             continue
         output.append(value)
     return output
-
-
-def _cue_language(cues: list[Cue]) -> str | None:
-    languages = {cue.language for cue in cues if cue.language}
-    if len(languages) == 1:
-        return next(iter(languages))
-    return "mixed" if languages else None
 
 
 def _mapping_keys(value: object) -> list[str]:

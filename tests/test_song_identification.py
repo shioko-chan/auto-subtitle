@@ -11,8 +11,10 @@ from subtitle_pipeline.song_identification import (
     OCRCandidate,
     SongIdentificationResult,
     VerifiedLyricSpan,
+    _anchor_has_continuous_support,
     _apply_local_match,
     _build_lyric_search_queries,
+    _competing_line_sets,
     _load_cache,
     _lyric_unit_timeline_errors,
     _parse_worker_json_output,
@@ -20,6 +22,7 @@ from subtitle_pipeline.song_identification import (
     _pyshiro_likelihood_wins,
     _recover_acoustic_phrase_neighbors,
     _recover_lyric_gaps,
+    _run_pyshiro_lines,
     _signature,
     aggregate_ocr_observations,
     apply_lyric_corrections,
@@ -52,6 +55,62 @@ class SongIdentificationTests(unittest.TestCase):
             _parse_worker_json_output('loading model...\n{"ok":true,"lines":[]}\n'),
             {"ok": True, "lines": []},
         )
+
+    @patch("subtitle_pipeline.song_identification.subprocess.run")
+    def test_pyshiro_worker_failure_audit_preserves_structured_error(self, run):
+        run.return_value.returncode = 1
+        run.return_value.stdout = json.dumps(
+            {
+                "ok": False,
+                "error_type": "RuntimeError",
+                "error": "display-unit phonemes differ from aligned line 0",
+                "traceback": "Traceback... worker.py line 82",
+            }
+        )
+        run.return_value.stderr = "environment warning"
+        audit: dict[str, object] = {}
+
+        response = _run_pyshiro_lines(
+            "uv",
+            Path("worker.py"),
+            Path("audio.wav"),
+            [LyricLine(0, "歌詞")],
+            JapaneseNormalizer(),
+            failure_audit=audit,
+        )
+
+        self.assertIsNone(response)
+        self.assertEqual(audit["reason"], "pyshiro_worker_failed")
+        self.assertEqual(audit["failure_stage"], "worker_execution")
+        self.assertEqual(audit["worker_returncode"], 1)
+        self.assertEqual(audit["worker_error_type"], "RuntimeError")
+        self.assertIn("display-unit phonemes", str(audit["worker_error"]))
+        self.assertEqual(audit["stderr_tail"], "environment warning")
+        request = audit["request"]
+        self.assertIsInstance(request, dict)
+        self.assertEqual(request["lyrics"][0]["text"], "歌詞")
+
+    @patch("subtitle_pipeline.song_identification.subprocess.run")
+    def test_pyshiro_worker_failure_audit_records_invalid_output(self, run):
+        run.return_value.returncode = 1
+        run.return_value.stdout = "model startup noise"
+        run.return_value.stderr = "worker crashed"
+        audit: dict[str, object] = {}
+
+        response = _run_pyshiro_lines(
+            "uv",
+            Path("worker.py"),
+            Path("audio.wav"),
+            [LyricLine(0, "歌詞")],
+            JapaneseNormalizer(),
+            failure_audit=audit,
+        )
+
+        self.assertIsNone(response)
+        self.assertEqual(audit["reason"], "pyshiro_worker_output_invalid")
+        self.assertEqual(audit["worker_returncode"], 1)
+        self.assertEqual(audit["stdout_tail"], "model startup noise")
+        self.assertEqual(audit["stderr_tail"], "worker crashed")
 
     def test_song_translation_stage_backfills_without_invalidating_signature(self):
         with TemporaryDirectory() as directory:
@@ -172,11 +231,81 @@ class SongIdentificationTests(unittest.TestCase):
         assert reviewed_song is not None
         self.assertEqual(reviewed_song.lines[1].translation_source, "llm_reviewed")
 
+    def test_external_lyrics_are_reviewed_without_modifying_official_lines(self):
+        with TemporaryDirectory() as directory:
+            library_path = Path(directory) / "lyrics.sqlite3"
+            library = LyricsLibrary(library_path)
+            try:
+                song = library.store_canonical_song(
+                    title="曲名",
+                    artist="歌手",
+                    aliases=[],
+                    source_url="https://example.com/lyrics",
+                    lines=[("一行目", None), ("二行目", None), ("三行目", None)],
+                )
+                library.store_translations(
+                    song.song_id,
+                    {0: "外部第一行", 1: "外部第二行", 2: "外部第三行"},
+                    source="external",
+                )
+                library.store_translations(
+                    song.song_id,
+                    {1: "官方第二行"},
+                    source="official",
+                )
+            finally:
+                library.close()
+            result = SongIdentificationResult(
+                [Cue(1, 2, "一行目", "singer", "singing")],
+                [
+                    {
+                        "song_id": song.song_id,
+                        "search_group": {"start": 1, "end": 2},
+                        "alignments": [
+                            {
+                                "corrected_text": "一行目",
+                                "lyric_line_ids": [0],
+                            }
+                        ],
+                    }
+                ],
+            )
+
+            translated = translate_aligned_song_lyrics(
+                result,
+                SongIdentificationConfig(
+                    enabled=True, lyrics_library_path=str(library_path)
+                ),
+                lambda *_args, **_kwargs: self.fail(
+                    "complete external lyrics must not be translated again"
+                ),
+                lyrics_translation_model="test-model",
+                review_lyrics=lambda *_args, **_kwargs: {
+                    0: "校对后的第一行",
+                    1: "模型试图修改官方行",
+                    2: "校对后的第三行",
+                },
+            )
+            library = LyricsLibrary(library_path)
+            try:
+                reviewed_song = library.get(song.song_id)
+            finally:
+                library.close()
+
+        self.assertEqual(
+            translated.corrected_cues[0].preferred_translation,
+            "校对后的第一行",
+        )
+        assert reviewed_song is not None
+        self.assertEqual(reviewed_song.lines[0].translation_source, "llm_reviewed")
+        self.assertEqual(reviewed_song.lines[1].translation, "官方第二行")
+        self.assertEqual(reviewed_song.lines[1].translation_source, "official")
+
     def test_song_cache_accepts_empty_corrected_cues(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "song-cache.json"
             path.write_text(
-                '{"version":14,"signature":"test","reports":[],"corrected_cues":[]}',
+                '{"version":17,"signature":"test","reports":[],"corrected_cues":[]}',
                 encoding="utf-8",
             )
 
@@ -825,6 +954,82 @@ class SongIdentificationTests(unittest.TestCase):
         self.assertTrue(accepted[0])
         self.assertFalse(too_close[0])
         self.assertFalse(below_floor[0])
+
+    def test_pyshiro_gap_uses_smaller_margin(self):
+        config = SongIdentificationConfig(
+            pyshiro_likelihood_floor=-30,
+            pyshiro_gap_likelihood_margin=0.1,
+            pyshiro_likelihood_margin=0.2,
+        )
+
+        accepted = _pyshiro_likelihood_wins(
+            {"likelihood_per_frame": -20.0},
+            [{"likelihood_per_frame": -20.15}],
+            config,
+            margin=config.pyshiro_gap_likelihood_margin,
+        )
+        strict = _pyshiro_likelihood_wins(
+            {"likelihood_per_frame": -20.0},
+            [{"likelihood_per_frame": -20.15}],
+            config,
+        )
+
+        self.assertTrue(accepted[0])
+        self.assertFalse(strict[0])
+
+    def test_strong_anchor_uses_floor_without_competitor_preference(self):
+        config = SongIdentificationConfig(pyshiro_likelihood_floor=-30)
+
+        accepted = _pyshiro_likelihood_wins(
+            {"likelihood_per_frame": -20.0},
+            [{"likelihood_per_frame": -19.0}],
+            config,
+            margin=0,
+            require_preference=False,
+        )
+        below_floor = _pyshiro_likelihood_wins(
+            {"likelihood_per_frame": -31.0},
+            [{"likelihood_per_frame": -40.0}],
+            config,
+            margin=0,
+            require_preference=False,
+        )
+
+        self.assertTrue(accepted[0])
+        self.assertFalse(below_floor[0])
+
+    def test_anchor_strength_requires_multiple_lines_or_contiguous_evidence(self):
+        isolated = LyricAnchor(0, 0, 1, 0.9)
+        left = LyricAnchor(1, 2, 3, 0.9)
+        right = LyricAnchor(2, 3, 4, 0.9)
+        multi_line = LyricAnchor(4, 5, 7, 0.9)
+
+        self.assertFalse(_anchor_has_continuous_support(isolated, (isolated, left)))
+        self.assertTrue(_anchor_has_continuous_support(left, (left, right)))
+        self.assertTrue(_anchor_has_continuous_support(multi_line, (multi_line,)))
+
+    def test_competing_lyrics_exclude_equivalent_normalized_readings(self):
+        song = LibrarySong(
+            "song",
+            "title",
+            "artist",
+            (),
+            "https://example.com",
+            "hash",
+            (
+                LyricLine(0, "今日は", "きょうは"),
+                LyricLine(1, "別の歌詞", "べつのかし"),
+                LyricLine(2, "今日 は", "きょうは"),
+                LyricLine(3, "最後の歌詞", "さいごのかし"),
+            ),
+        )
+
+        competitors = _competing_line_sets(
+            song, [0], normalizer=JapaneseNormalizer(), minimum=4
+        )
+
+        self.assertNotIn("今日 は", [lines[0].text for lines in competitors])
+        self.assertIn("別の歌詞", [lines[0].text for lines in competitors])
 
     def test_pyshiro_line_ranges_expand_one_asr_cue_into_lyric_line_cues(self):
         cues = [Cue(10, 20, "misheard lyrics", "singer", "singing")]

@@ -70,7 +70,7 @@ class KnowledgeIngestionTests(unittest.TestCase):
         self.assertEqual(second.unchanged, 1)
         self.assertEqual(hits[0].kind, "document_chunk")
 
-    def test_work_import_uses_metadata_and_speaker_sidecar(self) -> None:
+    def test_work_import_ignores_pipeline_asr(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             job = root / "work" / "job"
@@ -109,14 +109,13 @@ class KnowledgeIngestionTests(unittest.TestCase):
             )
             retriever = FanKnowledgeRetriever(root / "knowledge.sqlite3")
             summary = ingest_work_directory(retriever, root / "work")
-            hits = retriever.retrieve(
-                KnowledgeQuery("アクスタ", speaker="nakamachi_arale")
-            )
+            metadata_hits = retriever.retrieve(KnowledgeQuery("公式イベント"))
+            asr_hits = retriever.retrieve(KnowledgeQuery("アクスタ"))
             retriever.close()
 
-        self.assertEqual(summary.inserted_or_updated, 2)
-        self.assertEqual(hits[0].kind, "document_chunk")
-        self.assertGreater(hits[0].score.speaker, 0)
+        self.assertEqual(summary.inserted_or_updated, 1)
+        self.assertEqual(metadata_hits[0].kind, "document_chunk")
+        self.assertEqual(asr_hits, [])
 
     def test_youtube_cache_prefers_manual_subtitle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -151,6 +150,7 @@ class KnowledgeIngestionTests(unittest.TestCase):
             retriever.close()
 
         self.assertEqual(summary.inserted_or_updated, 2)
+        self.assertTrue(hits)
 
     def test_youtube_cache_keeps_metadata_without_description(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

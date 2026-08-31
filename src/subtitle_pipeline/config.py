@@ -127,6 +127,7 @@ class SongIdentificationConfig:
     lyric_gap_recheck_seconds: float = 20.0
     lyric_gap_vocal_active_ratio: float = 0.08
     pyshiro_likelihood_floor: float = -30.0
+    pyshiro_gap_likelihood_margin: float = 0.1
     pyshiro_likelihood_margin: float = 0.2
     lyric_neighbor_max_lines: int = 12
     lyric_neighbor_min_coverage: float = 0.45
@@ -197,6 +198,11 @@ class FanKnowledgeConfig:
     embedding_model: str | None = "intfloat/multilingual-e5-base"
     vector_index_path: str = "databases/fan-knowledge.faiss"
     vector_minimum_score: float = 0.62
+    reranker_model: str | None = "BAAI/bge-reranker-v2-m3"
+    reranker_minimum_score: float = 0.05
+    term_extraction_context_size: int = 262144
+    term_extraction_target_input_tokens: int = 220000
+    term_extraction_max_output_tokens: int = 16384
 
 
 @dataclass(frozen=True)
@@ -393,6 +399,10 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("fan_knowledge.youtube_playlist_limit must be positive")
     if not 0 <= knowledge.vector_minimum_score <= 1:
         raise ConfigError("fan_knowledge.vector_minimum_score must be between 0 and 1")
+    if not 0 <= knowledge.reranker_minimum_score <= 1:
+        raise ConfigError(
+            "fan_knowledge.reranker_minimum_score must be between 0 and 1"
+        )
     if config.llm.thinking not in (None, "enabled", "disabled"):
         raise ConfigError("llm.thinking must be 'enabled' or 'disabled'")
     if config.llm.reasoning_effort not in (
@@ -648,9 +658,9 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError(
             "song_identification.lyric_gap_vocal_active_ratio must be between 0 and 1"
         )
-    if songs.pyshiro_likelihood_margin < 0:
+    if songs.pyshiro_gap_likelihood_margin < 0 or songs.pyshiro_likelihood_margin < 0:
         raise ConfigError(
-            "song_identification.pyshiro_likelihood_margin cannot be negative"
+            "song identification pySHIRO likelihood margins cannot be negative"
         )
     if songs.lyric_neighbor_max_lines < 1:
         raise ConfigError(
@@ -755,6 +765,26 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("fan_knowledge top-k limits must be at least 1")
     if knowledge.translation_query_chars < 1:
         raise ConfigError("fan_knowledge.translation_query_chars must be at least 1")
+    if knowledge.term_extraction_context_size < 4096:
+        raise ConfigError(
+            "fan_knowledge.term_extraction_context_size must be at least 4096"
+        )
+    if knowledge.term_extraction_target_input_tokens < 1024:
+        raise ConfigError(
+            "fan_knowledge.term_extraction_target_input_tokens must be at least 1024"
+        )
+    if knowledge.term_extraction_max_output_tokens < 256:
+        raise ConfigError(
+            "fan_knowledge.term_extraction_max_output_tokens must be at least 256"
+        )
+    if (
+        knowledge.term_extraction_target_input_tokens
+        + knowledge.term_extraction_max_output_tokens
+        > knowledge.term_extraction_context_size
+    ):
+        raise ConfigError(
+            "fan_knowledge term extraction input and output budgets exceed context"
+        )
     if config.render.font_size_ratio <= 0:
         raise ConfigError("render.font_size_ratio must be positive")
     if config.render.portrait_font_size_ratio <= 0:

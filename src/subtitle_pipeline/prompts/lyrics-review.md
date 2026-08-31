@@ -19,6 +19,8 @@ Check every line for:
 LEXICAL_AND_TERM_EVIDENCE contains trusted project terminology and name
 mappings. Treat explicit mappings as authoritative. Do not invent dictionary
 meanings that are absent from the evidence.
+Do not reject a fitting fan-style name merely because さん is rendered as 桑 or
+ちゃん as 酱.
 
 Return only lines that require correction. Do not paraphrase acceptable lines.
 Return exactly one JSON object and no explanation:
