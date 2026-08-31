@@ -11,6 +11,7 @@ from subtitle_pipeline.upload import (
     _prepare_description,
     _record_upload_cooldown,
     _retry_after_from_output,
+    _submission_ids,
     _truncate_utf16,
     _utf16_units,
     _wait_for_upload_cooldown,
@@ -19,6 +20,21 @@ from subtitle_pipeline.upload import (
 
 
 class UploadTests(unittest.TestCase):
+    BILIUP_SUCCESS = (
+        'ResponseData { code: 0, data: Some(Object {"aid": Number(123), '
+        '"bvid": String("BV123")}), message: "OK" }'
+    )
+
+    def test_extracts_submission_ids_from_biliup_rust_debug_output(self):
+        output = (
+            '\x1b[32mINFO\x1b[0m ResponseData { code: 0, data: Some(Object '
+            '{"aid": Number(117147313377632), "bvid": String("BV1Wy8h6BEo7")}), '
+            'message: "OK" }'
+        )
+        self.assertEqual(
+            _submission_ids(output), (117147313377632, "BV1Wy8h6BEo7")
+        )
+
     def test_truncates_description_by_utf16_units_without_splitting_surrogate_pair(self):
         value = "a" * 1999 + "🎶" + "tail"
         result = _truncate_utf16(value, 2000)
@@ -56,7 +72,10 @@ class UploadTests(unittest.TestCase):
                 "subtitle_pipeline.upload.require_command", return_value="/bin/biliup"
             ), patch("subtitle_pipeline.upload._wait_for_upload_cooldown"), patch(
                 "subtitle_pipeline.upload._record_upload_cooldown"
-            ), patch("subtitle_pipeline.upload._run_biliup") as run:
+            ), patch(
+                "subtitle_pipeline.upload._run_biliup",
+                return_value=self.BILIUP_SUCCESS,
+            ) as run:
                 upload_to_bilibili(
                     video,
                     title="A title",
@@ -87,7 +106,10 @@ class UploadTests(unittest.TestCase):
                 "subtitle_pipeline.upload.require_command", return_value="/bin/biliup"
             ), patch("subtitle_pipeline.upload._wait_for_upload_cooldown"), patch(
                 "subtitle_pipeline.upload._record_upload_cooldown"
-            ), patch("subtitle_pipeline.upload._run_biliup") as run:
+            ), patch(
+                "subtitle_pipeline.upload._run_biliup",
+                return_value=self.BILIUP_SUCCESS,
+            ) as run:
                 upload_to_bilibili(
                     root / "video.mp4",
                     title="title",
@@ -117,7 +139,7 @@ class UploadTests(unittest.TestCase):
             failures = [
                 BiliupCommandError(1, '{"code":406,"message":"too fast"}'),
                 BiliupCommandError(1, "HTTP 429 Retry-After: 7"),
-                "success",
+                self.BILIUP_SUCCESS,
             ]
             with patch(
                 "subtitle_pipeline.upload.require_command", return_value="/bin/biliup"

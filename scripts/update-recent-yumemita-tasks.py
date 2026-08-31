@@ -184,7 +184,7 @@ def deduplicate(records: list[Record]) -> list[Record]:
     return sorted(
         by_video.values(),
         key=lambda record: (
-            record.published,
+            -record.published.timestamp(),
             channel_order.get(record.channel, len(channel_order)),
             record.video_id,
         ),

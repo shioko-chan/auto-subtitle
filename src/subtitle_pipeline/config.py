@@ -21,6 +21,10 @@ class DownloadConfig:
     js_runtime: str | None = "auto"
     concurrent_fragments: int = 8
     download_chat_replay: bool = True
+    download_top_comments: bool = True
+    top_comment_fetch_limit: int = 100
+    top_comment_min_likes: int = 10
+    top_comment_background_limit: int = 30
     video_format: str = (
         "bv*[vcodec^=vp9]+ba/bv*[vcodec^=vp09]+ba/bv*[vcodec^=avc1]+ba/b"
     )
@@ -271,6 +275,7 @@ class UploadConfig:
     )
     throttle_state_file: str = "work/bilibili-upload-throttle.json"
     pause_marker_file: str = "work/bilibili-upload-paused.json"
+    song_setlist_comment: bool = True
 
 
 @dataclass(frozen=True)
@@ -329,6 +334,12 @@ def load_config(path: Path) -> AppConfig:
 
     if not 1 <= config.download.concurrent_fragments <= 32:
         raise ConfigError("download.concurrent_fragments must be between 1 and 32")
+    if config.download.top_comment_fetch_limit < 1:
+        raise ConfigError("download.top_comment_fetch_limit must be at least 1")
+    if config.download.top_comment_min_likes < 0:
+        raise ConfigError("download.top_comment_min_likes cannot be negative")
+    if config.download.top_comment_background_limit < 1:
+        raise ConfigError("download.top_comment_background_limit must be at least 1")
     if config.llm.max_retries < 1:
         raise ConfigError("llm.max_retries must be at least 1")
     if config.llm.max_concurrency < 1:

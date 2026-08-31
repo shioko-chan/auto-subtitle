@@ -144,6 +144,8 @@ def extract_pending_terms(
     thinking: str | None,
     max_retries: int,
     maximum_documents: int | None = None,
+    maximum_candidates: int | None = None,
+    maximum_new_terms: int | None = None,
     include_backfill: bool = False,
     audit_path: Path | None = None,
     max_concurrency: int = 3,
@@ -169,6 +171,8 @@ def extract_pending_terms(
         context_size=context_size,
         target_input_tokens=target_input_tokens,
         include_backfill=include_backfill,
+        maximum_candidates=maximum_candidates,
+        maximum_new_terms=maximum_new_terms,
     )
     return replace(validation, documents=preparation.documents)
 
@@ -182,6 +186,7 @@ def validate_pending_terms(
     thinking: str | None,
     max_retries: int,
     maximum_candidates: int | None = None,
+    maximum_new_terms: int | None = None,
     include_backfill: bool = False,
     audit_path: Path | None = None,
     max_concurrency: int = 3,
@@ -195,6 +200,12 @@ def validate_pending_terms(
     candidates = _candidates_from_stored_occurrences(
         retriever.term_candidate_occurrences(queued_forms)
     )
+    candidate_order = {value: index for index, value in enumerate(queued_forms)}
+    candidates.sort(
+        key=lambda candidate: candidate_order[
+            _normalize_candidate(candidate.surface)
+        ]
+    )
     eligible_forms = {
         _normalize_candidate(candidate.surface) for candidate in candidates
     }
@@ -204,12 +215,14 @@ def validate_pending_terms(
     if not candidates:
         return TermExtractionSummary()
     accepted: list[ExtractedTerm] = []
+    known_surfaces: set[str] = set()
     pending_candidates: list[LocalTermCandidate] = []
     for candidate in candidates:
         known = retriever.known_term_mapping(candidate.surface, ())
         if known is None:
             pending_candidates.append(candidate)
             continue
+        known_surfaces.add(_normalize_candidate(candidate.surface))
         accepted.append(
             ExtractedTerm(
                 surface=candidate.surface,
@@ -288,9 +301,31 @@ def validate_pending_terms(
     if errors:
         raise RuntimeError(f"term extraction failed for {len(errors)} batch(es)") from errors[0]
 
+    model_terms = [
+        term
+        for term in accepted
+        if _normalize_candidate(term.surface) not in known_surfaces
+    ]
+    model_terms.sort(
+        key=lambda term: candidate_order[_normalize_candidate(term.surface)]
+    )
+    deferred_forms: set[str] = set()
+    if maximum_new_terms is not None and len(model_terms) > maximum_new_terms:
+        deferred_forms = {
+            _normalize_candidate(term.surface)
+            for term in model_terms[maximum_new_terms:]
+        }
+        model_terms = model_terms[:maximum_new_terms]
+    accepted = [
+        term
+        for term in accepted
+        if _normalize_candidate(term.surface) in known_surfaces
+    ] + model_terms
     stored, published = _store_terms_by_document(retriever, candidates, accepted)
     retriever.complete_term_reviews(
-        _normalize_candidate(candidate.surface) for candidate in candidates
+        _normalize_candidate(candidate.surface)
+        for candidate in candidates
+        if _normalize_candidate(candidate.surface) not in deferred_forms
     )
     return TermExtractionSummary(
         documents=0,

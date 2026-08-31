@@ -10,6 +10,11 @@ subtitle-pipeline --config config.toml knowledge ingest-work
 
 该命令读取每个任务的 YouTube metadata 和 SC，不导入本项目生成的 ASR 或字幕正文。普通观众 chat 默认不写入长期知识库；重复运行时根据内容哈希跳过未变化文档。
 
+单视频字幕管线会另行抓取有限数量、按 YouTube“热门评论”排序的顶层评论。
+达到点赞阈值的评论以 `youtube_comment` 低可信背景入库，可参与当前视频的主题
+检索，但不会被当作主播原话或官方事实。抓取数量、点赞阈值和最终保留数量由
+`[download]` 中的 `top_comment_*` 配置控制。
+
 ## 获取历史直播字幕
 
 视频、播放列表和频道 URL 都可交给同一命令：
@@ -69,7 +74,8 @@ subtitle-pipeline --config config.toml knowledge ingest-jsonl \
 
 ## 萃取术语
 
-新增或变化的文档会进入术语萃取队列：
+新增或变化的文档会进入术语萃取队列，但视频字幕流水线不会自动审核或新增
+term。需要维护术语库时显式运行：
 
 ```bash
 subtitle-pipeline --config config.toml knowledge extract-terms
@@ -93,4 +99,5 @@ DeepSeek 默认使用 262144 token 总上下文、220000 token 目标输入和 1
 subtitle-pipeline --config config.toml knowledge stats
 ```
 
-完整字幕流水线会按配置执行增量资料更新和待处理 term 萃取；已经处理且内容未变化的资料不会重复抓取。每次召回及各项分数记录到任务目录的 `fan-knowledge-audit.jsonl`。
+完整字幕流水线只按配置执行增量资料更新，不运行 term 萃取。术语新增仅由
+`knowledge extract-terms` 独立命令或人工维护触发。已经处理且内容未变化的资料不会重复抓取。每次召回及各项分数记录到任务目录的 `fan-knowledge-audit.jsonl`。

@@ -20,11 +20,67 @@ from subtitle_pipeline.knowledge_ingestion import (
     ingest_jsonl,
     ingest_work_directory,
     ingest_youtube_cache,
+    ingest_youtube_top_comments,
 )
 from subtitle_pipeline.subtitles import Cue
 
 
 class KnowledgeIngestionTests(unittest.TestCase):
+    def test_ingests_only_high_like_top_level_youtube_comments(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "comments.info.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "comments": [
+                            {
+                                "id": "high",
+                                "text": "等身大フィギュアの話だね",
+                                "author": "fan-a",
+                                "like_count": 42,
+                            },
+                            {
+                                "id": "reply",
+                                "parent": "high",
+                                "text": "返信",
+                                "author": "fan-b",
+                                "like_count": 100,
+                            },
+                            {
+                                "id": "low",
+                                "text": "低評価ではなく低いいね",
+                                "author": "fan-c",
+                                "like_count": 2,
+                            },
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            retriever = FanKnowledgeRetriever(root / "knowledge.sqlite3")
+            result = ingest_youtube_top_comments(
+                retriever,
+                path,
+                video_id="abcdefghijk",
+                title="配信",
+                source_url="https://www.youtube.com/watch?v=abcdefghijk",
+                published_at="2026-08-31",
+                minimum_likes=10,
+                maximum_comments=30,
+            )
+            hits = retriever.retrieve(
+                KnowledgeQuery("等身大フィギュア", exclude_video_id="abcdefghijk")
+            )
+            retriever.close()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.chunk_count, 1)
+        self.assertEqual(len(hits), 1)
+        self.assertIn("YouTube高赞评论", hits[0].title)
+        self.assertIn("fan-a", hits[0].body)
+        self.assertNotIn("返信", hits[0].body)
     def test_timed_chunks_preserve_speaker_and_split_tracks(self) -> None:
         chunks = chunk_timed_cues(
             [

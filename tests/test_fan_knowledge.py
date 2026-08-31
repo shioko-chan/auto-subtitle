@@ -801,6 +801,30 @@ class FanKnowledgeRetrieverTests(unittest.TestCase):
         self.assertTrue(hits)
         self.assertTrue(all("現在の動画" not in hit.body for hit in hits))
 
+    def test_retrieval_allows_comments_from_current_video(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
+            text = "高赞评论说这里在讨论等身大フィギュア"
+            retriever.upsert_document(
+                KnowledgeDocument(
+                    "document:comments",
+                    "youtube_comment",
+                    "abc_def1234",
+                    "当前视频评论",
+                    text,
+                    reliability=0.42,
+                ),
+                [KnowledgeChunk(0, text)],
+            )
+
+            hits = retriever.retrieve(
+                KnowledgeQuery("等身大フィギュア", exclude_video_id="abc_def1234")
+            )
+            retriever.close()
+
+        self.assertTrue(hits)
+        self.assertEqual(hits[0].title, "当前视频评论")
+
 
 if __name__ == "__main__":
     unittest.main()

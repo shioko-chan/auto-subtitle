@@ -278,6 +278,30 @@ B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服�
 `upload.description_max_chars` 调整上限。`description_prefix` 中的 `{youtube_url}` 会在
 上传时替换为当前任务的 YouTube URL。
 
+原始 YouTube 标题明确含有 `歌枠` 且歌曲识别得到有效歌名时，默认在投稿成功后生成
+`时间 歌名` 格式的顶层歌单评论。biliup 返回的 `aid`、`bvid`，评论接口响应及 `rpid`
+保存在任务目录的 `bilibili-setlist-comment.json`。稿件审核期间不会阻塞流水线：首次
+评论尝试统一安排在投稿成功一小时后；若稿件届时仍不可评论，任务继续按退避间隔保持
+待处理。后续投稿和批处理结束时会检查到期任务，也可手动运行：
+
+```bash
+uv run --extra asr subtitle-pipeline --config config.toml retry-comments
+```
+
+每次发送前会分页检查当前登录账号是否已经发布完全相同的顶层评论，避免流水线重试导致
+重复留言。评论失败不会把已经成功的投稿标记为失败。
+
+建议安装每 15 分钟检查一次到期任务的 systemd 用户定时器：
+
+```bash
+./scripts/install-bilibili-comment-timer.sh
+# 使用其他配置文件时，将其作为第一个参数传入。
+```
+
+定时器设置了 `Persistent=true`，关机期间错过的检查会在下次登录后补跑。查看运行状态和
+日志可使用 `systemctl --user status subtitle-comments.timer` 与
+`journalctl --user -u subtitle-comments.service`。
+
 更新任务列表为六个官方 YouTube 频道最近 14 天的公开直播录播（需要 Chromium
 已登录 YouTube，会员限定和未开播视频会被排除）：
 
@@ -287,7 +311,7 @@ uv run python scripts/update-recent-yumemita-tasks.py
 
 可先加 `--dry-run` 预览；通过 `--days`、`--browser` 调整时间范围和浏览器。
 脚本保留 `work/yumemita-2026-08-10-uploaded.txt` 中的成功投稿历史，并原子更新下面
-批处理脚本的 `RECORDS` 队列。
+批处理脚本的 `RECORDS` 队列。队列按发布时间从新到旧排列，优先处理最新视频。
 
 批量处理队列中的梦限大MewType公开直播录播：
 
@@ -366,6 +390,7 @@ PyTorch、CUDA 和 `libstdc++` 等运行库会由开发环境提供。
 - `upload.max_tags`：投稿使用的固定标签与自动标签总数上限。
 - `upload.tag_catalog_file`：经授权获取或人工维护的 B 站规范标签与热度目录。
 - `upload.description_max_chars`：简介的保守字符上限，同时作为 UTF-16 单位上限。
+- `upload.song_setlist_comment`：仅对原始标题含 `歌枠` 的投稿生成并幂等发布歌单评论。
 - `upload.cooldown_min_seconds` / `cooldown_max_seconds`：成功投稿后写入下一次投稿的
   随机冷却期限，默认 `60–120` 秒，跨进程生效。
 - `upload.rate_limit_retry_delays_seconds`：biliup 输出 `406/429` 且未提供

@@ -8,6 +8,7 @@ import warnings
 from dataclasses import replace
 from pathlib import Path
 
+from .bilibili_comments import process_pending_bilibili_comments
 from .chat_context import remove_youtube_chat_files
 from .config import AppConfig, ConfigError, llm_api_key, load_config
 from .fan_knowledge import FanKnowledgeRetriever
@@ -49,6 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("check", help="check local executables and configuration")
+    subparsers.add_parser(
+        "retry-comments", help="retry pending post-upload Bilibili comments"
+    )
 
     knowledge_parser = subparsers.add_parser(
         "knowledge", help="collect and inspect the local fan knowledge base"
@@ -98,6 +102,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="queue every existing document before extraction",
     )
     extraction_parser.add_argument("--limit", type=int)
+    extraction_parser.add_argument("--candidate-limit", type=int)
+    extraction_parser.add_argument("--maximum-new-terms", type=int)
     extraction_parser.add_argument(
         "--prepare-only",
         action="store_true",
@@ -118,6 +124,18 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(args.config)
         if args.command == "check":
             return _check(config)
+        if args.command == "retry-comments":
+            summary = process_pending_bilibili_comments(
+                config.work_dir.resolve(), config.upload
+            )
+            logging.info(
+                "Bilibili comments: posted=%d existing=%d pending=%d permanent=%d",
+                summary.posted,
+                summary.already_exists,
+                summary.pending,
+                summary.permanent_errors,
+            )
+            return 0
         if args.command == "knowledge":
             return _knowledge(config, args)
         override = True if args.upload else False if args.no_upload else None
@@ -151,6 +169,10 @@ def _knowledge(config: AppConfig, args: argparse.Namespace) -> int:
         if command == "extract-terms":
             if args.limit is not None and args.limit < 1:
                 raise ValueError("--limit must be at least 1")
+            if args.candidate_limit is not None and args.candidate_limit < 1:
+                raise ValueError("--candidate-limit must be at least 1")
+            if args.maximum_new_terms is not None and args.maximum_new_terms < 1:
+                raise ValueError("--maximum-new-terms must be at least 1")
             if args.backfill:
                 queued = retriever.queue_all_documents_for_term_extraction()
                 logging.info("queued %d documents for term extraction", queued)
@@ -216,6 +238,8 @@ def _knowledge(config: AppConfig, args: argparse.Namespace) -> int:
                     thinking=config.llm.thinking,
                     max_retries=config.llm.max_retries,
                     maximum_documents=args.limit,
+                    maximum_candidates=args.candidate_limit,
+                    maximum_new_terms=args.maximum_new_terms,
                     include_backfill=args.backfill,
                     max_concurrency=term_concurrency,
                     audit_path=(

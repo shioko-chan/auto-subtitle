@@ -7,8 +7,9 @@ import re
 import subprocess
 import time
 from collections import deque
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
 
 from .commands import require_command
 from .config import UploadConfig
@@ -23,6 +24,13 @@ class BiliupCommandError(RuntimeError):
         self.output = output
 
 
+@dataclass(frozen=True)
+class BilibiliSubmission:
+    aid: int | None
+    bvid: str | None
+    response: str
+
+
 def upload_to_bilibili(
     video: Path,
     *,
@@ -31,7 +39,7 @@ def upload_to_bilibili(
     source_url: str,
     tags: list[str],
     config: UploadConfig,
-) -> None:
+) -> BilibiliSubmission:
     biliup = require_command("biliup")
     cookie_file = Path(config.cookie_file)
     if not cookie_file.is_file():
@@ -85,9 +93,18 @@ def upload_to_bilibili(
     command.append(str(video))
     for attempt in range(len(config.rate_limit_retry_delays_seconds) + 1):
         try:
-            _run_biliup(command)
+            output = _run_biliup(command)
             _record_upload_cooldown(config)
-            return
+            try:
+                aid, bvid = _submission_ids(output)
+            except RuntimeError as exc:
+                logger.warning(
+                    "upload succeeded, but aid/bvid could not be parsed; "
+                    "skipping the post-upload comment: %s",
+                    exc,
+                )
+                aid, bvid = None, None
+            return BilibiliSubmission(aid=aid, bvid=bvid, response=output)
         except BiliupCommandError as exc:
             code = _bilibili_failure_code(exc.output)
             if code == 412:
@@ -115,6 +132,22 @@ def upload_to_bilibili(
                 delay,
             )
             time.sleep(delay)
+
+
+def _submission_ids(output: str) -> tuple[int, str]:
+    clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+    match = re.search(
+        r'["\']?aid["\']?\s*:\s*(?:Number\()?([0-9]+)\)?'
+        r'.{0,500}?["\']?bvid["\']?\s*:\s*(?:String\()?'
+        r'["\'](BV[0-9A-Za-z]+)["\']\)?',
+        clean,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        raise RuntimeError(
+            "biliup reported success but its output did not contain aid and bvid"
+        )
+    return int(match.group(1)), match.group(2)
 
 
 def _run_biliup(command: Sequence[str]) -> str:

@@ -7,6 +7,12 @@ video_format = "bv*[vcodec^=vp9]+ba/bv*[vcodec^=vp09]+ba/bv*[vcodec^=avc1]+ba/b"
 concurrent_fragments = 8
 # Download chat replay as temporary, time-local evidence for ASR correction and translation.
 download_chat_replay = true
+# Fetch a bounded set of top-level comments sorted by YouTube's "Top comments" order.
+# Retained comments are low-trust RAG background, not authoritative facts.
+download_top_comments = true
+top_comment_fetch_limit = 100
+top_comment_min_likes = 10
+top_comment_background_limit = 30
 # Automatically use Deno, Node or QuickJS when available; set "" to disable.
 js_runtime = "auto"
 # cookies_from_browser = "chrome"
@@ -327,3 +333,7 @@ cooldown_max_seconds = 120
 rate_limit_retry_delays_seconds = [120, 300, 600, 1200]
 throttle_state_file = "work/bilibili-upload-throttle.json"
 pause_marker_file = "work/bilibili-upload-paused.json"
+# After a successful upload, post a top-level setlist comment only when the
+# original YouTube title contains the literal text "歌枠". Drafts under review
+# are recorded under the job directory and retried by later runs.
+song_setlist_comment = true

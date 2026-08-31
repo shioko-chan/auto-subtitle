@@ -35,6 +35,7 @@ class DownloadResult:
     video: Path
     metadata: dict[str, object]
     chat_replay: Path | None = None
+    comments: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,11 @@ def download_youtube(
         if config.download_chat_replay
         else None
     )
+    comments = (
+        _download_youtube_top_comments(url, directory, config, common)
+        if config.download_top_comments
+        else None
+    )
 
     info_path = directory / "source.info.json"
     if not info_path.exists():
@@ -104,7 +110,47 @@ def download_youtube(
     video = max(candidates, key=lambda path: path.stat().st_size)
 
     logging.info("downloaded video: %s", video)
-    return DownloadResult(video, metadata, chat_replay)
+    return DownloadResult(video, metadata, chat_replay, comments)
+
+
+def _download_youtube_top_comments(
+    url: str,
+    directory: Path,
+    config: DownloadConfig,
+    common: list[str] | None = None,
+) -> Path | None:
+    expected = directory / "comments.info.json"
+    if expected.is_file():
+        return expected
+    limit = config.top_comment_fetch_limit
+    command = [
+        *(
+            common
+            or [
+                require_command("yt-dlp"),
+                "--no-playlist",
+                *_runtime_arguments(config),
+                *_authentication_arguments(config),
+            ]
+        ),
+        "--ignore-no-formats-error",
+        "--no-progress",
+        "--skip-download",
+        "--write-info-json",
+        "--write-comments",
+        "--extractor-args",
+        f"youtube:max_comments={limit},{limit},0,0;comment_sort=top",
+        "--output",
+        str(directory / "comments.%(ext)s"),
+        url,
+    ]
+    try:
+        run(command)
+    except CommandError as exc:
+        logging.warning("top YouTube comments unavailable: %s", exc)
+        expected.unlink(missing_ok=True)
+        return None
+    return expected if expected.is_file() else None
 
 
 def _download_youtube_chat_replay(

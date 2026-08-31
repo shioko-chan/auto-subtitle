@@ -734,10 +734,43 @@ class FanKnowledgeRetriever:
         )
         rows = self._database.execute(
             f"""
+            WITH evidence AS (
+                SELECT
+                    queue.normalized_form,
+                    queue.queued_at,
+                    MAX(candidate.strong_name_evidence) AS strong_name,
+                    MAX(CASE candidate.source_type
+                        WHEN 'official_news' THEN 4
+                        WHEN 'official_event' THEN 4
+                        WHEN 'official_music_notice' THEN 4
+                        WHEN 'x_post' THEN 3
+                        WHEN 'instagram_post' THEN 3
+                        WHEN 'youtube_manual_subtitle' THEN 2
+                        WHEN 'youtube_metadata' THEN 2
+                        ELSE 0
+                    END) AS written_source_tier,
+                    COUNT(DISTINCT candidate.source_type) AS source_count,
+                    COUNT(DISTINCT candidate.logical_document_id) AS document_count,
+                    SUM(candidate.occurrence_count) AS occurrence_count,
+                    MAX(candidate.reliability) AS reliability
+                FROM knowledge_term_review_queue AS queue
+                JOIN knowledge_term_candidate_occurrences AS candidate
+                  ON candidate.normalized_form = queue.normalized_form
+                WHERE queue.backfill = 0 OR ?
+                GROUP BY queue.normalized_form, queue.queued_at
+            )
             SELECT normalized_form
-            FROM knowledge_term_review_queue
-            WHERE backfill = 0 OR ?
-            ORDER BY queued_at, normalized_form
+            FROM evidence
+            ORDER BY
+                (strong_name AND written_source_tier > 0) DESC,
+                written_source_tier DESC,
+                strong_name DESC,
+                source_count DESC,
+                document_count DESC,
+                occurrence_count DESC,
+                reliability DESC,
+                queued_at,
+                normalized_form
             {limit}
             """,
             (int(include_backfill), *parameters),
@@ -1633,8 +1666,10 @@ class FanKnowledgeRetriever:
                 parameters: list[object] = [expression]
                 if query.exclude_video_id:
                     exclusion = (
-                        "AND documents.external_id != ? "
+                        "AND (documents.source_type = 'youtube_comment' OR ("
+                        "documents.external_id != ? "
                         "AND substr(documents.external_id, 1, length(?) + 1) != ? || ':'"
+                        "))"
                     )
                     parameters.extend(
                         [
@@ -1694,8 +1729,10 @@ class FanKnowledgeRetriever:
                 exclusion = ""
                 if query.exclude_video_id:
                     exclusion = (
-                        "AND documents.external_id != ? "
+                        "AND (documents.source_type = 'youtube_comment' OR ("
+                        "documents.external_id != ? "
                         "AND substr(documents.external_id, 1, length(?) + 1) != ? || ':'"
+                        "))"
                     )
                     parameters.extend(
                         [

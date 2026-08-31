@@ -29,6 +29,11 @@ class MediaDownloadTests(unittest.TestCase):
             directory = Path(temp)
 
             def fake_run(command):
+                if "--write-comments" in command:
+                    (directory / "comments.info.json").write_text(
+                        '{"comments": []}', encoding="utf-8"
+                    )
+                    return
                 (directory / "source.info.json").write_text(
                     json.dumps({"title": "Video", "language": "ja"}),
                     encoding="utf-8",
@@ -59,13 +64,19 @@ class MediaDownloadTests(unittest.TestCase):
             self.assertEqual(result.video, directory / "source.mp4")
             self.assertEqual(result.metadata["title"], "Video")
             self.assertEqual(result.chat_replay, directory / "source.live_chat.json")
-            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_count, 3)
             video_command = run.call_args_list[0].args[0]
             chat_command = run.call_args_list[1].args[0]
+            comment_command = run.call_args_list[2].args[0]
             self.assertNotIn("--write-subs", video_command)
             self.assertNotIn("--write-auto-subs", video_command)
             self.assertIn("--write-subs", chat_command)
             self.assertIn("live_chat", chat_command)
+            self.assertIn("--write-comments", comment_command)
+            self.assertTrue(
+                any("comment_sort=top" in argument for argument in comment_command)
+            )
+            self.assertEqual(result.comments, directory / "comments.info.json")
             self.assertIn("node:/usr/bin/node", video_command)
             self.assertIn(DownloadConfig().video_format, video_command)
             fragments_index = video_command.index("--concurrent-fragments")
@@ -89,7 +100,11 @@ class MediaDownloadTests(unittest.TestCase):
                 result = download_youtube(
                     "https://youtu.be/test",
                     directory,
-                    DownloadConfig(js_runtime=None, download_chat_replay=False),
+                    DownloadConfig(
+                        js_runtime=None,
+                        download_chat_replay=False,
+                        download_top_comments=False,
+                    ),
                 )
 
             self.assertEqual(result.video, directory / "source.mp4")

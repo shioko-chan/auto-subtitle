@@ -20,6 +20,11 @@ from .asr import (
     transcribe_with_qwen,
 )
 from .asr_correction import correct_asr_windows, entities_from_context
+from .bilibili_comments import (
+    build_song_setlist_comment,
+    create_comment_task,
+    process_pending_bilibili_comments,
+)
 from .chat_context import CurrentVideoChatIndex, remove_youtube_chat_files
 from .config import AppConfig, LLMConfig, llm_api_key
 from .fan_knowledge import (
@@ -28,6 +33,7 @@ from .fan_knowledge import (
     KnowledgeQuery,
     video_date_from_metadata,
 )
+from .knowledge_ingestion import ingest_youtube_top_comments
 from .knowledge_update import update_knowledge_if_stale
 from .local_llm_server import LocalLLMServer
 from .media import download_youtube, render_subtitles, subtitle_layout
@@ -48,8 +54,6 @@ from .subtitles import (
     write_srt,
 )
 from .telemetry import pipeline_metrics, stage_metrics
-from .term_extraction import extract_pending_terms
-from .term_web_search import TermWebSearcher
 from .translate import OpenAICompatibleTranslator
 from .upload import upload_to_bilibili
 
@@ -73,6 +77,8 @@ class PipelineResult:
     translated_metadata: Path
     rendered_video: Path
     uploaded: bool
+    bilibili_aid: int | None
+    bilibili_bvid: str | None
 
 
 def run_pipeline(
@@ -224,6 +230,22 @@ def _run_pipeline_stages(
     video_date = video_date_from_metadata(downloaded.metadata)
     current_video_id = str(downloaded.metadata.get("id") or "").strip() or None
     if fan_knowledge is not None:
+        if downloaded.comments is not None and current_video_id is not None:
+            comment_result = ingest_youtube_top_comments(
+                fan_knowledge,
+                downloaded.comments,
+                video_id=current_video_id,
+                title=str(downloaded.metadata.get("title") or current_video_id),
+                source_url=url,
+                published_at=video_date,
+                minimum_likes=config.download.top_comment_min_likes,
+                maximum_comments=config.download.top_comment_background_limit,
+            )
+            if comment_result is not None:
+                logging.info(
+                    "indexed %d high-like YouTube comments as current-video background",
+                    comment_result.chunk_count,
+                )
         imported = fan_knowledge.ingest_translation_context(translation_context)
         logging.info("indexed %d curated fan-knowledge records", imported)
     japanese_single_word_list = _japanese_single_word_list(translation_context)
@@ -363,57 +385,6 @@ def _run_pipeline_stages(
             local_llm_server.start()
     else:
         local_llm_server.start()
-    if fan_knowledge is not None:
-        with stage_metrics("pipeline.term_extraction"):
-            term_context_size = (
-                min(
-                    config.fan_knowledge.term_extraction_context_size,
-                    config.llm.local_server_context_size,
-                )
-                if config.llm.local_server_enabled
-                else config.fan_knowledge.term_extraction_context_size
-            )
-            term_max_output_tokens = min(
-                config.fan_knowledge.term_extraction_max_output_tokens,
-                max(256, term_context_size // 4),
-            )
-            term_target_input_tokens = min(
-                config.fan_knowledge.term_extraction_target_input_tokens,
-                term_context_size - term_max_output_tokens,
-            )
-            term_concurrency = min(
-                config.llm.max_concurrency,
-                (
-                    config.llm.local_server_parallel
-                    if config.llm.local_server_enabled
-                    else config.llm.max_concurrency
-                ),
-            )
-            term_searcher = TermWebSearcher(
-                Path(config.song_identification.search_worker_project)
-            )
-            term_summary = extract_pending_terms(
-                fan_knowledge,
-                request=translator.request,
-                model=config.llm.model,
-                max_tokens=term_max_output_tokens,
-                thinking=config.llm.thinking,
-                max_retries=config.llm.max_retries,
-                max_concurrency=term_concurrency,
-                audit_path=job_dir / "term-extraction-audit.jsonl",
-                search_web=term_searcher.search,
-                context_size=term_context_size,
-                target_input_tokens=term_target_input_tokens,
-            )
-        logging.info(
-            "term extraction: documents=%d batches=%d candidates=%d "
-            "stored=%d published=%d",
-            term_summary.documents,
-            term_summary.batches,
-            term_summary.candidates,
-            term_summary.stored,
-            term_summary.published,
-        )
     with stage_metrics("pipeline.song_lyrics_translation"):
         if song_result.reports:
             song_result = translate_aligned_song_lyrics(
@@ -612,9 +583,11 @@ def _run_pipeline_stages(
     should_upload = (
         config.upload.enabled if upload_override is None else upload_override
     )
+    submission = None
     if should_upload:
         with stage_metrics("pipeline.upload"):
-            upload_to_bilibili(
+            process_pending_bilibili_comments(config.work_dir.resolve(), config.upload)
+            submission = upload_to_bilibili(
                 rendered_path,
                 title=title,
                 description=description,
@@ -622,6 +595,27 @@ def _run_pipeline_stages(
                 tags=upload_tags,
                 config=config.upload,
             )
+            setlist = (
+                build_song_setlist_comment(source_title, song_result.reports)
+                if config.upload.song_setlist_comment
+                else None
+            )
+            if (
+                setlist is not None
+                and submission.aid is not None
+                and submission.bvid is not None
+            ):
+                create_comment_task(
+                    job_dir,
+                    aid=submission.aid,
+                    bvid=submission.bvid,
+                    message=setlist,
+                    source_url=url,
+                    upload_response=submission.response,
+                )
+                process_pending_bilibili_comments(
+                    config.work_dir.resolve(), config.upload
+                )
 
     result = PipelineResult(
         job_dir=job_dir,
@@ -631,6 +625,8 @@ def _run_pipeline_stages(
         translated_metadata=metadata_path,
         rendered_video=rendered_path,
         uploaded=should_upload,
+        bilibili_aid=submission.aid if submission is not None else None,
+        bilibili_bvid=submission.bvid if submission is not None else None,
     )
     _write_manifest(result, url, title)
     return result

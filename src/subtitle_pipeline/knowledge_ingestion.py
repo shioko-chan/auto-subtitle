@@ -161,6 +161,67 @@ def ingest_jsonl(
     return summary
 
 
+def ingest_youtube_top_comments(
+    retriever: FanKnowledgeRetriever,
+    path: Path,
+    *,
+    video_id: str,
+    title: str,
+    source_url: str | None,
+    published_at: str | None,
+    minimum_likes: int,
+    maximum_comments: int,
+) -> DocumentUpsertResult | None:
+    if not path.is_file():
+        return None
+    metadata = _read_json_object(path)
+    values = metadata.get("comments")
+    if not isinstance(values, list):
+        return None
+
+    comments: list[tuple[int, str, str]] = []
+    seen_ids: set[str] = set()
+    for value in values:
+        if not isinstance(value, dict) or value.get("parent") not in (None, "root"):
+            continue
+        comment_id = str(value.get("id") or "").strip()
+        text = re.sub(r"\s+", " ", str(value.get("text") or "")).strip()
+        author = str(value.get("author") or "").strip() or "匿名用户"
+        likes = _integer(value.get("like_count"))
+        if not text or likes < minimum_likes or (comment_id and comment_id in seen_ids):
+            continue
+        if comment_id:
+            seen_ids.add(comment_id)
+        comments.append((likes, author, text))
+
+    comments.sort(key=lambda item: item[0], reverse=True)
+    comments = comments[:maximum_comments]
+    if not comments:
+        return None
+    chunks = [
+        KnowledgeChunk(
+            ordinal=index,
+            text=f"[YouTube高赞评论][{author}][赞 {likes}] {text}",
+            language="mixed",
+        )
+        for index, (likes, author, text) in enumerate(comments)
+    ]
+    document = KnowledgeDocument(
+        document_id=_document_id("youtube_comment", video_id),
+        source_type="youtube_comment",
+        external_id=video_id,
+        title=f"{title}（YouTube高赞评论）",
+        text="\n".join(chunk.text for chunk in chunks),
+        source_url=source_url,
+        published_at=published_at,
+        fetched_at=_now(),
+        language="mixed",
+        metadata={"comment_count": len(chunks), "minimum_likes": minimum_likes},
+        reliability=0.42,
+    )
+    return retriever.upsert_document(document, chunks)
+
+
 def ingest_document_mapping(
     retriever: FanKnowledgeRetriever,
     value: object,
@@ -757,6 +818,13 @@ def _document_id(source_type: str, external_id: str) -> str:
 
 def _optional_float(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
+
+
+def _integer(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _now() -> str:

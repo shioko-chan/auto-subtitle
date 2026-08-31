@@ -67,6 +67,20 @@ class RecentTaskTests(unittest.TestCase):
             self.assertNotIn("failed", result)
             self.assertIn("echo run", result)
 
+    def test_deduplicate_orders_newest_video_first(self):
+        records = [
+            tasks.Record(datetime(2026, 8, 19, tzinfo=UTC), "ritsu", "older"),
+            tasks.Record(datetime(2026, 8, 21, tzinfo=UTC), "arale", "newest"),
+            tasks.Record(datetime(2026, 8, 20, tzinfo=UTC), "miyako", "middle"),
+        ]
+
+        ordered = tasks.deduplicate(records)
+
+        self.assertEqual(
+            [record.video_id for record in ordered],
+            ["newest", "middle", "older"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -258,6 +258,139 @@ class TermExtractionTests(unittest.TestCase):
         self.assertEqual(incremental, [])
         self.assertGreater(len(backfill), 0)
 
+    def test_review_queue_prioritizes_reliable_written_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
+            retriever.upsert_document(
+                KnowledgeDocument(
+                    "document:ranking",
+                    "official_news",
+                    "ranking",
+                    "告知",
+                    "すやバラ公式とすやバラ配信",
+                ),
+                [KnowledgeChunk(0, "すやバラ公式とすやバラ配信")],
+            )
+            document = retriever.pending_term_documents()[0]
+            chunk_id = document.chunks[0].chunk_id
+            retriever.replace_term_candidate_occurrences(
+                [document.document_id],
+                [
+                    TermCandidateOccurrence(
+                        "すやバラ公式",
+                        "すやバラ公式",
+                        document.document_id,
+                        document.document_id,
+                        chunk_id,
+                        "[OFFICIAL]すやバラ公式",
+                        "official_news",
+                        1.0,
+                        True,
+                        1,
+                    ),
+                    TermCandidateOccurrence(
+                        "すやバラ配信",
+                        "すやバラ配信",
+                        document.document_id,
+                        document.document_id,
+                        chunk_id,
+                        "[ASR]すやバラ配信",
+                        "youtube_auto_subtitle",
+                        0.6,
+                        True,
+                        100,
+                    ),
+                ],
+            )
+            retriever.finish_term_preparation(
+                [document],
+                touched_forms=["すやバラ公式", "すやバラ配信"],
+                pending_review_forms=["すやバラ公式", "すやバラ配信"],
+                backfill=False,
+            )
+
+            pending = retriever.pending_term_review_forms()
+            retriever.close()
+
+        self.assertEqual(pending, ["すやバラ公式", "すやバラ配信"])
+
+    def test_validation_caps_new_terms_and_defers_overflow(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
+            retriever.upsert_document(
+                KnowledgeDocument(
+                    "document:term-cap",
+                    "official_news",
+                    "term-cap",
+                    "告知",
+                    "すやバラ甲、すやバラ乙、すやバラ丙",
+                ),
+                [KnowledgeChunk(0, "すやバラ甲、すやバラ乙、すやバラ丙")],
+            )
+            document = retriever.pending_term_documents()[0]
+            chunk_id = document.chunks[0].chunk_id
+            surfaces = ("すやバラ甲", "すやバラ乙", "すやバラ丙")
+            retriever.replace_term_candidate_occurrences(
+                [document.document_id],
+                [
+                    TermCandidateOccurrence(
+                        surface,
+                        surface,
+                        document.document_id,
+                        document.document_id,
+                        chunk_id,
+                        f"[OFFICIAL]{surface}",
+                        "official_news",
+                        1.0,
+                        True,
+                        1,
+                    )
+                    for surface in surfaces
+                ],
+            )
+            retriever.finish_term_preparation(
+                [document],
+                touched_forms=surfaces,
+                pending_review_forms=surfaces,
+                backfill=False,
+            )
+
+            def request(_body: dict[str, object]) -> dict[str, object]:
+                return _response(
+                    {
+                        "terms": [
+                            {
+                                "candidate": surface,
+                                "canonical_zh": surface,
+                                "confidence": 0.9,
+                                "action": "accept",
+                                "search_query": "",
+                            }
+                            for surface in surfaces
+                        ]
+                    }
+                )
+
+            validate_pending_terms(
+                retriever,
+                request=request,
+                model="test-model",
+                max_tokens=1024,
+                thinking=None,
+                max_retries=1,
+                maximum_new_terms=2,
+            )
+            active = retriever._database.execute(
+                "SELECT surface FROM knowledge_extracted_terms "
+                "WHERE status = 'active' ORDER BY surface"
+            ).fetchall()
+            pending = retriever.pending_term_review_forms()
+            retriever.close()
+
+        self.assertEqual(len(active), 2)
+        self.assertEqual(len(pending), 1)
+        self.assertNotIn(pending[0], {row["surface"] for row in active})
+
     def test_local_patterns_cover_domain_name_forms(self) -> None:
         values = _local_term_surfaces(
             "夢限大みゅーたいぷのすやバラ配信。"
