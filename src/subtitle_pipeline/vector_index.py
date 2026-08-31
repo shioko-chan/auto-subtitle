@@ -65,6 +65,14 @@ class LocalVectorIndex:
         with self._lock:
             return self._search(text, limit)
 
+    def release_model(self) -> bool:
+        with self._lock:
+            if self._model is None:
+                return False
+            self._model = None
+            self._device = "cpu"
+            return True
+
     def _search(self, text: str, limit: int) -> dict[str, float]:
         self._load_index()
         if self._index is None or not self._ids:

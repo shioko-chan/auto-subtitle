@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 import sqlite3
@@ -17,6 +18,7 @@ from typing import Self
 from .cross_encoder import LocalCrossEncoderReranker
 from .vector_index import LocalVectorIndex
 
+_LOGGER = logging.getLogger(__name__)
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_+.-]*|[\u3040-\u30ff\u3400-\u9fff]+")
 _JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 _SCHEMA_VERSION = 7
@@ -275,7 +277,35 @@ class FanKnowledgeRetriever:
         self._initialize()
 
     def close(self) -> None:
+        self.release_models()
         self._database.close()
+
+    def release_models(self) -> int:
+        released = sum(
+            (
+                int(self._vector_index.release_model())
+                if self._vector_index is not None
+                else 0,
+                int(self._reranker.release_model())
+                if self._reranker is not None
+                else 0,
+            )
+        )
+        if not released:
+            return 0
+
+        import gc
+
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+        _LOGGER.info("released %d fan-knowledge retrieval model(s)", released)
+        return released
 
     def __enter__(self) -> Self:
         return self

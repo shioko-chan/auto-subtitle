@@ -198,6 +198,7 @@ def _run_pipeline_stages(
     if fan_knowledge is not None:
         with stage_metrics("pipeline.knowledge_update"):
             update_knowledge_if_stale(config, fan_knowledge)
+        fan_knowledge.release_models()
     with stage_metrics("pipeline.download"):
         downloaded = download_youtube(url, job_dir, config.download)
 
@@ -299,34 +300,38 @@ def _run_pipeline_stages(
         if config.llm.local_server_enabled:
             with stage_metrics("pipeline.local_llm_asr_correction_startup"):
                 local_llm_server.start()
-        return correct_asr_windows(
-            records,
-            entities=asr_entities,
-            request=translator.request,
-            model=config.llm.model,
-            cache_path=job_dir / "asr-correction-cache.json",
-            audit_path=job_dir / "asr-correction-audit.jsonl",
-            batch_windows=config.asr_correction.batch_windows,
-            batch_chars=config.asr_correction.batch_chars,
-            max_tokens=config.asr_correction.max_tokens,
-            retrieve_knowledge=(
-                lambda record, text: (
-                    fan_knowledge.retrieve(
-                        KnowledgeQuery(
-                            text=text,
-                            speaker=str(record.get("speaker") or "") or None,
-                            video_date=video_date,
-                            ocr_text=str(record.get("ocr_text") or ""),
-                            chat_text=str(record.get("chat_text") or ""),
-                            exclude_video_id=current_video_id,
-                            top_k=config.fan_knowledge.top_k_asr,
+        try:
+            return correct_asr_windows(
+                records,
+                entities=asr_entities,
+                request=translator.request,
+                model=config.llm.model,
+                cache_path=job_dir / "asr-correction-cache.json",
+                audit_path=job_dir / "asr-correction-audit.jsonl",
+                batch_windows=config.asr_correction.batch_windows,
+                batch_chars=config.asr_correction.batch_chars,
+                max_tokens=config.asr_correction.max_tokens,
+                retrieve_knowledge=(
+                    lambda record, text: (
+                        fan_knowledge.retrieve(
+                            KnowledgeQuery(
+                                text=text,
+                                speaker=str(record.get("speaker") or "") or None,
+                                video_date=video_date,
+                                ocr_text=str(record.get("ocr_text") or ""),
+                                chat_text=str(record.get("chat_text") or ""),
+                                exclude_video_id=current_video_id,
+                                top_k=config.fan_knowledge.top_k_asr,
+                            )
                         )
+                        if fan_knowledge is not None
+                        else None
                     )
-                    if fan_knowledge is not None
-                    else None
-                )
-            ),
-        )
+                ),
+            )
+        finally:
+            if fan_knowledge is not None:
+                fan_knowledge.release_models()
 
     with stage_metrics("pipeline.audio_and_asr"):
         source_subtitle = transcribe_with_qwen(

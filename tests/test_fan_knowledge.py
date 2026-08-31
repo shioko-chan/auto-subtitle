@@ -6,6 +6,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -22,6 +23,22 @@ from subtitle_pipeline.fan_knowledge import (
 
 
 class FanKnowledgeRetrieverTests(unittest.TestCase):
+    def test_release_models_releases_vector_and_reranker_models(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
+            retriever._vector_index = MagicMock()
+            retriever._vector_index.release_model.return_value = True
+            retriever._reranker = MagicMock()
+            retriever._reranker.release_model.return_value = True
+
+            with patch("torch.cuda.is_available", return_value=False):
+                released = retriever.release_models()
+
+            self.assertEqual(released, 2)
+            retriever._vector_index.release_model.assert_called_once_with()
+            retriever._reranker.release_model.assert_called_once_with()
+            retriever.close()
+
     def test_changed_documents_are_queued_for_term_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")

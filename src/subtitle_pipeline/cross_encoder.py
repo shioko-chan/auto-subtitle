@@ -32,6 +32,13 @@ class LocalCrossEncoderReranker:
             for value in values
         ]
 
+    def release_model(self) -> bool:
+        with self._lock:
+            if self._model is None:
+                return False
+            self._model = None
+            return True
+
     def _load_model(self):
         if self._model is None:
             try:

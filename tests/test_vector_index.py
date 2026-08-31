@@ -13,6 +13,19 @@ from subtitle_pipeline.vector_index import LocalVectorIndex
 
 
 class LocalVectorIndexTests(unittest.TestCase):
+    def test_release_model_preserves_loaded_index(self) -> None:
+        index = LocalVectorIndex(Path("unused.faiss"), "fake")
+        loaded_index = object()
+        index._model = object()
+        index._device = "cuda"
+        index._index = loaded_index
+
+        self.assertTrue(index.release_model())
+        self.assertIsNone(index._model)
+        self.assertEqual(index._device, "cpu")
+        self.assertIs(index._index, loaded_index)
+        self.assertFalse(index.release_model())
+
     def test_search_serializes_shared_embedding_model(self) -> None:
         class ReentryDetectingModel:
             def __init__(self) -> None:
