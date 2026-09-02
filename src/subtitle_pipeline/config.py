@@ -271,6 +271,14 @@ class UploadConfig:
 
 
 @dataclass(frozen=True)
+class ClipsConfig:
+    upload: bool = False
+    max_speech_seconds: float = 480.0
+    chat_peak_zscore: float = 3.0
+    chat_min_unique_authors: int = 5
+
+
+@dataclass(frozen=True)
 class AppConfig:
     work_dir: Path = Path("work")
     download: DownloadConfig = field(default_factory=DownloadConfig)
@@ -286,6 +294,7 @@ class AppConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
     upload: UploadConfig = field(default_factory=UploadConfig)
+    clips: ClipsConfig = field(default_factory=ClipsConfig)
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -320,6 +329,7 @@ def load_config(path: Path) -> AppConfig:
             llm=LLMConfig(**_section(data, "llm")),
             render=RenderConfig(**_section(data, "render")),
             upload=UploadConfig(**_section(data, "upload")),
+            clips=ClipsConfig(**_section(data, "clips")),
         )
     except TypeError as exc:
         raise ConfigError(f"unknown or missing configuration field: {exc}") from exc
@@ -820,6 +830,12 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError(
             "upload.rate_limit_retry_delays_seconds must contain positive delays"
         )
+    if config.clips.max_speech_seconds < 30:
+        raise ConfigError("clips.max_speech_seconds must be at least 30")
+    if config.clips.chat_peak_zscore < 0:
+        raise ConfigError("clips.chat_peak_zscore cannot be negative")
+    if config.clips.chat_min_unique_authors < 1:
+        raise ConfigError("clips.chat_min_unique_authors must be at least 1")
     return config
 
 

@@ -16,6 +16,7 @@ from subtitle_pipeline.upload import (
     _utf16_units,
     _wait_for_upload_cooldown,
     upload_to_bilibili,
+    upload_videos_to_bilibili,
 )
 
 
@@ -27,15 +28,15 @@ class UploadTests(unittest.TestCase):
 
     def test_extracts_submission_ids_from_biliup_rust_debug_output(self):
         output = (
-            '\x1b[32mINFO\x1b[0m ResponseData { code: 0, data: Some(Object '
+            "\x1b[32mINFO\x1b[0m ResponseData { code: 0, data: Some(Object "
             '{"aid": Number(117147313377632), "bvid": String("BV1Wy8h6BEo7")}), '
             'message: "OK" }'
         )
-        self.assertEqual(
-            _submission_ids(output), (117147313377632, "BV1Wy8h6BEo7")
-        )
+        self.assertEqual(_submission_ids(output), (117147313377632, "BV1Wy8h6BEo7"))
 
-    def test_truncates_description_by_utf16_units_without_splitting_surrogate_pair(self):
+    def test_truncates_description_by_utf16_units_without_splitting_surrogate_pair(
+        self,
+    ):
         value = "a" * 1999 + "🎶" + "tail"
         result = _truncate_utf16(value, 2000)
         self.assertEqual(result, "a" * 1999)
@@ -68,14 +69,18 @@ class UploadTests(unittest.TestCase):
             cookie.write_text("{}", encoding="utf-8")
             video = root / "video.mp4"
             config = UploadConfig(cookie_file=str(cookie), tags=["中字", "科技"])
-            with patch(
-                "subtitle_pipeline.upload.require_command", return_value="/bin/biliup"
-            ), patch("subtitle_pipeline.upload._wait_for_upload_cooldown"), patch(
-                "subtitle_pipeline.upload._record_upload_cooldown"
-            ), patch(
-                "subtitle_pipeline.upload._run_biliup",
-                return_value=self.BILIUP_SUCCESS,
-            ) as run:
+            with (
+                patch(
+                    "subtitle_pipeline.upload.require_command",
+                    return_value="/bin/biliup",
+                ),
+                patch("subtitle_pipeline.upload._wait_for_upload_cooldown"),
+                patch("subtitle_pipeline.upload._record_upload_cooldown"),
+                patch(
+                    "subtitle_pipeline.upload._run_biliup",
+                    return_value=self.BILIUP_SUCCESS,
+                ) as run,
+            ):
                 upload_to_bilibili(
                     video,
                     title="A title",
@@ -85,7 +90,9 @@ class UploadTests(unittest.TestCase):
                     config=config,
                 )
             command = run.call_args.args[0]
-            self.assertEqual(command[:4], ["/bin/biliup", "--user-cookie", str(cookie), "upload"])
+            self.assertEqual(
+                command[:4], ["/bin/biliup", "--user-cookie", str(cookie), "upload"]
+            )
             self.assertNotIn("--source", command)
             self.assertNotIn("https://youtube.test/watch?v=1", command)
             self.assertIn("中字,自动生成", command)
@@ -103,14 +110,18 @@ class UploadTests(unittest.TestCase):
                 cookie_file=str(cookie),
                 description_prefix="原视频：{youtube_url}\n字幕说明",
             )
-            with patch(
-                "subtitle_pipeline.upload.require_command", return_value="/bin/biliup"
-            ), patch("subtitle_pipeline.upload._wait_for_upload_cooldown"), patch(
-                "subtitle_pipeline.upload._record_upload_cooldown"
-            ), patch(
-                "subtitle_pipeline.upload._run_biliup",
-                return_value=self.BILIUP_SUCCESS,
-            ) as run:
+            with (
+                patch(
+                    "subtitle_pipeline.upload.require_command",
+                    return_value="/bin/biliup",
+                ),
+                patch("subtitle_pipeline.upload._wait_for_upload_cooldown"),
+                patch("subtitle_pipeline.upload._record_upload_cooldown"),
+                patch(
+                    "subtitle_pipeline.upload._run_biliup",
+                    return_value=self.BILIUP_SUCCESS,
+                ) as run,
+            ):
                 upload_to_bilibili(
                     root / "video.mp4",
                     title="title",
@@ -124,6 +135,48 @@ class UploadTests(unittest.TestCase):
             self.assertEqual(
                 description,
                 f"原视频：{source_url}\n字幕说明\n\n正文",
+            )
+
+    def test_builds_one_multi_part_command_in_supplied_order(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cookie = root / "cookies.json"
+            cookie.write_text("{}", encoding="utf-8")
+            parts = [root / "001_first.mp4", root / "002_second.mp4"]
+            config = UploadConfig(cookie_file=str(cookie))
+            with (
+                patch(
+                    "subtitle_pipeline.upload.require_command",
+                    return_value="/bin/biliup",
+                ),
+                patch("subtitle_pipeline.upload._wait_for_upload_cooldown"),
+                patch("subtitle_pipeline.upload._record_upload_cooldown"),
+                patch(
+                    "subtitle_pipeline.upload._run_biliup",
+                    return_value=self.BILIUP_SUCCESS,
+                ) as run,
+            ):
+                upload_videos_to_bilibili(
+                    parts,
+                    title="合集",
+                    description="简介",
+                    source_url="https://youtube.test/video",
+                    tags=["切片"],
+                    config=config,
+                )
+
+            command = run.call_args.args[0]
+            self.assertEqual(command[-2:], [str(parts[0]), str(parts[1])])
+
+    def test_rejects_empty_multi_part_upload(self):
+        with self.assertRaisesRegex(ValueError, "at least one video"):
+            upload_videos_to_bilibili(
+                [],
+                title="empty",
+                description="",
+                source_url="https://youtube.test/video",
+                tags=["切片"],
+                config=UploadConfig(),
             )
 
     def test_retries_rate_limited_complete_upload_with_configured_delays(self):
@@ -142,11 +195,17 @@ class UploadTests(unittest.TestCase):
                 BiliupCommandError(1, "HTTP 429 Retry-After: 7"),
                 self.BILIUP_SUCCESS,
             ]
-            with patch(
-                "subtitle_pipeline.upload.require_command", return_value="/bin/biliup"
-            ), patch("subtitle_pipeline.upload._run_biliup", side_effect=failures) as run, patch(
-                "subtitle_pipeline.upload.time.sleep"
-            ) as sleep, patch("subtitle_pipeline.upload._record_upload_cooldown"):
+            with (
+                patch(
+                    "subtitle_pipeline.upload.require_command",
+                    return_value="/bin/biliup",
+                ),
+                patch(
+                    "subtitle_pipeline.upload._run_biliup", side_effect=failures
+                ) as run,
+                patch("subtitle_pipeline.upload.time.sleep") as sleep,
+                patch("subtitle_pipeline.upload._record_upload_cooldown"),
+            ):
                 upload_to_bilibili(
                     root / "video.mp4",
                     title="title",
@@ -170,9 +229,13 @@ class UploadTests(unittest.TestCase):
                 pause_marker_file=str(marker),
             )
             error = BiliupCommandError(1, '{"code":412,"message":"risk"}')
-            with patch(
-                "subtitle_pipeline.upload.require_command", return_value="/bin/biliup"
-            ), patch("subtitle_pipeline.upload._run_biliup", side_effect=error):
+            with (
+                patch(
+                    "subtitle_pipeline.upload.require_command",
+                    return_value="/bin/biliup",
+                ),
+                patch("subtitle_pipeline.upload._run_biliup", side_effect=error),
+            ):
                 with self.assertRaisesRegex(RuntimeError, "queue paused"):
                     upload_to_bilibili(
                         root / "video.mp4",
@@ -193,13 +256,15 @@ class UploadTests(unittest.TestCase):
                 cooldown_max_seconds=120,
                 throttle_state_file=str(path),
             )
-            with patch("subtitle_pipeline.upload.random.uniform", return_value=75), patch(
-                "subtitle_pipeline.upload.time.time", return_value=1000
+            with (
+                patch("subtitle_pipeline.upload.random.uniform", return_value=75),
+                patch("subtitle_pipeline.upload.time.time", return_value=1000),
             ):
                 _record_upload_cooldown(config)
-            with patch("subtitle_pipeline.upload.time.time", return_value=1020), patch(
-                "subtitle_pipeline.upload.time.sleep"
-            ) as sleep:
+            with (
+                patch("subtitle_pipeline.upload.time.time", return_value=1020),
+                patch("subtitle_pipeline.upload.time.sleep") as sleep,
+            ):
                 _wait_for_upload_cooldown(path)
             sleep.assert_called_once_with(55)
 

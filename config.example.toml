@@ -327,3 +327,10 @@ pause_marker_file = "work/bilibili-upload-paused.json"
 # Five minutes after a successful upload, automatically post a top-level
 # setlist comment when the original YouTube title contains the literal "歌枠".
 song_setlist_comment = true
+
+[clips]
+# Independent from upload.enabled; clips also accepts --upload/--no-upload.
+upload = false
+max_speech_seconds = 480
+chat_peak_zscore = 3.0
+chat_min_unique_authors = 5

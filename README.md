@@ -285,6 +285,38 @@ Playwright 和已登录的 Chromium 页面自动发布。每次发送前会分�
 已经发布完全相同的顶层评论，避免重复留言；评论失败会记录接口响应和页面截图，但不会
 把已经成功的投稿标记为失败。
 
+## 自动切片
+
+`clips` 是独立命令，只读取已经完成的任务目录，不会调用或修改主流水线。它根据直播
+弹幕密度、独立观众数、重复反应及付费/会员事件发现候选，再让 LLM 在连续字幕范围内
+选择完整上下文。歌回中有可靠识别和时间证据的歌曲会各自生成一个分 P，且不会再生成
+与歌曲重叠的语音高光。
+
+```bash
+# 仅分析并生成切片
+uv run subtitle-pipeline --config config.toml clips --no-upload \
+  'https://www.youtube.com/watch?v=...'
+
+# 生成后作为一个多 P 投稿上传
+uv run subtitle-pipeline --config config.toml clips --upload \
+  'https://www.youtube.com/watch?v=...'
+```
+
+命令要求 `work/<video-id>/` 已有 `translated.mp4`、最终字幕、翻译元数据和源视频信息；
+缺少时会直接报错，不会补跑主流水线。结果写到 `work/<video-id>/clips/`：分析与审计数据
+保存在 `analysis.json`，视频保存在 `parts/`。上传成功后会写入 `upload.json`；后续重复
+运行可以补齐本地切片，但只要该记录存在就绝不再次上传。上传失败不会写成功记录。
+
+配置项位于独立的 `[clips]`：
+
+```toml
+[clips]
+upload = false
+max_speech_seconds = 480
+chat_peak_zscore = 3.0
+chat_min_unique_authors = 5
+```
+
 更新任务列表为六个官方 YouTube 频道最近 14 天的公开直播录播（需要 Chromium
 已登录 YouTube，会员限定和未开播视频会被排除）：
 

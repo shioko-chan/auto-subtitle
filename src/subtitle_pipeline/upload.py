@@ -40,6 +40,27 @@ def upload_to_bilibili(
     tags: list[str],
     config: UploadConfig,
 ) -> BilibiliSubmission:
+    return upload_videos_to_bilibili(
+        [video],
+        title=title,
+        description=description,
+        source_url=source_url,
+        tags=tags,
+        config=config,
+    )
+
+
+def upload_videos_to_bilibili(
+    videos: Sequence[Path],
+    *,
+    title: str,
+    description: str,
+    source_url: str,
+    tags: list[str],
+    config: UploadConfig,
+) -> BilibiliSubmission:
+    if not videos:
+        raise ValueError("at least one video is required for Bilibili upload")
     biliup = require_command("biliup")
     cookie_file = Path(config.cookie_file)
     if not cookie_file.is_file():
@@ -53,9 +74,7 @@ def upload_to_bilibili(
             "before resuming"
         )
     _wait_for_upload_cooldown(Path(config.throttle_state_file))
-    description_prefix = config.description_prefix.replace(
-        "{youtube_url}", source_url
-    )
+    description_prefix = config.description_prefix.replace("{youtube_url}", source_url)
     upload_description = _prepare_description(
         description,
         prefix=description_prefix,
@@ -87,7 +106,7 @@ def upload_to_bilibili(
     ]
     if config.line:
         command.extend(["--line", config.line])
-    command.append(str(video))
+    command.extend(str(video) for video in videos)
     for attempt in range(len(config.rate_limit_retry_delays_seconds) + 1):
         try:
             output = _run_biliup(command)
@@ -195,7 +214,14 @@ def _wait_for_upload_cooldown(path: Path) -> None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         next_allowed_at = float(payload["next_allowed_at"])
-    except (FileNotFoundError, OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+    except (
+        FileNotFoundError,
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        json.JSONDecodeError,
+    ):
         return
     delay = next_allowed_at - time.time()
     if delay > 0:

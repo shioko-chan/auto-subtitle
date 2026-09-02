@@ -113,7 +113,9 @@ class CurrentVideoChatIndex:
                 handle.write(json.dumps(value, ensure_ascii=False) + "\n")
 
 
-def read_youtube_live_chat(path: Path) -> list[YouTubeChatMessage]:
+def read_youtube_live_chat(
+    path: Path, *, include_low_information: bool = False
+) -> list[YouTubeChatMessage]:
     messages: list[YouTubeChatMessage] = []
     with path.open(encoding="utf-8") as handle:
         for line in handle:
@@ -143,7 +145,9 @@ def read_youtube_live_chat(path: Path) -> list[YouTubeChatMessage]:
                 membership = renderer_name == "liveChatMembershipItemRenderer"
                 if not text and membership:
                     text = _runs_text(renderer.get("headerSubtext"))
-                if not useful_chat_text(text):
+                if not include_low_information and not useful_chat_text(text):
+                    continue
+                if not text and not amount and not membership:
                     continue
                 messages.append(
                     YouTubeChatMessage(
@@ -216,8 +220,7 @@ def _format_selected_messages(messages: list[YouTubeChatMessage]) -> list[str]:
         values = active.get(key)
         if (
             values is None
-            or message.offset_seconds - values[0].offset_seconds
-            > _REPEAT_GROUP_SECONDS
+            or message.offset_seconds - values[0].offset_seconds > _REPEAT_GROUP_SECONDS
         ):
             values = []
             active[key] = values

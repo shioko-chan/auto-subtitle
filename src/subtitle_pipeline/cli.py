@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .chat_context import remove_youtube_chat_files
+from .clips import run_clips
 from .config import AppConfig, ConfigError, llm_api_key, load_config
 from .fan_knowledge import FanKnowledgeRetriever
 from .knowledge_collection import collect_official_documents, collect_sns_documents
@@ -46,6 +47,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     upload_group.add_argument(
         "--no-upload", action="store_true", help="render locally but never upload"
+    )
+
+    clips_parser = subparsers.add_parser(
+        "clips",
+        help="find and render highlights from a completed pipeline job",
+    )
+    clips_parser.add_argument("url", help="the completed job's YouTube video URL")
+    clips_upload_group = clips_parser.add_mutually_exclusive_group()
+    clips_upload_group.add_argument(
+        "--upload", action="store_true", help="upload even if clips.upload is false"
+    )
+    clips_upload_group.add_argument(
+        "--no-upload",
+        action="store_true",
+        help="generate clips locally but never upload",
     )
 
     subparsers.add_parser("check", help="check local executables and configuration")
@@ -122,6 +138,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "knowledge":
             return _knowledge(config, args)
         override = True if args.upload else False if args.no_upload else None
+        if args.command == "clips":
+            clips = run_clips(args.url, config, upload_override=override)
+            logging.info("clips complete: %d part(s)", len(clips.parts))
+            logging.info(
+                "clips uploaded to Bilibili: %s",
+                "yes" if clips.uploaded else "no",
+            )
+            return 0
         result = run_pipeline(args.url, config, upload_override=override)
         logging.info("complete: %s", result.rendered_video)
         logging.info("uploaded to Bilibili: %s", "yes" if result.uploaded else "no")
@@ -359,7 +383,7 @@ def _check(config: AppConfig) -> int:
         else:
             missing.append(executable)
             logging.error("missing executable: %s", executable)
-    if config.upload.enabled:
+    if config.upload.enabled or config.clips.upload:
         path = shutil.which("biliup")
         if path:
             logging.info("found biliup: %s", path)

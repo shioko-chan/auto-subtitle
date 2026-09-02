@@ -116,6 +116,10 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.render.nvenc_cq, 20)
             self.assertEqual(config.upload.cooldown_min_seconds, 60)
             self.assertEqual(config.upload.cooldown_max_seconds, 120)
+            self.assertFalse(config.clips.upload)
+            self.assertEqual(config.clips.max_speech_seconds, 480)
+            self.assertEqual(config.clips.chat_peak_zscore, 3.0)
+            self.assertEqual(config.clips.chat_min_unique_authors, 5)
             self.assertEqual(
                 config.upload.rate_limit_retry_delays_seconds,
                 [120, 300, 600, 1200],
@@ -141,6 +145,29 @@ class ConfigTests(unittest.TestCase):
             path = Path(temp) / "config.toml"
             path.write_text("[download]\nconcurrent_fragments = 0\n", encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, "concurrent_fragments"):
+                load_config(path)
+
+    def test_loads_clip_upload_independently_from_full_upload(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(
+                "[upload]\nenabled = false\n[clips]\nupload = true\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+            self.assertFalse(config.upload.enabled)
+            self.assertTrue(config.clips.upload)
+
+    def test_rejects_invalid_clip_thresholds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(
+                "[clips]\nchat_min_unique_authors = 0\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ConfigError, "chat_min_unique_authors"):
                 load_config(path)
 
     def test_rejects_unknown_render_backend(self):

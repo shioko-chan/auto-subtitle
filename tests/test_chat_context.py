@@ -8,10 +8,40 @@ from pathlib import Path
 from subtitle_pipeline.chat_context import (
     CurrentVideoChatIndex,
     YouTubeChatMessage,
+    read_youtube_live_chat,
 )
 
 
 class CurrentVideoChatIndexTests(unittest.TestCase):
+    def test_clip_analysis_can_retain_reaction_only_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "source.live_chat.json"
+            payload = {
+                "replayChatItemAction": {
+                    "videoOffsetTimeMsec": "10000",
+                    "actions": [
+                        {
+                            "addChatItemAction": {
+                                "item": {
+                                    "liveChatTextMessageRenderer": {
+                                        "id": "reaction-1",
+                                        "authorName": {"simpleText": "viewer"},
+                                        "message": {"runs": [{"text": ":_TAIKI:"}]},
+                                    }
+                                }
+                            }
+                        }
+                    ],
+                }
+            }
+            path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+            self.assertEqual(read_youtube_live_chat(path), [])
+            messages = read_youtube_live_chat(path, include_low_information=True)
+
+            self.assertEqual(len(messages), 1)
+            self.assertEqual(messages[0].text, ":_TAIKI:")
+
     def test_includes_all_useful_time_local_messages_and_audits_selection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             audit = Path(temporary) / "audit.jsonl"
