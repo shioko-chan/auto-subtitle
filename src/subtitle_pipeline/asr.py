@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import subprocess
 import unicodedata
 from collections.abc import Callable
@@ -31,6 +32,7 @@ _ASR_GENERATION_TOKENS_PER_SECOND = 32
 _ASR_GENERATION_TOKEN_OVERHEAD = 32
 _MIN_SPEAKER_CUE_COVERAGE = 0.30
 _MAX_ZERO_DURATION_ALIGNMENT_GAP_SECONDS = 2.0
+_SONG_SUPPORT_MAX_SECONDS = 18.0
 
 ASRTextCorrector = Callable[[list[dict[str, object]]], list[dict[str, object]]]
 SongCueProcessor = Callable[[list[Cue]], list[Cue]]
@@ -67,6 +69,27 @@ def transcribe_with_qwen(
 ) -> Path:
     japanese_single_word_list = sorted(set(japanese_single_word_list or []))
     duration = _media_duration(video)
+    skip_conditioned_asr = False
+    if (
+        analysis_config is not None
+        and analysis_config.skip_dicow_for_single_person_streams
+    ):
+        from .speakers import title_characters
+
+        title_matches = title_characters(
+            metadata or {}, analysis_config.character_styles_file
+        )
+        skip_conditioned_asr = len(title_matches) == 1
+        if skip_conditioned_asr:
+            logging.info(
+                "skipping DiCoW because the video title identifies one member: %s",
+                title_matches[0],
+            )
+        else:
+            logging.info(
+                "single-person title check found %d members; keeping DiCoW enabled",
+                len(title_matches),
+            )
     with AudioBufferPool(video, destination.parent, duration) as audio_pool:
         if analysis_config is not None and analysis_config.enabled:
             with stage_metrics("audio.analysis_total", analysis_config.device):
@@ -89,6 +112,7 @@ def transcribe_with_qwen(
                         japanese_single_word_list,
                         asr_text_corrector,
                         song_cue_processor,
+                        skip_conditioned_asr,
                     )
             except _StaleRuntimeAudio:
                 logging.info(
@@ -115,6 +139,7 @@ def transcribe_with_qwen(
                         japanese_single_word_list,
                         asr_text_corrector,
                         song_cue_processor,
+                        skip_conditioned_asr,
                     )
         with stage_metrics("asr.transcription_total", config.device):
             return _transcribe_unanalyzed(
@@ -222,6 +247,133 @@ def _transcribe_unanalyzed(
     return destination
 
 
+def _raw_song_support_cues(
+    records: list[dict[str, object]],
+) -> list[Cue]:
+    cues: list[Cue] = []
+    for record_index, record in enumerate(records):
+        text = str(record.get("text") or "").strip()
+        start = float(record.get("core_start") or 0.0)
+        end = float(record.get("core_end") or start)
+        if not text or end <= start:
+            continue
+        support_group = record.get("window_id", record_index)
+        assignment = f"song_alignment_support:{support_group}"
+        pieces = [
+            value.strip()
+            for value in re.findall(r".*?(?:[。！？!?]+|$)", text)
+            if value.strip()
+        ]
+        if not pieces:
+            pieces = [text]
+        total_characters = sum(len(value) for value in pieces)
+        cursor = start
+        for piece_index, piece in enumerate(pieces):
+            piece_duration = (end - start) * len(piece) / max(1, total_characters)
+            piece_end = (
+                end if piece_index == len(pieces) - 1 else cursor + piece_duration
+            )
+            subdivisions = max(
+                1, math.ceil((piece_end - cursor) / _SONG_SUPPORT_MAX_SECONDS)
+            )
+            for subdivision in range(subdivisions):
+                text_start = round(len(piece) * subdivision / subdivisions)
+                text_end = round(len(piece) * (subdivision + 1) / subdivisions)
+                cue_start = cursor + (piece_end - cursor) * subdivision / subdivisions
+                cue_end = (
+                    cursor + (piece_end - cursor) * (subdivision + 1) / subdivisions
+                )
+                fragment = piece[text_start:text_end].strip()
+                if fragment and cue_end > cue_start:
+                    cues.append(
+                        Cue(
+                            cue_start,
+                            cue_end,
+                            fragment,
+                            kind="speech",
+                            speaker_assignment=assignment,
+                        )
+                    )
+            cursor = piece_end
+    return cues
+
+
+def _cached_song_support_cues(
+    cached: dict[str, object],
+    regions: list[AudioRegion],
+    *,
+    excluded_indices: set[int] | None = None,
+) -> list[Cue]:
+    excluded = excluded_indices or set()
+    records: list[dict[str, object]] = []
+    for index, region in enumerate(regions):
+        if index in excluded or region.kind != "speech":
+            continue
+        record = cached.get(str(index))
+        if not isinstance(record, dict) or not isinstance(record.get("cues"), list):
+            continue
+        records.append(
+            {
+                "core_start": region.start,
+                "core_end": region.end,
+                "text": str(record.get("text") or ""),
+                "window_id": index,
+            }
+        )
+    return _raw_song_support_cues(records)
+
+
+def _conditioned_asr_records(
+    cues: list[Cue], first_window_id: int
+) -> tuple[list[dict[str, object]], list[AudioRegion]]:
+    records: list[dict[str, object]] = []
+    regions: list[AudioRegion] = []
+    for position, cue in enumerate(cues):
+        window_id = first_window_id + position
+        records.append(
+            {
+                "core_start": cue.start,
+                "core_end": cue.end,
+                "language": cue.language or "Japanese",
+                "text": cue.text,
+                "speaker": cue.speaker,
+                "window_id": window_id,
+                "asr_source": "dicow",
+            }
+        )
+        regions.append(
+            AudioRegion(
+                cue.start,
+                cue.end,
+                "speech",
+                cue.speaker,
+                overlap=True,
+                asr_route="dicow",
+            )
+        )
+    return records, regions
+
+
+def _conditioned_aligned_cues(
+    records: list[dict[str, object]], first_window_id: int
+) -> list[Cue]:
+    cues: list[Cue] = []
+    for position, record in enumerate(records):
+        speaker = str(record.get("speaker") or "") or None
+        for cue in _decode_cached_cues(
+            list(record.get("cues") or []), first_window_id + position
+        ):
+            cues.append(
+                replace(
+                    cue,
+                    speaker=speaker,
+                    kind="conditioned_speech",
+                    speaker_assignment="dicow_overlap",
+                )
+            )
+    return sorted(cues, key=lambda cue: (cue.start, cue.end, cue.speaker or ""))
+
+
 def _transcribe_analyzed(
     video: Path,
     destination: Path,
@@ -232,6 +384,7 @@ def _transcribe_analyzed(
     japanese_single_word_list: list[str] | None = None,
     asr_text_corrector: ASRTextCorrector | None = None,
     song_cue_processor: SongCueProcessor | None = None,
+    skip_conditioned_asr: bool = False,
 ) -> Path:
     speech_windows = _speech_asr_windows(analysis, config)
     routed_regions = [
@@ -244,7 +397,7 @@ def _transcribe_analyzed(
     cache_path = destination.parent / "asr-analysis-cache.json"
     signature = {
         **_cache_signature(video, duration, config, japanese_single_word_list),
-        "analysis_version": 15,
+        "analysis_version": 16,
         "analysis_config": asdict(analysis_config),
         "regions": [_analysis_region_signature(region) for region in regions],
     }
@@ -325,13 +478,21 @@ def _transcribe_analyzed(
                 record["cues"], index, raw_text=str(record.get("text") or "")
             )
         )
-    processed_singing_cues = (
-        song_cue_processor(singing_cues)
-        if song_cue_processor is not None
-        else singing_cues
-    )
+    processed_singing_cues = singing_cues
+    song_cues_processed = False
+
+    def process_songs(supporting_cues: list[Cue]) -> None:
+        nonlocal processed_singing_cues, song_cues_processed
+        if song_cues_processed:
+            return
+        song_cues_processed = True
+        if song_cue_processor is None:
+            return
+        processed = song_cue_processor([*singing_cues, *supporting_cues])
+        processed_singing_cues = [cue for cue in processed if cue.kind == "singing"]
 
     speech_missing = [index for index in missing if regions[index].kind == "speech"]
+    raw_records: list[dict[str, object]] = []
     if speech_missing:
         raw_cache_path = destination.parent / "asr-raw-speech-cache.json"
         raw_signature = {
@@ -381,38 +542,100 @@ def _transcribe_analyzed(
                 del raw_model
                 _release_cuda()
 
-        raw_records = []
         for index in speech_missing:
             value = raw_chunks.get(str(index))
             if not isinstance(value, dict):
                 raise RuntimeError(f"raw ASR cache is missing speech region {index}")
             raw_records.append({**value, "window_id": index})
-        correctable_records = [
-            record
-            for record in raw_records
-            if regions[int(record["window_id"])].asr_route != "song_speech_fallback"
-        ]
-        if asr_text_corrector is not None and correctable_records:
-            with stage_metrics("asr.text_correction"):
-                corrected_records = asr_text_corrector(correctable_records)
-        else:
-            corrected_records = correctable_records
-        if len(corrected_records) != len(correctable_records):
-            raise RuntimeError("ASR text corrector changed the speech window count")
-        corrected_by_id = {
-            int(record["window_id"]): record for record in corrected_records
-        }
-        records = [
-            corrected_by_id.get(int(record["window_id"]), record)
-            for record in raw_records
-        ]
 
+    from .conditioned_asr import (
+        ConditionedASRTranscription,
+        reconcile_long_overlaps,
+        transcribe_long_overlaps,
+    )
+
+    if skip_conditioned_asr:
+        conditioned_transcription = ConditionedASRTranscription([], [])
+    else:
+        with stage_metrics("asr.conditioned_transcription", analysis_config.device):
+            conditioned_transcription = transcribe_long_overlaps(
+                analysis.diarization,
+                audio_pool.main(),
+                destination.parent,
+                analysis_config,
+            )
+
+    if speech_missing:
+        cached_supporting_cues = _cached_song_support_cues(
+            cached,
+            regions,
+            excluded_indices=set(speech_missing),
+        )
+        process_songs(
+            [
+                *cached_supporting_cues,
+                *_raw_song_support_cues(raw_records),
+            ]
+        )
+    if not song_cues_processed:
+        process_songs(_cached_song_support_cues(cached, regions))
+
+    conditioned_signature = [asdict(cue) for cue in conditioned_transcription.cues]
+    conditioned_cache = cache.get("conditioned")
+    conditioned_cached_cues: list[Cue] | None = None
+    if (
+        isinstance(conditioned_cache, dict)
+        and conditioned_cache.get("raw_cues") == conditioned_signature
+        and isinstance(conditioned_cache.get("cues"), list)
+    ):
+        conditioned_cached_cues = _decode_cached_cues(
+            conditioned_cache["cues"], len(regions)
+        )
+
+    conditioned_records: list[dict[str, object]] = []
+    conditioned_regions: list[AudioRegion] = []
+    if conditioned_cached_cues is None:
+        conditioned_records, conditioned_regions = _conditioned_asr_records(
+            conditioned_transcription.cues, len(regions)
+        )
+
+    correctable_records = [
+        record
+        for record in raw_records
+        if regions[int(record["window_id"])].asr_route != "song_speech_fallback"
+    ]
+    correction_input = sorted(
+        [*correctable_records, *conditioned_records],
+        key=lambda record: (
+            float(record.get("core_start") or 0.0),
+            int(record["window_id"]),
+        ),
+    )
+    if asr_text_corrector is not None and correction_input:
+        with stage_metrics("asr.text_correction"):
+            corrected_records = asr_text_corrector(correction_input)
+    else:
+        corrected_records = correction_input
+    if len(corrected_records) != len(correction_input):
+        raise RuntimeError("ASR text corrector changed the speech window count")
+    corrected_by_id = {int(record["window_id"]): record for record in corrected_records}
+    records = [
+        corrected_by_id.get(int(record["window_id"]), record) for record in raw_records
+    ]
+    corrected_conditioned_records = [
+        corrected_by_id.get(int(record["window_id"]), record)
+        for record in conditioned_records
+    ]
+
+    alignment_records = [*records, *corrected_conditioned_records]
+    aligned_records: dict[int, dict[str, object]] = {}
+    if alignment_records:
         aligner = _load_qwen_aligner(config, japanese_single_word_list)
         try:
             aligned_records = _align_speech_records(
                 aligner,
-                records,
-                regions,
+                alignment_records,
+                [*regions, *conditioned_regions],
                 audio_pool.main(),
                 config,
                 duration,
@@ -421,6 +644,8 @@ def _transcribe_analyzed(
         finally:
             del aligner
             _release_cuda()
+
+    if speech_missing:
         for index in speech_missing:
             region = regions[index]
             record = aligned_records[index]
@@ -442,6 +667,20 @@ def _transcribe_analyzed(
                 region.speaker or "unknown",
                 len(record["cues"]),
             )
+
+    if conditioned_cached_cues is None:
+        conditioned_aligned_records = [
+            aligned_records[int(record["window_id"])]
+            for record in corrected_conditioned_records
+        ]
+        conditioned_cached_cues = _conditioned_aligned_cues(
+            conditioned_aligned_records, len(regions)
+        )
+        cache["conditioned"] = {
+            "raw_cues": conditioned_signature,
+            "cues": [asdict(cue) for cue in conditioned_cached_cues],
+        }
+        _write_cache(cache_path, cache)
 
     cues: list[Cue] = list(processed_singing_cues)
     for index in range(len(regions)):
@@ -478,15 +717,11 @@ def _transcribe_analyzed(
     if not cues:
         raise RuntimeError("analyzed Qwen3-ASR did not produce any speech")
     if analysis.diarization:
-        from .conditioned_asr import repair_long_overlaps
-
-        with stage_metrics("asr.conditioned_overlap", analysis_config.device):
-            conditioned = repair_long_overlaps(
+        with stage_metrics("asr.conditioned_reconciliation"):
+            conditioned = reconcile_long_overlaps(
                 cues,
-                analysis.diarization,
-                audio_pool.main(),
-                destination.parent,
-                analysis_config,
+                conditioned_cached_cues or [],
+                conditioned_transcription.windows,
                 qwen_windows=[
                     record
                     for index in range(len(regions))
@@ -1874,8 +2109,7 @@ def _speech_candidate_quality(
     duration = max(region.end - region.start, 1e-6)
     compact = "".join(character for character in text if not character.isspace())
     japanese = sum(
-        "\u3040" <= character <= "\u30ff"
-        or "\u3400" <= character <= "\u9fff"
+        "\u3040" <= character <= "\u30ff" or "\u3400" <= character <= "\u9fff"
         for character in compact
     )
     hangul = sum("\uac00" <= character <= "\ud7af" for character in compact)
@@ -2456,9 +2690,7 @@ def _result_to_cues(
                 following_start - start if following_start is not None else 0.0
             )
             assigned_end = (
-                min(following_start, keep_end)
-                if following_start is not None
-                else start
+                min(following_start, keep_end) if following_start is not None else start
             )
             if (
                 in_owned_range

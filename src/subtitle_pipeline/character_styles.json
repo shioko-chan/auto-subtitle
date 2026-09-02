@@ -4,7 +4,13 @@
       "id": "nakamachi_arale",
       "source_name": "仲町あられ",
       "identity_aliases": ["仲町あられ", "Nakamachi Arale", "arale_yumemita"],
-      "subtitle_style": {"primary_color": "#FFFFFF", "outline_color": "#FFE052"}
+      "subtitle_style": {
+        "primary_color": "#FFFFFF",
+        "outline_color": "#B88600",
+        "outline_width": 2,
+        "outer_outline_color": "#FFE052",
+        "outer_outline_width": 8
+      }
     },
     {
       "id": "miyanaga_nonoka",

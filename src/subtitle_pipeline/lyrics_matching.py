@@ -10,7 +10,7 @@ from sudachipy import dictionary, tokenizer
 from .english_g2p import EnglishJapaneseG2P
 from .lyrics_library import LibrarySong
 
-_SMALL_KANA = frozenset("ぁぃぅぇぉゃゅょゎァィゥェォャュョヮ")
+_SMALL_KANA = frozenset("ぁぃぅぇぉゃゅょゎっァィゥェォャュョヮッ")
 _ENGLISH_WORD_RE = re.compile(r"[A-Za-z]+(?:['’-][A-Za-z]+)*")
 _MAX_LYRIC_LINES_PER_ANCHOR = 24
 _MAX_LYRIC_LENGTH_RATIO = 1.75
@@ -76,6 +76,12 @@ class JapaneseNormalizer:
                 value = self._clean_reading(
                     reading if reading and reading != "*" else surface
                 )
+            if units and surface and (
+                surface[0] in _SMALL_KANA or surface[0] == "ー"
+            ):
+                previous_text, previous_reading = units[-1]
+                units[-1] = (previous_text + surface, previous_reading + value)
+                continue
             if value:
                 split = self._split_surface_reading(surface, value)
                 if not split:
@@ -276,7 +282,6 @@ def match_song(
     anchor_threshold: float = 0.48,
     minimum_anchors: int = 3,
     minimum_score: float = 0.48,
-    minimum_margin: float = 0.05,
     normalizer: JapaneseNormalizer | None = None,
 ) -> SongMatch | None:
     normalizer = normalizer or JapaneseNormalizer()
@@ -323,11 +328,6 @@ def match_song(
         return None
     candidates.sort(key=lambda value: value.score, reverse=True)
     if candidates[0].score < minimum_score:
-        return None
-    if (
-        len(candidates) > 1
-        and candidates[0].score - candidates[1].score < minimum_margin
-    ):
         return None
     return candidates[0]
 

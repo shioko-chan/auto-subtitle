@@ -33,17 +33,21 @@ class ConditionedASRResult:
     evidence: list[dict[str, object]]
 
 
-def repair_long_overlaps(
-    cues: list[Cue],
+@dataclass(frozen=True)
+class ConditionedASRTranscription:
+    windows: list[ConditionedWindow]
+    cues: list[Cue]
+
+
+def transcribe_long_overlaps(
     diarization: list[AudioRegion],
     audio: AudioBuffer,
     job_dir: Path,
     config: AudioAnalysisConfig,
-    qwen_windows: list[dict[str, object]] | None = None,
-) -> ConditionedASRResult:
+) -> ConditionedASRTranscription:
     windows = _conditioned_windows(diarization, audio.duration, config)
     if not windows:
-        return ConditionedASRResult(cues, [])
+        return ConditionedASRTranscription([], [])
     if config.conditioned_asr_backend == "disabled":
         first = windows[0]
         raise RuntimeError(
@@ -57,9 +61,9 @@ def repair_long_overlaps(
         "revision": config.conditioned_asr_revision,
         "windows": [_window_payload(window) for window in windows],
     }
-    repaired = _load_cache(cache_path, signature)
-    if repaired is None:
-        repaired = [
+    transcribed = _load_cache(cache_path, signature)
+    if transcribed is None:
+        transcribed = [
             Cue(
                 cue.start,
                 cue.end,
@@ -70,13 +74,37 @@ def repair_long_overlaps(
             )
             for cue in _run_dicow(audio, windows, config)
         ]
-        _write_cache(cache_path, signature, repaired)
-    usable_repaired = _without_repetition_hallucinations(repaired)
-    evidence = _conditioned_evidence(
-        windows, usable_repaired, qwen_windows or []
+        _write_cache(cache_path, signature, transcribed)
+    return ConditionedASRTranscription(
+        windows, _without_repetition_hallucinations(transcribed)
     )
-    return ConditionedASRResult(
-        _replace_windows(cues, usable_repaired, windows), evidence
+
+
+def reconcile_long_overlaps(
+    baseline: list[Cue],
+    repaired: list[Cue],
+    windows: list[ConditionedWindow],
+    *,
+    qwen_windows: list[dict[str, object]] | None = None,
+) -> ConditionedASRResult:
+    evidence = _conditioned_evidence(windows, repaired, qwen_windows or [])
+    return ConditionedASRResult(_replace_windows(baseline, repaired, windows), evidence)
+
+
+def repair_long_overlaps(
+    cues: list[Cue],
+    diarization: list[AudioRegion],
+    audio: AudioBuffer,
+    job_dir: Path,
+    config: AudioAnalysisConfig,
+    qwen_windows: list[dict[str, object]] | None = None,
+) -> ConditionedASRResult:
+    transcription = transcribe_long_overlaps(diarization, audio, job_dir, config)
+    return reconcile_long_overlaps(
+        cues,
+        transcription.cues,
+        transcription.windows,
+        qwen_windows=qwen_windows,
     )
 
 
@@ -228,11 +256,7 @@ def _expand_overlap(
     )
     speakers = tuple(
         sorted(
-            {
-                _condition_label(region)
-                for region in turns
-                if _condition_label(region)
-            }
+            {_condition_label(region) for region in turns if _condition_label(region)}
         )
     )
     return ConditionedWindow(round(start, 3), round(end, 3), speakers, turns)
@@ -392,8 +416,10 @@ def _replace_windows(
         matching = [
             window for window in windows if window.start <= midpoint <= window.end
         ]
-        if matching and cue.speaker is None and any(
-            _simultaneous_speakers(window, midpoint) > 1 for window in matching
+        if (
+            matching
+            and cue.speaker is None
+            and any(_simultaneous_speakers(window, midpoint) > 1 for window in matching)
         ):
             continue
         if not matching or all(
@@ -411,8 +437,7 @@ def _simultaneous_speakers(window: ConditionedWindow, timestamp: float) -> int:
         {
             _condition_label(turn)
             for turn in window.turns
-            if turn.start <= timestamp <= turn.end
-            and _condition_label(turn)
+            if turn.start <= timestamp <= turn.end and _condition_label(turn)
         }
     )
 

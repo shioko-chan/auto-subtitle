@@ -61,6 +61,14 @@ class JapaneseNormalizerTests(unittest.TestCase):
             ],
         )
 
+    def test_small_kana_split_across_morphology_tokens_stays_in_previous_unit(self):
+        normalizer = JapaneseNormalizer()
+
+        units = normalizer.display_units("夢限大みゅーたいぷ")
+
+        self.assertIn(("みゅー", "みゅ"), units)
+        self.assertNotIn(("ゅー", "ゅ"), units)
+
     def test_english_lyrics_keep_display_text_and_use_katakana_readings(self):
         normalizer = JapaneseNormalizer()
 
@@ -201,6 +209,46 @@ class JapaneseNormalizerTests(unittest.TestCase):
             [(item.line_start, item.line_end) for item in match.anchors],
             [(2, 3), (3, 4), (4, 5)],
         )
+
+    def test_equally_scored_lyric_sources_do_not_cancel_a_valid_match(self):
+        lines = tuple(
+            LyricLine(index, text)
+            for index, text in enumerate(
+                ["きらり空に響く星の声", "海を照らす光", "その先へ行こう"]
+            )
+        )
+        songs = [
+            LibrarySong(
+                "source-a",
+                "Wonder Caravan!",
+                "水瀬いのり",
+                (),
+                "https://source-a.example/lyrics",
+                "hash-a",
+                lines,
+            ),
+            LibrarySong(
+                "source-b",
+                "Wonder Caravan！",
+                "水瀬いのり",
+                (),
+                "https://source-b.example/lyrics",
+                "hash-b",
+                lines,
+            ),
+        ]
+
+        match = match_song(
+            [line.text for line in lines],
+            songs,
+            anchor_threshold=0.9,
+            minimum_anchors=3,
+            minimum_score=0.4,
+        )
+
+        self.assertIsNotNone(match)
+        assert match is not None
+        self.assertEqual(match.song.song_id, "source-a")
 
     def test_semiglobal_match_extracts_repeated_short_version_as_separate_takes(self):
         song = LibrarySong(

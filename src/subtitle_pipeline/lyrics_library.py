@@ -191,6 +191,8 @@ class LyricsLibrary:
                 if not text.strip() or line_no < 0 or line_no >= len(song.lines):
                     continue
                 current = song.lines[line_no]
+                if current.translation_source == "verified":
+                    continue
                 if _translation_priority(source) < _translation_priority(
                     current.translation_source
                 ):
@@ -253,6 +255,6 @@ def _translation_priority(source: str | None) -> int:
         "machine": 1,
         "llm": 2,
         "external": 3,
-        "llm_reviewed": 4,
         "official": 5,
+        "verified": 6,
     }.get(source, 0)

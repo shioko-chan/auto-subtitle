@@ -123,54 +123,6 @@ def _response(content):
 
 
 class ApiCompatibilityTests(unittest.TestCase):
-    def test_lyrics_review_only_applies_explicit_corrections(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(), TranslationConfig(), "secret"
-        )
-        response = _response(
-            json.dumps(
-                {
-                    "corrections": [
-                        {
-                            "line_id": "1",
-                            "text": "和这个世界一起蜕变吧",
-                            "reason": "外来语误译和无依据增译",
-                        }
-                    ]
-                },
-                ensure_ascii=False,
-            )
-        )
-        with patch.object(translator, "_request", return_value=response) as request:
-            reviewed = translator.review_lyrics(
-                "Song",
-                "Artist",
-                ["前の行", "この世とメタモルフォーゼしようぜ", "次の行"],
-                {0: "前一行", 1: "让这世界与变形虫共舞吧", 2: "下一行"},
-                translation_context={"terms": {"メタモルフォーゼ": "蜕变"}},
-            )
-
-        self.assertEqual(
-            reviewed,
-            {0: "前一行", 1: "和这个世界一起蜕变吧", 2: "下一行"},
-        )
-        prompt = request.call_args.args[0]["messages"][1]["content"]
-        self.assertIn("この世とメタモルフォーゼしようぜ", prompt)
-        self.assertIn("让这世界与变形虫共舞吧", prompt)
-        self.assertIn("メタモルフォーゼ", prompt)
-
-    def test_lyrics_review_accepts_no_corrections(self):
-        translator = OpenAICompatibleTranslator(
-            LLMConfig(), TranslationConfig(), "secret"
-        )
-        response = _response('{"corrections":[]}')
-        with patch.object(translator, "_request", return_value=response):
-            reviewed = translator.review_lyrics(
-                "Song", "Artist", ["正しい歌詞"], {0: "正确的歌词"}
-            )
-
-        self.assertEqual(reviewed, {0: "正确的歌词"})
-
     def test_lyrics_prompt_excludes_runtime_audit_payloads(self):
         translator = OpenAICompatibleTranslator(
             LLMConfig(), TranslationConfig(), "secret"

@@ -608,18 +608,41 @@ def _write_ass(
     )
     styles = [default_style, source_default_style]
     for character_id, character in sorted((character_styles or {}).items()):
+        character_outline = (
+            character.outline_width
+            if character.outline_width is not None
+            else outline
+        )
         styles.append(
             f"Style: {_ass_style_name(character_id)},{safe_font_name},{font_size},"
             f"{_ass_color(character.primary_color)},&H000000FF,"
             f"{_ass_color(character.outline_color)},&H00000000,0,0,0,0,"
-            f"100,100,0,0,1,{outline},0,2,1,1,{margin_vertical},1"
+            f"100,100,0,0,1,{character_outline},0,2,1,1,{margin_vertical},1"
         )
         styles.append(
             f"Style: {_ass_source_style_name(character_id)},{safe_font_name},"
             f"{source_font_size},{_ass_color(character.primary_color)},&H000000FF,"
             f"{_ass_color(character.outline_color)},&H00000000,0,0,0,0,"
-            f"100,100,0,0,1,{outline},0,2,1,1,{margin_vertical},1"
+            f"100,100,0,0,1,{character_outline},0,2,1,1,{margin_vertical},1"
         )
+        if character.outer_outline_color and character.outer_outline_width:
+            transparent_primary = _ass_color(character.primary_color).replace(
+                "&H00", "&HFF", 1
+            )
+            styles.append(
+                f"Style: {_ass_outer_style_name(character_id)},{safe_font_name},"
+                f"{font_size},{transparent_primary},&H000000FF,"
+                f"{_ass_color(character.outer_outline_color)},&H00000000,"
+                f"0,0,0,0,100,100,0,0,1,{character.outer_outline_width},"
+                f"0,2,1,1,{margin_vertical},1"
+            )
+            styles.append(
+                f"Style: {_ass_outer_source_style_name(character_id)},"
+                f"{safe_font_name},{source_font_size},{transparent_primary},"
+                f"&H000000FF,{_ass_color(character.outer_outline_color)},"
+                f"&H00000000,0,0,0,0,100,100,0,0,1,"
+                f"{character.outer_outline_width},0,2,1,1,{margin_vertical},1"
+            )
     styles_text = "\n".join(styles)
     header = (
         "[Script Info]\n"
@@ -707,15 +730,36 @@ def _write_ass(
             )
         start = _ass_timestamp(cue.start)
         end = _ass_timestamp(cue.end)
+        character_style = (character_styles or {}).get(speaker or "")
+        has_outer_outline = bool(
+            not is_singing
+            and character_style is not None
+            and character_style.outer_outline_color
+            and character_style.outer_outline_width
+        )
+        if has_outer_outline:
+            events.append(
+                "Dialogue: 0,"
+                f"{start},{end},"
+                f"{_ass_outer_style_name(speaker or '')},{speaker or ''},"
+                f"0,0,{event_margin},,{event_text}"
+            )
         events.append(
-            "Dialogue: 0,"
+            f"Dialogue: {1 if has_outer_outline else 0},"
             f"{start},{end},"
             f"{style_name},{speaker or ''},0,0,{event_margin},,"
             f"{event_text}"
         )
         if source_text:
+            if has_outer_outline:
+                events.append(
+                    "Dialogue: 0,"
+                    f"{start},{end},"
+                    f"{_ass_outer_source_style_name(speaker or '')},"
+                    f"{speaker or ''},0,0,{source_margin},,{escaped_source_text}"
+                )
             events.append(
-                "Dialogue: 0,"
+                f"Dialogue: {1 if has_outer_outline else 0},"
                 f"{start},{end},"
                 f"{source_style_name},{speaker or ''},0,0,{source_margin},,"
                 f"{escaped_source_text}"
@@ -745,6 +789,14 @@ def _ass_style_name(value: str) -> str:
 
 def _ass_source_style_name(value: str) -> str:
     return _ass_style_name(value) + "_Japanese"
+
+
+def _ass_outer_style_name(value: str) -> str:
+    return _ass_style_name(value) + "_Outer"
+
+
+def _ass_outer_source_style_name(value: str) -> str:
+    return _ass_source_style_name(value) + "_Outer"
 
 
 def _ass_timestamp(value: float) -> str:

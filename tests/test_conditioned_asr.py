@@ -4,17 +4,51 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from subtitle_pipeline.asr import (
+    _conditioned_aligned_cues,
+    _conditioned_asr_records,
+)
 from subtitle_pipeline.audio_analysis import AudioRegion
 from subtitle_pipeline.conditioned_asr import (
     _conditioned_windows,
     _replace_windows,
+    reconcile_long_overlaps,
     repair_long_overlaps,
+    transcribe_long_overlaps,
 )
 from subtitle_pipeline.config import AudioAnalysisConfig
 from subtitle_pipeline.subtitles import Cue
 
 
 class ConditionedASRTests(unittest.TestCase):
+    def test_conditioned_records_preserve_source_and_use_corrected_alignment(self):
+        raw = [Cue(1.0, 3.0, "raw", "A", "conditioned_speech")]
+
+        records, regions = _conditioned_asr_records(raw, 7)
+        corrected_records = [
+            {
+                **records[0],
+                "text": "corrected",
+                "cues": [
+                    {
+                        "start": 1.1,
+                        "end": 2.9,
+                        "text": "corrected",
+                        "kind": "speech",
+                    }
+                ],
+            }
+        ]
+        result = _conditioned_aligned_cues(corrected_records, 7)
+
+        self.assertEqual(records[0]["window_id"], 7)
+        self.assertEqual(records[0]["asr_source"], "dicow")
+        self.assertEqual(regions[0].asr_route, "dicow")
+        self.assertEqual(
+            [(cue.text, cue.speaker, cue.kind) for cue in result],
+            [("corrected", "A", "conditioned_speech")],
+        )
+
     def test_half_second_overlap_creates_conditioned_window_by_default(self):
         diarization = [
             AudioRegion(0, 4, "speech", "A", anonymous_speaker="S0"),
@@ -128,6 +162,32 @@ class ConditionedASRTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first.cues[0].kind, "conditioned_speech")
         run.assert_called_once()
+
+    def test_transcription_and_reconciliation_accept_corrected_aligned_cues(self):
+        diarization = [
+            AudioRegion(0, 4, "speech", "A", anonymous_speaker="S0"),
+            AudioRegion(2, 5, "speech", "B", anonymous_speaker="S1"),
+        ]
+        baseline = [Cue(1.5, 3.5, "Qwen baseline", "A")]
+        audio = SimpleNamespace(duration=10)
+        config = AudioAnalysisConfig(overlap_context_seconds=0.5)
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch(
+                "subtitle_pipeline.conditioned_asr._run_dicow",
+                return_value=[Cue(1.5, 3.0, "raw DiCoW", "A")],
+            ),
+        ):
+            transcription = transcribe_long_overlaps(
+                diarization, audio, Path(temp), config
+            )
+
+        corrected = [Cue(1.6, 2.9, "corrected DiCoW", "A", "conditioned_speech")]
+        result = reconcile_long_overlaps(baseline, corrected, transcription.windows)
+
+        self.assertEqual([cue.text for cue in transcription.cues], ["raw DiCoW"])
+        self.assertEqual([cue.text for cue in result.cues], ["corrected DiCoW"])
+        self.assertEqual(result.evidence[0]["dicow"][0]["text"], "corrected DiCoW")
 
     def test_qwen_overlap_units_are_preserved_as_read_only_evidence(self):
         diarization = [

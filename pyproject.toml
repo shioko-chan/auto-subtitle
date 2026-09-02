@@ -13,6 +13,7 @@ dependencies = [
     "gallery-dl>=1.30,<2",
     "faiss-cpu>=1.12,<2",
     "phonemizer>=3.3,<4",
+    "playwright>=1.55,<2",
     "sentence-transformers>=5,<6",
     "ja-ginza>=5.2,<6",
     "SudachiDict-core>=20250515",
@@ -24,6 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 asr = [
     "demucs>=4,<5",
+    "easyocr>=1.7,<2",
     "librosa>=0.11,<1",
     "pyannote-audio>=4,<5",
     "qwen-asr @ git+https://github.com/shioko-chan/Qwen3-ASR.git@013c382687fc7a5b862f851e10ecb6611977b340",

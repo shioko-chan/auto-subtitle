@@ -280,27 +280,10 @@ B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服�
 
 原始 YouTube 标题明确含有 `歌枠` 且歌曲识别得到有效歌名时，默认在投稿成功后生成
 `时间 歌名` 格式的顶层歌单评论。biliup 返回的 `aid`、`bvid`，评论接口响应及 `rpid`
-保存在任务目录的 `bilibili-setlist-comment.json`。稿件审核期间不会阻塞流水线：首次
-评论尝试统一安排在投稿成功一小时后；若稿件届时仍不可评论，任务继续按退避间隔保持
-待处理。后续投稿和批处理结束时会检查到期任务，也可手动运行：
-
-```bash
-uv run --extra asr subtitle-pipeline --config config.toml retry-comments
-```
-
-每次发送前会分页检查当前登录账号是否已经发布完全相同的顶层评论，避免流水线重试导致
-重复留言。评论失败不会把已经成功的投稿标记为失败。
-
-建议安装每 15 分钟检查一次到期任务的 systemd 用户定时器：
-
-```bash
-./scripts/install-bilibili-comment-timer.sh
-# 使用其他配置文件时，将其作为第一个参数传入。
-```
-
-定时器设置了 `Persistent=true`，关机期间错过的检查会在下次登录后补跑。查看运行状态和
-日志可使用 `systemctl --user status subtitle-comments.timer` 与
-`journalctl --user -u subtitle-comments.service`。
+保存在任务目录的 `bilibili-setlist-comment.json`。流水线等待投稿成功后 5 分钟，再通过
+Playwright 和已登录的 Chromium 页面自动发布。每次发送前会分页检查当前登录账号是否
+已经发布完全相同的顶层评论，避免重复留言；评论失败会记录接口响应和页面截图，但不会
+把已经成功的投稿标记为失败。
 
 更新任务列表为六个官方 YouTube 频道最近 14 天的公开直播录播（需要 Chromium
 已登录 YouTube，会员限定和未开播视频会被排除）：

@@ -23,17 +23,23 @@ class CharacterStyle:
     source_name: str
     primary_color: str
     outline_color: str
+    outline_width: int | None = None
+    outer_outline_color: str | None = None
+    outer_outline_width: int | None = None
+
+
+def _character_style_data(path_value: str | None = None) -> dict[str, object]:
+    if path_value:
+        return json.loads(Path(path_value).expanduser().read_text(encoding="utf-8"))
+    return json.loads(
+        resources.files("subtitle_pipeline")
+        .joinpath("character_styles.json")
+        .read_text(encoding="utf-8")
+    )
 
 
 def load_character_styles(path_value: str | None = None) -> dict[str, CharacterStyle]:
-    if path_value:
-        value = json.loads(Path(path_value).expanduser().read_text(encoding="utf-8"))
-    else:
-        value = json.loads(
-            resources.files("subtitle_pipeline")
-            .joinpath("character_styles.json")
-            .read_text(encoding="utf-8")
-        )
+    value = _character_style_data(path_value)
     styles: dict[str, CharacterStyle] = {}
     for character in value.get("characters", []):
         style = character["subtitle_style"]
@@ -42,6 +48,17 @@ def load_character_styles(path_value: str | None = None) -> dict[str, CharacterS
             str(character["source_name"]),
             _hex_color(str(style["primary_color"])),
             _hex_color(str(style.get("outline_color", "#000000"))),
+            int(style["outline_width"]) if "outline_width" in style else None,
+            (
+                _hex_color(str(style["outer_outline_color"]))
+                if "outer_outline_color" in style
+                else None
+            ),
+            (
+                int(style["outer_outline_width"])
+                if "outer_outline_width" in style
+                else None
+            ),
         )
         styles[item.id] = item
     return styles
@@ -50,14 +67,7 @@ def load_character_styles(path_value: str | None = None) -> dict[str, CharacterS
 def metadata_character(
     metadata: dict[str, object], path_value: str | None = None
 ) -> str | None:
-    if path_value:
-        value = json.loads(Path(path_value).expanduser().read_text(encoding="utf-8"))
-    else:
-        value = json.loads(
-            resources.files("subtitle_pipeline")
-            .joinpath("character_styles.json")
-            .read_text(encoding="utf-8")
-        )
+    value = _character_style_data(path_value)
     evidence = " ".join(
         str(metadata.get(key) or "")
         for key in ("channel", "channel_id", "uploader", "uploader_id")
@@ -71,6 +81,26 @@ def metadata_character(
         )
     ]
     return matches[0] if len(matches) == 1 else None
+
+
+def title_characters(
+    metadata: dict[str, object], path_value: str | None = None
+) -> tuple[str, ...]:
+    title = str(metadata.get("title") or "").casefold()
+    if not title:
+        return ()
+    value = _character_style_data(path_value)
+    matches = {
+        str(character["id"])
+        for character in value.get("characters", [])
+        if isinstance(character, dict)
+        and any(
+            str(alias).strip().casefold() in title
+            for alias in character.get("identity_aliases", [])
+            if str(alias).strip()
+        )
+    }
+    return tuple(sorted(matches))
 
 
 def identify_speakers(

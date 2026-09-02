@@ -14,7 +14,6 @@ from subtitle_pipeline.staged_translation import (
     _topic_request_groups,
     run_fixed_translation,
     run_segmentation,
-    run_translation_review,
 )
 from subtitle_pipeline.subtitles import Cue, TimedTextUnit, text_display_width
 
@@ -333,7 +332,7 @@ class StagedTranslationTests(unittest.TestCase):
         self.assertEqual([prompt.count('<CUE id="') for prompt in prompts], [16, 4])
         self.assertEqual(len(result), 20)
 
-    def test_segmentation_retries_an_overwide_source_group(self):
+    def test_segmentation_accepts_an_overwide_source_group_without_retry(self):
         cues = [Cue(0, 1, "あいう", "A"), Cue(1, 2, "えおか", "A")]
         track = SpeakerTrack(
             "A",
@@ -343,20 +342,13 @@ class StagedTranslationTests(unittest.TestCase):
                 LocalUnit("A", 1, (1,), 1, 2, "えおか", "A", "speech"),
             ),
         )
-        responses = iter(
-            [
-                {"cues": [{"start_id": 0, "end_id": 1}]},
-                {
-                    "cues": [
-                        {"start_id": 0, "end_id": 0},
-                        {"start_id": 1, "end_id": 1},
-                    ]
-                },
-            ]
-        )
+        requests = 0
 
         def request(_body):
-            return {"choices": [{"message": {"content": json.dumps(next(responses))}}]}
+            nonlocal requests
+            requests += 1
+            response = {"cues": [{"start_id": 0, "end_id": 1}]}
+            return {"choices": [{"message": {"content": json.dumps(response)}}]}
 
         result = run_segmentation(
             tracks=[track],
@@ -374,7 +366,8 @@ class StagedTranslationTests(unittest.TestCase):
             sudachi_versions={},
         )
 
-        self.assertEqual([cue.text for cue in result], ["あいう", "えおか"])
+        self.assertEqual([cue.text for cue in result], ["あいうえおか"])
+        self.assertEqual(requests, 1)
 
     def test_fixed_translation_cannot_change_source_boundaries(self):
         source = [Cue(0, 1, "原文一", "A"), Cue(1, 2, "原文二", "A")]
@@ -856,167 +849,6 @@ class StagedTranslationTests(unittest.TestCase):
         self.assertEqual(events[1]["downgrade_reason"], "empty_translation")
         self.assertEqual(events[1]["source_text"], "原文二")
         self.assertEqual(events[1]["final_text"], "MT:原文二")
-
-    def test_translation_review_corrects_and_harmonizes_draft_once(self):
-        source = [Cue(0, 1, "ふざけんな、この野郎", "A")]
-        draft = [Cue(0, 1, "你他妈少胡闹了，混蛋东西", "A", source_text=source[0].text)]
-        prompts: list[str] = []
-
-        def request(body):
-            prompts.append(body["messages"][1]["content"])
-            return {
-                "_audit_request_id": "review-1",
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {
-                                    "corrections": [
-                                        {"cue_id": 0, "text": "别闹了，你这家伙"}
-                                    ]
-                                },
-                                ensure_ascii=False,
-                            )
-                        }
-                    }
-                ],
-            }
-
-        with tempfile.TemporaryDirectory() as temporary:
-            audit = Path(temporary) / "translation-audit.jsonl"
-            result = run_translation_review(
-                source_cues=source,
-                translated_cues=draft,
-                llm=LLMConfig(),
-                translation=TranslationConfig(),
-                request=request,
-                finish_reason=finish_reason,
-                log_invalid_response=ignore_audit,
-                translation_context={},
-                maximum_units=8.0,
-                honorific_rules="",
-                cache_path=None,
-                audit_path=audit,
-            )
-            events = [json.loads(line) for line in audit.read_text().splitlines()]
-
-        self.assertEqual([cue.text for cue in result], ["别闹了，你这家伙"])
-        self.assertEqual(len(prompts), 1)
-        self.assertIn("soft target", prompts[0])
-        self.assertIn("general video platform", prompts[0])
-        self.assertIn("你他妈少胡闹了，混蛋东西", prompts[0])
-        self.assertTrue(events[0]["changed"])
-        self.assertEqual(events[0]["request_id"], "review-1")
-
-    def test_translation_review_prepares_all_topic_evidence_before_llm(self):
-        source = [Cue(0, 1, "一", "A"), Cue(10, 11, "二", "A")]
-        draft = [
-            Cue(cue.start, cue.end, f"译{index}", cue.speaker, source_text=cue.text)
-            for index, cue in enumerate(source)
-        ]
-        events: list[str] = []
-
-        def retrieve(cues, _chat):
-            events.append(f"retrieve:{cues[0].text}")
-            return []
-
-        def request(_body):
-            events.append("request")
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {"corrections": []}, ensure_ascii=False
-                            )
-                        }
-                    }
-                ]
-            }
-
-        run_translation_review(
-            source_cues=source,
-            translated_cues=draft,
-            llm=LLMConfig(),
-            translation=TranslationConfig(),
-            request=request,
-            finish_reason=finish_reason,
-            log_invalid_response=ignore_audit,
-            translation_context={},
-            maximum_units=23.0,
-            honorific_rules="",
-            cache_path=None,
-            retrieve_knowledge=retrieve,
-        )
-
-        self.assertEqual(events[:2], ["retrieve:一", "retrieve:二"])
-        self.assertEqual(events.count("request"), 2)
-
-    def test_translation_review_accepts_overwide_result_without_retry(self):
-        source = [Cue(0, 1, "これは必要な説明です", "A")]
-        draft = [Cue(0, 1, "这是不能省略的必要说明", "A", source_text=source[0].text)]
-        requests = 0
-
-        def request(_body):
-            nonlocal requests
-            requests += 1
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {"corrections": []}, ensure_ascii=False
-                            )
-                        }
-                    }
-                ]
-            }
-
-        result = run_translation_review(
-            source_cues=source,
-            translated_cues=draft,
-            llm=LLMConfig(max_retries=5),
-            translation=TranslationConfig(),
-            request=request,
-            finish_reason=finish_reason,
-            log_invalid_response=ignore_audit,
-            translation_context={},
-            maximum_units=4.0,
-            honorific_rules="",
-            cache_path=None,
-        )
-
-        self.assertEqual(result, draft)
-        self.assertEqual(requests, 1)
-
-    def test_translation_review_failure_preserves_draft_without_retry(self):
-        source = [Cue(0, 1, "原文", "A")]
-        draft = [Cue(0, 1, "译文", "A", source_text=source[0].text)]
-        requests = 0
-        failures: list[Exception] = []
-
-        def request(_body):
-            nonlocal requests
-            requests += 1
-            return {"choices": [{"message": {"content": "not json"}}]}
-
-        result = run_translation_review(
-            source_cues=source,
-            translated_cues=draft,
-            llm=LLMConfig(max_retries=5),
-            translation=TranslationConfig(),
-            request=request,
-            finish_reason=finish_reason,
-            log_invalid_response=lambda _stage, error, *_args: failures.append(error),
-            translation_context={},
-            maximum_units=20.0,
-            honorific_rules="",
-            cache_path=None,
-        )
-
-        self.assertEqual(result, draft)
-        self.assertEqual(requests, 1)
-        self.assertEqual(len(failures), 1)
 
     def test_song_line_splits_on_pyshiro_units_at_japanese_limit(self):
         units = tuple(

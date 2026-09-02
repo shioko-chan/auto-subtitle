@@ -123,25 +123,17 @@ speaker_profile_min_samples_per_center = 20
 # character_styles_file = "character-styles.json"
 
 [song_identification]
-# Inspect only the short interval around each detected start of singing.
+# OCR one frame per search group only for titles that explicitly describe music.
 enabled = true
-device = "gpu:0"
-detection_model = "PP-OCRv5_mobile_det"
-recognition_model = "PP-OCRv5_server_rec"
-ocr_worker_project = "tools/song_ocr"
+device = "cuda:0"
 search_worker_project = "tools/song_search"
-seconds_before_start = 30.0
-seconds_after_start = 15.0
-sample_interval_seconds = 1.0
 song_search_group_gap_seconds = 35.0
 minimum_ocr_score = 0.45
-minimum_persistent_frames = 2
 max_search_results = 5
 lyrics_library_path = "databases/lyrics.sqlite3"
 match_anchor_threshold = 0.48
 match_minimum_anchors = 3
 match_minimum_score = 0.48
-match_minimum_margin = 0.05
 pyshiro_worker_project = "tools/pyshiro"
 # Used only after a song is confirmed and a lyric gap has no existing stem.
 vocal_separation_device = "cuda:0"
@@ -324,7 +316,7 @@ max_tags = 10
 # tag_catalog_file = "bilibili-tags.json"
 source = ""
 title_prefix = "【中字】"
-description_prefix = "翻译：Qwen，校对：Qwen，时轴：Qwen\n请以原视频为准：\n{youtube_url}\n─────── ⋆⋅☆⋅⋆ ───────\n\n"
+description_prefix = "翻译：Qwen，时轴：Qwen\n请以原视频为准：\n{youtube_url}\n─────── ⋆⋅☆⋅⋆ ───────\n\n"
 description_max_chars = 1800
 # line = "kodo"
 limit = 3
@@ -333,7 +325,6 @@ cooldown_max_seconds = 120
 rate_limit_retry_delays_seconds = [120, 300, 600, 1200]
 throttle_state_file = "work/bilibili-upload-throttle.json"
 pause_marker_file = "work/bilibili-upload-paused.json"
-# After a successful upload, post a top-level setlist comment only when the
-# original YouTube title contains the literal text "歌枠". Drafts under review
-# are recorded under the job directory and retried by later runs.
+# Five minutes after a successful upload, automatically post a top-level
+# setlist comment when the original YouTube title contains the literal "歌枠".
 song_setlist_comment = true

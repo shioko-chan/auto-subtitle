@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -9,13 +10,14 @@ import numpy as np
 
 from subtitle_pipeline.asr import (
     _add_punctuation_boundary_hints,
+    _align_speech_records,
     _analysis_region_signature,
     _analysis_regions,
-    _align_speech_records,
     _asr_generation_token_limit,
     _cache_signature,
     _HeartTranscriptorAdapter,
     _load_cache,
+    _raw_song_support_cues,
     _record_timeline_is_healthy,
     _remove_text_overlap,
     _repetition_hallucination,
@@ -26,12 +28,12 @@ from subtitle_pipeline.asr import (
     _speaker_assignment_for_aligned_cue,
     _speaker_assignment_timeline,
     _speaker_for_aligned_cue,
-    _speech_candidate_quality,
     _speech_asr_windows,
+    _speech_candidate_quality,
     _timeline_retry_split,
     _transcribe_analyzed,
-    _transcribe_raw_range,
     _transcribe_range,
+    _transcribe_raw_range,
     _transcribe_song_range,
     _transcribe_speech_batch,
     _valid_cached_record,
@@ -40,10 +42,31 @@ from subtitle_pipeline.asr import (
 )
 from subtitle_pipeline.audio_analysis import AcousticPhrase, AudioAnalysis, AudioRegion
 from subtitle_pipeline.config import ASRConfig, AudioAnalysisConfig
+from subtitle_pipeline.conditioned_asr import (
+    ConditionedASRTranscription,
+    ConditionedWindow,
+)
 from subtitle_pipeline.subtitles import Cue
 
 
 class QwenASRTests(unittest.TestCase):
+    def test_raw_song_support_cues_split_long_raw_asr_without_losing_order(self):
+        text = "最初の文です。" + "長い歌詞" * 20 + "！最後です。"
+        cues = _raw_song_support_cues(
+            [{"core_start": 10.0, "core_end": 50.0, "text": text}]
+        )
+
+        self.assertGreater(len(cues), 3)
+        self.assertTrue(all(cue.end - cue.start <= 18.000001 for cue in cues))
+        self.assertTrue(
+            all(
+                (cue.speaker_assignment or "").startswith("song_alignment_support:")
+                for cue in cues
+            )
+        )
+        self.assertEqual("".join(cue.text for cue in cues), text)
+        self.assertTrue(all(left.end <= right.start for left, right in pairwise(cues)))
+
     def test_song_speech_quality_rejects_mixed_hangul_and_unstable_languages(self):
         record = {
             "text": "これは歌です 안녕하세요 this is not stable",
@@ -182,9 +205,7 @@ class QwenASRTests(unittest.TestCase):
         self.assertEqual(result["text"], "")
         self.assertEqual(result["cues"], [])
         self.assertTrue(result["skipped_empty"])
-        self.assertEqual(
-            result["correction_method"], "alignment_unusable_discarded"
-        )
+        self.assertEqual(result["correction_method"], "alignment_unusable_discarded")
         self.assertEqual(
             result["alignment_error"],
             "corrected_and_original_timeline_invalid",
@@ -341,12 +362,8 @@ class QwenASRTests(unittest.TestCase):
                     language="Japanese",
                     time_stamps=SimpleNamespace(
                         items=[
-                            SimpleNamespace(
-                                text="話", start_time=0.0, end_time=0.4
-                            ),
-                            SimpleNamespace(
-                                text="そう", start_time=0.4, end_time=0.4
-                            ),
+                            SimpleNamespace(text="話", start_time=0.0, end_time=0.4),
+                            SimpleNamespace(text="そう", start_time=0.4, end_time=0.4),
                             SimpleNamespace(
                                 text="ね",
                                 start_time=following_start,
@@ -696,6 +713,9 @@ class QwenASRTests(unittest.TestCase):
                     "subtitle_pipeline.asr._align_speech_records",
                     return_value={0: record},
                 ) as align,
+                patch(
+                    "subtitle_pipeline.conditioned_asr.transcribe_long_overlaps"
+                ) as conditioned,
             ):
                 _transcribe_analyzed(
                     video,
@@ -704,6 +724,7 @@ class QwenASRTests(unittest.TestCase):
                     AudioAnalysisConfig(),
                     AudioAnalysis([region], []),
                     pool,
+                    skip_conditioned_asr=True,
                 )
 
             media_duration.assert_called_once_with(video)
@@ -712,6 +733,102 @@ class QwenASRTests(unittest.TestCase):
             indexed = transcribe.call_args.args[2]
             self.assertEqual((indexed[0][1].start, indexed[0][1].end), (10.0, 11.0))
             self.assertIs(align.call_args.args[3], buffer)
+            conditioned.assert_not_called()
+
+    def test_dicow_is_transcribed_before_shared_correction_and_alignment(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            video = root / "source.mp4"
+            destination = root / "source.qwen3-asr.srt"
+            video.write_bytes(b"video")
+            diarization = [
+                AudioRegion(0.0, 4.0, "speech", "A"),
+                AudioRegion(2.0, 5.0, "speech", "B"),
+            ]
+            window = ConditionedWindow(1.5, 5.0, ("A", "B"), tuple(diarization))
+            events: list[str] = []
+            buffer = SimpleNamespace(duration=10.0)
+            pool = SimpleNamespace(
+                contains=lambda _uri: True,
+                resolve=lambda _uri: buffer,
+                main=lambda: buffer,
+            )
+
+            def transcribe_conditioned(*_args, **_kwargs):
+                events.append("dicow")
+                return ConditionedASRTranscription(
+                    [window],
+                    [Cue(2.0, 3.0, "DiCoW raw", "B", "conditioned_speech")],
+                )
+
+            def correct(records):
+                events.append("correct")
+                self.assertTrue(
+                    any(item.get("asr_source") == "dicow" for item in records)
+                )
+                return [
+                    {
+                        **record,
+                        "text": (
+                            "DiCoW corrected"
+                            if record.get("asr_source") == "dicow"
+                            else record["text"]
+                        ),
+                    }
+                    for record in records
+                ]
+
+            def align(_aligner, records, _regions, *_args):
+                events.append("align")
+                return {
+                    int(record["window_id"]): {
+                        **record,
+                        "cues": [
+                            {
+                                "start": record["core_start"],
+                                "end": record["core_end"],
+                                "text": record["text"],
+                            }
+                        ],
+                    }
+                    for record in records
+                }
+
+            with (
+                patch("subtitle_pipeline.asr._media_duration", return_value=10.0),
+                patch("subtitle_pipeline.asr._load_qwen_model", return_value=object()),
+                patch(
+                    "subtitle_pipeline.asr._transcribe_raw_speech_batch",
+                    return_value={
+                        0: {
+                            "core_start": 0.0,
+                            "core_end": 5.0,
+                            "text": "Qwen raw",
+                            "language": "Japanese",
+                        }
+                    },
+                ),
+                patch(
+                    "subtitle_pipeline.conditioned_asr.transcribe_long_overlaps",
+                    side_effect=transcribe_conditioned,
+                ),
+                patch(
+                    "subtitle_pipeline.asr._load_qwen_aligner", return_value=object()
+                ),
+                patch("subtitle_pipeline.asr._align_speech_records", side_effect=align),
+            ):
+                _transcribe_analyzed(
+                    video,
+                    destination,
+                    ASRConfig(),
+                    AudioAnalysisConfig(),
+                    AudioAnalysis([], [], diarization=diarization),
+                    pool,
+                    asr_text_corrector=correct,
+                )
+
+            self.assertEqual(events, ["dicow", "correct", "align"])
+            self.assertIn("DiCoW corrected", destination.read_text(encoding="utf-8"))
 
     def test_speech_windows_merge_nearby_turns_across_speakers(self):
         analysis = AudioAnalysis(
@@ -1306,9 +1423,7 @@ class QwenASRTests(unittest.TestCase):
         self.assertTrue(record["discarded_repetition"])
         self.assertEqual(audit["kind"], "raw_speech")
         self.assertEqual(audit["action"], "discard")
-        self.assertEqual(
-            record["repetition_diagnostics"][0]["reason"], audit["reason"]
-        )
+        self.assertEqual(record["repetition_diagnostics"][0]["reason"], audit["reason"])
 
     def test_removes_repeated_text_from_overlapping_song_window(self):
         self.assertEqual(

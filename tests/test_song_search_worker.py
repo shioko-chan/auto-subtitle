@@ -92,6 +92,29 @@ class SongSearchWorkerTests(unittest.TestCase):
         self.assertEqual(value["artist"], "大森靖子")
         self.assertEqual(len(value["lines"]), 3)
 
+    def test_parses_utanet_movie_page_markup(self):
+        worker = _worker_module()
+        document = """
+        <meta name="description"
+              content="B'zの「月光」動画視聴ページです。歌詞と動画を見ることができます。">
+        <div class="row kashi">
+          <div class="col-12">
+            <div class="position-relative">
+              <h2 class="mb-3 kashi-title">月光</h2>
+              <div class="movie-song-links"><a href="/song/7019/">歌詞を見る</a></div>
+            </div>
+            <div>眠りにおちてゆく<br>むさぼるように見つめ<br>青く染まる部屋</div>
+            <!-- PC向け マイ歌ネット動画登録 -->
+          </div>
+        </div>
+        """
+
+        value = worker._parse_utanet(document)
+
+        self.assertEqual(value["title"], "月光")
+        self.assertEqual(value["artist"], "B'z")
+        self.assertEqual(len(value["lines"]), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

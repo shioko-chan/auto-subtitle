@@ -23,7 +23,7 @@ from .asr_correction import correct_asr_windows, entities_from_context
 from .bilibili_comments import (
     build_song_setlist_comment,
     create_comment_task,
-    process_pending_bilibili_comments,
+    publish_comment_task,
 )
 from .chat_context import CurrentVideoChatIndex, remove_youtube_chat_files
 from .config import AppConfig, LLMConfig, llm_api_key
@@ -398,7 +398,6 @@ def _run_pipeline_stages(
                 translator.translate_lyrics,
                 translation_context,
                 config.llm.model,
-                review_lyrics=translator.review_lyrics,
             )
     song_result = split_aligned_song_cues(song_result, japanese_guidance_units)
     cues = song_result.corrected_cues
@@ -455,17 +454,6 @@ def _run_pipeline_stages(
             segmented,
             translation_context=translation_context,
             cache_path=job_dir / "cue-translation-cache.json",
-            audit_path=job_dir / "translation-audit.jsonl",
-            retrieve_knowledge=retrieve_translation_knowledge,
-            retrieve_chat=retrieve_translation_chat,
-        )
-    with stage_metrics("pipeline.llm_translation_review"):
-        translated = translator.review_translated_cues(
-            segmented,
-            translated,
-            translation_context=translation_context,
-            max_line_units=layout.max_line_units,
-            cache_path=job_dir / "cue-translation-review-cache.json",
             audit_path=job_dir / "translation-audit.jsonl",
             retrieve_knowledge=retrieve_translation_knowledge,
             retrieve_chat=retrieve_translation_chat,
@@ -589,9 +577,9 @@ def _run_pipeline_stages(
         config.upload.enabled if upload_override is None else upload_override
     )
     submission = None
+    comment_task = None
     if should_upload:
         with stage_metrics("pipeline.upload"):
-            process_pending_bilibili_comments(config.work_dir.resolve(), config.upload)
             submission = upload_to_bilibili(
                 rendered_path,
                 title=title,
@@ -601,7 +589,12 @@ def _run_pipeline_stages(
                 config=config.upload,
             )
             setlist = (
-                build_song_setlist_comment(source_title, song_result.reports)
+                build_song_setlist_comment(
+                    downloaded.metadata,
+                    song_result.reports,
+                    _youtube_comments(downloaded.comments),
+                    minimum_comment_likes=config.download.top_comment_min_likes,
+                )
                 if config.upload.song_setlist_comment
                 else None
             )
@@ -610,16 +603,20 @@ def _run_pipeline_stages(
                 and submission.aid is not None
                 and submission.bvid is not None
             ):
-                create_comment_task(
+                comment_task = create_comment_task(
                     job_dir,
                     aid=submission.aid,
                     bvid=submission.bvid,
                     message=setlist,
                     source_url=url,
-                    upload_response=submission.response,
                 )
-                process_pending_bilibili_comments(
-                    config.work_dir.resolve(), config.upload
+        if comment_task is not None:
+            with stage_metrics("pipeline.bilibili_comment"):
+                comment_status = publish_comment_task(comment_task, config.upload)
+            if comment_status not in {"posted", "already_exists"}:
+                logging.warning(
+                    "Bilibili setlist comment publication finished with status=%s",
+                    comment_status,
                 )
 
     result = PipelineResult(
@@ -699,6 +696,18 @@ def _youtube_metadata_context(metadata: dict[str, object]) -> dict[str, object]:
     return {
         key: metadata[key] for key in keys if metadata.get(key) not in (None, "", [])
     }
+
+
+def _youtube_comments(path: Path | None) -> list[object]:
+    if path is None or not path.is_file():
+        return []
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.warning("cannot read downloaded YouTube comments: %s", exc)
+        return []
+    comments = value.get("comments") if isinstance(value, dict) else None
+    return comments if isinstance(comments, list) else []
 
 
 def _subtitle_evidence(cues: list[Cue], limit: int) -> str:

@@ -401,6 +401,56 @@ class SubtitleRenderTests(unittest.TestCase):
         self.assertIn("Speaker_fuji_miyako,fuji_miyako,0,0,0,,都子", content)
         self.assertIn("Default,unknown,0,0,156,,默认", content)
 
+    def test_ass_layers_optional_character_outer_outline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "subtitle.ass"
+            styles = {
+                "nakamachi_arale": CharacterStyle(
+                    "nakamachi_arale",
+                    "仲町あられ",
+                    "#FFFFFF",
+                    "#B88600",
+                    2,
+                    "#FFE052",
+                    8,
+                )
+            }
+            _write_ass(
+                [Cue(1, 2, "阿拉蕾", "nakamachi_arale")],
+                path,
+                width=1080,
+                height=1920,
+                font_name="Noto Sans CJK SC",
+                font_size=48,
+                margin_vertical=96,
+                outline=5,
+                character_styles=styles,
+            )
+            content = path.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "Style: Speaker_nakamachi_arale,Noto Sans CJK SC,48,"
+            "&H00FFFFFF,&H000000FF,&H000086B8,&H00000000,"
+            "0,0,0,0,100,100,0,0,1,2,",
+            content,
+        )
+        self.assertIn(
+            "Style: Speaker_nakamachi_arale_Outer,Noto Sans CJK SC,48,"
+            "&HFFFFFFFF,&H000000FF,&H0052E0FF,&H00000000,"
+            "0,0,0,0,100,100,0,0,1,8,",
+            content,
+        )
+        self.assertIn(
+            "Dialogue: 0,0:00:01.00,0:00:02.00,"
+            "Speaker_nakamachi_arale_Outer,nakamachi_arale,0,0,0,,阿拉蕾",
+            content,
+        )
+        self.assertIn(
+            "Dialogue: 1,0:00:01.00,0:00:02.00,"
+            "Speaker_nakamachi_arale,nakamachi_arale,0,0,0,,阿拉蕾",
+            content,
+        )
+
     def test_ass_decorates_only_singing_cues_without_underlining(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "subtitle.ass"

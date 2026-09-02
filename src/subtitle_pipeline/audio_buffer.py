@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import subprocess
+import threading
 from dataclasses import dataclass
 from multiprocessing import shared_memory
 from pathlib import Path
@@ -16,6 +17,8 @@ from .telemetry import stage_metrics
 logger = logging.getLogger(__name__)
 
 _SHARED_URI_PREFIX = "shm://"
+_MAIN_AUDIO_DECODE_TIMEOUT_SECONDS = 60.0
+_MAIN_AUDIO_DECODE_ATTEMPTS = 2
 
 
 @dataclass(frozen=True)
@@ -219,26 +222,15 @@ class AudioBufferPool:
             "pipe:1",
         ]
         logger.info("decoding 16 kHz mono audio once into shared memory")
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         byte_view = memory.buf.cast("B")
         view_released = False
-        written = 0
         try:
-            assert process.stdout is not None
-            while True:
-                if written >= len(byte_view):
-                    raise RuntimeError("decoded audio exceeded the allocated shared memory")
-                count = process.stdout.readinto(byte_view[written:])
-                if not count:
-                    break
-                written += count
-            stderr = process.stderr.read() if process.stderr is not None else b""
-            return_code = process.wait()
-            if return_code != 0:
-                raise RuntimeError(
-                    "ffmpeg audio decode failed: "
-                    + stderr.decode("utf-8", errors="replace")[-2000:]
-                )
+            written = _decode_process_with_retries(
+                command,
+                byte_view,
+                timeout_seconds=_MAIN_AUDIO_DECODE_TIMEOUT_SECONDS,
+                attempts=_MAIN_AUDIO_DECODE_ATTEMPTS,
+            )
             sample_count = written // np.dtype(np.float32).itemsize
             if sample_count == 0:
                 raise RuntimeError("ffmpeg decoded no audio samples")
@@ -256,8 +248,6 @@ class AudioBufferPool:
             )
             return buffer
         except Exception:
-            process.kill()
-            process.wait()
             byte_view.release()
             view_released = True
             memory.close()
@@ -266,10 +256,6 @@ class AudioBufferPool:
         finally:
             if not view_released:
                 byte_view.release()
-            if process.stdout is not None:
-                process.stdout.close()
-            if process.stderr is not None:
-                process.stderr.close()
 
     def _cleanup_abandoned(self) -> None:
         payload = self._registry_payload()
@@ -326,6 +312,80 @@ class AudioBufferPool:
         temporary = self.registry_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         temporary.replace(self.registry_path)
+
+
+def _decode_process_with_retries(
+    command: list[str],
+    target: memoryview,
+    *,
+    timeout_seconds: float,
+    attempts: int,
+) -> int:
+    if attempts < 1:
+        raise ValueError("audio decode attempts must be at least one")
+    for attempt in range(1, attempts + 1):
+        try:
+            return _decode_process_once(command, target, timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            if attempt >= attempts:
+                raise RuntimeError(
+                    f"ffmpeg audio decode timed out after {attempts} attempts "
+                    f"of {timeout_seconds:.0f}s"
+                ) from exc
+            logger.warning(
+                "ffmpeg audio decode timed out after %.0fs; retrying (%d/%d)",
+                timeout_seconds,
+                attempt + 1,
+                attempts,
+            )
+    raise AssertionError("unreachable")
+
+
+def _decode_process_once(
+    command: list[str], target: memoryview, timeout_seconds: float
+) -> int:
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    timed_out = threading.Event()
+
+    def kill_on_timeout() -> None:
+        if process.poll() is None:
+            timed_out.set()
+            process.kill()
+
+    timer = threading.Timer(timeout_seconds, kill_on_timeout)
+    timer.daemon = True
+    timer.start()
+    written = 0
+    try:
+        assert process.stdout is not None
+        while True:
+            if written >= len(target):
+                raise RuntimeError("decoded audio exceeded the allocated shared memory")
+            count = process.stdout.readinto(target[written:])
+            if not count:
+                break
+            written += count
+        stderr = process.stderr.read() if process.stderr is not None else b""
+        return_code = process.wait()
+        if timed_out.is_set():
+            raise subprocess.TimeoutExpired(command, timeout_seconds)
+        if return_code != 0:
+            raise RuntimeError(
+                "ffmpeg audio decode failed: "
+                + stderr.decode("utf-8", errors="replace")[-2000:]
+            )
+        return written
+    except Exception:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        raise
+    finally:
+        timer.cancel()
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
 
 
 def is_shared_audio_uri(value: str | None) -> bool:

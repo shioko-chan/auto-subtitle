@@ -48,6 +48,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.audio_analysis.diarization_backend, "pyannote")
             self.assertEqual(config.audio_analysis.overlap_conditioned_asr_seconds, 0.5)
             self.assertEqual(config.audio_analysis.conditioned_asr_backend, "dicow")
+            self.assertFalse(config.audio_analysis.skip_dicow_for_single_person_streams)
             self.assertEqual(config.audio_analysis.conditioned_asr_batch_size, 4)
             self.assertEqual(config.audio_analysis.moss_window_seconds, 480.0)
             self.assertEqual(config.audio_analysis.moss_max_window_seconds, 540.0)
@@ -83,7 +84,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.audio_analysis.singing_asr_max_seconds, 15.0)
             self.assertEqual(config.audio_analysis.singing_asr_search_seconds, 4.0)
             self.assertFalse(config.song_identification.enabled)
-            self.assertEqual(config.song_identification.device, "gpu:0")
+            self.assertEqual(config.song_identification.device, "cuda:0")
             self.assertEqual(
                 config.song_identification.song_search_group_gap_seconds, 35.0
             )
@@ -122,6 +123,18 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("vcodec^=vp9]", config.download.video_format)
             self.assertIn("vcodec^=vp09", config.download.video_format)
             self.assertEqual(config.download.concurrent_fragments, 8)
+
+    def test_enables_single_person_dicow_skip(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(
+                "[audio_analysis]\nskip_dicow_for_single_person_streams = true\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+        self.assertTrue(config.audio_analysis.skip_dicow_for_single_person_streams)
 
     def test_rejects_invalid_download_fragment_concurrency(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -167,14 +180,14 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "unknown.*configuration field"):
                 load_config(path)
 
-    def test_rejects_invalid_song_ocr_interval(self):
+    def test_rejects_invalid_song_ocr_score(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.toml"
             path.write_text(
-                "[song_identification]\nsample_interval_seconds = 0\n",
+                "[song_identification]\nminimum_ocr_score = 2\n",
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(ConfigError, "sample_interval_seconds"):
+            with self.assertRaisesRegex(ConfigError, "minimum_ocr_score"):
                 load_config(path)
 
     def test_rejects_unknown_speaker_embedding_backend(self):

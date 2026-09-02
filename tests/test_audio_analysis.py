@@ -37,6 +37,7 @@ from subtitle_pipeline.speakers import (
     identify_speakers,
     load_character_styles,
     metadata_character,
+    title_characters,
 )
 
 
@@ -529,6 +530,20 @@ class AudioAnalysisTests(unittest.TestCase):
         styles = load_character_styles()
         self.assertEqual(styles["minetsuki_ritsu"].primary_color, "#FFFFFF")
         self.assertEqual(styles["minetsuki_ritsu"].outline_color, "#65A9FF")
+        self.assertEqual(styles["nakamachi_arale"].outline_width, 2)
+        self.assertEqual(styles["nakamachi_arale"].outer_outline_color, "#FFE052")
+        self.assertEqual(styles["nakamachi_arale"].outer_outline_width, 8)
+
+    def test_title_characters_distinguishes_single_multi_and_unknown_titles(self):
+        self.assertEqual(
+            title_characters({"title": "【朝活】おはよう【藤都子/ゆめみた】"}),
+            ("fuji_miyako",),
+        )
+        self.assertEqual(
+            title_characters({"title": "【筋トレ】仲町あられ / 藤都子"}),
+            ("fuji_miyako", "nakamachi_arale"),
+        )
+        self.assertEqual(title_characters({"title": "名前のない配信"}), ())
 
     def test_speaker_profiles_are_scoped_to_embedding_model(self):
         with tempfile.TemporaryDirectory() as temp:

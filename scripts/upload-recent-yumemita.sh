@@ -206,11 +206,6 @@ done
 printf '\nBatch complete: %d succeeded, %d skipped, %d failed.\n' \
     "$succeeded" "$skipped" "$failed"
 log_status "COMPLETE succeeded=$succeeded skipped=$skipped failed=$failed"
-printf 'Retrying post-upload comments for approved drafts...\n'
-if ! uv run --extra asr subtitle-pipeline --config "$CONFIG_PATH" retry-comments; then
-    log_status "WARN post-upload-comment-retry-failed"
-    printf 'Post-upload comment retry failed; pending tasks remain recorded.\n' >&2
-fi
 printf 'Status log: %s\n' "$STATUS_PATH"
 
 if ((failed > 0)); then

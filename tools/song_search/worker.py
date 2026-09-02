@@ -270,11 +270,33 @@ def _parse_utanet(document: str) -> dict[str, object] | None:
         )
         if artist_match is not None:
             artist = _plain_html_text(artist_match.group(1))
+    if not artist and title:
+        description_match = re.search(
+            r'<meta[^>]+name=(["\'])description\1[^>]+content=(["\'])(.*?)\2',
+            document,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if description_match is not None:
+            description = _plain_html_text(description_match.group(3))
+            artist_match = re.match(
+                rf"(.+?)の[「『]{re.escape(title)}[」』](?:歌詞|動画視聴)",
+                description,
+            )
+            if artist_match is not None:
+                artist = artist_match.group(1).strip()
     match = re.search(
         r'<div[^>]+(?:id|class)=["\'][^"\']*kashi_area[^"\']*["\'][^>]*>(.*?)</div>',
         document,
         flags=re.IGNORECASE | re.DOTALL,
     )
+    if match is None:
+        match = re.search(
+            r'<div[^>]+class=["\'][^"\']*\bkashi\b[^"\']*["\'][^>]*>'
+            r'.*?<h2[^>]+class=["\'][^"\']*kashi-title[^"\']*["\'][^>]*>.*?</h2>'
+            r'.*?<div>(.*?)</div>\s*<!--\s*PC向け',
+            document,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
     if match is None or "Enable JavaScript and cookies" in document:
         return None
     lines = _html_lyric_lines(match.group(1))

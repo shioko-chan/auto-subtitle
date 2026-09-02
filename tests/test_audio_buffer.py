@@ -1,15 +1,51 @@
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from multiprocessing import shared_memory
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
-from subtitle_pipeline.audio_buffer import AudioBufferPool
+from subtitle_pipeline.audio_buffer import (
+    AudioBufferPool,
+    _decode_process_once,
+    _decode_process_with_retries,
+)
 
 
 class AudioBufferTests(unittest.TestCase):
+    def test_audio_decode_process_times_out(self):
+        target = memoryview(bytearray(16))
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                _decode_process_once(
+                    [sys.executable, "-c", "import time; time.sleep(5)"],
+                    target,
+                    0.05,
+                )
+        finally:
+            target.release()
+
+    def test_audio_decode_retries_once_after_timeout(self):
+        target = memoryview(bytearray(16))
+        timeout = subprocess.TimeoutExpired(["ffmpeg"], 60)
+        try:
+            with patch(
+                "subtitle_pipeline.audio_buffer._decode_process_once",
+                side_effect=[timeout, 8],
+            ) as decode:
+                written = _decode_process_with_retries(
+                    ["ffmpeg"], target, timeout_seconds=60, attempts=2
+                )
+        finally:
+            target.release()
+
+        self.assertEqual(written, 8)
+        self.assertEqual(decode.call_count, 2)
+
     def test_shared_buffer_registry_and_cleanup(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

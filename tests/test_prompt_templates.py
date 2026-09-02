@@ -13,9 +13,7 @@ class PromptTemplateTests(unittest.TestCase):
             "asr-correct.md",
             "segment-source-cues.md",
             "translate-fixed-cues.md",
-            "review-fixed-translations.md",
             "lyrics-translate.md",
-            "lyrics-review.md",
             "metadata-translate.md",
         ):
             with self.subTest(name=name):

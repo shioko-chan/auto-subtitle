@@ -64,6 +64,8 @@
           pkgs.uv
           pkgs.ffmpeg
           pkgs.espeak-ng
+          pkgs.chromium
+          pkgs.noto-fonts-monochrome-emoji
           cuda.cuda_nvcc
           cuda.cuda_cccl
           assCudaRender

@@ -407,12 +407,6 @@ class PipelineTests(unittest.TestCase):
                     FakeTranslator.translation_context = context
                     return [Cue(cue.start, cue.end, "你好") for cue in cues]
 
-                def review_translated_cues(
-                    self, source_cues, translated_cues, **context
-                ):
-                    FakeTranslator.review_context = context
-                    return translated_cues
-
                 def translate_metadata(self, title, description, **context):
                     self.context = context
                     return "中文标题", "中文简介", "内容摘要", ["动画", "音乐企划"]
@@ -475,7 +469,7 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("pipeline.audio_and_asr", performance["summary"])
             self.assertIn("pipeline.llm_cue_segmentation", performance["summary"])
             self.assertIn("pipeline.llm_cue_translation", performance["summary"])
-            self.assertIn("pipeline.llm_translation_review", performance["summary"])
+            self.assertNotIn("pipeline.llm_translation_review", performance["summary"])
             self.assertIn("pipeline.metadata_translation", performance["summary"])
             self.assertIn("pipeline.render", performance["summary"])
             self.assertNotIn("pipeline.upload", performance["summary"])
@@ -497,10 +491,6 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(
                 FakeTranslator.translation_context["cache_path"].name,
                 "cue-translation-cache.json",
-            )
-            self.assertEqual(
-                FakeTranslator.review_context["cache_path"].name,
-                "cue-translation-review-cache.json",
             )
             self.assertEqual(FakeTranslator.audit_path.name, "llm-audit.jsonl")
             upload.assert_not_called()

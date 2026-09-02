@@ -36,13 +36,22 @@ class LyricsLibraryTests(unittest.TestCase):
             )
             loaded = library.get(song.song_id)
             self.assertEqual(loaded.lines[0].translation, "想要告诉你")
+            library.store_translations(song.song_id, {0: "官方译词"}, source="official")
             library.store_translations(
-                song.song_id, {0: "官方译词"}, source="official"
+                song.song_id, {0: "人工确认译词"}, source="verified"
+            )
+            library.store_translations(
+                song.song_id, {0: "后来写入的官方译词"}, source="official"
+            )
+            library.store_translations(
+                song.song_id, {0: "后来写入的人工译词"}, source="verified"
             )
             library.store_translations(
                 song.song_id, {0: "较低优先级译词"}, source="llm"
             )
-            self.assertEqual(library.get(song.song_id).lines[0].translation, "官方译词")
+            verified_line = library.get(song.song_id).lines[0]
+            self.assertEqual(verified_line.translation, "人工确认译词")
+            self.assertEqual(verified_line.translation_source, "verified")
             library.close()
 
     def test_matches_multiple_sequential_noisy_anchors(self):

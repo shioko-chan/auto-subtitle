@@ -63,6 +63,7 @@ class AudioAnalysisConfig:
     overlap_conditioned_asr_seconds: float = 0.5
     overlap_context_seconds: float = 2.0
     conditioned_asr_backend: str = "dicow"
+    skip_dicow_for_single_person_streams: bool = False
     conditioned_asr_model: str = "BUT-FIT/DiCoW_v3_3"
     conditioned_asr_revision: str = "c34b64d9a9c5148c65fd355bb188d60343a6b44f"
     conditioned_asr_worker_project: str = "tools/dicow"
@@ -108,23 +109,15 @@ class AudioAnalysisConfig:
 @dataclass(frozen=True)
 class SongIdentificationConfig:
     enabled: bool = False
-    device: str = "gpu:0"
-    detection_model: str = "PP-OCRv5_mobile_det"
-    recognition_model: str = "PP-OCRv5_server_rec"
-    ocr_worker_project: str = "tools/song_ocr"
+    device: str = "cuda:0"
     search_worker_project: str = "tools/song_search"
-    seconds_before_start: float = 30.0
-    seconds_after_start: float = 15.0
-    sample_interval_seconds: float = 1.0
     song_search_group_gap_seconds: float = 35.0
     minimum_ocr_score: float = 0.45
-    minimum_persistent_frames: int = 2
     max_search_results: int = 5
     lyrics_library_path: str = "databases/lyrics.sqlite3"
     match_anchor_threshold: float = 0.48
     match_minimum_anchors: int = 3
     match_minimum_score: float = 0.48
-    match_minimum_margin: float = 0.05
     pyshiro_worker_project: str = "tools/pyshiro"
     vocal_separation_device: str = "cuda:0"
     pyshiro_max_window_seconds: float = 20.0
@@ -627,12 +620,6 @@ def load_config(path: Path) -> AppConfig:
             "audio_analysis.speaker_profile_min_samples_per_center must be at least 1"
         )
     songs = config.song_identification
-    if songs.seconds_before_start < 0 or songs.seconds_after_start < 0:
-        raise ConfigError("song identification OCR windows cannot be negative")
-    if songs.sample_interval_seconds <= 0:
-        raise ConfigError(
-            "song_identification.sample_interval_seconds must be positive"
-        )
     if songs.song_search_group_gap_seconds < 0:
         raise ConfigError(
             "song_identification.song_search_group_gap_seconds cannot be negative"
@@ -640,10 +627,6 @@ def load_config(path: Path) -> AppConfig:
     if not 0 <= songs.minimum_ocr_score <= 1:
         raise ConfigError(
             "song_identification.minimum_ocr_score must be between 0 and 1"
-        )
-    if songs.minimum_persistent_frames < 1:
-        raise ConfigError(
-            "song_identification.minimum_persistent_frames must be at least 1"
         )
     if songs.max_search_results < 1:
         raise ConfigError("song identification search limits must be at least 1")
@@ -655,8 +638,10 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError(
             "song_identification.match_minimum_anchors must be at least 2"
         )
-    if not 0 <= songs.match_minimum_score <= 1 or songs.match_minimum_margin < 0:
-        raise ConfigError("song identification match score settings are invalid")
+    if not 0 <= songs.match_minimum_score <= 1:
+        raise ConfigError(
+            "song_identification.match_minimum_score must be between 0 and 1"
+        )
     if songs.pyshiro_max_window_seconds <= 0 or songs.pyshiro_max_window_seconds > 20:
         raise ConfigError(
             "song_identification.pyshiro_max_window_seconds must be in (0, 20]"

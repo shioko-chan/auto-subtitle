@@ -16,7 +16,6 @@ from pathlib import Path
 from .config import LLMConfig, SegmentationConfig, TranslationConfig
 from .fan_knowledge import KnowledgeHit
 from .llm_response import (
-    parse_json_object,
     structured_request_body,
     structured_response_content,
 )
@@ -47,7 +46,6 @@ logger = logging.getLogger(__name__)
 _CACHE_VERSION = 4
 _SEGMENT_PROMPT = "segment-source-cues.md"
 _TRANSLATE_PROMPT = "translate-fixed-cues.md"
-_REVIEW_PROMPT = "review-fixed-translations.md"
 _CONTENT_ATTEMPTS = 2
 _TOPIC_MAX_CUES = 16
 _TOPIC_MAX_SECONDS = 90.0
@@ -106,7 +104,7 @@ def run_segmentation(
     sudachi_versions: dict[str, str],
 ) -> list[Cue]:
     signature = _signature(
-        "segmentation",
+        "segmentation-guidance-only",
         {
             "tracks": [asdict(track) for track in tracks],
             "config": asdict(segmentation),
@@ -119,7 +117,7 @@ def run_segmentation(
     cached = _load_records(cache_path, signature, SegmentRecord)
     if cached is not None:
         records = [SegmentRecord(**value) for value in cached]
-        _validate_final_segments(records, tracks, source_maximum_units)
+        _validate_final_segments(records, tracks)
         return _records_to_source_cues(source_cues, tracks, records)
 
     all_units = [unit for track in tracks for unit in track.units]
@@ -178,7 +176,7 @@ def run_segmentation(
             for future in as_completed(futures):
                 records.extend(future.result())
     records.sort(key=lambda value: (value.track, value.start_id))
-    _validate_final_segments(records, tracks, source_maximum_units)
+    _validate_final_segments(records, tracks)
     _write_records(cache_path, signature, records)
     return _records_to_source_cues(source_cues, tracks, records)
 
@@ -327,228 +325,6 @@ def run_fixed_translation(
     return result
 
 
-def run_translation_review(
-    *,
-    source_cues: list[Cue],
-    translated_cues: list[Cue],
-    llm: LLMConfig,
-    translation: TranslationConfig,
-    request: Callable[[dict[str, object]], dict[str, object]],
-    finish_reason: Callable[[object], str | None],
-    log_invalid_response: Callable[
-        [str, Exception, object, dict[str, object] | None, object], None
-    ],
-    translation_context: dict[str, object],
-    maximum_units: float,
-    honorific_rules: str,
-    cache_path: Path | None,
-    retrieve_knowledge: Callable[[list[Cue], str], list[KnowledgeHit]] | None = None,
-    retrieve_chat: Callable[[list[Cue]], str] | None = None,
-    audit_path: Path | None = None,
-) -> list[Cue]:
-    if len(source_cues) != len(translated_cues):
-        raise ValueError(
-            "translation review requires aligned source and translated cues"
-        )
-    signature = _signature(
-        "translation_review",
-        {
-            "source": [asdict(cue) for cue in source_cues],
-            "draft": [asdict(cue) for cue in translated_cues],
-            "model": llm.model,
-            "target_language": translation.target_language,
-            "maximum_units": maximum_units,
-            "context": translation_context,
-            "prompt": prompt_templates_digest(_REVIEW_PROMPT),
-        },
-    )
-    cached = _load_records(cache_path, signature, Cue)
-    if cached is not None:
-        result = [cue_from_mapping(value) for value in cached]
-        _write_translation_audit(
-            audit_path,
-            [
-                _translation_review_audit_entry(
-                    cue_id,
-                    source_cues[cue_id],
-                    translated_cues[cue_id].text,
-                    cue.text,
-                    maximum_units,
-                    "cache",
-                )
-                for cue_id, cue in enumerate(result)
-                if source_cues[cue_id].kind != "singing"
-            ],
-        )
-        return result
-
-    result = list(translated_cues)
-    pending = [
-        cue_id for cue_id, cue in enumerate(source_cues) if cue.kind != "singing"
-    ]
-    groups = _topic_request_groups(source_cues, pending, translation)
-    audit_lock = threading.Lock()
-    evidence_by_group = _prepare_topic_evidence(
-        groups,
-        source_cues,
-        retrieve_knowledge,
-        retrieve_chat,
-        metric_name="rag.fixed_translation_review",
-    )
-
-    def process(ids: list[int]) -> tuple[dict[int, Cue], list[dict[str, object]]]:
-        selected = [source_cues[cue_id] for cue_id in ids]
-        evidence = evidence_by_group[tuple(ids)]
-        chat_evidence = evidence.chat
-        knowledge = evidence.knowledge
-        term_references = evidence.term_references
-        start = min(cue.start for cue in selected)
-        end = max(cue.end for cue in selected)
-        dialogue = _translation_dialogue_context(
-            source_cues, selected, start, end, translation
-        )
-        source_index = {id(cue): cue_id for cue_id, cue in enumerate(source_cues)}
-        reference = compact_translation_reference_context(translation_context)
-        prompt = render_user_prompt(
-            _REVIEW_PROMPT,
-            MAXIMUM_UNITS=f"{maximum_units:.3f}",
-            HONORIFIC_TRANSLATION_RULES=honorific_rules,
-            REFERENCE_TEXT=reference_text(reference),
-            TERM_REFERENCE=_format_term_references(term_references),
-            CHAT_EVIDENCE=chat_evidence or "(none)",
-            DIALOGUE_CONTEXT="\n".join(
-                _format_review_context_cue(
-                    cue,
-                    translated_cues[source_index[id(cue)]],
-                )
-                for cue in dialogue
-            )
-            or "(none)",
-            CUE_TEXT=_format_review_cues(
-                ids,
-                source_cues,
-                translated_cues,
-                knowledge,
-                maximum_units,
-            ),
-        )
-        body = structured_request_body(
-            model=llm.model,
-            prompt_name=_REVIEW_PROMPT,
-            prompt=prompt,
-            max_tokens=translation.max_tokens,
-            temperature=0.1,
-            json_mode=llm.json_mode,
-            thinking=llm.thinking,
-        )
-        response: object = None
-        content: object = None
-        reviewed = {cue_id: translated_cues[cue_id] for cue_id in ids}
-        request_id: str | None = None
-        method = "unchanged"
-        try:
-            _validate_prompt_budget(prompt, llm, translation)
-            response = request(body)
-            content = structured_response_content(
-                response, finish_reason=finish_reason
-            )
-            corrections = parse_json_object(content).get("corrections")
-            if not isinstance(corrections, list):
-                raise TypeError("translation review requires a corrections array")
-            local_to_global = dict(enumerate(ids))
-            seen: set[int] = set()
-            for position, value in enumerate(corrections):
-                if not isinstance(value, dict) or set(value) != {"cue_id", "text"}:
-                    raise RuntimeError(
-                        f"translation review correction {position} "
-                        "has unexpected fields"
-                    )
-                local_id = _integer(value["cue_id"], "cue_id", position)
-                if local_id not in local_to_global or local_id in seen:
-                    raise RuntimeError(
-                        f"invalid or duplicate review cue_id={local_id}"
-                    )
-                text = value["text"]
-                if not isinstance(text, str) or not text.strip():
-                    raise TypeError(
-                        f"translation review cue {position} text is not non-empty text"
-                    )
-                text = text.strip()
-                seen.add(local_id)
-                global_id = local_to_global[local_id]
-                reviewed[global_id] = replace(translated_cues[global_id], text=text)
-            request_id_value = response.get("_audit_request_id")
-            request_id = (
-                request_id_value if isinstance(request_id_value, str) else None
-            )
-            method = "llm_review"
-        except Exception as exc:  # noqa: BLE001 - single-attempt review fails open
-            log_invalid_response(
-                "fixed translation review", exc, content, body, response
-            )
-            logger.warning(
-                "translation review failed without retry; preserving "
-                "%d draft cue(s): %s",
-                len(ids),
-                exc,
-            )
-            method = f"draft_preserved_{type(exc).__name__}"
-
-        audit_entries: list[dict[str, object]] = []
-        for cue_id in ids:
-            final_text = reviewed[cue_id].text
-            width = text_display_width(final_text)
-            if width > maximum_units:
-                logger.warning(
-                    "accepting overwide reviewed cue cue_id=%d width=%.3f "
-                    "limit=%.3f text=%r",
-                    cue_id,
-                    width,
-                    maximum_units,
-                    final_text,
-                )
-            audit_entries.append(
-                _translation_review_audit_entry(
-                    cue_id,
-                    source_cues[cue_id],
-                    translated_cues[cue_id].text,
-                    final_text,
-                    maximum_units,
-                    method,
-                    request_id=request_id,
-                )
-            )
-        return reviewed, audit_entries
-
-    if groups:
-        logger.info(
-            "reviewing %d translated cues in %d request group(s) "
-            "with concurrency=%d soft_Chinese_limit=%.3f",
-            len(pending),
-            len(groups),
-            llm.max_concurrency,
-            maximum_units,
-        )
-        with (
-            stage_metrics("llm.fixed_translation_review"),
-            ThreadPoolExecutor(
-                max_workers=min(llm.max_concurrency, len(groups)),
-                thread_name_prefix="fixed-review",
-            ) as executor,
-        ):
-            futures = [executor.submit(process, group) for group in groups]
-            for future in as_completed(futures):
-                reviewed, audit_entries = future.result()
-                for cue_id, cue in reviewed.items():
-                    result[cue_id] = cue
-                _write_translation_audit(
-                    audit_path, audit_entries, lock=audit_lock
-                )
-
-    _write_records(cache_path, signature, result)
-    return result
-
-
 def _segment_resilient(
     track: SpeakerTrack,
     start: int,
@@ -680,9 +456,7 @@ def _request_segmentation(
             content = structured_response_content(
                 response, finish_reason=finish_reason
             )
-            return _validate_segments(
-                parse_content(content), track, start, end, maximum_units
-            )
+            return _validate_segments(parse_content(content), track, start, end)
         except Exception as exc:
             log_invalid_response(
                 "source cue segmentation", exc, content, body, response
@@ -707,7 +481,6 @@ def _validate_segments(
     track: SpeakerTrack,
     start: int,
     end: int,
-    maximum_units: float,
 ) -> list[SegmentRecord]:
     if not values:
         raise RuntimeError("segmentation response contains no cues")
@@ -724,13 +497,6 @@ def _validate_segments(
             or relative_end > end - start
         ):
             raise RuntimeError(f"segmentation coverage failed at cue {position}")
-        selected = track.units[start + relative_start : start + relative_end]
-        source = join_source_fragments((unit.text, unit.language) for unit in selected)
-        width = text_display_width(source)
-        if width > maximum_units:
-            raise RuntimeError(
-                f"source cue width={width:.3f} exceeds Japanese limit={maximum_units:.3f}"
-            )
         records.append(
             SegmentRecord(
                 track.key,
@@ -1153,38 +919,6 @@ def _format_translation_cues(
     return "\n\n".join(values)
 
 
-def _format_review_cues(
-    ids: list[int],
-    source_cues: list[Cue],
-    translated_cues: list[Cue],
-    knowledge: list[KnowledgeHit],
-    maximum_units: float,
-) -> str:
-    knowledge_text = _format_topic_knowledge(knowledge)
-    values = ["<TOPIC_BLOCK>", f"FAN_KNOWLEDGE:\n{knowledge_text}", "CUES:"]
-    for local_id, cue_id in enumerate(ids):
-        source = source_cues[cue_id]
-        draft = translated_cues[cue_id]
-        values.append(
-            f'<CUE id="{local_id}" width="{text_display_width(draft.text):.3f}" '
-            f'limit="{maximum_units:.3f}" '
-            f'speaker="{escape_prompt_text(source.speaker or "unknown")}" '
-            f'language="{language_for_text(source.text, source.language)}">\n'
-            f"SOURCE_TEXT:\n{escape_prompt_text(source.text)}\n"
-            f"DRAFT_TRANSLATION:\n{escape_prompt_text(draft.text)}\n"
-            "</CUE>"
-        )
-    values.append("</TOPIC_BLOCK>")
-    return "\n\n".join(values)
-
-
-def _format_review_context_cue(source: Cue, translated: Cue) -> str:
-    return (
-        f"<{source.speaker or 'unknown'}>"
-        f"{escape_prompt_text(source.text)} => {escape_prompt_text(translated.text)}"
-    )
-
-
 def _fit_translation_prompt(
     *,
     ids: list[int],
@@ -1497,7 +1231,7 @@ def _records_to_source_cues(
 
 
 def _validate_final_segments(
-    records: list[SegmentRecord], tracks: list[SpeakerTrack], maximum_units: float
+    records: list[SegmentRecord], tracks: list[SpeakerTrack]
 ) -> None:
     by_track: dict[str, list[SegmentRecord]] = {}
     for record in records:
@@ -1510,17 +1244,6 @@ def _validate_final_segments(
             if record.start_id != expected or record.end_id <= record.start_id:
                 raise RuntimeError(
                     f"segmentation cache track {track.key} is not contiguous"
-                )
-            source = join_source_fragments(
-                (unit.text, unit.language)
-                for unit in track.units[record.start_id : record.end_id]
-            )
-            if (
-                len(track.units[record.start_id : record.end_id]) > 1
-                and text_display_width(source) > maximum_units
-            ):
-                raise RuntimeError(
-                    f"segmentation cache track {track.key} contains an overwide merged cue"
                 )
             expected = record.end_id
         if expected != len(track.units):
@@ -1565,36 +1288,6 @@ def _translation_audit_entry(
         "final_text": final_text,
         "translation_source": source,
         "downgrade_reason": downgrade_reason,
-    }
-
-
-def _translation_review_audit_entry(
-    cue_id: int,
-    source: Cue,
-    draft_text: str,
-    final_text: str,
-    maximum_units: float,
-    method: str,
-    *,
-    request_id: str | None = None,
-) -> dict[str, object]:
-    return {
-        "timestamp": datetime.now(UTC).isoformat(),
-        "event": "translation_review_result",
-        "request_id": request_id,
-        "cue_id": cue_id,
-        "start": source.start,
-        "end": source.end,
-        "speaker": source.speaker,
-        "kind": source.kind,
-        "source_text": source.text,
-        "draft_text": draft_text,
-        "final_text": final_text,
-        "changed": final_text != draft_text,
-        "final_width": text_display_width(final_text),
-        "soft_width_limit": maximum_units,
-        "overwide": text_display_width(final_text) > maximum_units,
-        "review_source": method,
     }
 
 

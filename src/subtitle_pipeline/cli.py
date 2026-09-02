@@ -8,7 +8,6 @@ import warnings
 from dataclasses import replace
 from pathlib import Path
 
-from .bilibili_comments import process_pending_bilibili_comments
 from .chat_context import remove_youtube_chat_files
 from .config import AppConfig, ConfigError, llm_api_key, load_config
 from .fan_knowledge import FanKnowledgeRetriever
@@ -50,10 +49,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("check", help="check local executables and configuration")
-    subparsers.add_parser(
-        "retry-comments", help="retry pending post-upload Bilibili comments"
-    )
-
     knowledge_parser = subparsers.add_parser(
         "knowledge", help="collect and inspect the local fan knowledge base"
     )
@@ -124,18 +119,6 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(args.config)
         if args.command == "check":
             return _check(config)
-        if args.command == "retry-comments":
-            summary = process_pending_bilibili_comments(
-                config.work_dir.resolve(), config.upload
-            )
-            logging.info(
-                "Bilibili comments: posted=%d existing=%d pending=%d permanent=%d",
-                summary.posted,
-                summary.already_exists,
-                summary.pending,
-                summary.permanent_errors,
-            )
-            return 0
         if args.command == "knowledge":
             return _knowledge(config, args)
         override = True if args.upload else False if args.no_upload else None
