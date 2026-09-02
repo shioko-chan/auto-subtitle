@@ -271,7 +271,7 @@ uv run --extra asr subtitle-pipeline --config config.toml run --upload 'https://
 uv run --extra asr subtitle-pipeline --config config.toml run 'https://www.youtube.com/watch?v=...'
 ```
 
-默认 `copyright = 2` 表示转载，来源自动使用 YouTube URL；若 `source` 非空则使用配置值。
+默认 `copyright = 2` 表示转载，但不会另填转载来源，以免 B 站把 URL 自动加到简介首行。
 上传使用 `biliup --user-cookie ... upload`，不会把 Cookie 内容放到命令行。
 B 站简介默认限制为 1800 个字符且同时检查 UTF-16 长度，为服务端计数差异留出余量。
 超长正文优先在段落或整行边界缩短，并为 `description_prefix` 预留空间；可通过

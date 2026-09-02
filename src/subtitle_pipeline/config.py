@@ -255,7 +255,6 @@ class UploadConfig:
     tags: list[str] = field(default_factory=lambda: ["中文字幕"])
     max_tags: int = 10
     tag_catalog_file: str | None = None
-    source: str = ""
     title_prefix: str = ""
     description_prefix: str = ""
     description_max_chars: int = 1800

@@ -314,7 +314,6 @@ tags = ["中文字幕", "YouTube"]
 max_tags = 10
 # Import a tag/heat catalog obtained through an authorized source.
 # tag_catalog_file = "bilibili-tags.json"
-source = ""
 title_prefix = "【中字】"
 description_prefix = "翻译：Qwen，时轴：Qwen\n请以原视频为准：\n{youtube_url}\n─────── ⋆⋅☆⋅⋆ ───────\n\n"
 description_max_chars = 1800

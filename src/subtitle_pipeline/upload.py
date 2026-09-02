@@ -53,7 +53,6 @@ def upload_to_bilibili(
             "before resuming"
         )
     _wait_for_upload_cooldown(Path(config.throttle_state_file))
-    source = config.source or source_url
     description_prefix = config.description_prefix.replace(
         "{youtube_url}", source_url
     )
@@ -86,8 +85,6 @@ def upload_to_bilibili(
         "--limit",
         str(config.limit),
     ]
-    if config.copyright == 2:
-        command.extend(["--source", source])
     if config.line:
         command.extend(["--line", config.line])
     command.append(str(video))

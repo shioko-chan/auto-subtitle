@@ -86,13 +86,14 @@ class UploadTests(unittest.TestCase):
                 )
             command = run.call_args.args[0]
             self.assertEqual(command[:4], ["/bin/biliup", "--user-cookie", str(cookie), "upload"])
-            self.assertIn("https://youtube.test/watch?v=1", command)
+            self.assertNotIn("--source", command)
+            self.assertNotIn("https://youtube.test/watch?v=1", command)
             self.assertIn("中字,自动生成", command)
             description = command[command.index("--desc") + 1]
             self.assertEqual(description, "Description")
             self.assertEqual(command[-1], str(video))
 
-    def test_expands_youtube_url_in_description_prefix(self):
+    def test_expands_youtube_url_placeholder_in_description_prefix(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             cookie = root / "cookies.json"
