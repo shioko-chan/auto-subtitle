@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # hooks. Keep unrelated model construction out of that process-global context.
 _MODEL_LOAD_LOCK = threading.Lock()
 
-_CACHE_VERSION = 14
+_CACHE_VERSION = 15
 _SINGING_LABELS = {
     "chant",
     "child singing",
@@ -76,12 +76,10 @@ class AudioRegion:
 class AcousticPhrase:
     start: float
     end: float
-    singing_level: str
     speech_level: str
     singing_score: float
     speech_score: float
     music_score: float
-    vocal_score: float
     diarization_overlap_seconds: float
     route_alt: bool
     route_speech: bool
@@ -148,7 +146,6 @@ def analyze_audio(
         audit=song_detection_audit,
     )
     vocal_candidates: list[tuple[AudioRegion, AudioBuffer]] = []
-    vocal_scores: list[AudioRegion] = []
     fallback_vocals_path: Path | None = None
     if raw_candidates:
         phrase_candidates = _smart_acoustic_phrase_regions(
@@ -156,7 +153,7 @@ def analyze_audio(
             audio_pool.main() if audio_pool is not None else None,
             config,
         )
-        with stage_metrics("audio.vocal_separation_and_detection", config.device):
+        with stage_metrics("audio.vocal_separation", config.device):
             if audio_pool is not None:
                 vocal_candidates = _separate_vocal_candidates(
                     video,
@@ -166,29 +163,13 @@ def analyze_audio(
                     # Persist candidate stems for later canonical-lyric alignment.
                     debug_dir=job_dir / "vocal-candidates",
                 )
-                vocal_scores = _score_singing_sources(
-                    [
-                        (
-                            candidate.start,
-                            _buffer_waveform(buffer),
-                            buffer.sample_rate,
-                        )
-                        for candidate, buffer in vocal_candidates
-                    ],
-                    config,
-                )
             else:
                 vocals_path = job_dir / "source.vocals.wav"
                 fallback_vocals_path = vocals_path.resolve()
                 _separate_vocals(video, vocals_path, config.device)
-                vocal_waveform, vocal_rate = _load_waveform(vocals_path)
-                vocal_scores = _score_singing_windows(
-                    vocal_waveform, vocal_rate, config
-                )
     acoustic_phrases = _build_acoustic_phrases(
         raw_scores,
         phrase_candidates if raw_candidates else [],
-        vocal_scores,
         ordinary_diarization,
         vocal_candidates,
         config,
@@ -473,7 +454,6 @@ def _singing_evidence_score(singing_score: float, speech_score: float) -> float:
 def _build_acoustic_phrases(
     raw_scores: list[AudioRegion],
     raw_candidates: list[AudioRegion],
-    vocal_scores: list[AudioRegion],
     diarization: list[AudioRegion],
     vocal_candidates: list[tuple[AudioRegion, AudioBuffer]],
     config: AudioAnalysisConfig,
@@ -490,11 +470,6 @@ def _build_acoustic_phrases(
             for item in raw_scores
             if min(end, item.end) - max(start, item.start) > 0
         ]
-        vocals = [
-            item
-            for item in vocal_scores
-            if min(end, item.end) - max(start, item.start) > 0
-        ]
         singing_score = max(
             (float(item.confidence or 0.0) for item in raw), default=0.0
         )
@@ -503,9 +478,6 @@ def _build_acoustic_phrases(
         )
         music_score = max(
             (float(item.music_confidence or 0.0) for item in raw), default=0.0
-        )
-        vocal_score = max(
-            (float(item.confidence or 0.0) for item in vocals), default=0.0
         )
         overlap_spans = [
             (max(start, turn.start), min(end, turn.end))
@@ -519,10 +491,9 @@ def _build_acoustic_phrases(
                 0.0,
             )
         )
-        singing_level, speech_level, route_alt, route_speech = _acoustic_phrase_route(
+        speech_level, route_alt, route_speech = _acoustic_phrase_route(
             singing_score,
             speech_score,
-            vocal_score,
             diarization_overlap,
             config,
         )
@@ -545,12 +516,10 @@ def _build_acoustic_phrases(
             AcousticPhrase(
                 round(start, 3),
                 round(end, 3),
-                singing_level,
                 speech_level,
                 round(singing_score, 4),
                 round(speech_score, 4),
                 round(music_score, 4),
-                round(vocal_score, 4),
                 round(diarization_overlap, 3),
                 route_alt,
                 route_speech,
@@ -659,16 +628,9 @@ def _acoustic_cut_points(
 def _acoustic_phrase_route(
     singing_score: float,
     speech_score: float,
-    vocal_score: float,
     diarization_overlap_seconds: float,
     config: AudioAnalysisConfig,
-) -> tuple[str, str, bool, bool]:
-    if vocal_score >= config.singing_vocal_threshold:
-        singing_level = "high"
-    elif singing_score >= config.singing_threshold:
-        singing_level = "medium"
-    else:
-        singing_level = "low"
+) -> tuple[str, bool, bool]:
     if (
         diarization_overlap_seconds >= 0.08
         or speech_score >= config.singing_speech_takeover_threshold
@@ -679,9 +641,8 @@ def _acoustic_phrase_route(
     else:
         speech_level = "none"
     return (
-        singing_level,
         speech_level,
-        singing_level in {"high", "medium"},
+        singing_score >= config.singing_threshold,
         speech_level == "strong",
     )
 
@@ -967,12 +928,6 @@ def _decode_stereo_range(
         raise RuntimeError("song candidate contains no decoded audio")
     values = values[: len(values) - len(values) % 2].reshape(-1, 2)
     return torch.from_numpy(values.T.copy()), sample_rate
-
-
-def _buffer_waveform(buffer: AudioBuffer) -> Any:
-    import torch
-
-    return torch.from_numpy(buffer.samples).unsqueeze(0)
 
 
 def _mark_overlaps(regions: list[AudioRegion]) -> list[AudioRegion]:

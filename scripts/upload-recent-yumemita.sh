@@ -38,7 +38,6 @@ require_command() {
 require_command uv
 require_command biliup
 require_command jq
-require_command sha256sum
 
 if [[ ! -f "$CONFIG_PATH" ]]; then
     printf 'Config file not found: %s\n' "$CONFIG_PATH" >&2
@@ -151,10 +150,7 @@ failed=0
 for index in "${!RECORDS[@]}"; do
     IFS='|' read -r published channel video_id <<<"${RECORDS[$index]}"
     url="https://www.youtube.com/watch?v=$video_id"
-    hash="$(printf '%s' "$url" | sha256sum)"
-    job_id="${hash%% *}"
-    job_id="${job_id:0:12}"
-    manifest="$WORK_DIR/$job_id/manifest.json"
+    manifest="$WORK_DIR/$video_id/manifest.json"
     position=$((index + 1))
 
     if [[ -f "$STOP_PATH" ]]; then

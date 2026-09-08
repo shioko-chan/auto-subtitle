@@ -2103,8 +2103,10 @@ def _transcribe_raw_range(
 
 
 def _speech_candidate_quality(
-    record: dict[str, object], region: AudioRegion
+    record: dict[str, object], region: AudioRegion, *, song_context: bool | None = None
 ) -> dict[str, object]:
+    if song_context is None:
+        song_context = region.asr_route == "song_speech_fallback"
     text = str(record.get("text") or "").strip()
     duration = max(region.end - region.start, 1e-6)
     compact = "".join(character for character in text if not character.isspace())
@@ -2154,13 +2156,18 @@ def _speech_candidate_quality(
     density = len(compact) / duration
     if len(compact) >= 80 and density > 15:
         reasons.append("excessive_text_density")
-    if hangul >= 4 and hangul / max(1, scripted) >= 0.08 and japanese + latin >= 4:
+    if (
+        song_context
+        and hangul >= 4
+        and hangul / max(1, scripted) >= 0.08
+        and japanese + latin >= 4
+    ):
         reasons.append("unexpected_hangul_mixed_script")
     language_keys = {
         "korean" if value in {"ko", "kor", "korean", "한국어"} else value
         for value in languages
     }
-    if record.get("recovered_from_repetition") and (
+    if song_context and record.get("recovered_from_repetition") and (
         len(language_keys) >= 3
         or ("korean" in language_keys and len(language_keys) >= 2)
     ):
@@ -2180,6 +2187,7 @@ def _speech_candidate_quality(
             "singing_score": region.confidence,
             "speech_score": region.speech_confidence,
             "music_score": region.music_confidence,
+            "song_context": song_context,
         },
     }
 
@@ -2195,7 +2203,7 @@ def _write_speech_quality_audit(
     path.parent.mkdir(parents=True, exist_ok=True)
     event = {
         "timestamp": datetime.now(UTC).isoformat(),
-        "kind": "song_speech_fallback_quality",
+        "kind": "speech_quality",
         "start": round(region.start, 3),
         "end": round(region.end, 3),
         "action": "keep" if quality["accepted"] else "discard",
@@ -2324,18 +2332,22 @@ def _align_speech_records(
                         "correction_method": "alignment_unusable_discarded",
                         "alignment_error": "corrected_and_original_timeline_invalid",
                     }
-            if (
-                region.asr_route == "song_speech_fallback"
-                and str(aligned.get("text") or "").strip()
-            ):
-                quality = _speech_candidate_quality(aligned, region)
+            if str(aligned.get("text") or "").strip():
+                song_context = region.asr_route == "song_speech_fallback" or any(
+                    other.kind == "singing"
+                    and min(region.end, other.end) - max(region.start, other.start) > 0
+                    for other in regions
+                )
+                quality = _speech_candidate_quality(
+                    aligned, region, song_context=song_context
+                )
                 _write_speech_quality_audit(
                     speech_quality_audit_path, aligned, region, quality
                 )
                 aligned["speech_quality"] = quality
                 if not quality["accepted"]:
                     logging.warning(
-                        "discarding low-quality song speech candidate %.3f-%.3fs: %s",
+                        "discarding low-quality speech candidate %.3f-%.3fs: %s",
                         region.start,
                         region.end,
                         ",".join(str(value) for value in quality["reasons"]),

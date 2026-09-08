@@ -439,6 +439,31 @@ class FanKnowledgeRetrieverTests(unittest.TestCase):
             all(hit.kind not in {"term", "character", "entity"} for hit in background)
         )
 
+    def test_asr_term_references_include_phonetically_close_known_term(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
+            retriever.upsert(
+                [
+                    KnowledgeRecord(
+                        "term:training-club",
+                        "term",
+                        "筋トレ部",
+                        "筋トレ部的参考中文译法为健身部。",
+                        reading="きんとれぶ",
+                        reliability=0.98,
+                    )
+                ]
+            )
+
+            hits = retriever.retrieve_asr_term_references(
+                KnowledgeQuery("昨日金トレプで話した", top_k=4)
+            )
+            retriever.close()
+
+        self.assertEqual([hit.record_id for hit in hits], ["term:training-club"])
+        self.assertGreaterEqual(hits[0].score.kana, 0.78)
+        self.assertEqual(hits[0].retrieval_ranks, {"kana": 1})
+
     def test_cross_encoder_reranks_body_and_rejects_title_only_match(self) -> None:
         class FakeCrossEncoder:
             def predict(self, pairs, **_kwargs):

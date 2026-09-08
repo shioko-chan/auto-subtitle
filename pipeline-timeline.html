@@ -1,0 +1,1051 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Pipeline Timeline</title>
+    <style>
+      :root {
+        --bg: #161718;
+        --panel: #202224;
+        --panel-2: #292b2e;
+        --panel-3: #313438;
+        --line: #42464b;
+        --line-soft: #35383c;
+        --text: #f0f1f2;
+        --muted: #a3a7ad;
+        --accent: #58a6ff;
+        --playhead: #ff5d67;
+        --label-width: 184px;
+        font-family: Inter, "Noto Sans CJK SC", "PingFang SC", sans-serif;
+      }
+
+      * { box-sizing: border-box; }
+
+      html, body { height: 100%; }
+
+      body {
+        margin: 0;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--text);
+        font-size: 13px;
+      }
+
+      button, input { font: inherit; }
+
+      button {
+        min-height: 30px;
+        padding: 0 11px;
+        border: 1px solid #4b4f55;
+        border-radius: 4px;
+        background: #303338;
+        color: var(--text);
+        cursor: pointer;
+        white-space: nowrap;
+      }
+
+      button:hover { background: #3a3e43; }
+      button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+      .app {
+        height: 100%;
+        height: 100dvh;
+        display: grid;
+        grid-template-rows: 44px minmax(0, 42fr) minmax(0, 58fr);
+      }
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-width: 0;
+        padding: 6px 10px;
+        border-bottom: 1px solid #090a0b;
+        background: #242629;
+      }
+
+      .brand {
+        flex: 0 0 auto;
+        margin: 0 8px 0 0;
+        font-size: 14px;
+        font-weight: 700;
+        letter-spacing: 0;
+      }
+
+      .job-name {
+        min-width: 0;
+        overflow: hidden;
+        color: var(--muted);
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .topbar-spacer { flex: 1; }
+
+      .status-pill {
+        flex: 0 0 auto;
+        padding: 4px 8px;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        color: #c6c9cd;
+        background: #1c1e20;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .upper {
+        min-height: 0;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) clamp(280px, 25vw, 360px);
+        border-bottom: 1px solid #090a0b;
+      }
+
+      .monitor {
+        min-width: 0;
+        min-height: 0;
+        display: grid;
+        place-items: center;
+        position: relative;
+        overflow: hidden;
+        border-right: 1px solid #090a0b;
+        background: #0a0a0a;
+      }
+
+      video {
+        display: block;
+        width: 100%;
+        height: 100%;
+        min-width: 0;
+        min-height: 0;
+        object-fit: contain;
+        background: #000;
+      }
+
+      .empty-state {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        color: #8f949a;
+        background: #111214;
+        pointer-events: none;
+      }
+
+      .empty-state.hidden { display: none; }
+
+      .inspector {
+        min-width: 0;
+        min-height: 0;
+        display: grid;
+        grid-template-rows: auto auto 1fr;
+        background: var(--panel);
+      }
+
+      .panel-title {
+        margin: 0;
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--line-soft);
+        font-size: 12px;
+        font-weight: 700;
+        color: #d9dbde;
+      }
+
+      .selection-summary {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 5px 12px;
+        min-height: 72px;
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--line-soft);
+      }
+
+      .selection-summary strong {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .selection-summary span { color: var(--muted); }
+
+      .json-view {
+        min-height: 0;
+        margin: 0;
+        overflow: auto;
+        padding: 11px 12px 18px;
+        background: #191b1d;
+        color: #d7dadc;
+        font: 11px/1.55 "SFMono-Regular", Consolas, monospace;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      .timeline-panel {
+        min-height: 0;
+        display: grid;
+        grid-template-rows: 42px 1fr;
+        background: #1c1e20;
+      }
+
+      .timeline-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 6px 10px;
+        border-bottom: 1px solid #090a0b;
+        background: #25272a;
+      }
+
+      .timecode {
+        width: 100px;
+        color: #f7d774;
+        font: 13px "SFMono-Regular", Consolas, monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .zoom-control {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        margin-left: auto;
+        color: var(--muted);
+      }
+
+      .zoom-control input { width: 150px; accent-color: var(--accent); }
+
+      .follow-control {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        color: #c9ccd0;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+
+      .follow-control input { accent-color: var(--accent); }
+
+      .timeline-grid {
+        min-height: 0;
+        display: grid;
+        grid-template-columns: var(--label-width) minmax(0, 1fr);
+      }
+
+      .track-labels {
+        min-height: 0;
+        overflow-x: hidden;
+        overflow-y: auto;
+        scrollbar-gutter: stable;
+        scrollbar-color: #5d6268 #1b1d1f;
+        scrollbar-width: thin;
+        border-right: 1px solid #0d0e0f;
+        background: #242629;
+      }
+
+      .track-labels::-webkit-scrollbar { width: 10px; }
+      .track-labels::-webkit-scrollbar-track { background: #1b1d1f; }
+      .track-labels::-webkit-scrollbar-thumb {
+        border: 2px solid #1b1d1f;
+        border-radius: 5px;
+        background: #5d6268;
+      }
+
+      .track-labels::-webkit-scrollbar-thumb:hover { background: #747a81; }
+
+      .ruler-label {
+        height: 30px;
+        display: flex;
+        align-items: center;
+        padding: 0 10px;
+        border-bottom: 1px solid var(--line-soft);
+        color: #8f949a;
+        font-size: 11px;
+      }
+
+      .track-label {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 7px;
+        padding: 0 9px;
+        border-bottom: 1px solid var(--line-soft);
+        color: #d7d9dc;
+      }
+
+      .track-label-name {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .track-count {
+        color: #8f949a;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .timeline-scroll {
+        min-width: 0;
+        min-height: 0;
+        overflow: auto;
+        background: #181a1c;
+      }
+
+      .timeline-surface {
+        position: relative;
+        min-height: 100%;
+      }
+
+      .time-ruler-labels {
+        position: absolute;
+        z-index: 1;
+        top: 0;
+        left: 0;
+        height: 20px;
+        overflow: hidden;
+        color: #d0d3d6;
+        font: 12px/16px ui-monospace, "SFMono-Regular", Consolas, monospace;
+        pointer-events: none;
+      }
+
+      .time-ruler-label {
+        position: absolute;
+        top: 3px;
+        white-space: nowrap;
+      }
+
+      canvas {
+        position: sticky;
+        left: 0;
+        display: block;
+        cursor: crosshair;
+      }
+
+      .tooltip {
+        position: fixed;
+        z-index: 10;
+        max-width: 360px;
+        padding: 6px 8px;
+        border: 1px solid #656a70;
+        border-radius: 4px;
+        background: rgba(20, 21, 23, 0.96);
+        color: #f2f3f4;
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+        font-size: 11px;
+        line-height: 1.4;
+        pointer-events: none;
+      }
+
+      .tooltip.hidden { display: none; }
+
+      .tooltip-heading { margin-bottom: 3px; color: #f2f3f4; }
+      .tooltip-scores { display: flex; flex-wrap: wrap; gap: 3px 10px; }
+      .tooltip-score { font-weight: 700; }
+
+      @media (max-width: 900px) {
+        .app { grid-template-rows: 44px minmax(0, 44fr) minmax(0, 56fr); }
+        .upper { grid-template-columns: minmax(0, 3fr) minmax(240px, 2fr); }
+        .job-name, .status-pill { display: none; }
+        .topbar-spacer { display: block; }
+        .timeline-toolbar { overflow-x: auto; }
+        .zoom-control { flex: 0 0 auto; margin-left: 0; }
+        :root { --label-width: 150px; }
+      }
+
+      @media (max-width: 640px) {
+        .app { grid-template-rows: 44px minmax(260px, 48fr) minmax(260px, 52fr); }
+        .upper {
+          grid-template-columns: minmax(0, 1fr);
+          grid-template-rows: minmax(160px, 28dvh) minmax(0, 1fr);
+        }
+        .monitor { border-right: 0; border-bottom: 1px solid #090a0b; }
+        .selection-summary { min-height: 58px; padding-block: 7px; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="app">
+      <header class="topbar">
+        <h1 class="brand">Pipeline Timeline</h1>
+        <button id="openButton" type="button">打开任务目录</button>
+        <input id="directoryInput" type="file" webkitdirectory multiple hidden />
+        <span class="job-name" id="jobName">未载入任务</span>
+        <span class="topbar-spacer"></span>
+        <span class="status-pill" id="status">0 tracks</span>
+      </header>
+
+      <section class="upper">
+        <div class="monitor">
+          <video id="video" controls preload="metadata"></video>
+          <div class="empty-state" id="emptyState">选择 work/&lt;job&gt; 任务目录</div>
+        </div>
+        <aside class="inspector">
+          <h2 class="panel-title">证据检查器</h2>
+          <div class="selection-summary">
+            <strong id="selectionLabel">未选择区段</strong>
+            <span id="selectionTrack">-</span>
+            <span id="selectionTime">00:00:00.000</span>
+            <span id="selectionDuration">0.000s</span>
+          </div>
+          <pre class="json-view" id="jsonView">{}</pre>
+        </aside>
+      </section>
+
+      <section class="timeline-panel">
+        <div class="timeline-toolbar">
+          <span class="timecode" id="timecode">00:00:00.000</span>
+          <button id="fitButton" type="button">适合窗口</button>
+          <label class="follow-control"><input id="followToggle" type="checkbox" checked />跟随播放头</label>
+          <div class="zoom-control">
+            <span>缩放</span>
+            <input id="zoomRange" type="range" min="-3.5" max="6" step="0.1" value="0" />
+          </div>
+        </div>
+        <div class="timeline-grid">
+          <div class="track-labels" id="trackLabels"></div>
+          <div class="timeline-scroll" id="timelineScroll">
+            <div class="timeline-surface" id="timelineSurface">
+              <canvas id="timelineCanvas"></canvas>
+              <div class="time-ruler-labels" id="timeRulerLabels" aria-hidden="true"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+    <div class="tooltip hidden" id="tooltip"></div>
+
+    <script>
+      const COLORS = {
+        ast: "#e7c55b",
+        candidate: "#f08c46",
+        phrase: "#a881e6",
+        diarization: "#57b7c2",
+        speech: "#44a77b",
+        singing: "#df6d87",
+        asr: "#5f91df",
+        group: "#d46ec8",
+        pyshiro: "#d28b54",
+        verified: "#8ecf5d",
+        local: "#a3a8ae",
+        final: "#e8e9ea",
+      };
+
+      const SCORE_COLORS = {
+        singing: "#ef778f",
+        speech: "#62c4cb",
+        music: "#e3c55c",
+      };
+
+      const SPEAKER_COLORS = [
+        "#4eb5b0", "#d77987", "#7e9de3", "#c89c4e", "#9d7bd0",
+        "#64a46d", "#d77745", "#7fa6a9", "#c56da4", "#8791a0",
+      ];
+
+      const state = {
+        duration: 1,
+        pxPerSecond: 1,
+        tracks: [],
+        selected: null,
+        videoUrl: null,
+        drawPending: false,
+      };
+
+      const video = document.getElementById("video");
+      const input = document.getElementById("directoryInput");
+      const scroll = document.getElementById("timelineScroll");
+      const surface = document.getElementById("timelineSurface");
+      const canvas = document.getElementById("timelineCanvas");
+      const ctx = canvas.getContext("2d");
+      const labels = document.getElementById("trackLabels");
+      const rulerLabels = document.getElementById("timeRulerLabels");
+      const tooltip = document.getElementById("tooltip");
+      const zoomRange = document.getElementById("zoomRange");
+
+      document.getElementById("openButton").addEventListener("click", () => input.click());
+      input.addEventListener("change", () => loadDirectory([...input.files]));
+      document.getElementById("fitButton").addEventListener("click", fitTimeline);
+      zoomRange.addEventListener("input", () => setZoom(2 ** Number(zoomRange.value), video.currentTime));
+      scroll.addEventListener("scroll", () => {
+        if (labels.scrollTop !== scroll.scrollTop) labels.scrollTop = scroll.scrollTop;
+        scheduleDraw();
+      }, { passive: true });
+      labels.addEventListener("scroll", () => {
+        if (scroll.scrollTop !== labels.scrollTop) scroll.scrollTop = labels.scrollTop;
+      }, { passive: true });
+      window.addEventListener("resize", updateLayout);
+
+      video.addEventListener("loadedmetadata", () => {
+        if (Number.isFinite(video.duration)) state.duration = Math.max(state.duration, video.duration);
+        fitTimeline();
+      });
+      video.addEventListener("timeupdate", () => {
+        document.getElementById("timecode").textContent = formatTime(video.currentTime);
+        followPlayhead();
+        scheduleDraw();
+      });
+      video.addEventListener("play", animatePlayback);
+
+      canvas.addEventListener("click", (event) => {
+        const point = canvasPoint(event);
+        const hit = hitTest(point.x, point.y);
+        seekTo(hit ? hit.item.start : visibleStart() + point.x / state.pxPerSecond);
+        if (hit) selectItem(hit.track, hit.item);
+      });
+
+      canvas.addEventListener("mousemove", (event) => {
+        const point = canvasPoint(event);
+        const hit = hitTest(point.x, point.y);
+        if (!hit) {
+          tooltip.classList.add("hidden");
+          return;
+        }
+        renderTooltip(hit);
+        tooltip.style.left = `${Math.min(window.innerWidth - 370, event.clientX + 12)}px`;
+        tooltip.style.top = `${Math.min(window.innerHeight - 60, event.clientY + 12)}px`;
+        tooltip.classList.remove("hidden");
+      });
+      canvas.addEventListener("mouseleave", () => tooltip.classList.add("hidden"));
+
+      window.addEventListener("keydown", (event) => {
+        if (event.target.matches("input, button")) return;
+        if (event.code === "Space") {
+          event.preventDefault();
+          video.paused ? video.play() : video.pause();
+        } else if (event.code === "ArrowLeft") {
+          seekTo(video.currentTime - (event.shiftKey ? 5 : 1));
+        } else if (event.code === "ArrowRight") {
+          seekTo(video.currentTime + (event.shiftKey ? 5 : 1));
+        }
+      });
+
+      async function loadDirectory(files) {
+        if (!files.length) return;
+        setStatus("读取中");
+        const byName = new Map();
+        for (const file of files) {
+          if (!byName.has(file.name)) byName.set(file.name, file);
+        }
+
+        const [audio, asr, sourceCues, local, song, metadata, finalSrt] = await Promise.all([
+          readJson(byName.get("audio-analysis.json")),
+          readJson(byName.get("asr-analysis-cache.json")),
+          readJson(byName.get("source.qwen3-asr.cues.json")),
+          readJson(byName.get("local-segmentation.json")),
+          readJson(byName.get("song-identification-cache.json")),
+          readJson(byName.get("source.info.json")),
+          readText(byName.get("source.semantic.srt")),
+        ]);
+
+        const alignmentFiles = files.filter((file) =>
+          file.webkitRelativePath.includes("/song-alignment/") && file.name === "alignment.json"
+        );
+        const alignments = (await Promise.all(alignmentFiles.map(readJson))).filter(Boolean);
+        state.tracks = buildTracks({ audio, asr, sourceCues, local, song, alignments, finalSrt });
+        state.duration = maximumEnd(state.tracks) || 1;
+
+        const rootName = files[0].webkitRelativePath.split("/")[0] || "local job";
+        const title = metadata?.title || metadata?.fulltitle || rootName;
+        document.getElementById("jobName").textContent = `${rootName} | ${title}`;
+
+        const videoFile = byName.get("translated.mp4") || byName.get("source.mp4");
+        if (state.videoUrl) URL.revokeObjectURL(state.videoUrl);
+        if (videoFile) {
+          state.videoUrl = URL.createObjectURL(videoFile);
+          video.src = state.videoUrl;
+          document.getElementById("emptyState").classList.add("hidden");
+        } else {
+          video.removeAttribute("src");
+          video.load();
+          document.getElementById("emptyState").classList.remove("hidden");
+        }
+
+        renderLabels();
+        fitTimeline();
+        setStatus(`${state.tracks.length} tracks`);
+      }
+
+      function buildTracks(data) {
+        const tracks = [];
+        const audio = data.audio || {};
+        const windows = audio.song_detection?.windows || [];
+        addTrack(tracks, "AST scores", COLORS.ast, 68, windows.map((item) => ({
+          start: number(item.start), end: number(item.end), label: scoreLabel(item), data: item,
+        })), "scores");
+        addTrack(tracks, "AST candidates", COLORS.candidate, 38,
+          (audio.song_detection?.candidates || []).map(regionItem));
+        addTrack(tracks, "AcousticPhrase", COLORS.phrase, 44,
+          (audio.acoustic_phrases || []).map((item, index) => ({
+            start: number(item.start), end: number(item.end),
+            label: `${index} | ${item.speech_level} | ${routeLabel(item)}`,
+            data: { index, ...item },
+          })));
+        addTrack(tracks, "pyannote", COLORS.diarization, 42,
+          (audio.diarization || []).map((item) => ({ ...regionItem(item), color: speakerColor(item.speaker) })));
+        addTrack(tracks, "Speech route", COLORS.speech, 38,
+          (audio.speech || []).map((item) => ({ ...regionItem(item), color: speakerColor(item.speaker) })));
+        addTrack(tracks, "ALT route", COLORS.singing, 38,
+          (audio.singing || []).map(regionItem));
+
+        const chunks = Object.entries(data.asr?.chunks || {}).map(([id, item]) => ({
+          start: number(item.core_start ?? item.start),
+          end: number(item.core_end ?? item.end),
+          label: `${id} | ${item.cues?.[0]?.kind || item.kind || "ASR"} | ${truncate(item.text || "", 70)}`,
+          data: { id, ...item },
+        }));
+        addTrack(tracks, "ASR / ALT chunks", COLORS.asr, 42, chunks);
+
+        const groupedReports = new Map();
+        (data.song?.reports || []).forEach((report, index) => {
+          const group = report.search_group;
+          if (!group) return;
+          const key = `${number(group.start)}:${number(group.end)}:${(group.cue_ids || []).join(",")}`;
+          const entry = groupedReports.get(key) || {
+            start: number(group.start),
+            end: number(group.end),
+            cue_ids: group.cue_ids || [],
+            reports: [],
+          };
+          entry.reports.push({
+            report_index: index,
+            song: report.song,
+            artist: report.artist,
+            confidence: report.confidence,
+            evidence: report.evidence,
+          });
+          groupedReports.set(key, entry);
+        });
+        const groups = [...groupedReports.values()].map((group) => {
+          const songs = [...new Set(group.reports.map((report) => report.song).filter(Boolean))];
+          const unmatchedCount = group.reports.filter((report) => !report.song).length;
+          const label = songs.length ? songs.join(" + ") : "unmatched";
+          return {
+            start: group.start,
+            end: group.end,
+            label,
+            data: { ...group, songs, unmatched_remainder_reports: unmatchedCount },
+          };
+        });
+        addTrack(tracks, "SongSearchGroup", COLORS.group, 38, groups);
+
+        const attempts = data.alignments.flatMap((entries, fileIndex) =>
+          (Array.isArray(entries) ? entries : []).filter(hasRange).map((item) => ({
+            start: number(item.start), end: number(item.end),
+            label: `${item.status || "attempt"} | ${item.reason || item.validation_policy || ""}`,
+            color: item.status === "aligned" ? "#69b87a" : item.status?.includes("rejected") ? "#c76363" : COLORS.pyshiro,
+            data: { alignment_file: fileIndex, ...item },
+          }))
+        );
+        addTrack(tracks, "pySHIRO attempts", COLORS.pyshiro, 42, attempts);
+
+        const verified = (data.song?.verified_lyric_spans || []).map((item) => ({
+          start: number(item.start), end: number(item.end),
+          label: `cue ${item.cue_id} | lines ${(item.lyric_line_ids || []).join(",")}`,
+          data: item,
+        }));
+        addTrack(tracks, "Verified lyrics", COLORS.verified, 42, verified);
+
+        const localUnits = (data.local?.tracks || []).flatMap((track) =>
+          (track.units || []).map((item) => ({
+            start: number(item.start), end: number(item.end),
+            label: `${item.speaker || track.speaker || track.key || "unknown"} | ${truncate(item.text || "", 70)}`,
+            color: item.kind === "singing" ? COLORS.singing : speakerColor(item.speaker || track.speaker),
+            data: item,
+          }))
+        );
+        addTrack(tracks, "Local units", COLORS.local, 42, localUnits);
+
+        const finalCues = parseSrt(data.finalSrt || "");
+        addTrack(tracks, "Final source cues", COLORS.final, 42, finalCues);
+        return tracks.filter((track) => track.items.length || track.kind === "scores");
+      }
+
+      function addTrack(target, name, color, height, items, kind = "blocks") {
+        target.push({ name, color, height, items: items.filter(validItem).sort(byStart), kind });
+      }
+
+      function regionItem(item) {
+        return {
+          start: number(item.start), end: number(item.end),
+          label: `${item.speaker || item.kind || "region"}${item.asr_route ? ` | ${item.asr_route}` : ""}`,
+          data: item,
+        };
+      }
+
+      function renderLabels() {
+        labels.replaceChildren();
+        const ruler = document.createElement("div");
+        ruler.className = "ruler-label";
+        ruler.textContent = "轨道";
+        labels.append(ruler);
+        for (const track of state.tracks) {
+          const row = document.createElement("div");
+          row.className = "track-label";
+          row.style.height = `${track.height}px`;
+          row.innerHTML = `
+            <span class="track-label-name">${escapeHtml(track.name)}</span>
+            <span class="track-count">${track.items.length}</span>`;
+          labels.append(row);
+        }
+      }
+
+      function updateLayout() {
+        const totalHeight = 30 + state.tracks.reduce((sum, track) => sum + track.height, 0);
+        const width = Math.max(1, scroll.clientWidth);
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = Math.round(width * dpr);
+        canvas.height = Math.round(totalHeight * dpr);
+        canvas.style.width = `${width}px`;
+        canvas.style.height = `${totalHeight}px`;
+        surface.style.width = `${Math.max(width, state.duration * state.pxPerSecond)}px`;
+        surface.style.height = `${totalHeight}px`;
+        renderRulerLabels();
+        scheduleDraw();
+      }
+
+      function draw() {
+        state.drawPending = false;
+        const dpr = window.devicePixelRatio || 1;
+        const width = canvas.clientWidth;
+        const height = canvas.clientHeight;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = "#181a1c";
+        ctx.fillRect(0, 0, width, height);
+
+        drawRuler(width);
+        let top = 30;
+        for (const track of state.tracks) {
+          ctx.fillStyle = Math.round(top / track.height) % 2 ? "#1c1e20" : "#202225";
+          ctx.fillRect(0, top, width, track.height);
+          ctx.strokeStyle = "#34373b";
+          ctx.beginPath();
+          ctx.moveTo(0, top + track.height - 0.5);
+          ctx.lineTo(width, top + track.height - 0.5);
+          ctx.stroke();
+          if (track.kind === "scores") drawScores(track, top, width);
+          else drawBlocks(track, top, width);
+          top += track.height;
+        }
+
+        const playheadX = timeToX(video.currentTime);
+        if (playheadX >= 0 && playheadX <= width) {
+          ctx.strokeStyle = "#ff5d67";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(Math.round(playheadX) + 0.5, 0);
+          ctx.lineTo(Math.round(playheadX) + 0.5, height);
+          ctx.stroke();
+          ctx.fillStyle = "#ff5d67";
+          ctx.beginPath();
+          ctx.moveTo(playheadX - 5, 0);
+          ctx.lineTo(playheadX + 5, 0);
+          ctx.lineTo(playheadX, 8);
+          ctx.closePath();
+          ctx.fill();
+        }
+      }
+
+      function drawRuler(width) {
+        ctx.fillStyle = "#25272a";
+        ctx.fillRect(0, 0, width, 30);
+        const interval = rulerInterval(state.pxPerSecond);
+        const start = visibleStart();
+        const end = start + width / state.pxPerSecond;
+        const first = Math.floor(start / interval) * interval;
+        for (let time = first; time <= end + interval; time += interval) {
+          const x = timeToX(time);
+          ctx.strokeStyle = "#64686e";
+          ctx.beginPath();
+          ctx.moveTo(Math.round(x) + 0.5, 20);
+          ctx.lineTo(Math.round(x) + 0.5, 30);
+          ctx.stroke();
+        }
+        renderRulerLabels();
+      }
+
+      function renderRulerLabels() {
+        const width = Math.max(1, scroll.clientWidth);
+        const signature = `${width}:${state.pxPerSecond}:${scroll.scrollLeft}`;
+        if (rulerLabels.dataset.signature === signature) return;
+        rulerLabels.dataset.signature = signature;
+        const interval = rulerInterval(state.pxPerSecond);
+        const start = visibleStart();
+        const end = start + width / state.pxPerSecond;
+        const first = Math.floor(start / interval) * interval;
+        rulerLabels.style.width = `${width}px`;
+        rulerLabels.style.transform = `translateX(${scroll.scrollLeft}px)`;
+        rulerLabels.replaceChildren();
+        let lastLabelRight = -Infinity;
+        for (let time = first; time <= end + interval; time += interval) {
+          const x = timeToX(time);
+          if (x < -1 || x > width + 1) continue;
+          const text = shortTime(time);
+          const labelWidth = text.length * 7.25;
+          const labelX = Math.max(5, Math.min(width - labelWidth - 5, x + 5));
+          if (labelX <= lastLabelRight + 12) continue;
+          const label = document.createElement("span");
+          label.className = "time-ruler-label";
+          label.style.left = `${labelX}px`;
+          label.textContent = text;
+          rulerLabels.append(label);
+          lastLabelRight = labelX + labelWidth;
+        }
+      }
+
+      function drawScores(track, top, width) {
+        const start = visibleStart();
+        const end = start + width / state.pxPerSecond;
+        const visible = track.items.filter((item) => item.end >= start && item.start <= end);
+        for (const item of visible) {
+          if (!item.data.selected) continue;
+          const x1 = timeToX(item.start);
+          const x2 = timeToX(item.end);
+          ctx.fillStyle = "rgba(240, 140, 70, 0.12)";
+          ctx.fillRect(x1, top + 2, Math.max(1, x2 - x1), track.height - 4);
+        }
+        drawScoreLine(visible, top, track.height, "singing", SCORE_COLORS.singing);
+        drawScoreLine(visible, top, track.height, "speech", SCORE_COLORS.speech);
+        drawScoreLine(visible, top, track.height, "music", SCORE_COLORS.music);
+      }
+
+      function renderTooltip(hit) {
+        tooltip.replaceChildren();
+        const heading = document.createElement("div");
+        heading.className = "tooltip-heading";
+        heading.textContent = `${hit.track.name} | ${formatRange(hit.item.start, hit.item.end)}`;
+        tooltip.append(heading);
+        if (hit.track.kind !== "scores") {
+          const detail = document.createElement("div");
+          detail.textContent = hit.item.label || "";
+          tooltip.append(detail);
+          return;
+        }
+        const scores = document.createElement("div");
+        scores.className = "tooltip-scores";
+        for (const key of ["singing", "speech", "music"]) {
+          const score = document.createElement("span");
+          score.className = "tooltip-score";
+          score.style.color = SCORE_COLORS[key];
+          score.textContent = `${key} ${number(hit.item.data[key]).toFixed(3)}`;
+          scores.append(score);
+        }
+        tooltip.append(scores);
+      }
+
+      function drawScoreLine(items, top, height, key, color) {
+        if (!items.length) return;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        const scoreY = (item) => {
+          const value = Math.max(0, Math.min(1, number(item.data[key])));
+          return top + height - 4 - value * (height - 8);
+        };
+        ctx.moveTo(timeToX(items[0].start), scoreY(items[0]));
+        items.forEach((item) => {
+          const x = timeToX((item.start + item.end) / 2);
+          ctx.lineTo(x, scoreY(item));
+        });
+        const last = items[items.length - 1];
+        ctx.lineTo(timeToX(last.end), scoreY(last));
+        ctx.stroke();
+      }
+
+      function drawBlocks(track, top, width) {
+        const start = visibleStart();
+        const end = start + width / state.pxPerSecond;
+        ctx.font = '10px Inter, "Noto Sans CJK SC", sans-serif';
+        ctx.textBaseline = "middle";
+        for (const item of track.items) {
+          if (item.end < start) continue;
+          if (item.start > end) break;
+          const x1 = timeToX(item.start);
+          const x2 = timeToX(item.end);
+          const x = Math.max(-2, x1);
+          const blockWidth = Math.max(2, Math.min(width + 4, x2) - x);
+          const y = top + 5;
+          const blockHeight = track.height - 10;
+          ctx.fillStyle = item.color || track.color;
+          ctx.globalAlpha = state.selected?.item === item ? 1 : 0.82;
+          ctx.fillRect(x, y, blockWidth, blockHeight);
+          ctx.globalAlpha = 1;
+          if (blockWidth > 45 && item.label) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(x + 4, y, blockWidth - 8, blockHeight);
+            ctx.clip();
+            ctx.fillStyle = readableText(item.color || track.color);
+            ctx.fillText(item.label, x + 5, y + blockHeight / 2);
+            ctx.restore();
+          }
+        }
+      }
+
+      function hitTest(x, y) {
+        if (y < 30) return null;
+        let top = 30;
+        for (const track of state.tracks) {
+          if (y >= top && y < top + track.height) {
+            const time = visibleStart() + x / state.pxPerSecond;
+            const matches = track.items.filter((item) => item.start <= time && item.end >= time);
+            if (!matches.length) return null;
+            const item = matches.sort((a, b) => (a.end - a.start) - (b.end - b.start))[0];
+            return { track, item };
+          }
+          top += track.height;
+        }
+        return null;
+      }
+
+      function selectItem(track, item) {
+        state.selected = { track, item };
+        document.getElementById("selectionLabel").textContent = item.label || "区段";
+        document.getElementById("selectionTrack").textContent = track.name;
+        document.getElementById("selectionTime").textContent = formatRange(item.start, item.end);
+        document.getElementById("selectionDuration").textContent = `${Math.max(0, item.end - item.start).toFixed(3)}s`;
+        document.getElementById("jsonView").textContent = JSON.stringify(item.data, null, 2);
+        scheduleDraw();
+      }
+
+      function setZoom(value, anchorTime) {
+        const viewportAnchor = Math.max(0, Math.min(scroll.clientWidth, timeToX(anchorTime)));
+        state.pxPerSecond = Math.max(0.08, Math.min(64, value));
+        updateLayout();
+        scroll.scrollLeft = Math.max(0, anchorTime * state.pxPerSecond - viewportAnchor);
+        scheduleDraw();
+      }
+
+      function fitTimeline() {
+        const width = Math.max(1, scroll.clientWidth - 8);
+        const value = Math.max(0.08, Math.min(64, width / Math.max(1, state.duration)));
+        zoomRange.value = Math.log2(value);
+        state.pxPerSecond = value;
+        scroll.scrollLeft = 0;
+        updateLayout();
+      }
+
+      function followPlayhead() {
+        if (!document.getElementById("followToggle").checked || video.paused) return;
+        const absoluteX = video.currentTime * state.pxPerSecond;
+        const left = scroll.scrollLeft;
+        const right = left + scroll.clientWidth;
+        if (absoluteX < left + scroll.clientWidth * 0.15 || absoluteX > right - scroll.clientWidth * 0.15) {
+          scroll.scrollLeft = Math.max(0, absoluteX - scroll.clientWidth * 0.35);
+        }
+      }
+
+      function animatePlayback() {
+        if (video.paused || video.ended) return;
+        followPlayhead();
+        scheduleDraw();
+        requestAnimationFrame(animatePlayback);
+      }
+
+      function seekTo(value) {
+        video.currentTime = Math.max(0, Math.min(state.duration, value));
+        document.getElementById("timecode").textContent = formatTime(video.currentTime);
+        scheduleDraw();
+      }
+
+      function scheduleDraw() {
+        if (state.drawPending) return;
+        state.drawPending = true;
+        requestAnimationFrame(draw);
+      }
+
+      function visibleStart() { return scroll.scrollLeft / state.pxPerSecond; }
+      function timeToX(time) { return time * state.pxPerSecond - scroll.scrollLeft; }
+      function canvasPoint(event) {
+        const rect = canvas.getBoundingClientRect();
+        return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      }
+
+      function maximumEnd(tracks) {
+        return Math.max(0, ...tracks.flatMap((track) => track.items.map((item) => item.end)));
+      }
+
+      function validItem(item) { return Number.isFinite(item.start) && Number.isFinite(item.end) && item.end >= item.start; }
+      function hasRange(item) { return item && Number.isFinite(Number(item.start)) && Number.isFinite(Number(item.end)); }
+      function byStart(a, b) { return a.start - b.start || a.end - b.end; }
+      function number(value) { const result = Number(value); return Number.isFinite(result) ? result : 0; }
+      function truncate(value, maximum) { return value.length > maximum ? `${value.slice(0, maximum - 1)}...` : value; }
+      function routeLabel(item) { return [item.route_alt && "ALT", item.route_speech && "speech"].filter(Boolean).join("+") || "audit"; }
+      function scoreLabel(item) {
+        return `singing ${number(item.singing).toFixed(3)} | speech ${number(item.speech).toFixed(3)} | music ${number(item.music).toFixed(3)}`;
+      }
+
+      function speakerColor(value) {
+        const text = value || "unknown";
+        let hash = 0;
+        for (let i = 0; i < text.length; i += 1) hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
+        return SPEAKER_COLORS[Math.abs(hash) % SPEAKER_COLORS.length];
+      }
+
+      function readableText(hex) {
+        const value = hex.replace("#", "");
+        const r = parseInt(value.slice(0, 2), 16);
+        const g = parseInt(value.slice(2, 4), 16);
+        const b = parseInt(value.slice(4, 6), 16);
+        return (r * 299 + g * 587 + b * 114) / 1000 > 145 ? "#151617" : "#ffffff";
+      }
+
+      function rulerInterval(pxPerSecond) {
+        const choices = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200, 3600];
+        return choices.find((value) => value * pxPerSecond >= 85) || 7200;
+      }
+
+      function formatTime(value) {
+        const safe = Math.max(0, Number(value) || 0);
+        const hours = Math.floor(safe / 3600);
+        const minutes = Math.floor((safe % 3600) / 60);
+        const seconds = Math.floor(safe % 60);
+        const milliseconds = Math.floor((safe % 1) * 1000);
+        return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}.${String(milliseconds).padStart(3, "0")}`;
+      }
+
+      function shortTime(value) {
+        const hours = Math.floor(value / 3600);
+        const minutes = Math.floor((value % 3600) / 60);
+        const seconds = Math.floor(value % 60);
+        return hours ? `${hours}:${pad(minutes)}:${pad(seconds)}` : `${pad(minutes)}:${pad(seconds)}`;
+      }
+
+      function formatRange(start, end) { return `${formatTime(start)} - ${formatTime(end)}`; }
+      function pad(value) { return String(value).padStart(2, "0"); }
+      function setStatus(value) { document.getElementById("status").textContent = value; }
+      function escapeHtml(value) {
+        return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+      }
+
+      async function readJson(file) {
+        if (!file) return null;
+        try { return JSON.parse(await file.text()); }
+        catch (error) { console.warn(`Cannot parse ${file.webkitRelativePath || file.name}`, error); return null; }
+      }
+
+      async function readText(file) { return file ? file.text() : ""; }
+
+      function parseSrt(text) {
+        if (!text.trim()) return [];
+        const timePattern = /(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s+-->\s+(\d{2}):(\d{2}):(\d{2})[,.](\d{3})/;
+        return text.trim().split(/\r?\n\r?\n+/).flatMap((block) => {
+          const lines = block.split(/\r?\n/);
+          const timeIndex = lines.findIndex((line) => timePattern.test(line));
+          if (timeIndex < 0) return [];
+          const match = lines[timeIndex].match(timePattern);
+          const start = srtTime(match.slice(1, 5));
+          const end = srtTime(match.slice(5, 9));
+          const label = lines.slice(timeIndex + 1).join(" ");
+          return [{ start, end, label: truncate(label, 90), data: { index: lines[0], text: label, start, end } }];
+        });
+      }
+
+      function srtTime(parts) {
+        return Number(parts[0]) * 3600 + Number(parts[1]) * 60 + Number(parts[2]) + Number(parts[3]) / 1000;
+      }
+
+      updateLayout();
+    </script>
+  </body>
+</html>

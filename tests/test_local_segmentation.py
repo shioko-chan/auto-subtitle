@@ -133,7 +133,10 @@ class LocalSegmentationTests(unittest.TestCase):
         )
         values = {track.key: track for track in tracks}
         self.assertEqual(set(values), {"A", "B"})
-        self.assertEqual(len(values["A"].units), 1)
+        self.assertEqual(
+            [unit.text for unit in values["A"].units],
+            ["A1", "A2"],
+        )
 
     def test_unknown_between_same_speaker_is_bridged_before_segmentation(self):
         cues = [

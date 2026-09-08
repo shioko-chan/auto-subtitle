@@ -84,7 +84,6 @@ class AudioAnalysisConfig:
     singing_threshold: float = 0.015
     singing_music_threshold: float = 0.05
     singing_speech_takeover_threshold: float = 0.5
-    singing_vocal_threshold: float = 0.15
     singing_merge_gap_seconds: float = 1.5
     singing_smoothing_windows: int = 3
     singing_phrase_silence_seconds: float = 0.45
@@ -132,8 +131,7 @@ class SongIdentificationConfig:
 
 @dataclass(frozen=True)
 class ASRCorrectionConfig:
-    batch_windows: int = 6
-    batch_chars: int = 3000
+    window_chars: int = 3000
     max_tokens: int = 8192
 
 
@@ -251,7 +249,7 @@ class UploadConfig:
     enabled: bool = False
     cookie_file: str = "cookies.json"
     copyright: int = 2
-    tid: int = 171
+    tid: int = 2047
     tags: list[str] = field(default_factory=lambda: ["中文字幕"])
     max_tags: int = 10
     tag_catalog_file: str | None = None
@@ -549,10 +547,6 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError(
             "audio_analysis.singing_speech_takeover_threshold must be between 0 and 1"
         )
-    if not 0 <= analysis.singing_vocal_threshold <= 1:
-        raise ConfigError(
-            "audio_analysis.singing_vocal_threshold must be between 0 and 1"
-        )
     if analysis.singing_merge_gap_seconds < 0:
         raise ConfigError("audio_analysis.singing_merge_gap_seconds cannot be negative")
     if (
@@ -676,10 +670,8 @@ def load_config(path: Path) -> AppConfig:
             "song_identification.lyric_neighbor_min_coverage must be between 0 and 1"
         )
     correction = config.asr_correction
-    if correction.batch_windows < 1:
-        raise ConfigError("asr_correction.batch_windows must be at least 1")
-    if correction.batch_chars < 1:
-        raise ConfigError("asr_correction.batch_chars must be at least 1")
+    if correction.window_chars < 1:
+        raise ConfigError("asr_correction.window_chars must be at least 1")
     segmentation = config.segmentation
     if segmentation.boundary_score_threshold < 0:
         raise ConfigError("segmentation.boundary_score_threshold cannot be negative")

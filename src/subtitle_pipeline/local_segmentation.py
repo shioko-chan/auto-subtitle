@@ -665,10 +665,11 @@ def _track_episodes(
         split = (
             previous is not None and cue.start - cues[previous].end >= hard_gap_seconds
         )
-        if previous is not None and cue.speaker is None:
+        if previous is not None:
             split = split or any(
-                other.speaker is not None
-                and other.end > cues[previous].end
+                other.speaker != cue.speaker
+                and other.speaker is not None
+                and other.start >= cues[previous].end - 1e-3
                 and other.start < cue.start
                 for other in cues
             )

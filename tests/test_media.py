@@ -143,7 +143,9 @@ class SubtitleRenderTests(unittest.TestCase):
 
         self.assertEqual(result, destination)
         run.assert_called_once()
-        self.assertIn("libx264", run.call_args.args[0])
+        command = run.call_args.args[0]
+        self.assertIn("-nostdin", command)
+        self.assertIn("libx264", command)
 
     def test_cuda_renderer_muxes_original_audio_without_reencoding(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -176,6 +178,7 @@ class SubtitleRenderTests(unittest.TestCase):
         self.assertIn("23", render_command)
         mux_command = run.call_args_list[1].args[0]
         self.assertEqual(mux_command[0], "ffmpeg")
+        self.assertIn("-nostdin", mux_command)
         self.assertIn("1:a?", mux_command)
         self.assertIn("copy", mux_command)
 

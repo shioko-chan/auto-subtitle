@@ -366,11 +366,9 @@ PyTorch、CUDA 和 `libstdc++` 等运行库会由开发环境提供。
 - `audio_analysis.initial_analysis_concurrency`：`1` 为顺序执行 diarization 与原音 AST；
   在显存和实测耗时允许时可设为 `2`。
 - `audio_analysis.debug_audio_artifacts`：仅调试时持久化分离音轨，默认 `false`。
-- `asr_correction.batch_windows` / `batch_chars`：单次 ASR 纠错请求的窗口数和原文字符上限，
-  默认 `6` / `3000`。
+- `asr_correction.window_chars`：相邻 ASR 记录组成一个连续纠错窗口时的原文字符上限，
+  默认 `3000`；窗口内部按最多 120 字的局部片段检索背景和近音术语，LLM 仍一次看到完整窗口。
 - `asr_correction.max_tokens`：ASR 纠错响应的输出 token 上限，默认 `8192`。
-- `asr_correction.context_before_seconds` / `context_after_seconds` /
-  `context_max_chars`：ASR 纠错的只读前后文范围和字符上限。
 - `segmentation.boundary_score_threshold`：本地候选边界的贪心切分阈值，默认 `3`。
 - `segmentation.local_unit_max_seconds`：本地单元最长目标，默认 `6` 秒；超过时从 2 秒后的
   候选中选择最高分边界。

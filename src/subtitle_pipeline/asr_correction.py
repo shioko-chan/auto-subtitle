@@ -4,7 +4,6 @@ import hashlib
 import json
 import logging
 import re
-import threading
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -24,9 +23,11 @@ from .prompt_templates import prompt_templates_digest, render_user_prompt
 logger = logging.getLogger(__name__)
 
 _PROMPT = "asr-correct.md"
-_CACHE_VERSION = 3
+_CACHE_VERSION = 4
 _JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 _SPACE_RE = re.compile(r"\s+")
+_RETRIEVAL_FRAGMENT_CHARS = 120
+_SENTENCE_END_RE = re.compile(r"(?<=[。！？!?])")
 
 
 @dataclass(frozen=True)
@@ -73,8 +74,7 @@ def correct_asr_windows(
     model: str,
     cache_path: Path,
     audit_path: Path,
-    batch_windows: int = 6,
-    batch_chars: int = 3000,
+    window_chars: int = 3000,
     max_tokens: int = 8192,
     retrieve_knowledge: Callable[[dict[str, object], str], list[KnowledgeHit]]
     | None = None,
@@ -82,44 +82,52 @@ def correct_asr_windows(
     if not records:
         return []
     cache = _load_cache(cache_path)
-    lock = threading.Lock()
     corrected: list[dict[str, object] | None] = [None] * len(records)
-    pending: list[tuple[int, dict[str, object], str, list[ASREntity]]] = []
-    knowledge_by_index: dict[int, list[KnowledgeHit]] = {}
+    prepared: list[tuple[int, dict[str, object], str, list[ASREntity]]] = []
     correction_config = {
-        "batch_windows": batch_windows,
-        "batch_chars": batch_chars,
+        "window_chars": window_chars,
         "max_tokens": max_tokens,
     }
     for index, record in enumerate(records):
         text = str(record.get("text") or "")
         deterministic = _replace_exact_aliases(text, entities)
         candidates = _candidate_entities(deterministic, entities)
-        knowledge = (
-            retrieve_knowledge(record, deterministic)
-            if retrieve_knowledge is not None
-            else []
-        )
-        knowledge_by_index[index] = knowledge
-        signature = _record_signature(
-            deterministic,
-            str(record.get("language") or ""),
-            candidates,
-            model,
-            correction_config,
-        )
-        cached = cache["records"].get(signature)
-        if isinstance(cached, str):
-            corrected[index] = _corrected_record(record, cached, "cache")
-        else:
-            pending.append((index, record, deterministic, candidates))
+        prepared.append((index, record, deterministic, candidates))
 
-    for batch in _pending_batches(pending, batch_windows, batch_chars):
+    for window in _correction_windows(prepared, window_chars):
+        fragments_by_index: dict[int, list[tuple[str, list[KnowledgeHit]]]] = {}
+        for index, record, text, _candidates in window:
+            fragments_by_index[index] = [
+                (
+                    fragment,
+                    retrieve_knowledge(record, fragment)
+                    if retrieve_knowledge is not None
+                    else [],
+                )
+                for fragment in _retrieval_fragments(text)
+            ]
+        signature = _window_signature(
+            window, fragments_by_index, model, correction_config
+        )
+        cached = cache["windows"].get(signature)
+        if (
+            isinstance(cached, list)
+            and len(cached) == len(window)
+            and all(isinstance(value, str) for value in cached)
+        ):
+            for (index, record, _text, _candidates), value in zip(
+                window, cached, strict=True
+            ):
+                corrected[index] = _corrected_record(record, value, "cache")
+            continue
         entity_union = _unique_entities(
-            entity for _, _, _, candidates in batch for entity in candidates
+            entity for _, _, _, candidates in window for entity in candidates
         )
         knowledge_union = _unique_knowledge(
-            hit for index, _, _, _ in batch for hit in knowledge_by_index[index]
+            hit
+            for index, _, _, _ in window
+            for _, hits in fragments_by_index[index]
+            for hit in hits
         )
         body = structured_request_body(
             model=model,
@@ -127,7 +135,7 @@ def correct_asr_windows(
             prompt=render_user_prompt(
                 _PROMPT,
                 ENTITY_REFERENCE=_format_entities(entity_union),
-                TARGET=_format_target_windows(batch, knowledge_by_index),
+                TARGET=_format_correction_window(window, fragments_by_index),
             ),
             max_tokens=max_tokens,
             temperature=0,
@@ -141,11 +149,11 @@ def correct_asr_windows(
             content = structured_response_content(
                 response, finish_reason=finish_reason
             )
-            parsed = _parse_response(content, len(batch))
+            parsed = _parse_response(content, len(window))
         except Exception as exc:  # noqa: BLE001 - API and validation failures fail open.
             logger.warning(
                 "ASR correction downgraded %d windows to rule-normalized text: %s",
-                len(batch),
+                len(window),
                 exc,
             )
             parsed = None
@@ -153,9 +161,9 @@ def correct_asr_windows(
         _append_audit(
             audit_path,
             {
-                "event": "asr_correction_batch",
+                "event": "asr_correction_window",
                 "window_ids": [
-                    record.get("window_id", index) for index, record, _, _ in batch
+                    record.get("window_id", index) for index, record, _, _ in window
                 ],
                 "request": body,
                 "response": response,
@@ -163,7 +171,8 @@ def correct_asr_windows(
                 "knowledge_ids": [hit.record_id for hit in knowledge_union],
             },
         )
-        for position, (index, record, deterministic, candidates) in enumerate(batch):
+        cached_values: list[str] = []
+        for position, (index, record, deterministic, candidates) in enumerate(window):
             if parsed is None:
                 value = deterministic
                 method = "rule_fallback"
@@ -178,61 +187,64 @@ def correct_asr_windows(
                     method = "llm" if value != deterministic else "unchanged"
                     error = None
             corrected[index] = _corrected_record(record, value, method)
-            signature = _record_signature(
-                deterministic,
-                str(record.get("language") or ""),
-                candidates,
-                model,
-                correction_config,
+            cached_values.append(value)
+            _append_audit(
+                audit_path,
+                {
+                    "window_id": record.get("window_id", index),
+                    "start": record.get("core_start"),
+                    "end": record.get("core_end"),
+                    "language": record.get("language"),
+                    "original_text": record.get("text", ""),
+                    "rule_text": deterministic,
+                    "corrected_text": value,
+                    "method": method,
+                    "error": error,
+                    "candidates": [entity.surface for entity in candidates],
+                    "knowledge_ids": [
+                        hit.record_id
+                        for hit in _unique_knowledge(
+                            hit
+                            for _fragment, hits in fragments_by_index[index]
+                            for hit in hits
+                        )
+                    ],
+                    "retrieval_fragments": [
+                        {
+                            "text": fragment,
+                            "knowledge_ids": [hit.record_id for hit in hits],
+                        }
+                        for fragment, hits in fragments_by_index[index]
+                    ],
+                },
             )
-            with lock:
-                cache["records"][signature] = value
-                _write_json(cache_path, cache)
-                _append_audit(
-                    audit_path,
-                    {
-                        "window_id": record.get("window_id", index),
-                        "start": record.get("core_start"),
-                        "end": record.get("core_end"),
-                        "language": record.get("language"),
-                        "original_text": record.get("text", ""),
-                        "rule_text": deterministic,
-                        "corrected_text": value,
-                        "method": method,
-                        "error": error,
-                        "candidates": [entity.surface for entity in candidates],
-                        "knowledge_ids": [
-                            hit.record_id for hit in knowledge_by_index[index]
-                        ],
-                    },
-                )
+        cache["windows"][signature] = cached_values
+        _write_json(cache_path, cache)
     return [value for value in corrected if value is not None]
 
 
-def _pending_batches(
+def _correction_windows(
     pending: list[tuple[int, dict[str, object], str, list[ASREntity]]],
-    maximum_windows: int,
     maximum_chars: int,
 ) -> list[list[tuple[int, dict[str, object], str, list[ASREntity]]]]:
-    if maximum_windows < 1 or maximum_chars < 1:
-        raise ValueError("ASR correction batch limits must be positive")
-    batches: list[list[tuple[int, dict[str, object], str, list[ASREntity]]]] = []
+    if maximum_chars < 1:
+        raise ValueError("ASR correction window limit must be positive")
+    windows: list[list[tuple[int, dict[str, object], str, list[ASREntity]]]] = []
     current: list[tuple[int, dict[str, object], str, list[ASREntity]]] = []
     characters = 0
     for item in pending:
         item_characters = len(item[2])
         if current and (
-            len(current) >= maximum_windows
-            or characters + item_characters > maximum_chars
+            characters + item_characters > maximum_chars
         ):
-            batches.append(current)
+            windows.append(current)
             current = []
             characters = 0
         current.append(item)
         characters += item_characters
     if current:
-        batches.append(current)
-    return batches
+        windows.append(current)
+    return windows
 
 
 def _replace_exact_aliases(text: str, entities: list[ASREntity]) -> str:
@@ -291,19 +303,19 @@ def _best_window_ratio(text: str, target: str) -> float:
 
 def _parse_response(content: object, expected: int) -> list[str]:
     value = parse_json_object(content)
-    windows = value.get("windows") if isinstance(value, dict) else None
-    if not isinstance(windows, list) or len(windows) != expected:
-        raise ValueError("ASR correction response window count mismatch")
+    segments = value.get("segments") if isinstance(value, dict) else None
+    if not isinstance(segments, list) or len(segments) != expected:
+        raise ValueError("ASR correction response segment count mismatch")
     output: list[str] = []
-    for expected_id, window in enumerate(windows):
-        if not isinstance(window, dict):
-            raise TypeError("ASR correction window is not an object")
+    for expected_id, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            raise TypeError("ASR correction segment is not an object")
         try:
-            window_id = int(window.get("window_id"))
+            segment_id = int(segment.get("segment_id"))
         except (TypeError, ValueError) as exc:
-            raise ValueError("ASR correction window_id is not an integer") from exc
-        corrected_text = window.get("corrected_text")
-        if window_id != expected_id or not isinstance(corrected_text, str):
+            raise ValueError("ASR correction segment_id is not an integer") from exc
+        corrected_text = segment.get("corrected_text")
+        if segment_id != expected_id or not isinstance(corrected_text, str):
             raise ValueError("ASR correction response IDs or text are invalid")
         output.append(corrected_text.strip())
     return output
@@ -329,29 +341,62 @@ def _format_entities(entities: list[ASREntity]) -> str:
     )
 
 
-def _format_target_windows(
-    batch: list[tuple[int, dict[str, object], str, list[ASREntity]]],
-    knowledge_by_index: dict[int, list[KnowledgeHit]],
+def _format_correction_window(
+    window: list[tuple[int, dict[str, object], str, list[ASREntity]]],
+    fragments_by_index: dict[int, list[tuple[str, list[KnowledgeHit]]]],
 ) -> str:
     values: list[str] = []
-    for position, (index, record, text, candidates) in enumerate(batch):
-        knowledge = knowledge_by_index[index][:3]
-        knowledge_text = (
-            "\n".join(
-                f"- <{hit.kind}:{hit.title}> {hit.body[:180]}" for hit in knowledge
-            )
-            or "(none)"
-        )
+    for position, (index, record, _text, candidates) in enumerate(window):
         chat_text = str(record.get("chat_text") or "").strip() or "(none)"
         candidate_text = "｜".join(entity.surface for entity in candidates) or "(none)"
+        fragments: list[str] = []
+        for fragment_id, (fragment, knowledge) in enumerate(
+            fragments_by_index[index]
+        ):
+            knowledge_text = (
+                "\n".join(
+                    f"- <{hit.kind}:{hit.title}> {hit.body[:180]}"
+                    for hit in knowledge[:3]
+                )
+                or "(none)"
+            )
+            fragments.append(
+                f'<RETRIEVAL_FRAGMENT id="{fragment_id}">\n'
+                f"TEXT:\n{fragment}\n"
+                f"FAN_KNOWLEDGE:\n{knowledge_text}\n"
+                "</RETRIEVAL_FRAGMENT>"
+            )
+        fragment_text = "\n".join(fragments)
         values.append(
-            f'<WINDOW id="{position}" candidates="{candidate_text}">\n'
-            f"FAN_KNOWLEDGE:\n{knowledge_text}\n"
+            f'<SEGMENT id="{position}" candidates="{candidate_text}">\n'
             f"CURRENT_VIDEO_CHAT:\n{chat_text}\n"
-            f"ASR_TEXT:\n{text}\n"
-            "</WINDOW>"
+            f"LOCAL_RETRIEVAL:\n{fragment_text}\n"
+            f"ASR_TEXT:\n{_text}\n"
+            "</SEGMENT>"
         )
-    return "\n\n".join(values) or "(none)"
+    return "<CORRECTION_WINDOW>\n" + "\n\n".join(values) + "\n</CORRECTION_WINDOW>"
+
+
+def _retrieval_fragments(text: str) -> list[str]:
+    text = text.strip()
+    if not text:
+        return [""]
+    fragments: list[str] = []
+    current = ""
+    for sentence in _SENTENCE_END_RE.split(text):
+        while len(sentence) > _RETRIEVAL_FRAGMENT_CHARS:
+            if current:
+                fragments.append(current)
+                current = ""
+            fragments.append(sentence[:_RETRIEVAL_FRAGMENT_CHARS])
+            sentence = sentence[_RETRIEVAL_FRAGMENT_CHARS:]
+        if current and len(current) + len(sentence) > _RETRIEVAL_FRAGMENT_CHARS:
+            fragments.append(current)
+            current = ""
+        current += sentence
+    if current:
+        fragments.append(current)
+    return fragments
 
 
 def _unique_knowledge(values: object) -> list[KnowledgeHit]:
@@ -375,18 +420,29 @@ def _unique_entities(values: object) -> list[ASREntity]:
     return output
 
 
-def _record_signature(
-    text: str,
-    language: str,
-    entities: list[ASREntity],
+def _window_signature(
+    window: list[tuple[int, dict[str, object], str, list[ASREntity]]],
+    fragments_by_index: dict[int, list[tuple[str, list[KnowledgeHit]]]],
     model: str,
     correction_config: dict[str, int | float],
 ) -> str:
     payload = {
         "version": _CACHE_VERSION,
-        "text": text,
-        "language": language,
-        "entities": [(item.surface, item.reading, item.aliases) for item in entities],
+        "segments": [
+            {
+                "text": text,
+                "language": str(record.get("language") or ""),
+                "entities": [
+                    (item.surface, item.reading, item.aliases) for item in entities
+                ],
+                "knowledge": [
+                    (hit.record_id, hit.title, hit.body)
+                    for _fragment, hits in fragments_by_index[_index]
+                    for hit in hits
+                ],
+            }
+            for _index, record, text, entities in window
+        ],
         "model": model,
         "config": correction_config,
         "prompt": prompt_templates_digest(_PROMPT),
@@ -426,9 +482,9 @@ def _load_cache(path: Path) -> dict[str, object]:
     except (OSError, json.JSONDecodeError):
         value = {}
     if value.get("version") != _CACHE_VERSION or not isinstance(
-        value.get("records"), dict
+        value.get("windows"), dict
     ):
-        return {"version": _CACHE_VERSION, "records": {}}
+        return {"version": _CACHE_VERSION, "windows": {}}
     return value
 
 

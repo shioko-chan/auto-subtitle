@@ -77,7 +77,6 @@ class ConfigTests(unittest.TestCase):
                 config.audio_analysis.speaker_profile_min_samples_per_center, 20
             )
             self.assertEqual(config.audio_analysis.singing_threshold, 0.015)
-            self.assertEqual(config.audio_analysis.singing_vocal_threshold, 0.15)
             self.assertEqual(config.audio_analysis.singing_smoothing_windows, 3)
             self.assertEqual(config.audio_analysis.singing_asr_target_seconds, 10.0)
             self.assertEqual(config.audio_analysis.singing_asr_min_seconds, 6.0)
@@ -96,8 +95,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.segmentation.local_unit_max_seconds, 6.0)
             self.assertEqual(config.segmentation.model_window_units, 240)
             self.assertEqual(config.segmentation.model_window_chars, 3000)
-            self.assertEqual(config.asr_correction.batch_windows, 6)
-            self.assertEqual(config.asr_correction.batch_chars, 3000)
+            self.assertEqual(config.asr_correction.window_chars, 3000)
             self.assertEqual(config.translation.batch_cues, 32)
             self.assertEqual(config.translation.batch_chars, 3000)
             self.assertEqual(config.llm.max_concurrency, 16)

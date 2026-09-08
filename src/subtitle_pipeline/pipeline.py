@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -11,7 +10,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 from .asr import (
@@ -41,6 +40,7 @@ from .song_identification import (
     SongIdentificationResult,
     arbitrate_verified_lyrics,
     identify_and_align_songs,
+    select_ocr_song_titles,
     split_aligned_song_cues,
     translate_aligned_song_lyrics,
 )
@@ -88,7 +88,7 @@ def run_pipeline(
     upload_override: bool | None = None,
 ) -> PipelineResult:
     url = normalize_youtube_url(url)
-    job_id = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+    job_id = youtube_video_id(url)
     job_dir = config.work_dir.resolve() / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     with _job_log(job_dir / "run.log"):
@@ -268,6 +268,27 @@ def _run_pipeline_stages(
 
     def process_song_cues(singing_cues: list[Cue]) -> list[Cue]:
         nonlocal early_song_result
+
+        def select_titles(candidate_sets):
+            try:
+                if config.llm.local_server_enabled:
+                    local_llm_server.start()
+                return select_ocr_song_titles(
+                    candidate_sets,
+                    video_title=str(downloaded.metadata.get("title") or ""),
+                    request=translator.request,
+                    model=config.llm.model,
+                    json_mode=config.llm.json_mode,
+                    thinking=config.llm.thinking,
+                )
+            except Exception as exc:  # noqa: BLE001 - OCR remains optional evidence.
+                logging.warning(
+                    "LLM song-title selection failed; continuing without OCR "
+                    "titles: %s",
+                    exc,
+                )
+                return [None for _ in candidate_sets]
+
         with stage_metrics("pipeline.song_identification"):
             if config.song_identification.enabled:
                 early_song_result = identify_and_align_songs(
@@ -277,6 +298,7 @@ def _run_pipeline_stages(
                     job_dir,
                     config.song_identification,
                     source_maximum_units=japanese_guidance_units,
+                    select_ocr_titles=select_titles,
                 )
             else:
                 early_song_result = SongIdentificationResult(singing_cues, [])
@@ -300,6 +322,29 @@ def _run_pipeline_stages(
         if config.llm.local_server_enabled:
             with stage_metrics("pipeline.local_llm_asr_correction_startup"):
                 local_llm_server.start()
+
+        def retrieve_asr_knowledge(
+            record: dict[str, object], text: str
+        ) -> list[KnowledgeHit]:
+            if fan_knowledge is None:
+                return []
+            query = KnowledgeQuery(
+                text=text,
+                speaker=str(record.get("speaker") or "") or None,
+                video_date=video_date,
+                ocr_text=str(record.get("ocr_text") or ""),
+                chat_text=str(record.get("chat_text") or ""),
+                exclude_video_id=current_video_id,
+                top_k=config.fan_knowledge.top_k_asr,
+            )
+            values = [
+                *fan_knowledge.retrieve_asr_term_references(query)[:2],
+                *fan_knowledge.retrieve_background(query),
+            ]
+            return list({hit.record_id: hit for hit in values}.values())[
+                : config.fan_knowledge.top_k_asr
+            ]
+
         try:
             return correct_asr_windows(
                 records,
@@ -308,26 +353,9 @@ def _run_pipeline_stages(
                 model=config.llm.model,
                 cache_path=job_dir / "asr-correction-cache.json",
                 audit_path=job_dir / "asr-correction-audit.jsonl",
-                batch_windows=config.asr_correction.batch_windows,
-                batch_chars=config.asr_correction.batch_chars,
+                window_chars=config.asr_correction.window_chars,
                 max_tokens=config.asr_correction.max_tokens,
-                retrieve_knowledge=(
-                    lambda record, text: (
-                        fan_knowledge.retrieve(
-                            KnowledgeQuery(
-                                text=text,
-                                speaker=str(record.get("speaker") or "") or None,
-                                video_date=video_date,
-                                ocr_text=str(record.get("ocr_text") or ""),
-                                chat_text=str(record.get("chat_text") or ""),
-                                exclude_video_id=current_video_id,
-                                top_k=config.fan_knowledge.top_k_asr,
-                            )
-                        )
-                        if fan_knowledge is not None
-                        else None
-                    )
-                ),
+                retrieve_knowledge=retrieve_asr_knowledge,
             )
         finally:
             if fan_knowledge is not None:
@@ -654,6 +682,26 @@ def normalize_youtube_url(url: str) -> str:
     if candidate != url:
         logging.info("normalized escaped YouTube URL: %s", candidate)
     return candidate
+
+
+def youtube_video_id(url: str) -> str:
+    parsed = urlsplit(url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname == "youtu.be":
+        video_id = parsed.path.strip("/").split("/", 1)[0]
+    elif parsed.path.rstrip("/") == "/watch":
+        video_id = parse_qs(parsed.query).get("v", [""])[0]
+    else:
+        path_parts = parsed.path.strip("/").split("/")
+        video_id = (
+            path_parts[1]
+            if len(path_parts) >= 2
+            and path_parts[0] in {"embed", "live", "shorts"}
+            else ""
+        )
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", video_id):
+        raise ValueError(f"YouTube URL has no valid video ID: {url}")
+    return video_id
 
 
 def _merge_tags(configured: list[str], generated: list[str], limit: int) -> list[str]:

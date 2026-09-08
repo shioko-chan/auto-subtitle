@@ -5,7 +5,7 @@ import unittest
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from subtitle_pipeline.config import AppConfig, FanKnowledgeConfig
 from subtitle_pipeline.fan_knowledge import FanKnowledgeRetriever
@@ -44,20 +44,58 @@ class KnowledgeUpdateTests(unittest.TestCase):
                 official_sources=["https://example.jp/news/"],
             )
             config = AppConfig(fan_knowledge=knowledge)
-            with (
-                patch(
-                    "subtitle_pipeline.knowledge_update.collect_official_documents",
-                    side_effect=RuntimeError("network failed"),
-                ),
-                self.assertRaisesRegex(RuntimeError, "network failed"),
+            with patch(
+                "subtitle_pipeline.knowledge_update.collect_official_documents",
+                side_effect=RuntimeError("network failed"),
             ):
-                update_knowledge_if_stale(config, retriever)
+                summary = update_knowledge_if_stale(config, retriever)
+            self.assertEqual(summary.scanned, 0)
             self.assertIsNone(retriever.metadata("automatic_update_last_success_at"))
             self.assertIn(
                 "network failed",
                 retriever.metadata("automatic_update_last_error") or "",
             )
             retriever.close()
+
+    def test_failed_collection_raises_when_existing_database_is_unreadable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = AppConfig(
+                fan_knowledge=FanKnowledgeConfig(
+                    database_path=str(Path(temporary) / "knowledge.sqlite3"),
+                    embedding_model=None,
+                )
+            )
+            retriever = MagicMock()
+            retriever.metadata.side_effect = RuntimeError("database unreadable")
+            with patch(
+                "subtitle_pipeline.knowledge_update._update_knowledge_if_stale",
+                side_effect=RuntimeError("network failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "network failed"):
+                    update_knowledge_if_stale(config, retriever)
+
+    def test_failed_collection_continues_when_error_audit_cannot_be_written(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = AppConfig(
+                fan_knowledge=FanKnowledgeConfig(
+                    database_path=str(Path(temporary) / "knowledge.sqlite3"),
+                    embedding_model=None,
+                )
+            )
+            retriever = MagicMock()
+            retriever.metadata.return_value = "2026-09-01T00:00:00+00:00"
+            retriever.set_metadata.side_effect = RuntimeError("read only")
+            with patch(
+                "subtitle_pipeline.knowledge_update._update_knowledge_if_stale",
+                side_effect=RuntimeError("network failed"),
+            ):
+                summary = update_knowledge_if_stale(config, retriever)
+
+        self.assertEqual(summary.scanned, 0)
 
 
 if __name__ == "__main__":

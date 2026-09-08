@@ -41,11 +41,11 @@ from subtitle_pipeline.asr import (
     transcribe_with_qwen,
 )
 from subtitle_pipeline.audio_analysis import AcousticPhrase, AudioAnalysis, AudioRegion
-from subtitle_pipeline.config import ASRConfig, AudioAnalysisConfig
 from subtitle_pipeline.conditioned_asr import (
     ConditionedASRTranscription,
     ConditionedWindow,
 )
+from subtitle_pipeline.config import ASRConfig, AudioAnalysisConfig
 from subtitle_pipeline.subtitles import Cue
 
 
@@ -116,6 +116,26 @@ class QwenASRTests(unittest.TestCase):
 
         self.assertTrue(quality["accepted"])
         self.assertEqual(quality["reasons"], [])
+
+    def test_speech_quality_rejects_repetition_outside_song_fallback(self):
+        text = "同じ文です。" * 40
+        quality = _speech_candidate_quality(
+            {
+                "text": text,
+                "cues": [
+                    {
+                        "start": 10.0,
+                        "end": 20.0,
+                        "text": text,
+                    }
+                ],
+            },
+            AudioRegion(10, 20, "speech", asr_route="qwen"),
+        )
+
+        self.assertFalse(quality["accepted"])
+        self.assertIn("repetition_loop", quality["reasons"])
+        self.assertFalse(quality["metrics"]["song_context"])
 
     def test_song_speech_quality_gate_discards_and_audits_before_arbitration(self):
         aligner = Mock()
@@ -1139,12 +1159,10 @@ class QwenASRTests(unittest.TestCase):
         phrase = AcousticPhrase(
             12,
             20,
-            "high",
             "strong",
             0.8,
             0.7,
             0.6,
-            0.9,
             0.0,
             True,
             True,

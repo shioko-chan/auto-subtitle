@@ -30,19 +30,39 @@ def update_knowledge_if_stale(
         try:
             result = _update_knowledge_if_stale(config, retriever)
         except Exception as exc:
-            retriever.set_metadata(
-                "automatic_update_last_error",
-                json.dumps(
-                    {
-                        "at": datetime.now(UTC).isoformat(),
-                        "type": type(exc).__name__,
-                        "message": str(exc)[:1000],
-                    },
-                    ensure_ascii=False,
-                ),
+            try:
+                previous_success_at = retriever.metadata(_LAST_SUCCESS_KEY)
+            except Exception:
+                logger.exception(
+                    "fan knowledge update failed and the existing database "
+                    "is unreadable"
+                )
+                raise exc
+            try:
+                retriever.set_metadata(
+                    "automatic_update_last_error",
+                    json.dumps(
+                        {
+                            "at": datetime.now(UTC).isoformat(),
+                            "type": type(exc).__name__,
+                            "message": str(exc)[:1000],
+                            "previous_success_at": previous_success_at,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            except Exception as audit_exc:
+                logger.warning(
+                    "could not record fan knowledge update failure: %s",
+                    audit_exc,
+                )
+            logger.error(
+                "fan knowledge update failed; continuing with the existing "
+                "database previous_success_at=%s: %s",
+                previous_success_at,
+                exc,
             )
-            logger.error("fan knowledge update failed; stopping pipeline: %s", exc)
-            raise
+            return IngestionSummary()
         retriever.set_metadata("automatic_update_last_error", "")
         return result
 

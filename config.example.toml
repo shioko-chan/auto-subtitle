@@ -91,9 +91,6 @@ singing_music_threshold = 0.05
 # Speech at or above this score is strong evidence and independently enables
 # speech ASR, even when the same phrase also routes through ALT.
 singing_speech_takeover_threshold = 0.5
-# Raw AST and vocal-stem AST provide independent singing evidence. Speech
-# evidence remains available even when the same phrase is routed through ALT.
-singing_vocal_threshold = 0.15
 # Smooth isolated AST misses/hits and merge only nearby candidate windows.
 singing_merge_gap_seconds = 1.5
 singing_smoothing_windows = 3
@@ -148,10 +145,8 @@ lyric_neighbor_max_lines = 12
 lyric_neighbor_min_coverage = 0.45
 
 [asr_correction]
-# ASR correction repeats every source window, so keep batches below the model
-# context capacity even when the output token cap is large.
-batch_windows = 6
-batch_chars = 3000
+# Adjacent ASR records share one continuous correction window up to this size.
+window_chars = 3000
 max_tokens = 8192
 
 [segmentation]
@@ -309,7 +304,7 @@ nvenc_cq = 20
 enabled = false
 cookie_file = "cookies.json"
 copyright = 2
-tid = 171
+tid = 2047
 tags = ["中文字幕", "YouTube"]
 max_tags = 10
 # Import a tag/heat catalog obtained through an authorized source.

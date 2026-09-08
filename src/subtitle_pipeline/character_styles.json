@@ -7,9 +7,7 @@
       "subtitle_style": {
         "primary_color": "#FFFFFF",
         "outline_color": "#B88600",
-        "outline_width": 2,
-        "outer_outline_color": "#FFE052",
-        "outer_outline_width": 8
+        "outline_width": 2
       }
     },
     {

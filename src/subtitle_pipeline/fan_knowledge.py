@@ -12,6 +12,7 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime
 from difflib import SequenceMatcher
+from functools import cache
 from pathlib import Path
 from typing import Self
 
@@ -1427,6 +1428,92 @@ class FanKnowledgeRetriever:
         )
         return hits
 
+    def retrieve_asr_term_references(
+        self, query: KnowledgeQuery
+    ) -> list[KnowledgeHit]:
+        """Return exact and phonetically close known terms for ASR correction."""
+        if query.top_k < 1 or not query.text.strip():
+            return []
+        normalized = _normalize_query(query.text)
+        with self._lock:
+            rows = self._database.execute(
+                "SELECT *, NULL AS fts_rank FROM knowledge_records"
+            ).fetchall()
+
+        candidates: list[
+            tuple[bool, float, int, sqlite3.Row, tuple[str, ...]]
+        ] = []
+        for row in rows:
+            if str(row["kind"]) not in _TERM_REFERENCE_KINDS:
+                continue
+            forms = _row_forms(row)
+            exact = _exact_entity_matches(normalized, forms)
+            phonetic_forms = _term_phonetic_forms(
+                str(row["title"]),
+                str(row["reading"] or ""),
+                tuple(json.loads(str(row["aliases"]))),
+            )
+            phonetic = max(
+                (
+                    _best_window_ratio(normalized.reading, reading)
+                    for reading in phonetic_forms
+                ),
+                default=0.0,
+            )
+            if not exact and phonetic < 0.78:
+                continue
+            candidates.append(
+                (
+                    bool(exact),
+                    1.0 if exact else phonetic,
+                    max((len(value) for value in phonetic_forms), default=0),
+                    row,
+                    exact,
+                )
+            )
+
+        candidates.sort(
+            key=lambda value: (
+                -int(value[0]),
+                -value[1],
+                -value[2],
+                str(value[3]["record_id"]),
+            )
+        )
+        hits: list[KnowledgeHit] = []
+        for rank, (exact, phonetic, _length, row, matched) in enumerate(
+            candidates[: query.top_k], 1
+        ):
+            reliability = float(row["reliability"])
+            hits.append(
+                KnowledgeHit(
+                    record_id=str(row["record_id"]),
+                    kind=str(row["kind"]),
+                    title=str(row["title"]),
+                    body=str(row["body"]),
+                    source_url=row["source_url"],
+                    score=KnowledgeScore(
+                        keyword=1.0 if exact else 0.0,
+                        kana=phonetic,
+                        vector=0.0,
+                        speaker=0.0,
+                        date=0.0,
+                        cross_evidence=0.0,
+                        reliability=reliability,
+                        total=(3.0 if exact else 2.0 * phonetic)
+                        + 0.75 * reliability,
+                        entity=1.0 if exact else 0.0,
+                    ),
+                    matched_terms=(
+                        matched
+                        if matched
+                        else (f"近音:{row['title']!s}",)
+                    ),
+                    retrieval_ranks={"entity" if exact else "kana": rank},
+                )
+            )
+        return hits
+
     def sync_vector_index(self) -> tuple[int, int]:
         if self._vector_index is None:
             return 0, 0
@@ -2301,6 +2388,36 @@ def _sudachi_tokenizer() -> object:
         instance = dictionary.Dictionary().create()
         _SUDACHI_LOCAL.tokenizer = instance
     return instance
+
+
+@cache
+def _term_phonetic_forms(
+    title: str, reading: str, aliases: tuple[str, ...]
+) -> tuple[str, ...]:
+    from sudachipy import tokenizer
+
+    values: list[str] = []
+    if reading:
+        values.append(_kana(reading))
+    for form in (title, *aliases):
+        if not form:
+            continue
+        parts = [
+            _kana(morpheme.reading_form())
+            for morpheme in _sudachi_tokenizer().tokenize(
+                form, tokenizer.Tokenizer.SplitMode.A
+            )
+            if morpheme.reading_form() not in {"", "*"}
+        ]
+        for start in range(len(parts)):
+            combined = ""
+            for part in parts[start:]:
+                combined += part
+                if len(combined) > 24:
+                    break
+                if len(combined) >= 5:
+                    values.append(combined)
+    return tuple(dict.fromkeys(values))
 
 
 def _exact_entity_matches(query: _NormalizedQuery, forms: list[str]) -> tuple[str, ...]:

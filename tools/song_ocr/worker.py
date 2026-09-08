@@ -38,7 +38,18 @@ def main() -> None:
             for result in results:
                 if not isinstance(result, (list, tuple)) or len(result) < 3:
                     continue
-                values.append([str(result[1]), float(result[2])])
+                box = result[0]
+                if not isinstance(box, (list, tuple)) or len(box) < 4:
+                    continue
+                xs = [float(point[0]) for point in box]
+                ys = [float(point[1]) for point in box]
+                values.append(
+                    [
+                        str(result[1]),
+                        float(result[2]),
+                        [min(xs), min(ys), max(xs), max(ys)],
+                    ]
+                )
             emit({"ok": True, "values": values})
         except Exception as exc:
             emit(

@@ -73,7 +73,6 @@ class AudioAnalysisTests(unittest.TestCase):
     def test_acoustic_phrases_only_cover_selected_ast_candidates(self):
         config = AudioAnalysisConfig(
             singing_threshold=0.2,
-            singing_vocal_threshold=0.6,
             singing_asr_max_seconds=15.0,
         )
         raw_scores = [
@@ -94,7 +93,6 @@ class AudioAnalysisTests(unittest.TestCase):
         phrases = _build_acoustic_phrases(
             raw_scores,
             candidates,
-            raw_scores,
             [],
             sources,
             config,
@@ -112,13 +110,11 @@ class AudioAnalysisTests(unittest.TestCase):
     def test_acoustic_phrase_rejects_partially_overlapping_stem(self):
         config = AudioAnalysisConfig(
             singing_threshold=0.2,
-            singing_vocal_threshold=0.6,
             singing_asr_max_seconds=15.0,
         )
         candidate = AudioRegion(0, 15, "singing", confidence=0.8)
 
         phrases = _build_acoustic_phrases(
-            [candidate],
             [candidate],
             [candidate],
             [],
@@ -138,26 +134,21 @@ class AudioAnalysisTests(unittest.TestCase):
     def test_acoustic_phrase_route_covers_full_singing_speech_matrix(self):
         config = AudioAnalysisConfig(
             singing_threshold=0.2,
-            singing_vocal_threshold=0.6,
             singing_speech_takeover_threshold=0.5,
         )
         cases = {
-            ("high", "strong"): (0.3, 0.6, 0.7, 0.0, True, True),
-            ("high", "weak"): (0.3, 0.2, 0.7, 0.0, True, False),
-            ("high", "none"): (0.3, 0.0, 0.7, 0.0, True, False),
-            ("medium", "strong"): (0.3, 0.6, 0.2, 0.0, True, True),
-            ("medium", "weak"): (0.3, 0.2, 0.2, 0.0, True, False),
-            ("medium", "none"): (0.3, 0.0, 0.2, 0.0, True, False),
-            ("low", "strong"): (0.1, 0.2, 0.2, 0.1, False, True),
-            ("low", "weak"): (0.1, 0.2, 0.2, 0.0, False, False),
-            ("low", "none"): (0.1, 0.0, 0.2, 0.0, False, False),
+            "strong": (0.3, 0.6, 0.0, ("strong", True, True)),
+            "weak": (0.3, 0.2, 0.0, ("weak", True, False)),
+            "none": (0.3, 0.0, 0.0, ("none", True, False)),
+            "overlap": (0.1, 0.2, 0.1, ("strong", False, True)),
+            "below-threshold": (0.1, 0.2, 0.0, ("weak", False, False)),
         }
-        for levels, values in cases.items():
-            singing, speech, vocal, overlap, route_alt, route_speech = values
-            with self.subTest(levels=levels):
+        for name, values in cases.items():
+            singing, speech, overlap, expected = values
+            with self.subTest(name=name):
                 self.assertEqual(
-                    _acoustic_phrase_route(singing, speech, vocal, overlap, config),
-                    (*levels, route_alt, route_speech),
+                    _acoustic_phrase_route(singing, speech, overlap, config),
+                    expected,
                 )
 
     def test_initial_diarization_and_ast_can_run_concurrently(self):
@@ -531,8 +522,8 @@ class AudioAnalysisTests(unittest.TestCase):
         self.assertEqual(styles["minetsuki_ritsu"].primary_color, "#FFFFFF")
         self.assertEqual(styles["minetsuki_ritsu"].outline_color, "#65A9FF")
         self.assertEqual(styles["nakamachi_arale"].outline_width, 2)
-        self.assertEqual(styles["nakamachi_arale"].outer_outline_color, "#FFE052")
-        self.assertEqual(styles["nakamachi_arale"].outer_outline_width, 8)
+        self.assertIsNone(styles["nakamachi_arale"].outer_outline_color)
+        self.assertIsNone(styles["nakamachi_arale"].outer_outline_width)
 
     def test_title_characters_distinguishes_single_multi_and_unknown_titles(self):
         self.assertEqual(

@@ -294,6 +294,7 @@ def render_subtitles(
         run(
             [
                 ffmpeg,
+                "-nostdin",
                 "-y",
                 "-i",
                 str(local_video),
@@ -344,6 +345,7 @@ def _render_subtitles_cuda(
         run(
             [
                 ffmpeg,
+                "-nostdin",
                 "-y",
                 "-i",
                 str(video_only),

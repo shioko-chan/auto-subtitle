@@ -24,6 +24,7 @@ from subtitle_pipeline.pipeline import (
     _youtube_metadata_context,
     normalize_youtube_url,
     run_pipeline,
+    youtube_video_id,
 )
 from subtitle_pipeline.reference_context import compact_reference_context
 from subtitle_pipeline.subtitles import Cue, write_srt
@@ -383,6 +384,26 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "supported YouTube"):
             normalize_youtube_url("https://example.com/watch?v=abc")
 
+    def test_extracts_youtube_video_id_from_supported_url_forms(self):
+        video_id = "0qxn9UjCyYU"
+        self.assertEqual(
+            youtube_video_id(f"https://www.youtube.com/watch?v={video_id}&t=30"),
+            video_id,
+        )
+        self.assertEqual(youtube_video_id(f"https://youtu.be/{video_id}"), video_id)
+        self.assertEqual(
+            youtube_video_id(f"https://www.youtube.com/live/{video_id}?feature=share"),
+            video_id,
+        )
+        self.assertEqual(
+            youtube_video_id(f"https://www.youtube.com/shorts/{video_id}"),
+            video_id,
+        )
+
+    def test_rejects_youtube_url_without_video_id(self):
+        with self.assertRaisesRegex(ValueError, "no valid video ID"):
+            youtube_video_id("https://www.youtube.com/")
+
     def test_uses_qwen_subtitle_and_respects_no_upload_override(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -450,6 +471,7 @@ class PipelineTests(unittest.TestCase):
                 )
 
             self.assertFalse(result.uploaded)
+            self.assertEqual(result.job_dir, root / "work" / "1")
             self.assertEqual(
                 result.translated_subtitle.read_text(encoding="utf-8").count("你好"),
                 1,

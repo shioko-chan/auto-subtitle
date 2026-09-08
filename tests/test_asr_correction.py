@@ -7,7 +7,7 @@ from pathlib import Path
 
 from subtitle_pipeline.asr_correction import (
     ASREntity,
-    _pending_batches,
+    _correction_windows,
     correct_asr_windows,
     entities_from_context,
 )
@@ -24,7 +24,7 @@ class ASRCorrectionTests(unittest.TestCase):
                 "choices": [
                     {
                         "message": {
-                            "content": '{"windows":[{"window_id":0,"corrected_text":"等身大フィギュア"}]}'
+                            "content": '{"segments":[{"segment_id":0,"corrected_text":"等身大フィギュア"}]}'
                         }
                     }
                 ]
@@ -51,15 +51,53 @@ class ASRCorrectionTests(unittest.TestCase):
         self.assertIn("Faithfulness means faithfulness to the likely spoken audio", prompt)
         self.assertIn("not to the literal ASR characters", prompt)
 
-    def test_batches_respect_window_and_character_limits(self) -> None:
+    def test_correction_windows_use_only_the_character_limit(self) -> None:
         pending = [
             (index, {}, text, [])
             for index, text in enumerate(("a" * 7, "b" * 7, "c" * 3))
         ]
-        batches = _pending_batches(pending, maximum_windows=2, maximum_chars=10)
+        batches = _correction_windows(pending, maximum_chars=10)
         self.assertEqual(
             [[item[0] for item in batch] for batch in batches], [[0], [1, 2]]
         )
+
+        short = [(index, {}, "x", []) for index in range(9)]
+        self.assertEqual(len(_correction_windows(short, maximum_chars=10)), 1)
+
+    def test_long_segment_retrieves_knowledge_by_local_fragment(self) -> None:
+        queries: list[str] = []
+
+        def request(_body: dict[str, object]) -> dict[str, object]:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "segments": [
+                                        {"segment_id": 0, "corrected_text": "修正"}
+                                    ]
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            correct_asr_windows(
+                [{"text": "あ" * 250, "language": "Japanese"}],
+                entities=[],
+                request=request,
+                model="test-model",
+                cache_path=root / "cache.json",
+                audit_path=root / "audit.jsonl",
+                retrieve_knowledge=lambda _record, text: queries.append(text) or [],
+            )
+
+        self.assertEqual([len(value) for value in queries], [120, 120, 10])
 
     def test_request_uses_stage_output_limit(self) -> None:
         bodies: list[dict[str, object]] = []
@@ -70,7 +108,7 @@ class ASRCorrectionTests(unittest.TestCase):
                 "choices": [
                     {
                         "message": {
-                            "content": '{"windows":[{"window_id":0,"corrected_text":"修正"}]}'
+                            "content": '{"segments":[{"segment_id":0,"corrected_text":"修正"}]}'
                         }
                     }
                 ]
@@ -93,7 +131,7 @@ class ASRCorrectionTests(unittest.TestCase):
     def test_fenced_json_response_is_accepted(self) -> None:
         response_content = (
             "```json\n"
-            '{"windows":[{"window_id":0,'
+            '{"segments":[{"segment_id":0,'
             '"corrected_text":"等身大フィギュア"}]}\n'
             "```"
         )
@@ -145,9 +183,9 @@ class ASRCorrectionTests(unittest.TestCase):
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "windows": [
+                                    "segments": [
                                         {
-                                            "window_id": 0,
+                                            "segment_id": 0,
                                             "corrected_text": "夢限大みゅーたいぷボーカル仲町あられです",
                                         }
                                     ]
@@ -188,7 +226,7 @@ class ASRCorrectionTests(unittest.TestCase):
         )
         prompt = requests[0]["messages"][1]["content"]
         self.assertIn(
-            '<WINDOW id="0" candidates="夢限大みゅーたいぷ｜仲町あられ">',
+            '<SEGMENT id="0" candidates="夢限大みゅーたいぷ｜仲町あられ">',
             prompt,
         )
         self.assertIn("<仲町あられ>", prompt)
@@ -238,9 +276,9 @@ class ASRCorrectionTests(unittest.TestCase):
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "windows": [
+                                    "segments": [
                                         {
-                                            "window_id": 0,
+                                            "segment_id": 0,
                                             "corrected_text": "TYありがとう",
                                         }
                                     ]
@@ -281,9 +319,9 @@ class ASRCorrectionTests(unittest.TestCase):
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "windows": [
-                                        {"window_id": 0, "corrected_text": "一"},
-                                        {"window_id": 1, "corrected_text": "二"},
+                                    "segments": [
+                                        {"segment_id": 0, "corrected_text": "一"},
+                                        {"segment_id": 1, "corrected_text": "二"},
                                     ]
                                 },
                                 ensure_ascii=False,
@@ -309,22 +347,27 @@ class ASRCorrectionTests(unittest.TestCase):
 
         prompt = requests[0]["messages"][1]["content"]
         self.assertIn(
-            '<WINDOW id="0" candidates="(none)">\n'
-            "FAN_KNOWLEDGE:\n(none)\nCURRENT_VIDEO_CHAT:\n第一窗口聊天\n"
-            "ASR_TEXT:\n一\n</WINDOW>",
+            '<SEGMENT id="0" candidates="(none)">\n'
+            "CURRENT_VIDEO_CHAT:\n第一窗口聊天\nLOCAL_RETRIEVAL:\n"
+            '<RETRIEVAL_FRAGMENT id="0">\nTEXT:\n一\n'
+            "FAN_KNOWLEDGE:\n(none)\n</RETRIEVAL_FRAGMENT>\n"
+            "ASR_TEXT:\n一\n</SEGMENT>",
             prompt,
         )
         self.assertIn(
-            '<WINDOW id="1" candidates="(none)">\n'
-            "FAN_KNOWLEDGE:\n(none)\nCURRENT_VIDEO_CHAT:\n第二窗口聊天\n"
-            "ASR_TEXT:\n二\n</WINDOW>",
+            '<SEGMENT id="1" candidates="(none)">\n'
+            "CURRENT_VIDEO_CHAT:\n第二窗口聊天\nLOCAL_RETRIEVAL:\n"
+            '<RETRIEVAL_FRAGMENT id="0">\nTEXT:\n二\n'
+            "FAN_KNOWLEDGE:\n(none)\n</RETRIEVAL_FRAGMENT>\n"
+            "ASR_TEXT:\n二\n</SEGMENT>",
             prompt,
         )
-        first_end = prompt.index("</WINDOW>")
-        second_start = prompt.index('<WINDOW id="1"')
+        first_end = prompt.index("</SEGMENT>")
+        second_start = prompt.index('<SEGMENT id="1"')
         self.assertLess(first_end, second_start)
 
-    def test_asr_cache_does_not_depend_on_retrieved_knowledge(self) -> None:
+    def test_asr_cache_changes_with_retrieved_knowledge(self) -> None:
+        calls = 0
         hit = KnowledgeHit(
             "knowledge:first",
             "note",
@@ -336,14 +379,16 @@ class ASRCorrectionTests(unittest.TestCase):
         )
 
         def request(_body: dict[str, object]) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
             return {
                 "choices": [
                     {
                         "message": {
                             "content": json.dumps(
                                 {
-                                    "windows": [
-                                        {"window_id": 0, "corrected_text": "修正"}
+                                    "segments": [
+                                        {"segment_id": 0, "corrected_text": "修正"}
                                     ]
                                 },
                                 ensure_ascii=False,
@@ -369,12 +414,19 @@ class ASRCorrectionTests(unittest.TestCase):
             )
             second = correct_asr_windows(
                 **arguments,
-                request=lambda _body: self.fail("LLM should not run on cache hit"),
+                request=request,
+                retrieve_knowledge=lambda _record, _text: [],
+            )
+            third = correct_asr_windows(
+                **arguments,
+                request=lambda _body: self.fail("unchanged evidence should use cache"),
                 retrieve_knowledge=lambda _record, _text: [],
             )
 
         self.assertEqual(first[0]["text"], "修正")
         self.assertEqual(second[0]["text"], "修正")
+        self.assertEqual(third[0]["correction_method"], "cache")
+        self.assertEqual(calls, 2)
 
     def test_asr_cache_changes_with_stage_configuration(self) -> None:
         calls = 0
@@ -386,7 +438,7 @@ class ASRCorrectionTests(unittest.TestCase):
                 "choices": [
                     {
                         "message": {
-                            "content": '{"windows":[{"window_id":0,"corrected_text":"修正"}]}'
+                            "content": '{"segments":[{"segment_id":0,"corrected_text":"修正"}]}'
                         }
                     }
                 ]
