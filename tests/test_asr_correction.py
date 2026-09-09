@@ -15,6 +15,38 @@ from subtitle_pipeline.fan_knowledge import KnowledgeHit, KnowledgeScore
 
 
 class ASRCorrectionTests(unittest.TestCase):
+    def test_all_retrieval_precedes_llm_and_survives_interruption(self):
+        events = []
+        records = [{"text": value, "language": "Japanese"} for value in ["あ", "い"]]
+
+        def retrieve(items):
+            events.append(("retrieve", [text for _, text in items]))
+            return [[] for _ in items]
+
+        def interrupted(body):
+            events.append(("llm", None))
+            raise KeyboardInterrupt()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            kwargs = dict(records=records, entities=[], model="test", window_chars=1,
+                          cache_path=root / "cache.sqlite3", audit_path=root / "audit.jsonl")
+            with self.assertRaises(KeyboardInterrupt):
+                correct_asr_windows(**kwargs, request=interrupted, retrieve_knowledge=retrieve)
+            self.assertEqual(events, [("retrieve", ["あ", "い"]), ("llm", None)])
+            responses = iter(["あ", "い"])
+
+            def request(body):
+                return {"choices": [{"message": {"content": json.dumps({"segments": [
+                    {"segment_id": 0, "corrected_text": next(responses)}
+                ]})}}]}
+
+            result = correct_asr_windows(
+                **kwargs, request=request,
+                retrieve_knowledge=lambda _: self.fail("cached requests must not retrieve again"),
+            )
+            self.assertEqual([record["text"] for record in result], ["あ", "い"])
+
     def test_prompt_requests_active_phonetic_and_lexical_correction(self) -> None:
         prompts: list[str] = []
 
@@ -94,7 +126,7 @@ class ASRCorrectionTests(unittest.TestCase):
                 model="test-model",
                 cache_path=root / "cache.json",
                 audit_path=root / "audit.jsonl",
-                retrieve_knowledge=lambda _record, text: queries.append(text) or [],
+                retrieve_knowledge=lambda items: [queries.append(text) or [] for _, text in items],
             )
 
         self.assertEqual([len(value) for value in queries], [120, 120, 10])
@@ -298,7 +330,7 @@ class ASRCorrectionTests(unittest.TestCase):
                 model="test-model",
                 cache_path=root / "cache.json",
                 audit_path=root / "audit.jsonl",
-                retrieve_knowledge=lambda _record, _text: [hit],
+                retrieve_knowledge=lambda items: [[hit] for _ in items],
             )
             audit = json.loads(
                 (root / "audit.jsonl").read_text(encoding="utf-8").splitlines()[-1]
@@ -366,7 +398,7 @@ class ASRCorrectionTests(unittest.TestCase):
         second_start = prompt.index('<SEGMENT id="1"')
         self.assertLess(first_end, second_start)
 
-    def test_asr_cache_changes_with_retrieved_knowledge(self) -> None:
+    def test_asr_cache_reuses_original_result_after_knowledge_changes(self) -> None:
         calls = 0
         hit = KnowledgeHit(
             "knowledge:first",
@@ -410,25 +442,25 @@ class ASRCorrectionTests(unittest.TestCase):
             first = correct_asr_windows(
                 **arguments,
                 request=request,
-                retrieve_knowledge=lambda _record, _text: [hit],
+                retrieve_knowledge=lambda items: [[hit] for _ in items],
             )
             second = correct_asr_windows(
                 **arguments,
                 request=request,
-                retrieve_knowledge=lambda _record, _text: [],
+                retrieve_knowledge=lambda items: [[] for _ in items],
             )
             third = correct_asr_windows(
                 **arguments,
                 request=lambda _body: self.fail("unchanged evidence should use cache"),
-                retrieve_knowledge=lambda _record, _text: [],
+                retrieve_knowledge=lambda items: [[] for _ in items],
             )
 
         self.assertEqual(first[0]["text"], "修正")
         self.assertEqual(second[0]["text"], "修正")
-        self.assertEqual(third[0]["correction_method"], "cache")
-        self.assertEqual(calls, 2)
+        self.assertEqual(third[0]["correction_method"], "llm")
+        self.assertEqual(calls, 1)
 
-    def test_asr_cache_changes_with_stage_configuration(self) -> None:
+    def test_asr_cache_keeps_stage_configuration(self) -> None:
         calls = 0
 
         def request(_body: dict[str, object]) -> dict[str, object]:
@@ -457,7 +489,7 @@ class ASRCorrectionTests(unittest.TestCase):
             correct_asr_windows(**arguments, max_tokens=1024)
             correct_asr_windows(**arguments, max_tokens=2048)
 
-        self.assertEqual(calls, 2)
+        self.assertEqual(calls, 1)
 
 
 if __name__ == "__main__":

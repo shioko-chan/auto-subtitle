@@ -11,12 +11,12 @@ from multiprocessing import shared_memory
 from pathlib import Path
 from typing import Any
 
+from .cache import CacheStore, config_snapshot, restore_config
 from .audio_buffer import AudioBuffer
 from .config import AudioAnalysisConfig
 
 logger = logging.getLogger(__name__)
 
-_CACHE_VERSION = 2
 _SILENCE_PROBE_SECONDS = 0.5
 
 
@@ -46,17 +46,15 @@ def transcribe_and_diarize(
     sample_rate: int = 16000,
 ) -> MossDiarizationResult:
     """Run MOSS once per long window and retain its speaker-aware transcript."""
-    prompt = _prompt(metadata, config.character_styles_file)
-    signature = _signature(video, config, prompt)
-    cache_path = job_dir / "moss-transcribe-diarize.json"
-    cached = _load_cache(cache_path, signature)
+    stage = CacheStore(job_dir / "cache.sqlite3").stage("audio_analysis", lambda: {
+        "config": config_snapshot(config), "metadata": metadata,
+    })
+    config = restore_config(config, stage.plan["config"])
+    prompt = stage.remember("moss:prompt", lambda: _prompt(stage.plan["metadata"], config.character_styles_file))
+    cached = stage.get("moss:result")
     if cached is not None:
-        logger.info(
-            "MOSS diarization cache: %d windows, %d segments",
-            len(cached.windows),
-            len(cached.segments),
-        )
-        return cached
+        return MossDiarizationResult([MossSegment(**item) for item in cached["segments"]], cached["transcripts"],
+                                    [tuple(item) for item in cached["windows"]])
 
     owns_memory = False
     memory: shared_memory.SharedMemory | None = None
@@ -83,20 +81,16 @@ def transcribe_and_diarize(
         sample_rate = audio_buffer.sample_rate
 
     try:
-        windows = _window_ranges(
-            samples,
-            sample_rate,
-            target_seconds=config.moss_window_seconds,
-            maximum_seconds=config.moss_max_window_seconds,
-            search_seconds=config.moss_window_search_seconds,
-        )
+        windows = [tuple(item) for item in stage.remember("moss:windows", lambda: _window_ranges(
+            samples, sample_rate, target_seconds=config.moss_window_seconds,
+            maximum_seconds=config.moss_max_window_seconds, search_seconds=config.moss_window_search_seconds,
+        ))]
         segments, transcripts = _run_windows(
             descriptor,
             windows,
             prompt,
             config,
-            cache_path=cache_path,
-            signature=signature,
+            stage=stage,
         )
     finally:
         if owns_memory:
@@ -106,7 +100,7 @@ def transcribe_and_diarize(
             memory.unlink()
 
     result = MossDiarizationResult(segments, transcripts, windows)
-    _write_cache(cache_path, signature, config, prompt, windows, segments, transcripts)
+    stage.put("moss:result", result, kind="aggregate")
     logger.info(
         "MOSS diarization wrote %d windows and %d speaker segments",
         len(windows),
@@ -121,17 +115,15 @@ def _run_windows(
     prompt: str,
     config: AudioAnalysisConfig,
     *,
-    cache_path: Path,
-    signature: str,
+    stage,
 ) -> tuple[list[MossSegment], list[dict[str, object]]]:
-    partial = _load_partial_cache(cache_path, signature, windows)
-    segments = list(partial[0]) if partial is not None else []
-    transcripts = list(partial[1]) if partial is not None else []
-    completed = {int(item["window"]) for item in transcripts}
-
+    segments = []
+    transcripts = []
     for index, window in enumerate(windows):
-        if index in completed:
-            logger.info("MOSS window %d/%d cache hit", index + 1, len(windows))
+        saved = stage.get(f"moss:{index}")
+        if saved is not None:
+            segments.extend(MossSegment(**value) for value in saved["segments"])
+            transcripts.append(saved["transcript"])
             continue
         logger.info(
             "MOSS window %d/%d: %.3f-%.3f",
@@ -163,15 +155,7 @@ def _run_windows(
         transcripts.append(transcript)
         segments.sort(key=lambda item: (item.start, item.end, item.speaker))
         transcripts.sort(key=lambda item: int(item["window"]))
-        _write_cache(
-            cache_path,
-            signature,
-            config,
-            prompt,
-            windows,
-            segments,
-            transcripts,
-        )
+        stage.put(f"moss:{index}", {"segments": [asdict(value) for value in remapped_segments], "transcript": transcript})
         logger.info(
             "MOSS window %d/%d cached: %d segments",
             index + 1,
@@ -179,32 +163,6 @@ def _run_windows(
             len(remapped_segments),
         )
     return segments, transcripts
-
-
-def _write_cache(
-    path: Path,
-    signature: str,
-    config: AudioAnalysisConfig,
-    prompt: str,
-    windows: list[tuple[float, float]],
-    segments: list[MossSegment],
-    transcripts: list[dict[str, object]],
-) -> None:
-    payload = {
-        "version": _CACHE_VERSION,
-        "signature": signature,
-        "model": config.moss_transcribe_model,
-        "prompt": prompt,
-        "windows": [{"start": start, "end": end} for start, end in windows],
-        "segments": [asdict(segment) for segment in segments],
-        "transcripts": transcripts,
-    }
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
 
 
 def _window_ranges(
@@ -408,96 +366,3 @@ def _prompt(metadata: dict[str, object], styles_path: str | None) -> str:
     )
 
 
-def _signature(video: Path, config: AudioAnalysisConfig, prompt: str) -> str:
-    stat = video.stat()
-    payload = {
-        "version": _CACHE_VERSION,
-        "video_size": stat.st_size,
-        "video_mtime_ns": stat.st_mtime_ns,
-        "model": config.moss_transcribe_model,
-        "window_seconds": config.moss_window_seconds,
-        "maximum_seconds": config.moss_max_window_seconds,
-        "search_seconds": config.moss_window_search_seconds,
-        "max_new_tokens": config.moss_max_new_tokens,
-        "prompt": prompt,
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
-def _load_cache(path: Path, signature: str) -> MossDiarizationResult | None:
-    if not path.is_file():
-        return None
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if (
-            value.get("version") != _CACHE_VERSION
-            or value.get("signature") != signature
-        ):
-            return None
-        windows = [
-            (float(item["start"]), float(item["end"])) for item in value["windows"]
-        ]
-        segments = _decode_segments(value["segments"], windows)
-        transcripts = _decode_transcripts(value["transcripts"], windows)
-        return MossDiarizationResult(segments, transcripts, windows)
-    except (
-        OSError,
-        ValueError,
-        TypeError,
-        KeyError,
-        RuntimeError,
-        json.JSONDecodeError,
-    ) as exc:
-        logger.warning("ignoring unreadable MOSS cache %s: %s", path, exc)
-        return None
-
-
-def _load_partial_cache(
-    path: Path,
-    signature: str,
-    windows: list[tuple[float, float]],
-) -> tuple[list[MossSegment], list[dict[str, object]]] | None:
-    if not path.is_file():
-        return None
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if value.get("version") != _CACHE_VERSION or value.get("signature") != signature:
-            return None
-        cached_windows = [
-            (float(item["start"]), float(item["end"])) for item in value["windows"]
-        ]
-        if cached_windows != windows:
-            return None
-        raw_transcripts = value["transcripts"]
-        if not isinstance(raw_transcripts, list) or len(raw_transcripts) > len(windows):
-            return None
-        transcripts: list[dict[str, object]] = []
-        for index, item in enumerate(raw_transcripts):
-            if not isinstance(item, dict):
-                return None
-            start, end = windows[index]
-            if (
-                int(item.get("window", -1)) != index
-                or abs(float(item.get("start", -1)) - start) > 1e-3
-                or abs(float(item.get("end", -1)) - end) > 1e-3
-                or not isinstance(item.get("raw"), str)
-            ):
-                return None
-            transcripts.append(
-                {"window": index, "start": start, "end": end, "raw": item["raw"]}
-            )
-        segments = _decode_segments(value["segments"], windows)
-        if any(_window_index(item.speaker) >= len(transcripts) for item in segments):
-            return None
-        return segments, transcripts
-    except (
-        OSError,
-        ValueError,
-        TypeError,
-        KeyError,
-        RuntimeError,
-        json.JSONDecodeError,
-    ):
-        return None

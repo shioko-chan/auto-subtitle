@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import argparse
 import logging
 import shutil
@@ -8,6 +9,8 @@ import warnings
 from dataclasses import replace
 from pathlib import Path
 
+from .cache import CacheStore, STAGES, job_lock
+from .publication import resolve
 from .chat_context import remove_youtube_chat_files
 from .clips import run_clips
 from .config import AppConfig, ConfigError, llm_api_key, load_config
@@ -22,7 +25,7 @@ from .knowledge_ingestion import (
     ingest_youtube_cache,
 )
 from .local_llm_server import LocalLLMServer
-from .pipeline import run_pipeline
+from .pipeline import run_pipeline, normalize_youtube_url, youtube_video_id
 from .term_extraction import extract_pending_terms, prepare_pending_terms
 from .term_web_search import TermWebSearcher
 from .translate import OpenAICompatibleTranslator
@@ -63,6 +66,29 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="generate clips locally but never upload",
     )
+
+    for command_parser in (run_parser, clips_parser):
+        command_parser.add_argument("--retry-degraded", action="store_true")
+        command_parser.add_argument("--stage", choices=tuple(STAGES))
+    cache_parser = subparsers.add_parser("cache", help="inspect or reset computation results")
+    cache_commands = cache_parser.add_subparsers(dest="cache_command", required=True)
+    cache_status = cache_commands.add_parser("status")
+    cache_status.add_argument("url")
+    cache_reset = cache_commands.add_parser("reset")
+    cache_reset.add_argument("url")
+    selection = cache_reset.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--stage", choices=tuple(STAGES))
+    selection.add_argument("--all", action="store_true")
+    publication_parser = subparsers.add_parser("publication")
+    publication_commands = publication_parser.add_subparsers(dest="publication_command", required=True)
+    resolution = publication_commands.add_parser("resolve")
+    resolution.add_argument("url")
+    resolution.add_argument("--target", choices=("main", "clips"), required=True)
+    outcome = resolution.add_mutually_exclusive_group(required=True)
+    outcome.add_argument("--uploaded", action="store_true")
+    outcome.add_argument("--not-uploaded", action="store_true")
+    resolution.add_argument("--aid", type=int)
+    resolution.add_argument("--bvid")
 
     subparsers.add_parser("check", help="check local executables and configuration")
     knowledge_parser = subparsers.add_parser(
@@ -137,16 +163,37 @@ def main(argv: list[str] | None = None) -> int:
             return _check(config)
         if args.command == "knowledge":
             return _knowledge(config, args)
+        if args.command in {"cache", "publication"}:
+            directory = config.work_dir.resolve() / youtube_video_id(normalize_youtube_url(args.url))
+            if args.command == "cache" and args.cache_command == "status":
+                print(json.dumps(CacheStore.inspect(directory / "cache.sqlite3"), ensure_ascii=False, indent=2))
+                return 0
+            with job_lock(directory):
+                if args.command == "publication":
+                    if args.not_uploaded and (args.aid is not None or args.bvid is not None):
+                        raise ValueError("--not-uploaded cannot include submission IDs")
+                    path = directory / ("manifest.json" if args.target == "main" else "clips/upload.json")
+                    resolve(path, uploaded=args.uploaded, aid=args.aid, bvid=args.bvid)
+                else:
+                    store = CacheStore(directory / "cache.sqlite3")
+                    if args.cache_command == "status":
+                        print(json.dumps(store.status(), ensure_ascii=False, indent=2))
+                    else:
+                        store.reset(args.stage)
+            return 0
+        if args.retry_degraded != bool(args.stage):
+            raise ValueError("--retry-degraded and --stage must be used together")
+        retry = {"retry_degraded": args.stage} if args.retry_degraded else {}
         override = True if args.upload else False if args.no_upload else None
         if args.command == "clips":
-            clips = run_clips(args.url, config, upload_override=override)
+            clips = run_clips(args.url, config, upload_override=override, **retry)
             logging.info("clips complete: %d part(s)", len(clips.parts))
             logging.info(
                 "clips uploaded to Bilibili: %s",
                 "yes" if clips.uploaded else "no",
             )
             return 0
-        result = run_pipeline(args.url, config, upload_override=override)
+        result = run_pipeline(args.url, config, upload_override=override, **retry)
         logging.info("complete: %s", result.rendered_video)
         logging.info("uploaded to Bilibili: %s", "yes" if result.uploaded else "no")
         return 0

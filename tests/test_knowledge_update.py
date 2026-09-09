@@ -13,6 +13,54 @@ from subtitle_pipeline.knowledge_update import update_knowledge_if_stale
 
 
 class KnowledgeUpdateTests(unittest.TestCase):
+    def test_failed_attempt_skips_rerun_until_interval_expires(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "knowledge.sqlite3"
+            config = AppConfig(fan_knowledge=FanKnowledgeConfig(
+                database_path=str(path), embedding_model=None,
+                youtube_sources=[], sns_sources=[],
+                official_sources=["https://example.jp/news/"],
+            ))
+            retriever = FanKnowledgeRetriever(path)
+            try:
+                with patch(
+                    "subtitle_pipeline.knowledge_update.collect_official_documents",
+                    side_effect=RuntimeError("network failed"),
+                ) as collect:
+                    update_knowledge_if_stale(config, retriever)
+                    error = retriever.metadata("automatic_update_last_error")
+                    update_knowledge_if_stale(config, retriever)
+                    self.assertEqual(collect.call_count, 1)
+                    self.assertEqual(retriever.metadata("automatic_update_last_error"), error)
+                    self.assertIsNone(retriever.metadata("automatic_update_last_success_at"))
+                    retriever.set_metadata("automatic_update_last_attempt_at", "2000-01-01T00:00:00+00:00")
+                    update_knowledge_if_stale(config, retriever)
+                    self.assertEqual(collect.call_count, 2)
+            finally:
+                retriever.close()
+
+    def test_interrupted_attempt_is_recorded_before_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "knowledge.sqlite3"
+            config = AppConfig(fan_knowledge=FanKnowledgeConfig(
+                database_path=str(path), embedding_model=None,
+                youtube_sources=[], sns_sources=[],
+                official_sources=["https://example.jp/news/"],
+            ))
+            retriever = FanKnowledgeRetriever(path)
+            try:
+                with patch(
+                    "subtitle_pipeline.knowledge_update.collect_official_documents",
+                    side_effect=KeyboardInterrupt,
+                ) as collect:
+                    with self.assertRaises(KeyboardInterrupt):
+                        update_knowledge_if_stale(config, retriever)
+                    self.assertIsNotNone(retriever.metadata("automatic_update_last_attempt_at"))
+                    update_knowledge_if_stale(config, retriever)
+                    self.assertEqual(collect.call_count, 1)
+            finally:
+                retriever.close()
+
     def test_recent_success_skips_collection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")

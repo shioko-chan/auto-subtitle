@@ -1283,14 +1283,44 @@ class FanKnowledgeRetriever:
     def _retrieve(
         self, query: KnowledgeQuery, *, include_term_records: bool
     ) -> list[KnowledgeHit]:
-        if query.top_k < 1 or not query.text.strip():
-            return []
-        normalized = _normalize_query(query.text)
-        vector_scores = (
-            self._vector_index.search(normalized.text, _VECTOR_CANDIDATES)
-            if self._vector_index is not None
-            else {}
+        return self._retrieve_many([query], include_term_records=include_term_records)[0]
+
+    def retrieve_background_many(self, queries: list[KnowledgeQuery]) -> list[list[KnowledgeHit]]:
+        return self._retrieve_many(queries, include_term_records=False)
+
+    def _retrieve_many(
+        self, queries: list[KnowledgeQuery], *, include_term_records: bool
+    ) -> list[list[KnowledgeHit]]:
+        results: list[list[KnowledgeHit]] = [[] for _ in queries]
+        active = [(i, query) for i, query in enumerate(queries) if query.top_k > 0 and query.text.strip()]
+        if not active:
+            return results
+        _LOGGER.info("Knowledge batch retrieval: encoding %d queries", len(active))
+        normalized = [_normalize_query(query.text) for _, query in active]
+        vector_rows = (
+            self._vector_index.search_many([value.text for value in normalized], _VECTOR_CANDIDATES)
+            if self._vector_index is not None else [{} for _ in active]
         )
+        _LOGGER.info("Knowledge batch retrieval: selecting candidates")
+        prepared = [
+            self._retrieval_candidates(query, norm, vectors, include_term_records=include_term_records)
+            for (_, query), norm, vectors in zip(active, normalized, vector_rows, strict=True)
+        ]
+        _LOGGER.info("Knowledge batch retrieval: reranking %d pairs", sum(len(hits) for hits, _ in prepared))
+        reranked = (
+            self._reranker.score_many([
+                (norm.text, [hit.body for hit in hits])
+                for norm, (hits, _) in zip(normalized, prepared, strict=True)
+            ])
+            if self._reranker is not None else [None for _ in active]
+        )
+        for (position, query), (hits, count), scores in zip(active, prepared, reranked, strict=True):
+            results[position] = self._finish_retrieval(
+                query, hits, count, scores, include_term_records=include_term_records
+            )
+        return results
+
+    def _retrieval_candidates(self, query, normalized, vector_scores, *, include_term_records):
         with self._lock:
             candidates = self._candidates(
                 query,
@@ -1310,11 +1340,10 @@ class FanKnowledgeRetriever:
             self._score(candidate, query, normalized, vector_scores, idf)
             for candidate in fused
         ]
-        if self._reranker is not None:
-            reranker_scores = self._reranker.score(
-                normalized.text,
-                [hit.body for hit in hits],
-            )
+        return hits, len(candidates)
+
+    def _finish_retrieval(self, query, hits, candidate_count, reranker_scores, *, include_term_records):
+        if reranker_scores is not None:
             hits = [
                 replace(
                     hit,
@@ -1345,7 +1374,7 @@ class FanKnowledgeRetriever:
             query,
             selected,
             rejected,
-            len(candidates),
+            candidate_count,
             event=(
                 "fan_knowledge_retrieval"
                 if include_term_records

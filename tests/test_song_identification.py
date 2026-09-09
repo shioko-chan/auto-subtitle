@@ -1,3 +1,4 @@
+from subtitle_pipeline.cache import CacheStore
 import json
 import unittest
 from pathlib import Path
@@ -17,22 +18,24 @@ from subtitle_pipeline.song_identification import (
     _apply_local_match,
     _build_lyric_search_queries,
     _competing_line_sets,
-    _load_cache,
+    decode_song_result,
     _lyric_unit_timeline_errors,
     _materialize_verification_stems,
     _merged_cue_duration,
     _parse_worker_json_output,
     _public_http_url,
     _pyshiro_likelihood_wins,
+    _rank_candidate_matches,
     _rank_lyric_search_results,
     _recover_lyric_ranges,
     _refine_match_with_speech_support,
     _routed_speech_cue_ids,
     _run_pyshiro_lines,
     _search_canonical_lyrics,
-    _signature,
+    _songs_matching_ocr_title,
     _supported_lyrics_url,
     _title_uses_music_mode,
+    _validate_ocr_title_song,
     _web_search_policy,
     aggregate_ocr_observations,
     apply_lyric_corrections,
@@ -47,6 +50,31 @@ from subtitle_pipeline.subtitles import Cue, TimedTextUnit
 
 
 class SongIdentificationTests(unittest.TestCase):
+    def test_ocr_title_selects_song_without_alt_text_match(self):
+        song = LibrarySong(
+            "song",
+            "Wonder Caravan!",
+            "水瀬いのり",
+            (),
+            "https://example.com/song",
+            "hash",
+            (
+                LyricLine(0, "きらきらの歌詞"),
+                LyricLine(1, "続いてゆく歌詞"),
+            ),
+        )
+        hypothesis = "まったく異なる聞き取り結果"
+        self.assertEqual(
+            _rank_candidate_matches(
+                [hypothesis], [song], SongIdentificationConfig(match_minimum_anchors=3)
+            ),
+            [],
+        )
+        guided = _songs_matching_ocr_title([song], "Wonder Caravan!")
+
+        self.assertEqual(len(guided), 1)
+        self.assertEqual(guided[0].song_id, "song")
+
     def test_song_alignment_support_uses_wider_route_without_widening_speech(self):
         group = group_song_search_groups([Cue(100, 110, "song", kind="singing")], 35)[0]
         cues = [
@@ -252,7 +280,7 @@ class SongIdentificationTests(unittest.TestCase):
             config = SongIdentificationConfig(
                 enabled=True, lyrics_library_path=str(library_path)
             )
-            signature_before = _signature(video, [], {}, config)
+            signature_before = CacheStore(root / "cache.sqlite3").stage("song_identification", lambda: {}).plan
             result = SongIdentificationResult(
                 [
                     Cue(1, 2, "一行目", "singer", "singing"),
@@ -278,8 +306,9 @@ class SongIdentificationTests(unittest.TestCase):
                     "llm",
                 ),
                 lyrics_translation_model="test-model",
+                cache_path=Path(directory) / "cache.sqlite3",
             )
-            signature_after = _signature(video, [], {}, config)
+            signature_after = CacheStore(root / "cache.sqlite3").existing("song_identification").plan
 
         self.assertEqual(
             [cue.preferred_translation for cue in translated.corrected_cues],
@@ -287,7 +316,7 @@ class SongIdentificationTests(unittest.TestCase):
         )
         self.assertEqual(signature_before, signature_after)
 
-    def test_existing_complete_llm_lyrics_are_used_without_another_llm_call(self):
+    def test_existing_machine_lyrics_do_not_bypass_stage_version(self):
         with TemporaryDirectory() as directory:
             library_path = Path(directory) / "lyrics.sqlite3"
             library = LyricsLibrary(library_path)
@@ -331,10 +360,9 @@ class SongIdentificationTests(unittest.TestCase):
                 SongIdentificationConfig(
                     enabled=True, lyrics_library_path=str(library_path)
                 ),
-                lambda *_args, **_kwargs: self.fail(
-                    "complete existing lyrics must not be translated again"
-                ),
+                lambda *_args, **_kwargs: ({0: "新前一行", 1: "蜕变", 2: "新下一行"}, "llm"),
                 lyrics_translation_model="test-model",
+                cache_path=Path(directory) / "cache.sqlite3",
             )
             library = LyricsLibrary(library_path)
             try:
@@ -342,7 +370,7 @@ class SongIdentificationTests(unittest.TestCase):
             finally:
                 library.close()
 
-        self.assertEqual(translated.corrected_cues[0].preferred_translation, "变形虫")
+        self.assertEqual(translated.corrected_cues[0].preferred_translation, "蜕变")
         assert stored_song is not None
         self.assertEqual(stored_song.lines[1].translation_source, "llm")
 
@@ -395,6 +423,7 @@ class SongIdentificationTests(unittest.TestCase):
                     "complete external lyrics must not be translated again"
                 ),
                 lyrics_translation_model="test-model",
+                cache_path=Path(directory) / "cache.sqlite3",
             )
             library = LyricsLibrary(library_path)
             try:
@@ -455,6 +484,7 @@ class SongIdentificationTests(unittest.TestCase):
                     "verified lyrics must not be translated"
                 ),
                 lyrics_translation_model="test-model",
+                cache_path=Path(directory) / "cache.sqlite3",
             )
 
         self.assertEqual(
@@ -464,16 +494,9 @@ class SongIdentificationTests(unittest.TestCase):
 
     def test_song_cache_accepts_empty_corrected_cues(self):
         with TemporaryDirectory() as directory:
-            path = Path(directory) / "song-cache.json"
-            path.write_text(
-                '{"version":24,"signature":"test","reports":[],"corrected_cues":[]}',
-                encoding="utf-8",
-            )
-
-            result = _load_cache(path, "test", [])
-
-        self.assertIsNotNone(result)
-        assert result is not None
+            stage = CacheStore(Path(directory) / "cache.sqlite3").stage("song_identification", lambda: {})
+            stage.finish({"reports": [], "corrected_cues": []})
+            result = decode_song_result(stage.get("__result__"))
         self.assertEqual(result.corrected_cues, [])
 
     @patch(
@@ -481,8 +504,8 @@ class SongIdentificationTests(unittest.TestCase):
         return_value=([], {"queries": [], "fetches": []}),
     )
     @patch(
-        "subtitle_pipeline.song_identification._load_ocr_cache",
-        return_value=[[]],
+        "subtitle_pipeline.song_identification.collect_ocr_candidates",
+        return_value=[],
     )
     def test_unmatched_song_search_group_preserves_internal_speech(
         self, _ocr_cache, _search
@@ -520,11 +543,12 @@ class SongIdentificationTests(unittest.TestCase):
     @patch("subtitle_pipeline.song_identification._validate_song_match")
     @patch("subtitle_pipeline.song_identification._rank_candidate_matches")
     @patch(
-        "subtitle_pipeline.song_identification._load_ocr_cache",
-        return_value=[[]],
+        "subtitle_pipeline.song_identification.collect_ocr_candidates",
+        return_value=[],
     )
+    @patch("subtitle_pipeline.song_identification._EasyOCR")
     def test_one_search_group_can_verify_two_songs(
-        self, _ocr_cache, rank_matches, validate_match
+        self, _easy_ocr, _ocr_cache, rank_matches, validate_match
     ):
         first_song = LibrarySong(
             "first",
@@ -544,12 +568,8 @@ class SongIdentificationTests(unittest.TestCase):
             "second-hash",
             (LyricLine(0, "第二曲"),),
         )
-        first_match = SongMatch(
-            first_song, (LyricAnchor(0, 0, 1, 0.9),), 0.9
-        )
-        second_match = SongMatch(
-            second_song, (LyricAnchor(0, 0, 1, 0.9),), 0.9
-        )
+        first_match = SongMatch(first_song, (LyricAnchor(0, 0, 1, 0.9),), 0.9)
+        second_match = SongMatch(second_song, (LyricAnchor(0, 0, 1, 0.9),), 0.9)
         rank_matches.side_effect = [[first_match], [second_match]]
 
         def validate(
@@ -609,57 +629,27 @@ class SongIdentificationTests(unittest.TestCase):
                 ),
             )
 
-        self.assertEqual([report["song"] for report in result.reports], [
-            "First Song",
-            "Second Song",
-        ])
+        self.assertEqual(
+            [report["song"] for report in result.reports],
+            [
+                "First Song",
+                "Second Song",
+            ],
+        )
         self.assertEqual(
             [cue.text for cue in result.corrected_cues], ["第一曲", "第二曲"]
         )
         self.assertEqual(validate_match.call_count, 2)
 
-    def test_song_cache_signature_ignores_runtime_metadata(self):
+    def test_song_cache_ignores_changed_metadata_until_reset(self):
         with TemporaryDirectory() as directory:
-            root = Path(directory)
-            video = root / "video.mp4"
-            video.write_bytes(b"video")
-            config = SongIdentificationConfig(
-                lyrics_library_path=str(root / "lyrics.sqlite3")
-            )
-            cues = [Cue(0, 1, "歌詞", kind="singing")]
-            first = _signature(
-                video,
-                cues,
-                {
-                    "id": "video-id",
-                    "title": "歌枠",
-                    "channel_id": "channel-id",
-                    "epoch": 100,
-                    "requested_downloads": [{"temporary": "value"}],
-                },
-                config,
-            )
-            second = _signature(
-                video,
-                cues,
-                {
-                    "id": "video-id",
-                    "title": "歌枠",
-                    "channel_id": "channel-id",
-                    "epoch": 200,
-                    "requested_downloads": [{"temporary": "changed"}],
-                },
-                config,
-            )
-            changed_title = _signature(
-                video,
-                cues,
-                {"id": "video-id", "title": "別の歌枠"},
-                config,
-            )
-
-        self.assertEqual(first, second)
-        self.assertNotEqual(first, changed_title)
+            store = CacheStore(Path(directory) / "cache.sqlite3")
+            first = store.stage("song_identification", lambda: {"title": "歌枠"})
+            second = store.stage("song_identification", lambda: {"title": "別の歌枠"})
+            self.assertEqual(first.plan, second.plan)
+            store.reset("song_identification")
+            third = store.stage("song_identification", lambda: {"title": "別の歌枠"})
+            self.assertNotEqual(first.plan, third.plan)
 
     @patch("subtitle_pipeline.song_identification._run_pyshiro_lines")
     @patch(
@@ -700,6 +690,7 @@ class SongIdentificationTests(unittest.TestCase):
         ]
         with TemporaryDirectory() as directory:
             job_dir = Path(directory)
+
             def create_stems(_video, probes, output_dir, _device, _manifest):
                 for index, probe in enumerate(probes):
                     wav = output_dir / f"{index}.wav"
@@ -727,9 +718,7 @@ class SongIdentificationTests(unittest.TestCase):
 
     @patch("subtitle_pipeline.song_identification._materialize_verification_stems")
     @patch("subtitle_pipeline.song_identification.shutil.which", return_value="uv")
-    def test_long_lyric_gap_is_split_at_pyshiro_limit(
-        self, _which, materialize
-    ):
+    def test_long_lyric_gap_is_split_at_pyshiro_limit(self, _which, materialize):
         song = LibrarySong(
             "song",
             "title",
@@ -760,6 +749,41 @@ class SongIdentificationTests(unittest.TestCase):
         probes = materialize.call_args.args[1]
         self.assertEqual(len(probes), 4)
         self.assertTrue(all(probe["end"] - probe["start"] <= 15 for probe in probes))
+
+    @patch("subtitle_pipeline.song_identification._verify_lyric_range")
+    @patch("subtitle_pipeline.song_identification._materialize_verification_stems")
+    @patch("subtitle_pipeline.song_identification.shutil.which", return_value="uv")
+    def test_prefix_recovery_uses_space_before_first_line_in_same_cue(
+        self, _which, _materialize, verify
+    ):
+        song = LibrarySong(
+            "song",
+            "Title",
+            "Singer",
+            (),
+            "https://example.com/song",
+            "hash",
+            tuple(LyricLine(index, f"歌詞{index}") for index in range(4)),
+        )
+        match = SongMatch(song, (LyricAnchor(0, 2, 3, 0.9),), 0.9)
+        verify.return_value = ([], [], {"status": "range_rejected"})
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "worker.py").write_text("", encoding="utf-8")
+            _recover_lyric_ranges(
+                root,
+                [Cue(10, 20, "歌詞2", kind="singing")],
+                [0],
+                match,
+                SongIdentificationConfig(pyshiro_worker_project=str(root)),
+                video=root / "video.mp4",
+                verified_replacements={0: [Cue(14, 18, "歌詞2", kind="singing")]},
+            )
+
+        probe = verify.call_args.args[0]
+        self.assertEqual(probe["route"], "take_prefix")
+        self.assertEqual((probe["start"], probe["end"]), (10, 14))
+        self.assertEqual(probe["line_ids"], [0, 1])
 
     def test_gap_recovery_never_bridges_separate_song_takes(self):
         song = LibrarySong(
@@ -867,6 +891,37 @@ class SongIdentificationTests(unittest.TestCase):
             )
 
         easy_ocr.assert_not_called()
+
+    @patch(
+        "subtitle_pipeline.song_identification.collect_ocr_candidates",
+        return_value=[
+            OCRCandidate("Current Song", 0.9, 1, 0.0, 0.0, (0.0, 0.0, 1.0, 1.0))
+        ],
+    )
+    @patch("subtitle_pipeline.song_identification._EasyOCR")
+    @patch("subtitle_pipeline.song_identification._search_canonical_lyrics", return_value=([], {"queries": [], "fetches": [], "worker_errors": []}))
+    def test_ocr_title_selector_failure_is_saved_as_degraded(
+        self, _search, _easy_ocr, _collect
+    ):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "video.mp4"
+            video.write_bytes(b"video")
+            selector = MagicMock(side_effect=TimeoutError("temporary"))
+
+            identify_and_align_songs(
+                video,
+                [Cue(0, 12, "unmatched lyric text", kind="singing")],
+                {"title": "【歌枠】test"},
+                root,
+                SongIdentificationConfig(
+                    enabled=True,
+                    lyrics_library_path=str(root / "lyrics.sqlite3")
+                ),
+                select_ocr_titles=selector,
+            )
+
+            self.assertEqual(CacheStore(root / "cache.sqlite3").existing("song_identification").record("group:0")["status"], "degraded")
 
     @patch(
         "subtitle_pipeline.song_identification.collect_ocr_candidates",
@@ -1023,11 +1078,74 @@ class SongIdentificationTests(unittest.TestCase):
             model="test-model",
             json_mode=True,
             thinking=None,
+            context_size=16384,
         )
 
         self.assertEqual(titles, ["Bling-Bang-Bang-Born", None])
         prompt = request.call_args.args[0]["messages"][1]["content"]
         self.assertIn('"bounds":[10.0,40.0,250.0,70.0]', prompt)
+
+    def test_ocr_title_selection_batches_to_fit_context(self):
+        def respond(body):
+            prompt = body["messages"][1]["content"]
+            groups = json.loads(prompt.split("OCR_GROUPS:\n", 1)[1])
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "groups": [
+                                        {
+                                            "group_id": group["group_id"],
+                                            "song_title": None,
+                                        }
+                                        for group in groups
+                                    ]
+                                }
+                            )
+                        },
+                    }
+                ]
+            }
+
+        request = MagicMock(side_effect=respond)
+        candidates = [
+            [
+                OCRCandidate(
+                    f"title-{index}-" + "x" * 1400,
+                    0.99,
+                    1,
+                    0.0,
+                    0.0,
+                    (10.0, 40.0, 250.0, 70.0),
+                )
+            ]
+            for index in range(8)
+        ]
+
+        titles = select_ocr_song_titles(
+            candidates,
+            video_title="【歌枠】test",
+            request=request,
+            model="test-model",
+            json_mode=True,
+            thinking=None,
+            context_size=4096,
+        )
+
+        self.assertEqual(titles, [None] * 8)
+        self.assertGreater(request.call_count, 1)
+        for call in request.call_args_list:
+            body = call.args[0]
+            prompt_characters = sum(
+                len(message["content"]) for message in body["messages"]
+            ) + 2
+            self.assertLessEqual(
+                prompt_characters + body["max_tokens"],
+                4096,
+            )
 
     def test_search_ocr_excludes_previously_confirmed_song_name(self):
         queries = _build_lyric_search_queries([], "OLD SONG", {"oldsong"})
@@ -1251,6 +1369,74 @@ class SongIdentificationTests(unittest.TestCase):
         self.assertEqual(timings[0][0][1:3], (10.2, 14.8))
         self.assertEqual(audits, [{"status": "aligned"}])
         materialize.assert_called_once()
+
+    @patch("subtitle_pipeline.song_identification._verify_lyric_range")
+    @patch("subtitle_pipeline.song_identification._materialize_verification_stems")
+    @patch("subtitle_pipeline.song_identification.shutil.which", return_value="uv")
+    def test_ocr_title_directly_aligns_lyrics_without_using_alt_text(
+        self, _which, _materialize, verify
+    ):
+        song = LibrarySong(
+            "song",
+            "Title",
+            "Singer",
+            (),
+            "https://example.com/song",
+            "hash",
+            (
+                LyricLine(0, "最初の歌詞"),
+                LyricLine(1, "次の歌詞"),
+                LyricLine(2, "三番目の歌詞"),
+                LyricLine(3, "最後の歌詞"),
+            ),
+        )
+        first = [
+            Cue(10.2, 12.4, "最初の歌詞", kind="singing"),
+            Cue(12.4, 14.8, "次の歌詞", kind="singing"),
+        ]
+        second = [
+            Cue(20.2, 22.4, "三番目の歌詞", kind="singing"),
+            Cue(22.4, 24.8, "最後の歌詞", kind="singing"),
+        ]
+        verify.side_effect = [
+            (
+                first,
+                [{"asr_cue_ids": [0], "lyric_line_ids": [0, 1]}],
+                {"status": "aligned"},
+            ),
+            (
+                second,
+                [{"asr_cue_ids": [1], "lyric_line_ids": [2, 3]}],
+                {"status": "aligned"},
+            ),
+        ]
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "worker.py").write_text("", encoding="utf-8")
+            match, alignment_ids, replacements, alignments, audits = (
+                _validate_ocr_title_song(
+                    root,
+                    root / "video.mp4",
+                    [
+                        Cue(10, 15, "completely wrong ALT", kind="singing"),
+                        Cue(20, 25, "also unrelated ALT", kind="singing"),
+                    ],
+                    [0, 1],
+                    song,
+                    SongIdentificationConfig(pyshiro_worker_project=str(root)),
+                )
+            )
+
+        probes = [call.args[0] for call in verify.call_args_list]
+        self.assertEqual([probe["line_ids"] for probe in probes], [[0, 1], [2, 3]])
+        self.assertTrue(all(not probe["require_preference"] for probe in probes))
+        self.assertTrue(all(probe["required_margin"] == 0.0 for probe in probes))
+        self.assertEqual(match.song.song_id, "song")
+        self.assertEqual(alignment_ids, [0, 1])
+        self.assertEqual(replacements, {0: first, 1: second})
+        self.assertEqual(len(alignments), 2)
+        self.assertEqual(audits, [{"status": "aligned"}, {"status": "aligned"}])
+        _materialize.assert_called_once()
 
     def test_verified_lyrics_trim_overlapping_speech_at_aligner_units(self):
         speech = Cue(

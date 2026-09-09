@@ -10,7 +10,7 @@ import socket
 import subprocess
 import sys
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, replace
 from difflib import SequenceMatcher
 from itertools import pairwise
@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .cache import StageCache, CacheStore, config_snapshot, restore_config
 from .commands import require_command
 from .config import SongIdentificationConfig
 from .llm_response import (
@@ -29,13 +30,12 @@ from .llm_response import (
 )
 from .lyrics_library import LibrarySong, LyricLine, LyricsLibrary
 from .lyrics_matching import JapaneseNormalizer, LyricAnchor, SongMatch, match_song
-from .prompt_templates import prompt_templates_digest, render_user_prompt
+from .prompt_budget import batch_prompt_items
+from .prompt_templates import prompt_system, render_user_prompt
 from .source_language import language_for_text
 from .subtitles import Cue, TimedTextUnit, cue_from_mapping, text_display_width
 
-_CACHE_VERSION = 24
 _PROMPT_VERSION = 8
-_OCR_CACHE_VERSION = 2
 _OCR_TITLE_PROMPT = "select-ocr-song-titles.md"
 _RELAXED_SEARCH_TITLE_KEYWORDS = (
     "歌枠",
@@ -109,94 +109,74 @@ def identify_and_align_songs(
     select_ocr_titles: Callable[[list[list[OCRCandidate]]], list[str | None]]
     | None = None,
 ) -> SongIdentificationResult:
+    stage = CacheStore(job_dir / "cache.sqlite3").stage("song_identification", lambda: {
+        "config": config_snapshot(config), "cues": [asdict(cue) for cue in cues],
+        "metadata": metadata, "source_maximum_units": source_maximum_units,
+    })
+    config = restore_config(config, stage.plan["config"])
+    cues = [cue_from_mapping(value) for value in stage.plan["cues"]]
+    metadata = stage.plan["metadata"]
+    source_maximum_units = stage.plan["source_maximum_units"]
+    cached = stage.get("__result__")
+    if cached is not None:
+        return decode_song_result(cached)
     groups = group_song_search_groups(cues, config.song_search_group_gap_seconds)
     if not config.enabled or not groups:
-        return SongIdentificationResult(cues, [])
-
-    cache_path = job_dir / "song-identification-cache.json"
-    signature = _signature(
-        video,
-        cues,
-        metadata,
-        config,
-        source_maximum_units=source_maximum_units,
-    )
-    cached = _load_cache(cache_path, signature, cues)
-    if cached is not None:
-        return cached
-
-    ocr_cache_path = job_dir / "song-ocr-cache.json"
-    ocr_signature = _ocr_signature(video, groups, metadata, config)
-    candidate_sets = _load_ocr_cache(ocr_cache_path, ocr_signature, len(groups))
-    if candidate_sets is None:
-        candidate_sets = []
-        ocr_succeeded = False
-        if not _title_uses_music_mode(metadata):
-            logging.info(
-                "skipping song OCR because the video title is not an explicit "
-                "music format"
-            )
-            candidate_sets = [[] for _ in groups]
-            ocr_succeeded = True
-        else:
-            try:
-                logging.info("starting EasyOCR song-title worker")
-                ocr = _EasyOCR(config)
-            except Exception as exc:
-                logging.warning(
-                    "song OCR worker failed to start; continuing without OCR: %s",
-                    exc,
-                )
-                candidate_sets = [[] for _ in groups]
-            else:
-                try:
-                    logging.info("EasyOCR song-title worker is ready")
-                    logging.info(
-                        "running one-frame song OCR for %d search groups", len(groups)
-                    )
-                    for index, group in enumerate(groups):
-                        try:
-                            candidates = collect_ocr_candidates(
-                                video,
-                                group,
-                                job_dir / "song-ocr-frames" / f"{index:03d}",
-                                config,
-                                ocr,
-                            )
-                        except Exception as exc:
-                            logging.warning(
-                                "song OCR failed for %.3f-%.3fs: %s",
-                                group.start,
-                                group.end,
-                                exc,
-                            )
-                            candidates = []
-                        candidate_sets.append(candidates)
-                        logging.info(
-                            "song OCR group %d/%d timestamp=%.3fs candidates=%d",
-                            index + 1,
-                            len(groups),
-                            group.start,
-                            len(candidates),
+        result = SongIdentificationResult(cues, [])
+        stage.finish(result)
+        return result
+    candidate_sets = []
+    ocr_failures = []
+    ocr = None
+    worker_error = None
+    try:
+        for index, group in enumerate(groups):
+            key = f"ocr:{index}"
+            saved = stage.get(key)
+            if saved is None:
+                reason = None
+                candidates = []
+                if _title_uses_music_mode(metadata):
+                    try:
+                        if worker_error is not None:
+                            raise RuntimeError(worker_error)
+                        if ocr is None:
+                            try:
+                                ocr = _EasyOCR(config)
+                            except Exception as exc:
+                                worker_error = f"{type(exc).__name__}: {exc}"
+                                raise
+                        candidates = collect_ocr_candidates(
+                            video, group, job_dir / "song-ocr-frames" / f"{index:03d}", config, ocr,
                         )
-                    ocr_succeeded = True
-                finally:
-                    ocr.close()
-        if ocr_succeeded:
-            _write_ocr_cache(ocr_cache_path, ocr_signature, candidate_sets)
+                    except Exception as exc:
+                        reason = f"{type(exc).__name__}: {exc}"
+                        logging.warning("song OCR unavailable for group %d: %s", index, reason)
+                saved = {"candidates": [asdict(candidate) for candidate in candidates], "error": reason}
+                stage.put(key, saved, source="ocr", reason=reason)
+            candidate_sets.append([OCRCandidate(**item) for item in saved["candidates"]])
+            ocr_failures.append(saved["error"])
+    finally:
+        if ocr is not None:
+            ocr.close()
 
-    ocr_titles = (
-        select_ocr_titles(candidate_sets)
-        if select_ocr_titles is not None and any(candidate_sets)
-        else [None for _ in groups]
-    )
-    if len(ocr_titles) != len(groups):
-        raise RuntimeError("OCR title selector changed the search-group count")
-    logging.info(
-        "LLM selected current song titles for %d/%d OCR search groups",
-        sum(title is not None for title in ocr_titles),
-        len(groups),
-    )
+    selection = stage.get("ocr_titles")
+    if selection is None:
+        reason = None
+        titles = [None for _ in groups]
+        if select_ocr_titles is not None and any(candidate_sets):
+            try:
+                titles = select_ocr_titles(candidate_sets)
+                if len(titles) != len(groups):
+                    raise ValueError("OCR title selector changed the search-group count")
+            except Exception as exc:
+                reason = f"{type(exc).__name__}: {exc}"
+                logging.warning("song-title selection downgraded: %s", reason)
+                titles = [None for _ in groups]
+        selection = {"titles": titles, "error": reason}
+        stage.put("ocr_titles", selection, source="llm", reason=reason)
+    ocr_titles = selection["titles"]
+    ocr_title_selection_failed = selection["error"] is not None
 
     reports: list[dict[str, object]] = []
     verified_spans: list[VerifiedLyricSpan] = []
@@ -206,243 +186,303 @@ def identify_and_align_songs(
     library = LyricsLibrary(Path(config.lyrics_library_path).resolve())
     try:
         for index, group in enumerate(groups):
-            candidates = candidate_sets[index]
-            ocr_title = ocr_titles[index]
-            group_singing_ids = [
-                cue_id for cue_id in group.cue_ids if cues[cue_id].kind == "singing"
-            ]
-            speech_ids = _routed_speech_cue_ids(group, cues, config)
-            library_songs = library.songs()
-            logging.info(
-                "song search group %d/%d range=%.3f-%.3fs alt_cues=%d "
-                "ocr_candidates=%d",
-                index + 1,
-                len(groups),
-                group.start,
-                group.end,
-                len(group_singing_ids),
-                len(candidates),
-            )
-            pending_ids = set(group_singing_ids)
-            while pending_ids:
-                singing_ids = sorted(pending_ids)
-                hypotheses = [cues[cue_id].text for cue_id in singing_ids]
-                route_cues = {
-                    "alt_cue_ids": singing_ids,
-                    "speech_cue_ids": speech_ids,
-                }
-                queries = _build_lyric_search_queries(
-                    hypotheses,
-                    ocr_title,
-                    confirmed_song_names,
+            saved = stage.get(f"group:{index}")
+            if saved is not None:
+                reports.extend(saved["reports"])
+                verified_spans.extend(VerifiedLyricSpan(**value) for value in saved["spans"])
+                lyric_replacements.update({int(key): [cue_from_mapping(item) for item in values]
+                                           for key, values in saved["replacements"].items()})
+                discarded_song_region_cues.update(saved["discarded"])
+                confirmed_song_names.update(saved["names"])
+                continue
+            with stage.attempt(f"group:{index}"):
+                report_start, span_start = len(reports), len(verified_spans)
+                prior_replacements = set(lyric_replacements)
+                prior_discarded = set(discarded_song_region_cues)
+                candidates = candidate_sets[index]
+                ocr_title = ocr_titles[index]
+                group_singing_ids = [
+                    cue_id for cue_id in group.cue_ids if cues[cue_id].kind == "singing"
+                ]
+                speech_ids = _routed_speech_cue_ids(group, cues, config)
+                library_songs = library.songs()
+                logging.info(
+                    "song search group %d/%d range=%.3f-%.3fs alt_cues=%d "
+                    "ocr_candidates=%d",
+                    index + 1,
+                    len(groups),
+                    group.start,
+                    group.end,
+                    len(group_singing_ids),
+                    len(candidates),
                 )
-                policy = _web_search_policy(
-                    [cues[cue_id] for cue_id in singing_ids],
-                    metadata,
-                    has_trusted_ocr=any(
-                        item.get("source") == "ocr" for item in queries
-                    ),
-                )
-                web_search_audit: dict[str, object] = {
-                    **policy,
-                    "queries": [],
-                    "fetches": [],
-                    "worker_errors": [],
-                }
-                resolved: tuple[
-                    str,
-                    SongMatch,
-                    list[int],
-                    dict[int, list[Cue]],
-                    list[dict[str, object]],
-                    list[dict[str, object]],
-                ] | None = None
-                attempted_song_ids: set[str] = set()
-                for candidate_match in _rank_candidate_matches(
-                    hypotheses, library_songs, config
-                ):
-                    attempted_song_ids.add(candidate_match.song.song_id)
-                    validated = _validate_song_match(
-                        job_dir,
-                        video,
-                        cues,
-                        singing_ids,
-                        speech_ids,
-                        candidate_match,
-                        config,
-                        source_maximum_units,
+                pending_ids = set(group_singing_ids)
+                while pending_ids:
+                    singing_ids = sorted(pending_ids)
+                    hypotheses = [cues[cue_id].text for cue_id in singing_ids]
+                    route_cues = {
+                        "alt_cue_ids": singing_ids,
+                        "speech_cue_ids": speech_ids,
+                    }
+                    queries = _build_lyric_search_queries(
+                        hypotheses,
+                        ocr_title,
+                        confirmed_song_names,
                     )
-                    (
-                        candidate_match,
-                        alignment_ids,
-                        replacements,
-                        alignments,
-                        audits,
-                    ) = validated
-                    if replacements:
-                        resolved = (
-                            "local_library",
+                    policy = _web_search_policy(
+                        [cues[cue_id] for cue_id in singing_ids],
+                        metadata,
+                        has_trusted_ocr=any(
+                            item.get("source") == "ocr" for item in queries
+                        ),
+                    )
+                    web_search_audit: dict[str, object] = {
+                        **policy,
+                        "queries": [],
+                        "fetches": [],
+                        "worker_errors": [],
+                    }
+                    resolved: (
+                        tuple[
+                            str,
+                            SongMatch,
+                            list[int],
+                            dict[int, list[Cue]],
+                            list[dict[str, object]],
+                            list[dict[str, object]],
+                        ]
+                        | None
+                    ) = None
+                    attempted_song_ids: set[str] = set()
+                    for song in _songs_matching_ocr_title(library_songs, ocr_title):
+                        validated = _validate_ocr_title_song(
+                            job_dir,
+                            video,
+                            cues,
+                            singing_ids,
+                            song,
+                            config,
+                        )
+                        if validated[2]:
+                            resolved = ("local_library", *validated)
+                            break
+                    if resolved is None:
+                        local_matches = _rank_candidate_matches(
+                            hypotheses, library_songs, config
+                        )
+                    else:
+                        local_matches = []
+                    for candidate_match in local_matches:
+                        attempted_song_ids.add(candidate_match.song.song_id)
+                        validated = _validate_song_match(
+                            job_dir,
+                            video,
+                            cues,
+                            singing_ids,
+                            speech_ids,
+                            candidate_match,
+                            config,
+                            source_maximum_units,
+                        )
+                        (
                             candidate_match,
                             alignment_ids,
                             replacements,
                             alignments,
                             audits,
-                        )
-                        break
-
-                if resolved is None and policy["eligible"]:
-                    logging.info(
-                        "song search group %d/%d starting web search mode=%s "
-                        "alt_coverage=%.3fs queries=%d",
-                        index + 1,
-                        len(groups),
-                        policy["mode"],
-                        policy["alt_coverage_seconds"],
-                        len(queries),
-                    )
-                    for query in queries[:_MAX_WEB_SEARCH_QUERIES]:
-                        fetched, audit = _search_canonical_lyrics(
-                            hypotheses, [query], config
-                        )
-                        for key in ("queries", "fetches", "worker_errors"):
-                            values = web_search_audit[key]
-                            assert isinstance(values, list)
-                            values.extend(audit.get(key, []))
-                        for candidate_match in _rank_candidate_matches(
-                            hypotheses, fetched, config
-                        ):
-                            if candidate_match.song.song_id in attempted_song_ids:
-                                continue
-                            attempted_song_ids.add(candidate_match.song.song_id)
-                            validated = _validate_song_match(
-                                job_dir,
-                                video,
-                                cues,
-                                singing_ids,
-                                speech_ids,
-                                candidate_match,
-                                config,
-                                source_maximum_units,
-                            )
-                            (
+                        ) = validated
+                        if replacements:
+                            resolved = (
+                                "local_library",
                                 candidate_match,
                                 alignment_ids,
                                 replacements,
                                 alignments,
                                 audits,
-                            ) = validated
-                            if replacements:
-                                resolved = (
-                                    "web",
+                            )
+                            break
+
+                    if resolved is None and policy["eligible"]:
+                        logging.info(
+                            "song search group %d/%d starting web search mode=%s "
+                            "alt_coverage=%.3fs queries=%d",
+                            index + 1,
+                            len(groups),
+                            policy["mode"],
+                            policy["alt_coverage_seconds"],
+                            len(queries),
+                        )
+                        for query in queries[:_MAX_WEB_SEARCH_QUERIES]:
+                            fetched, audit = _search_canonical_lyrics(
+                                hypotheses, [query], config
+                            )
+                            for key in ("queries", "fetches", "worker_errors"):
+                                values = web_search_audit[key]
+                                assert isinstance(values, list)
+                                values.extend(audit.get(key, []))
+                            for song in _songs_matching_ocr_title(fetched, ocr_title):
+                                validated = _validate_ocr_title_song(
+                                    job_dir,
+                                    video,
+                                    cues,
+                                    singing_ids,
+                                    song,
+                                    config,
+                                )
+                                if validated[2]:
+                                    resolved = ("web", *validated)
+                                    break
+                            if resolved is not None:
+                                break
+                            fetched_matches = _rank_candidate_matches(
+                                hypotheses, fetched, config
+                            )
+                            for candidate_match in fetched_matches:
+                                if candidate_match.song.song_id in attempted_song_ids:
+                                    continue
+                                attempted_song_ids.add(candidate_match.song.song_id)
+                                validated = _validate_song_match(
+                                    job_dir,
+                                    video,
+                                    cues,
+                                    singing_ids,
+                                    speech_ids,
+                                    candidate_match,
+                                    config,
+                                    source_maximum_units,
+                                )
+                                (
                                     candidate_match,
                                     alignment_ids,
                                     replacements,
                                     alignments,
                                     audits,
-                                )
+                                ) = validated
+                                if replacements:
+                                    resolved = (
+                                        "web",
+                                        candidate_match,
+                                        alignment_ids,
+                                        replacements,
+                                        alignments,
+                                        audits,
+                                    )
+                                    break
+                            if resolved is not None:
                                 break
-                        if resolved is not None:
-                            break
-                elif resolved is None:
+                    elif resolved is None:
+                        logging.info(
+                            "song search group %d/%d skipped web search reason=%s "
+                            "alt_coverage=%.3fs",
+                            index + 1,
+                            len(groups),
+                            policy["decision_reason"],
+                            policy["alt_coverage_seconds"],
+                        )
+                    if resolved is None:
+                        discarded_song_region_cues.update(singing_ids)
+                        reports.append(
+                            {
+                                "song": None,
+                                "artist": None,
+                                "confidence": "low",
+                                "evidence": ["no_acoustically_verified_lyric_match"],
+                                "sources": [],
+                                "alignments": [],
+                                "search_group": asdict(group),
+                                "route_cues": route_cues,
+                                "ocr_candidates": [asdict(item) for item in candidates],
+                                "ocr_song_title": ocr_title,
+                                "web_search": web_search_audit,
+                            }
+                        )
+                        break
+
+                    (
+                        provenance,
+                        match,
+                        alignment_ids,
+                        replacements,
+                        alignments,
+                        pyshiro_audit,
+                    ) = resolved
+                    if provenance == "web":
+                        stored = library.store_canonical_song(
+                            title=match.song.title,
+                            artist=match.song.artist,
+                            aliases=list(match.song.aliases),
+                            source_url=match.song.source_url,
+                            lines=[(line.text, line.reading) for line in match.song.lines],
+                        )
+                        match = SongMatch(stored, match.anchors, match.score)
+                        library_songs.append(stored)
+                    song = match.song
+                    confirmed_song_names.update(
+                        normalized
+                        for name in (song.title, *song.aliases)
+                        if (normalized := _normalize_identity_text(name))
+                    )
                     logging.info(
-                        "song search group %d/%d skipped web search reason=%s "
-                        "alt_coverage=%.3fs",
+                        "song search group %d/%d verified title=%r artist=%r "
+                        "source=%s score=%.3f",
                         index + 1,
                         len(groups),
-                        policy["decision_reason"],
-                        policy["alt_coverage_seconds"],
+                        song.title,
+                        song.artist,
+                        provenance,
+                        match.score,
                     )
-                if resolved is None:
-                    discarded_song_region_cues.update(singing_ids)
+                    for cue_id, values in replacements.items():
+                        lyric_replacements.setdefault(cue_id, []).extend(values)
+                        lyric_replacements[cue_id].sort(
+                            key=lambda value: (value.start, value.end)
+                        )
+                    verified_spans.extend(
+                        _verified_spans_for_match(
+                            match, replacements, alignments, pyshiro_audit
+                        )
+                    )
+                    consumed_ids = {
+                        alignment_ids[anchor.cue_index]
+                        for anchor in match.anchors
+                        if 0 <= anchor.cue_index < len(alignment_ids)
+                    }
+                    consumed_ids.update(
+                        cue_id for cue_id in replacements if cue_id in pending_ids
+                    )
+                    pending_ids.difference_update(consumed_ids)
+                    report_group = _expanded_report_group(group, alignment_ids, match, cues)
                     reports.append(
                         {
-                            "song": None,
-                            "artist": None,
-                            "confidence": "low",
-                            "evidence": ["no_acoustically_verified_lyric_match"],
-                            "sources": [],
-                            "alignments": [],
-                            "search_group": asdict(group),
+                            "song_id": song.song_id,
+                            "song": song.title,
+                            "artist": song.artist,
+                            "confidence": "high" if match.score >= 0.68 else "medium",
+                            "evidence": [provenance, "acoustically_verified_lyrics"],
+                            "sources": [song.source_url],
+                            "score": round(match.score, 6),
+                            "alignments": alignments,
+                            "pyshiro": pyshiro_audit,
+                            "search_group": report_group,
                             "route_cues": route_cues,
                             "ocr_candidates": [asdict(item) for item in candidates],
                             "ocr_song_title": ocr_title,
                             "web_search": web_search_audit,
                         }
                     )
-                    break
-
-                (
-                    provenance,
-                    match,
-                    alignment_ids,
-                    replacements,
-                    alignments,
-                    pyshiro_audit,
-                ) = resolved
-                if provenance == "web":
-                    stored = library.store_canonical_song(
-                        title=match.song.title,
-                        artist=match.song.artist,
-                        aliases=list(match.song.aliases),
-                        source_url=match.song.source_url,
-                        lines=[(line.text, line.reading) for line in match.song.lines],
-                    )
-                    match = SongMatch(stored, match.anchors, match.score)
-                    library_songs.append(stored)
-                song = match.song
-                confirmed_song_names.update(
-                    normalized
-                    for name in (song.title, *song.aliases)
-                    if (normalized := _normalize_identity_text(name))
-                )
-                logging.info(
-                    "song search group %d/%d verified title=%r artist=%r "
-                    "source=%s score=%.3f",
-                    index + 1,
-                    len(groups),
-                    song.title,
-                    song.artist,
-                    provenance,
-                    match.score,
-                )
-                for cue_id, values in replacements.items():
-                    lyric_replacements.setdefault(cue_id, []).extend(values)
-                    lyric_replacements[cue_id].sort(
-                        key=lambda value: (value.start, value.end)
-                    )
-                verified_spans.extend(
-                    _verified_spans_for_match(
-                        match, replacements, alignments, pyshiro_audit
-                    )
-                )
-                consumed_ids = {
-                    alignment_ids[anchor.cue_index]
-                    for anchor in match.anchors
-                    if 0 <= anchor.cue_index < len(alignment_ids)
-                }
-                consumed_ids.update(
-                    cue_id for cue_id in replacements if cue_id in pending_ids
-                )
-                pending_ids.difference_update(consumed_ids)
-                report_group = _expanded_report_group(group, alignment_ids, match, cues)
-                reports.append(
-                    {
-                        "song_id": song.song_id,
-                        "song": song.title,
-                        "artist": song.artist,
-                        "confidence": "high" if match.score >= 0.68 else "medium",
-                        "evidence": [provenance, "acoustically_verified_lyrics"],
-                        "sources": [song.source_url],
-                        "score": round(match.score, 6),
-                        "alignments": alignments,
-                        "pyshiro": pyshiro_audit,
-                        "search_group": report_group,
-                        "route_cues": route_cues,
-                        "ocr_candidates": [asdict(item) for item in candidates],
-                        "ocr_song_title": ocr_title,
-                        "web_search": web_search_audit,
-                    }
-                )
+                group_reports = reports[report_start:]
+                errors = _song_errors(group_reports)
+                if ocr_failures[index]:
+                    errors.append(ocr_failures[index])
+                if ocr_title_selection_failed:
+                    errors.append("ocr_title_selection_failed")
+                stage.put(f"group:{index}", {
+                    "reports": group_reports, "spans": [asdict(value) for value in verified_spans[span_start:]],
+                    "replacements": {key: [asdict(cue) for cue in values] for key, values in lyric_replacements.items()
+                                     if key not in prior_replacements},
+                    "discarded": sorted(discarded_song_region_cues - prior_discarded),
+                    "names": sorted(confirmed_song_names),
+                }, source="song_identification", reason="; ".join(errors) or None)
     finally:
         library.close()
     if discarded_song_region_cues:
@@ -471,29 +511,31 @@ def identify_and_align_songs(
             for item in arbitration
             if min(end, float(item["end"])) - max(start, float(item["start"])) > 0
         ]
-    # Song discovery may add canonical lyrics to the library.
-    # Sign the cache against the resulting library state, not its state at startup.
-    signature = _signature(
-        video,
-        cues,
-        metadata,
-        config,
-        source_maximum_units=source_maximum_units,
+    result = SongIdentificationResult(corrected, reports, tuple(verified_spans))
+    stage.finish(result)
+    (job_dir / "song-identification.json").write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
+def _song_errors(value: object) -> list[str]:
+    errors = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in {"error", "tool_errors", "worker_errors"} and child:
+                errors.append(str(child))
+            elif isinstance(child, (dict, list)):
+                errors.extend(_song_errors(child))
+    elif isinstance(value, list):
+        for child in value:
+            errors.extend(_song_errors(child))
+    return errors
+
+
+def decode_song_result(value: dict) -> SongIdentificationResult:
+    return SongIdentificationResult(
+        [cue_from_mapping(item) for item in value["corrected_cues"]], value["reports"],
+        tuple(VerifiedLyricSpan(**item) for item in value.get("verified_lyric_spans", [])),
     )
-    payload = {
-        "version": _CACHE_VERSION,
-        "signature": signature,
-        "reports": reports,
-        "corrected_cues": [asdict(cue) for cue in corrected],
-        "verified_lyric_spans": [asdict(span) for span in verified_spans],
-    }
-    if not any(report.get("error") or report.get("tool_errors") for report in reports):
-        temporary = cache_path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-        temporary.replace(cache_path)
-    return SongIdentificationResult(corrected, reports, tuple(verified_spans))
 
 
 def arbitrate_verified_lyrics(
@@ -604,9 +646,20 @@ def translate_aligned_song_lyrics(
     translate_lyrics: Callable[..., object],
     translation_context: dict[str, object] | None = None,
     lyrics_translation_model: str | None = None,
+    *, cache_path: Path,
 ) -> SongIdentificationResult:
     if not result.reports:
         return result
+    stage = CacheStore(cache_path).stage("lyrics_translation", lambda: {
+        "result": asdict(result), "config": config_snapshot(config),
+        "context": translation_context or {}, "model": lyrics_translation_model,
+    })
+    result = decode_song_result(stage.plan["result"])
+    config = restore_config(config, stage.plan["config"])
+    translation_context, lyrics_translation_model = stage.plan["context"], stage.plan["model"]
+    saved = stage.get("__result__")
+    if saved is not None:
+        return decode_song_result(saved)
     corrected = list(result.corrected_cues)
     library = LyricsLibrary(Path(config.lyrics_library_path).resolve())
     try:
@@ -626,6 +679,7 @@ def translate_aligned_song_lyrics(
                 translate_lyrics,
                 translation_context or {},
                 lyrics_translation_model,
+                cache=stage,
             )
             translations: dict[str, str] = {}
             alignments = report.get("alignments")
@@ -693,9 +747,10 @@ def translate_aligned_song_lyrics(
                     corrected[index] = replace(cue, preferred_translation=translated)
     finally:
         library.close()
-    return SongIdentificationResult(
-        corrected, result.reports, result.verified_lyric_spans
-    )
+    translated_result = SongIdentificationResult(corrected, result.reports, result.verified_lyric_spans)
+    if stage is not None:
+        stage.finish(translated_result)
+    return translated_result
 
 
 def split_aligned_song_cues(
@@ -758,6 +813,163 @@ def _rank_candidate_matches(
         if (match := _match_candidates(hypotheses, [song], config)) is not None
     ]
     return sorted(matches, key=lambda value: value.score, reverse=True)
+
+
+def _songs_matching_ocr_title(
+    songs: list[LibrarySong], ocr_title: str | None
+) -> list[LibrarySong]:
+    normalized_title = _normalize_identity_text(ocr_title or "")
+    if not normalized_title:
+        return []
+    matches: list[LibrarySong] = []
+    for song in songs:
+        names = {
+            normalized
+            for value in (song.title, *song.aliases)
+            if (normalized := _normalize_identity_text(value))
+        }
+        if not any(
+            normalized_title == name
+            or (
+                min(len(normalized_title), len(name)) >= 4
+                and (normalized_title in name or name in normalized_title)
+            )
+            for name in names
+        ):
+            continue
+        matches.append(song)
+    return matches
+
+
+def _validate_ocr_title_song(
+    job_dir: Path,
+    video: Path,
+    cues: list[Cue],
+    singing_ids: list[int],
+    song: LibrarySong,
+    config: SongIdentificationConfig,
+) -> tuple[
+    SongMatch,
+    list[int],
+    dict[int, list[Cue]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
+    empty_match = SongMatch(song, (), 1.0)
+    worker = Path(config.pyshiro_worker_project).resolve() / "worker.py"
+    uv = shutil.which("uv")
+    if uv is None or not worker.is_file() or not song.lines:
+        return (
+            empty_match,
+            singing_ids,
+            {},
+            [],
+            [
+                {
+                    "status": "skipped",
+                    "route": "trusted_ocr_title_direct",
+                    "reason": "pyshiro_worker_unavailable"
+                    if uv is None or not worker.is_file()
+                    else "canonical_lyrics_empty",
+                }
+            ],
+        )
+
+    probes: list[dict[str, object]] = []
+    for cue_index, cue_id in enumerate(singing_ids):
+        cue = cues[cue_id]
+        duration = cue.end - cue.start
+        if duration < 2:
+            continue
+        part_count = max(1, ceil(duration / config.pyshiro_max_window_seconds))
+        for part in range(part_count):
+            probes.append(
+                {
+                    "start": cue.start + duration * part / part_count,
+                    "end": cue.start + duration * (part + 1) / part_count,
+                    "cue_id": cue_id,
+                    "cue_index": cue_index,
+                    "take_index": 0,
+                    "part": part,
+                    "part_count": part_count,
+                    "anchor_sides": 0,
+                    "require_preference": False,
+                    "required_margin": 0.0,
+                    "validation_policy": "trusted_ocr_title_absolute_likelihood",
+                    "success_status": "aligned",
+                }
+            )
+    if not probes:
+        return empty_match, singing_ids, {}, [], []
+
+    output_dir = job_dir / "song-alignment" / song.song_id / "ocr-title-direct"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _materialize_verification_stems(
+        video,
+        probes,
+        output_dir,
+        config.vocal_separation_device,
+        job_dir / "vocal-candidates" / "manifest.json",
+    )
+
+    normalizer = JapaneseNormalizer()
+    anchors: list[LyricAnchor] = []
+    replacements: dict[int, list[Cue]] = {}
+    alignments: list[dict[str, object]] = []
+    audits: list[dict[str, object]] = []
+    next_line = 0
+    started = False
+    previous_end = -1.0
+    for probe in probes:
+        if started and float(probe["start"]) < previous_end - 1e-3:
+            continue
+        duration = float(probe["end"]) - float(probe["start"])
+        line_ids = (
+            _select_suffix_neighbor_lines(
+                song,
+                next_line,
+                "",
+                duration,
+                config.lyric_neighbor_max_lines,
+                normalizer,
+            )
+            if started
+            else list(range(min(2, len(song.lines))))
+        )
+        if not line_ids:
+            break
+        probe["line_ids"] = line_ids
+        probe["route"] = (
+            "trusted_ocr_title_sequence" if started else "trusted_ocr_title_direct"
+        )
+        match = SongMatch(song, (), 1.0)
+        recovered, recovered_alignments, audit = _verify_lyric_range(
+            probe, cues, match, config, uv, worker, normalizer
+        )
+        audits.append(audit)
+        if not recovered:
+            continue
+
+        cue_id = int(probe["cue_id"])
+        cue_index = int(probe["cue_index"])
+        replacements.setdefault(cue_id, []).extend(recovered)
+        alignments.extend(recovered_alignments)
+        anchors.append(LyricAnchor(cue_index, line_ids[0], line_ids[-1] + 1, 1.0, 0))
+        started = True
+        next_line = line_ids[-1] + 1
+        previous_end = recovered[-1].end
+        if next_line >= len(song.lines):
+            break
+
+    for values in replacements.values():
+        values.sort(key=lambda value: (value.start, value.end))
+    return (
+        SongMatch(song, tuple(anchors), 1.0),
+        singing_ids,
+        replacements,
+        alignments,
+        audits,
+    )
 
 
 def _web_search_policy(
@@ -1032,8 +1244,9 @@ def select_ocr_song_titles(
     model: str,
     json_mode: bool,
     thinking: str | None,
+    context_size: int,
 ) -> list[str | None]:
-    groups = []
+    groups: list[dict[str, object]] = []
     for group_id, candidates in enumerate(candidate_sets):
         lines = [
             {
@@ -1047,44 +1260,81 @@ def select_ocr_song_titles(
             )
         ]
         groups.append({"group_id": group_id, "ocr_lines": lines})
-    body = structured_request_body(
-        model=model,
-        prompt_name=_OCR_TITLE_PROMPT,
-        prompt=render_user_prompt(
+
+    def render(groups_batch: Sequence[dict[str, object]]) -> str:
+        return "\n\n".join(
+            (
+                prompt_system(_OCR_TITLE_PROMPT),
+                render_user_prompt(
+                    _OCR_TITLE_PROMPT,
+                    VIDEO_TITLE=video_title,
+                    OCR_GROUPS=json.dumps(
+                        groups_batch,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+        )
+
+    def output_tokens(group_count: int) -> int:
+        return max(512, min(4096, group_count * 48))
+
+    # OCR JSON is dominated by coordinates and punctuation, which tokenize much
+    # more densely than prose. One character per token is a conservative bound.
+    batches = batch_prompt_items(
+        groups,
+        render_prompt=render,
+        context_size=context_size,
+        max_output_tokens=output_tokens,
+        estimate_tokens=len,
+    )
+    logging.info(
+        "split %d OCR search groups into %d prompt batch(es)",
+        len(groups),
+        len(batches),
+    )
+    titles: list[str | None] = [None for _ in candidate_sets]
+    for batch in batches:
+        prompt = render_user_prompt(
             _OCR_TITLE_PROMPT,
             VIDEO_TITLE=video_title,
-            OCR_GROUPS=json.dumps(groups, ensure_ascii=False, separators=(",", ":")),
-        ),
-        max_tokens=max(512, min(4096, len(candidate_sets) * 48)),
-        temperature=0,
-        json_mode=json_mode,
-        thinking=thinking,
-    )
-    response = request(body)
-    content = structured_response_content(response, finish_reason=finish_reason)
-    parsed = parse_json_object(content)
-    values = parsed.get("groups")
-    if not isinstance(values, list):
-        raise TypeError("OCR song-title response has no groups array")
-    titles: list[str | None] = [None for _ in candidate_sets]
-    seen: set[int] = set()
-    for item in values:
-        if not isinstance(item, dict):
-            raise TypeError("OCR song-title group must be an object")
-        group_id = item.get("group_id")
-        title = item.get("song_title")
-        if not isinstance(group_id, int) or not 0 <= group_id < len(titles):
-            raise ValueError(f"invalid OCR song-title group_id: {group_id!r}")
-        if group_id in seen:
-            raise ValueError(f"duplicate OCR song-title group_id: {group_id}")
-        if title is not None and not isinstance(title, str):
-            raise TypeError("OCR song title must be text or null")
-        seen.add(group_id)
-        titles[group_id] = (
-            title.strip() if isinstance(title, str) and title.strip() else None
+            OCR_GROUPS=json.dumps(batch, ensure_ascii=False, separators=(",", ":")),
         )
-    if seen != set(range(len(titles))):
-        raise ValueError("OCR song-title response omitted search groups")
+        body = structured_request_body(
+            model=model,
+            prompt_name=_OCR_TITLE_PROMPT,
+            prompt=prompt,
+            max_tokens=output_tokens(len(batch)),
+            temperature=0,
+            json_mode=json_mode,
+            thinking=thinking,
+        )
+        response = request(body)
+        content = structured_response_content(response, finish_reason=finish_reason)
+        parsed = parse_json_object(content)
+        values = parsed.get("groups")
+        if not isinstance(values, list):
+            raise TypeError("OCR song-title response has no groups array")
+        expected = {int(group["group_id"]) for group in batch}
+        seen: set[int] = set()
+        for item in values:
+            if not isinstance(item, dict):
+                raise TypeError("OCR song-title group must be an object")
+            group_id = item.get("group_id")
+            title = item.get("song_title")
+            if not isinstance(group_id, int) or group_id not in expected:
+                raise ValueError(f"invalid OCR song-title group_id: {group_id!r}")
+            if group_id in seen:
+                raise ValueError(f"duplicate OCR song-title group_id: {group_id}")
+            if title is not None and not isinstance(title, str):
+                raise TypeError("OCR song title must be text or null")
+            seen.add(group_id)
+            titles[group_id] = (
+                title.strip() if isinstance(title, str) and title.strip() else None
+            )
+        if seen != expected:
+            raise ValueError("OCR song-title response omitted search groups")
     return titles
 
 
@@ -1142,41 +1392,43 @@ def _ensure_song_translations(
     translate_lyrics: Callable[..., object],
     translation_context: dict[str, object],
     model: str | None,
+    *, cache: StageCache,
 ) -> LibrarySong:
-    if all(line.translation for line in song.lines):
-        return song
-    if not all(line.translation for line in song.lines):
-        translated = translate_lyrics(
-            song.title,
-            song.artist,
-            [line.text for line in song.lines],
-            translation_context=translation_context,
-        )
-        if (
-            isinstance(translated, tuple)
-            and len(translated) == 2
-            and isinstance(translated[0], dict)
-            and translated[1] == "llm"
-        ):
-            translations, source = translated
-        elif isinstance(translated, dict):
-            translations, source = translated, "llm"
-        else:
-            raise TypeError("lyrics translator returned an invalid result")
-        library.store_translations(
-            song.song_id,
-            translations,
-            source=source,
-            model=model,
-            prompt_hash=prompt_templates_digest("lyrics-translate.md"),
-        )
-        refreshed = library.get(song.song_id)
-        assert refreshed is not None
-        song = refreshed
-
-    refreshed = library.get(song.song_id)
-    assert refreshed is not None
-    return refreshed
+    song_data = cache.remember("song:" + song.song_id, lambda: asdict(song))
+    from .lyrics_library import LyricLine
+    song = LibrarySong(**{**song_data, "lines": tuple(LyricLine(**line) for line in song_data["lines"])})
+    cached = cache.get(song.song_id)
+    if cached is not None:
+        return replace(song, lines=tuple(replace(line, translation=cached[str(line.line_no)]) for line in song.lines))
+    song = replace(song, lines=tuple(
+        replace(line, translation=None, translation_source=None)
+        if line.translation_source in {"llm", "local_mt"} else line for line in song.lines
+    ))
+    kept = {line.line_no: line.translation for line in song.lines if line.translation}
+    source = "authored"
+    translations = kept
+    if len(kept) != len(song.lines):
+        try:
+            translated = translate_lyrics(
+                song.title, song.artist, [line.text for line in song.lines],
+                translation_context=translation_context,
+            )
+            if isinstance(translated, tuple) and len(translated) == 2 and translated[1] in {"llm", "local_mt"}:
+                translations, source = translated
+            elif isinstance(translated, dict):
+                translations, source = translated, "llm"
+            else:
+                raise TypeError("lyrics translator returned an invalid result")
+            translations = {**translations, **kept}
+            if any(not isinstance(translations.get(line.line_no), str) or not translations[line.line_no].strip()
+                   for line in song.lines):
+                raise ValueError("lyrics translator did not return every canonical line")
+        except BaseException as exc:
+            cache.failed(song.song_id, exc)
+            raise
+    cache.put(song.song_id, translations, source=source,
+              reason="local_machine_translation" if source == "local_mt" else None)
+    return replace(song, lines=tuple(replace(line, translation=translations[line.line_no]) for line in song.lines))
 
 
 def _split_aligned_lyric_line(
@@ -1363,7 +1615,12 @@ def _validate_song_match(
     else:
         alignment_ids = singing_ids
     timing, audits = _align_match_with_pyshiro(
-        job_dir, video, cues, alignment_ids, match, config
+        job_dir,
+        video,
+        cues,
+        alignment_ids,
+        match,
+        config,
     )
     replacements, alignments = _apply_local_match(
         cues,
@@ -1374,7 +1631,13 @@ def _validate_song_match(
         source_maximum_units=source_maximum_units,
     )
     recovered, recovered_alignments, recovery_audits = _recover_lyric_ranges(
-        job_dir, cues, alignment_ids, match, config, video=video
+        job_dir,
+        cues,
+        alignment_ids,
+        match,
+        config,
+        video=video,
+        verified_replacements=replacements,
     )
     for cue_id, values in recovered.items():
         replacements.setdefault(cue_id, []).extend(values)
@@ -1430,6 +1693,7 @@ def _recover_lyric_ranges(
     config: SongIdentificationConfig,
     *,
     video: Path | None = None,
+    verified_replacements: dict[int, list[Cue]] | None = None,
 ) -> tuple[
     dict[int, list[Cue]],
     list[dict[str, object]],
@@ -1499,6 +1763,26 @@ def _recover_lyric_ranges(
         add_range(
             cues[cue_id].start,
             cues[cue_id].end,
+            list(
+                range(
+                    max(0, first.line_start - config.lyric_neighbor_max_lines),
+                    first.line_start,
+                )
+            ),
+            cue_id,
+            first.take_index,
+            "take_prefix",
+            1,
+        )
+    elif first.line_start > 0:
+        cue_id = singing_ids[first.cue_index]
+        verified = (verified_replacements or {}).get(cue_id, [])
+        verified_start = min(
+            (cue.start for cue in verified), default=cues[cue_id].start
+        )
+        add_range(
+            cues[cue_id].start,
+            verified_start,
             list(
                 range(
                     max(0, first.line_start - config.lyric_neighbor_max_lines),
@@ -1694,6 +1978,7 @@ def _materialize_verification_stems(
     if not requests:
         return
     from .audio_analysis import separate_vocal_ranges
+
     try:
         separate_vocal_ranges(video, requests, device)
     except Exception as exc:
@@ -2251,6 +2536,7 @@ def _align_match_with_pyshiro(
         cue_id = singing_ids[anchor.cue_index]
         cue = cues[cue_id]
         strong_anchor = _anchor_has_continuous_support(anchor, match.anchors)
+        absolute_likelihood_only = strong_anchor
         probes.append(
             {
                 "start": cue.start,
@@ -2260,9 +2546,11 @@ def _align_match_with_pyshiro(
                 "take_index": anchor.take_index,
                 "route": "initial_alt_anchor",
                 "anchor_sides": 0,
-                "require_preference": not strong_anchor,
+                "require_preference": not absolute_likelihood_only,
                 "required_margin": (
-                    config.pyshiro_likelihood_margin if not strong_anchor else 0.0
+                    config.pyshiro_likelihood_margin
+                    if not absolute_likelihood_only
+                    else 0.0
                 ),
                 "validation_policy": (
                     "strong_continuous_alt_anchor"
@@ -2801,143 +3089,3 @@ def _normalize_ocr_text(text: str) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", text)).strip()
 
 
-def _signature(
-    video: Path,
-    cues: list[Cue],
-    metadata: dict[str, object],
-    config: SongIdentificationConfig,
-    *,
-    source_maximum_units: float | None = None,
-) -> str:
-    stat = video.stat()
-    library_path = Path(config.lyrics_library_path).resolve()
-    library = LyricsLibrary(library_path)
-    try:
-        library_digest = library.canonical_digest()
-    finally:
-        library.close()
-    payload = {
-        "version": _PROMPT_VERSION,
-        "video": [stat.st_size, stat.st_mtime_ns],
-        "cues": [asdict(cue) for cue in cues],
-        "metadata": {
-            key: metadata[key] for key in _STABLE_METADATA_KEYS if key in metadata
-        },
-        "config": asdict(config),
-        "lyrics_library": library_digest,
-        "source_maximum_units": source_maximum_units,
-        "ocr_title_prompt": prompt_templates_digest(_OCR_TITLE_PROMPT),
-    }
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode()
-    ).hexdigest()
-
-
-def _ocr_signature(
-    video: Path,
-    groups: list[SongSearchGroup],
-    metadata: dict[str, object],
-    config: SongIdentificationConfig,
-) -> str:
-    stat = video.stat()
-    payload = {
-        "version": _OCR_CACHE_VERSION,
-        "video": [stat.st_size, stat.st_mtime_ns],
-        "search_groups": [asdict(group) for group in groups],
-        "music_title_mode": _title_uses_music_mode(metadata),
-        "ocr": {
-            key: value
-            for key, value in asdict(config).items()
-            if key
-            in {
-                "device",
-                "minimum_ocr_score",
-            }
-        },
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, default=str).encode()
-    ).hexdigest()
-
-
-def _load_ocr_cache(
-    path: Path, signature: str, group_count: int
-) -> list[list[OCRCandidate]] | None:
-    if not path.is_file():
-        return None
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if (
-            value.get("version") != _OCR_CACHE_VERSION
-            or value.get("signature") != signature
-        ):
-            return None
-        groups = value["candidate_sets"]
-        if not isinstance(groups, list) or len(groups) != group_count:
-            return None
-        candidates = [
-            [OCRCandidate(**item) for item in group]
-            for group in groups
-            if isinstance(group, list)
-        ]
-        if len(candidates) != group_count:
-            return None
-        logging.info("using song OCR cache with %d search groups", len(candidates))
-        return candidates
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        logging.warning("ignoring unreadable song OCR cache %s: %s", path, exc)
-        return None
-
-
-def _write_ocr_cache(
-    path: Path, signature: str, candidate_sets: list[list[OCRCandidate]]
-) -> None:
-    payload = {
-        "version": _OCR_CACHE_VERSION,
-        "signature": signature,
-        "candidate_sets": [
-            [asdict(candidate) for candidate in candidates]
-            for candidates in candidate_sets
-        ],
-    }
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    temporary.replace(path)
-
-
-def _load_cache(
-    path: Path, signature: str, cues: list[Cue]
-) -> SongIdentificationResult | None:
-    if not path.is_file():
-        return None
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if (
-            value.get("version") != _CACHE_VERSION
-            or value.get("signature") != signature
-        ):
-            return None
-        raw_corrected = value["corrected_cues"]
-        reports = value["reports"]
-        if not isinstance(raw_corrected, list) or not isinstance(reports, list):
-            return None
-        corrected = [cue_from_mapping(item) for item in raw_corrected]
-        spans = tuple(
-            VerifiedLyricSpan(
-                **{
-                    **item,
-                    "lyric_line_ids": tuple(item.get("lyric_line_ids", ())),
-                }
-            )
-            for item in value.get("verified_lyric_spans", [])
-            if isinstance(item, dict)
-        )
-        logging.info("using song identification cache with %d reports", len(reports))
-        return SongIdentificationResult(corrected, reports, spans)
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        logging.warning(
-            "ignoring unreadable song identification cache %s: %s", path, exc
-        )
-        return None

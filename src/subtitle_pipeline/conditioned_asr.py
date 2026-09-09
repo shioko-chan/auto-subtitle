@@ -7,6 +7,7 @@ import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .cache import CacheStore, config_snapshot, restore_config
 from .audio_analysis import AudioRegion, _overlap_intersections
 from .audio_buffer import AudioBuffer
 from .config import AudioAnalysisConfig
@@ -14,7 +15,6 @@ from .subtitles import Cue, cue_from_mapping
 
 logger = logging.getLogger(__name__)
 
-_CACHE_VERSION = 4
 _MAX_WINDOW_SECONDS = 30.0
 _CONDITIONED_CUE_KIND = "conditioned_speech"
 
@@ -45,39 +45,29 @@ def transcribe_long_overlaps(
     job_dir: Path,
     config: AudioAnalysisConfig,
 ) -> ConditionedASRTranscription:
-    windows = _conditioned_windows(diarization, audio.duration, config)
-    if not windows:
-        return ConditionedASRTranscription([], [])
-    if config.conditioned_asr_backend == "disabled":
-        first = windows[0]
-        raise RuntimeError(
-            "long overlapping speech requires conditioned ASR, but the backend is "
-            f"disabled ({first.start:.3f}-{first.end:.3f}s)"
-        )
-    cache_path = job_dir / "conditioned-asr-cache.json"
-    signature = {
-        "version": _CACHE_VERSION,
-        "model": config.conditioned_asr_model,
-        "revision": config.conditioned_asr_revision,
-        "windows": [_window_payload(window) for window in windows],
-    }
-    transcribed = _load_cache(cache_path, signature)
-    if transcribed is None:
-        transcribed = [
-            Cue(
-                cue.start,
-                cue.end,
-                cue.text,
-                cue.speaker,
-                _CONDITIONED_CUE_KIND,
-                language="Japanese",
-            )
-            for cue in _run_dicow(audio, windows, config)
-        ]
-        _write_cache(cache_path, signature, transcribed)
-    return ConditionedASRTranscription(
-        windows, _without_repetition_hallucinations(transcribed)
-    )
+    stage = CacheStore(job_dir / "cache.sqlite3").stage("conditioned_asr", lambda: {
+        "config": config_snapshot(config),
+        "windows": [asdict(window) for window in _conditioned_windows(diarization, audio.duration, config)],
+    })
+    config = restore_config(config, stage.plan["config"])
+    windows = [ConditionedWindow(value["start"], value["end"], tuple(value["speakers"]),
+               tuple(AudioRegion(**turn) for turn in value["turns"])) for value in stage.plan["windows"]]
+    transcribed = []
+    for index, window in enumerate(windows):
+        value = stage.get(str(index))
+        if value is None:
+            with stage.attempt(str(index)):
+                if config.conditioned_asr_backend == "disabled":
+                    raise RuntimeError("long overlapping speech requires conditioned ASR, but the backend is disabled")
+                raw = [Cue(cue.start, cue.end, cue.text, cue.speaker, _CONDITIONED_CUE_KIND, language="Japanese")
+                       for cue in _run_dicow(audio, [window], config)]
+                clean = _without_repetition_hallucinations(raw)
+                reason = "repetition_loop" if len(clean) != len(raw) else None
+                stage.put(str(index), [asdict(cue) for cue in clean], source="dicow", reason=reason)
+                value = [asdict(cue) for cue in clean]
+        transcribed.extend(cue_from_mapping(item) for item in value)
+    stage.finish([asdict(cue) for cue in transcribed])
+    return ConditionedASRTranscription(windows, transcribed)
 
 
 def reconcile_long_overlaps(
@@ -447,28 +437,3 @@ def _condition_label(region: AudioRegion) -> str | None:
     return region.speaker or region.anonymous_speaker
 
 
-def _load_cache(path: Path, signature: dict[str, object]) -> list[Cue] | None:
-    if not path.is_file():
-        return None
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if value.get("signature") != signature:
-            return None
-        return [cue_from_mapping(item) for item in value["cues"]]
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-        logger.warning("ignoring unreadable conditioned ASR cache: %s", path)
-        return None
-
-
-def _write_cache(path: Path, signature: dict[str, object], cues: list[Cue]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(
-            {"signature": signature, "cues": [asdict(cue) for cue in cues]},
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)

@@ -5,15 +5,17 @@ import logging
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
+from .cache import CacheStore, config_snapshot, restore_config
 from .chat_context import remove_youtube_chat_files
 from .commands import CommandError, require_command, run
 from .config import DownloadConfig, RenderConfig
 from .speakers import CharacterStyle
 from .subtitles import (
     Cue,
+    cue_from_mapping,
     TimedTextUnit,
     read_subtitles,
     text_display_width,
@@ -61,11 +63,70 @@ class RenderCue:
     source_units: tuple[TimedTextUnit, ...] = ()
 
 
-def download_youtube(
+def download_youtube(url: str, directory: Path, config: DownloadConfig) -> DownloadResult:
+    stage = CacheStore(directory / "cache.sqlite3").stage("download", lambda: {
+        "url": url, "config": config_snapshot(config),
+    })
+    config = restore_config(config, stage.plan["config"])
+    value = stage.get("media")
+    if value is None or not Path(value["video"]).is_file() or not Path(value["video"]).stat().st_size:
+        with stage.attempt("media"):
+            downloaded = _download_youtube(stage.plan["url"], directory, replace(
+                config, download_chat_replay=False, download_top_comments=False,
+            ))
+            value = {"video": str(downloaded.video), "metadata": downloaded.metadata}
+            stage.put("media", value, source="download")
+    (directory / "source.info.json").write_text(json.dumps(value["metadata"], ensure_ascii=False), encoding="utf-8")
+
+    paths = {}
+    for name, enabled, fetch in (
+        ("chat_replay", config.download_chat_replay, _download_youtube_chat_replay),
+        ("comments", config.download_top_comments, _download_youtube_top_comments),
+    ):
+        record = stage.get(name)
+        if record is None:
+            errors = []
+            with stage.attempt(name):
+                path = fetch(stage.plan["url"], directory, config, errors=errors) if enabled else None
+                record = {"path": str(path) if path is not None else None,
+                          "content": path.read_text(encoding="utf-8") if path is not None else None}
+                stage.put(name, record, source="download" if path is not None else "no_match",
+                          reason="; ".join(errors) or None)
+        path = Path(record["path"]) if record["path"] else None
+        if path is not None and (not path.is_file() or not path.stat().st_size):
+            path.write_text(record["content"], encoding="utf-8")
+        paths[name] = path
+    result = DownloadResult(Path(value["video"]), value["metadata"], paths["chat_replay"], paths["comments"])
+    stage.finish(result)
+    return result
+
+
+def _download_youtube(
     url: str, directory: Path, config: DownloadConfig
 ) -> DownloadResult:
-    yt_dlp = require_command("yt-dlp")
     directory.mkdir(parents=True, exist_ok=True)
+    info_path = directory / "source.info.json"
+    candidates = [
+        path
+        for path in directory.glob("source.*")
+        if path.suffix.lower()
+        not in {".json", ".srt", ".vtt", ".part", ".ytdl", ".description"}
+    ]
+    if info_path.is_file() and candidates:
+        video = max(candidates, key=lambda path: path.stat().st_size)
+        logging.info("using existing downloaded video: %s", video)
+        return DownloadResult(
+            video,
+            json.loads(info_path.read_text(encoding="utf-8")),
+            directory / "source.live_chat.json"
+            if (directory / "source.live_chat.json").is_file()
+            else None,
+            directory / "comments.info.json"
+            if (directory / "comments.info.json").is_file()
+            else None,
+        )
+
+    yt_dlp = require_command("yt-dlp")
     output = directory / "source.%(ext)s"
     common = [yt_dlp, "--no-playlist", *_runtime_arguments(config)]
     common.extend(_authentication_arguments(config))
@@ -95,7 +156,6 @@ def download_youtube(
         else None
     )
 
-    info_path = directory / "source.info.json"
     if not info_path.exists():
         raise RuntimeError("yt-dlp completed but did not create source.info.json")
     metadata = json.loads(info_path.read_text(encoding="utf-8"))
@@ -118,6 +178,7 @@ def _download_youtube_top_comments(
     directory: Path,
     config: DownloadConfig,
     common: list[str] | None = None,
+    *, errors: list[str] | None = None,
 ) -> Path | None:
     expected = directory / "comments.info.json"
     if expected.is_file():
@@ -147,6 +208,8 @@ def _download_youtube_top_comments(
     try:
         run(command)
     except CommandError as exc:
+        if errors is not None:
+            errors.append(f"{type(exc).__name__}: {exc}")
         logging.warning("top YouTube comments unavailable: %s", exc)
         expected.unlink(missing_ok=True)
         return None
@@ -158,6 +221,7 @@ def _download_youtube_chat_replay(
     directory: Path,
     config: DownloadConfig,
     common: list[str] | None = None,
+    *, errors: list[str] | None = None,
 ) -> Path | None:
     expected = directory / "source.live_chat.json"
     if expected.is_file():
@@ -186,6 +250,8 @@ def _download_youtube_chat_replay(
     try:
         run(command)
     except CommandError as exc:
+        if errors is not None:
+            errors.append(f"{type(exc).__name__}: {exc}")
         logging.warning("current-video chat replay unavailable: %s", exc)
         remove_youtube_chat_files(directory)
         return None
@@ -221,7 +287,38 @@ def _runtime_arguments(config: DownloadConfig) -> list[str]:
     return ["--js-runtimes", runtime]
 
 
-def render_subtitles(
+def render_subtitles(video: Path, subtitle: Path, destination: Path, config: RenderConfig, *,
+                     semantic_segments: dict[int, list[str]] | None = None,
+                     cues: list[Cue] | None = None,
+                     character_styles: dict[str, CharacterStyle] | None = None) -> Path:
+    stage = CacheStore(destination.parent / "cache.sqlite3").stage("render", lambda: {
+        "config": config_snapshot(config), "cues": [asdict(cue) for cue in (cues if cues is not None else read_subtitles(subtitle))],
+        "semantic_segments": semantic_segments,
+        "character_styles": {key: asdict(value) for key, value in (character_styles or {}).items()},
+    })
+    saved = stage.get("video")
+    if saved is not None and destination.is_file() and destination.stat().st_size > 0:
+        return destination
+    config = restore_config(config, stage.plan["config"])
+    cues = [cue_from_mapping(value) for value in stage.plan["cues"]]
+    segments = stage.plan["semantic_segments"]
+    segments = {int(key): value for key, value in segments.items()} if segments is not None else None
+    styles = {key: CharacterStyle(**value) for key, value in stage.plan["character_styles"].items()}
+    temporary = destination.with_name(destination.stem + ".building.mp4")
+    try:
+        _render_subtitles(video, subtitle, temporary, config, semantic_segments=segments,
+                          cues=cues, character_styles=styles)
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            raise RuntimeError("renderer produced no video")
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    stage.put("video", {"path": str(destination)})
+    stage.finish({"path": str(destination)})
+    return destination
+
+
+def _render_subtitles(
     video: Path,
     subtitle: Path,
     destination: Path,

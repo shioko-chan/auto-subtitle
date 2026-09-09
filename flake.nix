@@ -2,15 +2,11 @@
   description = "CUDA development shell for the subtitle pipeline";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
-    llama-cpp-src = {
-      url = "github:ggml-org/llama.cpp";
-      flake = false;
-    };
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
   outputs =
-    { nixpkgs, llama-cpp-src, ... }:
+    { nixpkgs, ... }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs {
@@ -22,16 +18,19 @@
         };
       };
       cuda = pkgs.cudaPackages;
-      llamaCpp = pkgs.llama-cpp.overrideAttrs (_: {
-        version = "0";
-        src = llama-cpp-src;
-      });
       assCudaRender = pkgs.stdenv.mkDerivation {
         pname = "ass-cuda-render";
         version = "0.1.0";
         src = ./native;
-        nativeBuildInputs = [ pkgs.pkg-config cuda.cuda_nvcc ];
-        buildInputs = [ pkgs.ffmpeg.dev pkgs.libass.dev cuda.cuda_cudart ];
+        nativeBuildInputs = [
+          pkgs.pkg-config
+          cuda.cuda_nvcc
+        ];
+        buildInputs = [
+          pkgs.ffmpeg.dev
+          pkgs.libass.dev
+          cuda.cuda_cudart
+        ];
         buildPhase = ''
           nvcc -std=c++17 -O3 -lineinfo \
             $(pkg-config --cflags libavformat libavcodec libavutil libass) \
@@ -45,13 +44,13 @@
         '';
       };
       runtimeLibraries = [
+        # The installed TorchCodec supports FFmpeg through version 8.
+        pkgs.ffmpeg_8
+        pkgs.espeak-ng
         cuda.cuda_cudart
         cuda.libcublas
         cuda.libcusparse
         cuda.libnvjitlink
-        pkgs.ffmpeg
-        pkgs.espeak-ng
-        pkgs.glib
         pkgs.libglvnd
         pkgs.stdenv.cc.cc.lib
         pkgs.zlib
@@ -67,12 +66,12 @@
           pkgs.chromium
           pkgs.noto-fonts-monochrome-emoji
           cuda.cuda_nvcc
-          cuda.cuda_cccl
+          cuda.cccl
           assCudaRender
           pkgs.pkg-config
           pkgs.ffmpeg.dev
           pkgs.libass.dev
-          llamaCpp
+          pkgs.llama-cpp
         ];
 
         CUDA_HOME = "${cuda.cuda_nvcc}";

@@ -151,6 +151,10 @@ def create_comment_task(
     source_url: str,
 ) -> Path:
     path = job_dir / _TASK_NAME
+    if path.is_file():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing.get("aid") == aid and existing.get("bvid") == bvid:
+            return path
     now = time.time()
     payload = {
         "status": "scheduled",
@@ -174,6 +178,8 @@ def create_comment_task(
 
 def publish_comment_task(path: Path, config: UploadConfig) -> str:
     payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("status") in {"posted", "already_exists"}:
+        return str(payload["status"])
     if payload.get("status") != "scheduled":
         raise ValueError(f"comment is not scheduled: {path}")
     publish_at = float(payload["publish_at"])

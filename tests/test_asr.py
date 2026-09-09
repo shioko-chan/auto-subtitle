@@ -1,3 +1,4 @@
+from subtitle_pipeline.cache import CacheStore
 import json
 import tempfile
 import unittest
@@ -11,12 +12,9 @@ import numpy as np
 from subtitle_pipeline.asr import (
     _add_punctuation_boundary_hints,
     _align_speech_records,
-    _analysis_region_signature,
     _analysis_regions,
     _asr_generation_token_limit,
-    _cache_signature,
     _HeartTranscriptorAdapter,
-    _load_cache,
     _raw_song_support_cues,
     _record_timeline_is_healthy,
     _remove_text_overlap,
@@ -136,6 +134,72 @@ class QwenASRTests(unittest.TestCase):
         self.assertFalse(quality["accepted"])
         self.assertIn("repetition_loop", quality["reasons"])
         self.assertFalse(quality["metrics"]["song_context"])
+
+    def test_speech_quality_rejects_coherent_text_in_dominant_song_region(self):
+        quality = _speech_candidate_quality(
+            {
+                "text": "君の笑顔を想像して幸せがつながるように歌い続ける",
+                "language": "Japanese",
+                "cues": [{"start": 10.0, "end": 20.0, "text": "lyrics"}],
+            },
+            AudioRegion(10, 20, "speech"),
+            song_context=True,
+            strong_song_coverage=0.9,
+        )
+
+        self.assertFalse(quality["accepted"])
+        self.assertIn("dominant_singing_music_region", quality["reasons"])
+
+    def test_speech_quality_keeps_talk_with_short_song_overlap(self):
+        quality = _speech_candidate_quality(
+            {
+                "text": "こんばんは、今日は最初に予定を説明します",
+                "language": "Japanese",
+                "cues": [{"start": 10.0, "end": 20.0, "text": "speech"}],
+            },
+            AudioRegion(10, 20, "speech"),
+            song_context=True,
+            strong_song_coverage=0.3,
+        )
+
+        self.assertTrue(quality["accepted"])
+
+    def test_speech_alignment_discards_window_covered_by_song_evidence(self):
+        aligner = Mock()
+        aligner.align.return_value = [object()]
+        record = {
+            "window_id": 0,
+            "core_start": 10.0,
+            "core_end": 20.0,
+            "language": "Japanese",
+            "text": "君の笑顔を想像して歌い続ける",
+        }
+        regions = [
+            AudioRegion(10, 20, "speech"),
+            AudioRegion(10, 20, "singing", confidence=0.1, music_confidence=0.9),
+        ]
+        audio_buffer = SimpleNamespace(
+            sample_rate=16000,
+            slice=Mock(return_value=np.zeros(16000, dtype=np.float32)),
+        )
+        with patch(
+            "subtitle_pipeline.asr._result_to_cues",
+            return_value=[Cue(10, 20, record["text"])],
+        ):
+            result = _align_speech_records(
+                aligner,
+                [record],
+                regions,
+                audio_buffer,
+                ASRConfig(max_inference_batch_size=1),
+                30,
+            )[0]
+
+        self.assertEqual(result["text"], "")
+        self.assertEqual(result["correction_method"], "speech_quality_gate_discarded")
+        self.assertIn(
+            "dominant_singing_music_region", result["speech_quality"]["reasons"]
+        )
 
     def test_song_speech_quality_gate_discards_and_audits_before_arbitration(self):
         aligner = Mock()
@@ -404,23 +468,13 @@ class QwenASRTests(unittest.TestCase):
                 self.assertEqual(cues[0].text, "話そう")
                 self.assertEqual((cues[0].start, cues[0].end), (0.0, 0.4))
 
-    def test_single_word_list_participates_in_asr_cache_signature(self):
+    def test_asr_plan_retains_single_word_list_on_resume(self):
         with tempfile.TemporaryDirectory() as temp:
-            video = Path(temp) / "source.mp4"
-            video.write_bytes(b"video")
-            config = ASRConfig()
-
-            first = _cache_signature(video, 1.0, config, ["藤都子"])
-            reordered = _cache_signature(
-                video, 1.0, config, ["藤都子", "宮永ののか", "藤都子"]
-            )
-            changed = _cache_signature(video, 1.0, config, ["宮永ののか"])
-
-        self.assertEqual(first["japanese_single_word_list"], ["藤都子"])
-        self.assertEqual(
-            reordered["japanese_single_word_list"], ["宮永ののか", "藤都子"]
-        )
-        self.assertNotEqual(first, changed)
+            store = CacheStore(Path(temp) / "cache.sqlite3")
+            first = store.stage("raw_speech", lambda: {"words": ["藤都子"]})
+            changed = store.stage("raw_speech", lambda: {"words": ["宮永ののか"]})
+            self.assertEqual(first.plan, changed.plan)
+            self.assertEqual(changed.plan["words"], ["藤都子"])
 
     def test_speech_batch_transcribes_four_windows_in_one_model_call(self):
         calls = []
@@ -599,18 +653,12 @@ class QwenASRTests(unittest.TestCase):
         self.assertEqual(model.max_new_tokens, 2048)
         self.assertEqual(record["generation_token_limit"], 128)
 
-    def test_cache_signature_normalizes_json_container_types(self):
+    def test_asr_cache_roundtrips_container_values(self):
         with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "cache.json"
-            path.write_text(
-                '{"version":13,"signature":{"speakers":["A","B"]},'
-                '"chunks":{"0":{"text":"x","cues":[]}}}',
-                encoding="utf-8",
-            )
-
-            result = _load_cache(path, {"speakers": ("A", "B")})
-
-        self.assertIn("0", result["chunks"])
+            stage = CacheStore(Path(temp) / "cache.sqlite3").stage("raw_speech", lambda: {"speakers": ("A", "B")})
+            stage.put("0", {"text": "x", "cues": []})
+            self.assertEqual(stage.plan["speakers"], ["A", "B"])
+            self.assertEqual(stage.get("0")["text"], "x")
 
     def test_old_cue_sidecar_version_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -635,16 +683,6 @@ class QwenASRTests(unittest.TestCase):
             cues = read_cue_sidecar(path)
 
         self.assertEqual(cues[0].language, "English")
-
-    def test_shared_audio_names_do_not_invalidate_asr_cache_signature(self):
-        left = _analysis_region_signature(
-            AudioRegion(1, 2, "speech", "A", source_path="shm://first")
-        )
-        right = _analysis_region_signature(
-            AudioRegion(1, 2, "speech", "A", source_path="shm://second")
-        )
-        self.assertEqual(left, right)
-        self.assertEqual(left["source_path"], "shared-memory")
 
     def test_groups_fragments_from_one_separated_speaker_track(self):
         result = _analysis_regions(
@@ -847,7 +885,7 @@ class QwenASRTests(unittest.TestCase):
                     asr_text_corrector=correct,
                 )
 
-            self.assertEqual(events, ["dicow", "correct", "align"])
+            self.assertEqual(events, ["dicow", "correct", "align", "align"])
             self.assertIn("DiCoW corrected", destination.read_text(encoding="utf-8"))
 
     def test_speech_windows_merge_nearby_turns_across_speakers(self):
@@ -1529,7 +1567,7 @@ class QwenASRTests(unittest.TestCase):
                     for call in calls
                 )
             )
-            self.assertTrue((root / "asr-cache.json").is_file())
+            self.assertTrue((root / "cache.sqlite3").is_file())
             self.assertFalse((root / "asr-chunks").exists())
             self.assertEqual(destination.read_text(encoding="utf-8").count("一"), 2)
             self.assertNotIn("一。", destination.read_text(encoding="utf-8"))
@@ -1603,9 +1641,7 @@ class QwenASRTests(unittest.TestCase):
             self.assertIn("左", destination.read_text(encoding="utf-8"))
             self.assertIn("右", destination.read_text(encoding="utf-8"))
             self.assertNotIn("。", destination.read_text(encoding="utf-8"))
-            cache = __import__("json").loads(
-                (root / "asr-cache.json").read_text(encoding="utf-8")
-            )
+            cache = {"chunks": {"0": CacheStore(root / "cache.sqlite3").existing("raw_speech").get("0")}}
             self.assertTrue(cache["chunks"]["0"]["recovered_from_repetition"])
             diagnostics = cache["chunks"]["0"]["repetition_diagnostics"]
             self.assertTrue(diagnostics[0]["minimal_reproducer"])

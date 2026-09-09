@@ -504,7 +504,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(asr.call_args.args[5], [])
             self.assertEqual(
                 FakeTranslator.segmentation_context["cache_path"].name,
-                "cue-segmentation-cache.json",
+                "cache.sqlite3",
             )
             self.assertEqual(
                 FakeTranslator.segmentation_context["audit_path"].name,
@@ -512,7 +512,7 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(
                 FakeTranslator.translation_context["cache_path"].name,
-                "cue-translation-cache.json",
+                "cache.sqlite3",
             )
             self.assertEqual(FakeTranslator.audit_path.name, "llm-audit.jsonl")
             upload.assert_not_called()

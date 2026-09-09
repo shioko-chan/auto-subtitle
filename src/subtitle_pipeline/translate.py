@@ -16,6 +16,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import certifi
+from copy import copy
 
 from .config import LLMConfig, SegmentationConfig, TranslationConfig
 from .fan_knowledge import KnowledgeHit
@@ -28,12 +29,14 @@ from .llm_response import (
 )
 from .local_segmentation import build_speaker_tracks
 from .local_translation import LocalJapaneseTranslator
+from .prompt_budget import estimate_prompt_tokens
 from .prompt_templates import render_user_prompt
 from .reference_context import (
     compact_lyrics_reference_context,
     compact_reference_context,
 )
-from .subtitles import Cue
+from .subtitles import Cue, cue_from_mapping
+from .cache import CacheStore, config_snapshot, restore_config
 from .telemetry import stage_metrics
 
 
@@ -92,6 +95,7 @@ class OpenAICompatibleTranslator:
         self.config = config
         self.translation = translation
         self.api_key = api_key
+        self.before_request = None
         self.audit_path = audit_path
         self._audit_lock = threading.Lock()
         self._audit_request_ids: dict[int, str] = {}
@@ -110,6 +114,35 @@ class OpenAICompatibleTranslator:
             payload.setdefault("thinking", {"type": self.config.thinking})
         return self._request(payload)
 
+    def stage_request(self, cache_path: Path | None, name: str):
+        """Use the stage's saved transport settings, with live credentials."""
+        def request(body):
+            stage = CacheStore(cache_path).existing(name) if cache_path is not None else None
+            if stage is None:
+                return self._request(body)
+            snapshot = stage.plan.get("llm") or stage.remember(
+                "request_config", lambda: config_snapshot(self.config)
+            )
+            sender = copy(self)
+            sender.config = restore_config(self.config, snapshot)
+            return sender._request(body)
+        return request
+
+    def _stage_executor(self, cache_path: Path | None, name: str):
+        stage = CacheStore(cache_path).existing(name) if cache_path is not None else None
+        if stage is None:
+            return self
+        execution = stage.remember("execution", lambda: {
+            "llm": stage.plan.get("llm", config_snapshot(self.config)),
+            "translation": stage.plan.get("translation", config_snapshot(self.translation)),
+        })
+        sender = copy(self)
+        sender.config = restore_config(self.config, execution["llm"])
+        sender.translation = restore_config(self.translation, execution["translation"])
+        if (sender.translation.local_model, sender.translation.local_device) != (self.translation.local_model, self.translation.local_device):
+            sender.local_translator = LocalJapaneseTranslator(sender.translation.local_model, sender.translation.local_device)
+        return sender
+
     def segment_cues(
         self,
         cues: list[Cue],
@@ -121,6 +154,20 @@ class OpenAICompatibleTranslator:
     ) -> list[Cue]:
         if not cues:
             return []
+        if cache_path is not None:
+            saved_stage = CacheStore(cache_path).existing("segmentation")
+            if saved_stage is not None:
+                cached = saved_stage.get("__result__")
+                if cached is not None:
+                    return [cue_from_mapping(value) for value in cached]
+                from .staged_translation import run_segmentation
+                return run_segmentation(
+                    tracks=[], source_cues=cues, segmentation=config, llm=self.config,
+                    request=self.stage_request(cache_path, "segmentation"), source_maximum_units=max_line_units * 1.25,
+                    cache_path=cache_path, sudachi_versions={}, parse_content=_parse_cue_records,
+                    finish_reason=_finish_reason, retry_delay=_transient_retry_delay,
+                    is_nontransient=_is_nontransient_http_error, log_invalid_response=self._log_invalid_response,
+                )
         source_maximum_units = max_line_units * 1.25
         with stage_metrics("subtitle.local_segmentation"):
             tracks, sudachi_versions = build_speaker_tracks(
@@ -136,7 +183,7 @@ class OpenAICompatibleTranslator:
             source_cues=cues,
             segmentation=config,
             llm=self.config,
-            request=self._request,
+            request=self.stage_request(cache_path, "segmentation"),
             source_maximum_units=source_maximum_units,
             cache_path=cache_path,
             sudachi_versions=sudachi_versions,
@@ -166,7 +213,7 @@ class OpenAICompatibleTranslator:
             source_cues=cues,
             translation=self.translation,
             llm=self.config,
-            request=self._request,
+            request=self.stage_request(cache_path, "translation"),
             translation_context=translation_context or {},
             cache_path=cache_path,
             honorific_rules=_HONORIFIC_TRANSLATION_RULES,
@@ -188,8 +235,10 @@ class OpenAICompatibleTranslator:
         lines: list[str],
         *,
         translation_context: dict[str, object] | None = None,
+        cache_path: Path | None = None,
     ) -> tuple[dict[int, str], str]:
         """Translate canonical lyric lines without changing their correspondence."""
+        self = self._stage_executor(cache_path, "lyrics_translation")
         if not lines:
             return {}, "llm"
         prompt = render_user_prompt(
@@ -264,7 +313,9 @@ class OpenAICompatibleTranslator:
         ip_aliases: dict[str, object] | None = None,
         bilibili_tag_catalog: dict[str, object] | None = None,
         translation_context: dict[str, object] | None = None,
+        cache_path: Path | None = None,
     ) -> tuple[str, str, str, list[str]]:
+        self = self._stage_executor(cache_path, "metadata")
         source = {
             "title": title,
             "description": description[
@@ -414,6 +465,10 @@ class OpenAICompatibleTranslator:
                 handle.write(json.dumps(entry, ensure_ascii=False, default=repr) + "\n")
 
     def _request(self, body: dict[str, object]) -> dict[str, object]:
+        if self.before_request is not None:
+            self.before_request(self.config)
+        if callable(self.api_key):
+            self.api_key = self.api_key()
         request_id = uuid.uuid4().hex
         self._audit_request_ids[id(body)] = request_id
         url, request_body = _prepare_api_request(self.config, body)
@@ -510,7 +565,7 @@ class OpenAICompatibleTranslator:
             "event": "llm_request_context",
             "model": body.get("model", self.config.model),
             "input_characters": len(prompt),
-            "estimated_input_tokens": _estimate_tokens(prompt),
+            "estimated_input_tokens": estimate_prompt_tokens(prompt),
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "max_output_tokens": body.get("max_tokens"),
@@ -846,14 +901,6 @@ def _log_response_usage(response: object) -> None:
     )
 
 
-def _estimate_tokens(text: str) -> int:
-    cjk = sum(
-        "\u3040" <= character <= "\u30ff" or "\u3400" <= character <= "\u9fff"
-        for character in text
-    )
-    return cjk + math.ceil((len(text) - cjk) / 4)
-
-
 def _prompt_section_sizes(prompt: str) -> dict[str, dict[str, int]]:
     marker_names = {
         "ENTITY_REFERENCE:": "entity_reference",
@@ -878,7 +925,7 @@ def _prompt_section_sizes(prompt: str) -> dict[str, dict[str, int]]:
     values = {
         name: {
             "characters": len(text),
-            "estimated_tokens": _estimate_tokens(text),
+            "estimated_tokens": estimate_prompt_tokens(text),
         }
         for name, lines in sections.items()
         if (text := "".join(lines).strip())
@@ -886,7 +933,7 @@ def _prompt_section_sizes(prompt: str) -> dict[str, dict[str, int]]:
     fixed_text = "".join(fixed).strip()
     values["fixed_prompt"] = {
         "characters": len(fixed_text),
-        "estimated_tokens": _estimate_tokens(fixed_text),
+        "estimated_tokens": estimate_prompt_tokens(fixed_text),
     }
     return values
 

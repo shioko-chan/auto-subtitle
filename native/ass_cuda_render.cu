@@ -8,6 +8,7 @@ extern "C" {
 #include <libavutil/dict.h>
 #include <libavutil/display.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_cuda.h>
 #include <libavutil/opt.h>
 }
 
@@ -42,6 +43,18 @@ static void check_av(int result, const char *operation) {
 static void check_cuda(cudaError_t result, const char *operation) {
     if (result != cudaSuccess)
         fail(std::string(operation) + ": " + cudaGetErrorString(result));
+}
+
+static cudaStream_t frame_cuda_stream(const AVFrame *frame) {
+    if (!frame->hw_frames_ctx)
+        fail("CUDA frame did not expose a hardware frame context");
+    AVHWFramesContext *frames =
+        reinterpret_cast<AVHWFramesContext *>(frame->hw_frames_ctx->data);
+    if (!frames->device_ctx || !frames->device_ctx->hwctx)
+        fail("CUDA frame did not expose a hardware device context");
+    AVCUDADeviceContext *cuda =
+        reinterpret_cast<AVCUDADeviceContext *>(frames->device_ctx->hwctx);
+    return reinterpret_cast<cudaStream_t>(cuda->stream);
 }
 
 __global__ static void blend_luma(
@@ -182,7 +195,9 @@ static void rgb_to_yuv(
     }
 }
 
-static void render_ass(Renderer &state, AVFrame *frame, int64_t time_ms) {
+static void render_ass(
+    Renderer &state, AVFrame *frame, int64_t time_ms, cudaStream_t stream
+) {
     int changed = 0;
     ASS_Image *images = ass_render_frame(state.renderer, state.track, time_ms, &changed);
     bool bt709 = frame->colorspace == AVCOL_SPC_BT709 ||
@@ -267,7 +282,7 @@ static void render_ass(Renderer &state, AVFrame *frame, int64_t time_ms) {
     dim3 threads(16, 16);
     for (const Renderer::DeviceImage &image : state.images) {
         dim3 luma_blocks((image.width + 15) / 16, (image.height + 15) / 16);
-        blend_luma<<<luma_blocks, threads>>>(
+        blend_luma<<<luma_blocks, threads, 0, stream>>>(
             frame->data[0], frame->linesize[0], frame->width, frame->height,
             image.mask, image.stride, image.width, image.height,
             image.dst_x, image.dst_y, image.opacity, image.y,
@@ -278,7 +293,7 @@ static void render_ass(Renderer &state, AVFrame *frame, int64_t time_ms) {
         int chroma_width = (image.width + 2) / 2 + 1;
         int chroma_height = (image.height + 2) / 2 + 1;
         dim3 chroma_blocks((chroma_width + 15) / 16, (chroma_height + 15) / 16);
-        blend_chroma<<<chroma_blocks, threads>>>(
+        blend_chroma<<<chroma_blocks, threads, 0, stream>>>(
             frame->data[1], frame->linesize[1], frame->width, frame->height,
             image.mask, image.stride, image.width, image.height,
             image.dst_x, image.dst_y, image.opacity, image.u, image.v,
@@ -290,7 +305,6 @@ static void render_ass(Renderer &state, AVFrame *frame, int64_t time_ms) {
         );
         check_cuda(cudaGetLastError(), "launch subtitle blend");
     }
-    check_cuda(cudaDeviceSynchronize(), "finish subtitle blend");
 }
 
 struct Output {
@@ -397,7 +411,7 @@ static void drain_encoder(Output &output, AVFrame *frame) {
     av_packet_free(&packet);
 }
 
-static AVFrame *copy_cuda_frame(const AVFrame *source) {
+static AVFrame *copy_cuda_frame(const AVFrame *source, cudaStream_t stream) {
     if (!source->hw_frames_ctx)
         fail("decoded frame did not expose CUDA frame context");
     AVHWFramesContext *frames = reinterpret_cast<AVHWFramesContext *>(source->hw_frames_ctx->data);
@@ -413,18 +427,18 @@ static AVFrame *copy_cuda_frame(const AVFrame *source) {
     check_av(av_hwframe_get_buffer(destination->hw_frames_ctx, destination, 0),
              "allocate CUDA output surface");
     check_cuda(
-        cudaMemcpy2D(
+        cudaMemcpy2DAsync(
             destination->data[0], destination->linesize[0],
             source->data[0], source->linesize[0], source->width, source->height,
-            cudaMemcpyDeviceToDevice
+            cudaMemcpyDeviceToDevice, stream
         ),
         "copy decoded luma"
     );
     check_cuda(
-        cudaMemcpy2D(
+        cudaMemcpy2DAsync(
             destination->data[1], destination->linesize[1],
             source->data[1], source->linesize[1], source->width, (source->height + 1) / 2,
-            cudaMemcpyDeviceToDevice
+            cudaMemcpyDeviceToDevice, stream
         ),
         "copy decoded chroma"
     );
@@ -521,6 +535,7 @@ int main(int argc, char **argv) {
     }
     int64_t last_encoder_pts = AV_NOPTS_VALUE;
     int64_t corrected_timestamps = 0;
+    cudaStream_t render_stream = nullptr;
     auto process_frames = [&]() {
         while (true) {
             int result = avcodec_receive_frame(decoder, decoded);
@@ -534,7 +549,8 @@ int main(int argc, char **argv) {
                 );
             if (!output.header_written)
                 initialize_output(output, output_path.c_str(), decoder, video_stream, decoded, preset, cq);
-            AVFrame *rendered = copy_cuda_frame(decoded);
+            render_stream = frame_cuda_stream(decoded);
+            AVFrame *rendered = copy_cuda_frame(decoded, render_stream);
             int64_t source_timestamp = rendered->best_effort_timestamp;
             if (source_timestamp == AV_NOPTS_VALUE)
                 source_timestamp = rendered->pts;
@@ -545,7 +561,7 @@ int main(int argc, char **argv) {
             int64_t time_ms = av_rescale_q(
                 source_timestamp, video_stream->time_base, AVRational{1, 1000}
             );
-            render_ass(subtitles, rendered, time_ms);
+            render_ass(subtitles, rendered, time_ms, render_stream);
             int64_t encoder_pts = source_timestamp;
             if (last_encoder_pts != AV_NOPTS_VALUE && encoder_pts <= last_encoder_pts) {
                 encoder_pts = last_encoder_pts + frame_step;
@@ -553,6 +569,7 @@ int main(int argc, char **argv) {
             }
             rendered->pts = encoder_pts;
             last_encoder_pts = encoder_pts;
+            check_cuda(cudaStreamSynchronize(render_stream), "finish CUDA frame");
             drain_encoder(output, rendered);
             av_frame_free(&rendered);
             av_frame_unref(decoded);

@@ -18,19 +18,28 @@ class LocalCrossEncoderReranker:
         self._lock = threading.Lock()
 
     def score(self, query: str, passages: list[str]) -> list[float]:
-        if not passages:
-            return []
+        return self.score_many([(query, passages)])[0]
+
+    def score_many(self, queries: list[tuple[str, list[str]]]) -> list[list[float]]:
+        pairs = [(query, passage) for query, passages in queries for passage in passages]
+        if not pairs:
+            return [[] for _ in queries]
         with self._lock:
             model = self._load_model()
             values = model.predict(
-                [(query, passage) for passage in passages],
+                pairs,
                 batch_size=self.batch_size,
                 show_progress_bar=False,
             )
-        return [
-            float(value.item() if hasattr(value, "item") else value)
-            for value in values
-        ]
+        scores = [float(value.item() if hasattr(value, "item") else value) for value in values]
+        if len(scores) != len(pairs):
+            raise ValueError("reranker returned a different number of scores than pairs")
+        output = []
+        offset = 0
+        for _, passages in queries:
+            output.append(scores[offset : offset + len(passages)])
+            offset += len(passages)
+        return output
 
     def release_model(self) -> bool:
         with self._lock:

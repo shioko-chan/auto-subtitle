@@ -843,8 +843,10 @@ class StagedTranslationTests(unittest.TestCase):
 
         self.assertEqual(
             [event["translation_source"] for event in events],
-            ["llm", "local_mt", "cache", "cache"],
+            ["llm", "local_mt", "llm", "local_mt"],
         )
+        self.assertTrue(events[2]["cache_hit"])
+        self.assertEqual(events[3]["downgrade_reason"], "empty_translation")
         self.assertEqual(events[0]["request_id"], "request-1")
         self.assertEqual(events[1]["downgrade_reason"], "empty_translation")
         self.assertEqual(events[1]["source_text"], "原文二")

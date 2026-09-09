@@ -13,6 +13,19 @@ from subtitle_pipeline.vector_index import LocalVectorIndex
 
 
 class LocalVectorIndexTests(unittest.TestCase):
+    def test_batch_encodes_queries_together_and_preserves_empty_positions(self):
+        from unittest.mock import Mock
+        index = LocalVectorIndex(Path("unused.faiss"), "fake")
+        index._model = Mock()
+        index._model.encode.return_value = np.asarray([[1, 0], [0, 1]], dtype=np.float32)
+        index._index = Mock()
+        index._index.search.return_value = (np.asarray([[0.9], [0.8]]), np.asarray([[1], [2]]))
+        index._ids = {"first": 1, "second": 2}
+        self.assertEqual(index.search_many(["a", "", "b"], 1), [{"first": 0.9}, {}, {"second": 0.8}])
+        self.assertEqual(index._model.encode.call_count, 1)
+        self.assertEqual(index._model.encode.call_args.args[0], ["query: a", "query: b"])
+        self.assertEqual(index._index.search.call_count, 1)
+
     def test_release_model_preserves_loaded_index(self) -> None:
         index = LocalVectorIndex(Path("unused.faiss"), "fake")
         loaded_index = object()

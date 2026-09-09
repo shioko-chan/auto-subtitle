@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
 import unicodedata
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
 from functools import cache
 from pathlib import Path
 
+from .cache import CacheStore
 from .fan_knowledge import KnowledgeHit
 from .llm_response import (
     finish_reason,
@@ -18,12 +18,11 @@ from .llm_response import (
     structured_request_body,
     structured_response_content,
 )
-from .prompt_templates import prompt_templates_digest, render_user_prompt
+from .prompt_templates import render_user_prompt
 
 logger = logging.getLogger(__name__)
 
 _PROMPT = "asr-correct.md"
-_CACHE_VERSION = 4
 _JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
 _SPACE_RE = re.compile(r"\s+")
 _RETRIEVAL_FRAGMENT_CHARS = 120
@@ -76,72 +75,93 @@ def correct_asr_windows(
     audit_path: Path,
     window_chars: int = 3000,
     max_tokens: int = 8192,
-    retrieve_knowledge: Callable[[dict[str, object], str], list[KnowledgeHit]]
+    retrieve_knowledge: Callable[[list[tuple[dict[str, object], str]]], list[list[KnowledgeHit]]]
     | None = None,
 ) -> list[dict[str, object]]:
     if not records:
         return []
-    cache = _load_cache(cache_path)
+    stage = CacheStore(cache_path).stage("asr_correction", lambda: {
+        "records": records, "entities": [asdict(value) for value in entities],
+        "model": model, "window_chars": window_chars, "max_tokens": max_tokens,
+    })
+    records = stage.plan["records"]
+    entities = [ASREntity(**value) for value in stage.plan["entities"]]
+    model, window_chars, max_tokens = (stage.plan[key] for key in ("model", "window_chars", "max_tokens"))
+    cached_result = stage.get("__result__")
+    if cached_result is not None:
+        return cached_result
     corrected: list[dict[str, object] | None] = [None] * len(records)
     prepared: list[tuple[int, dict[str, object], str, list[ASREntity]]] = []
-    correction_config = {
-        "window_chars": window_chars,
-        "max_tokens": max_tokens,
-    }
     for index, record in enumerate(records):
         text = str(record.get("text") or "")
         deterministic = _replace_exact_aliases(text, entities)
         candidates = _candidate_entities(deterministic, entities)
         prepared.append((index, record, deterministic, candidates))
 
-    for window in _correction_windows(prepared, window_chars):
-        fragments_by_index: dict[int, list[tuple[str, list[KnowledgeHit]]]] = {}
-        for index, record, text, _candidates in window:
-            fragments_by_index[index] = [
-                (
-                    fragment,
-                    retrieve_knowledge(record, fragment)
-                    if retrieve_knowledge is not None
-                    else [],
-                )
-                for fragment in _retrieval_fragments(text)
-            ]
-        signature = _window_signature(
-            window, fragments_by_index, model, correction_config
-        )
-        cached = cache["windows"].get(signature)
-        if (
-            isinstance(cached, list)
-            and len(cached) == len(window)
-            and all(isinstance(value, str) for value in cached)
-        ):
-            for (index, record, _text, _candidates), value in zip(
-                window, cached, strict=True
-            ):
-                corrected[index] = _corrected_record(record, value, "cache")
+    windows = list(_correction_windows(prepared, window_chars))
+    retrieval_items = [
+        (index, record, fragment)
+        for window_number, window in enumerate(windows)
+        if stage.get(str(window_number)) is None and stage.get(f"request:{window_number}") is None
+        for index, record, text, _ in window
+        for fragment in _retrieval_fragments(text)
+    ]
+    logger.info("ASR correction preparing retrieval: windows=%d fragments=%d", len(windows), len(retrieval_items))
+    retrieved = (
+        retrieve_knowledge([(record, fragment) for _, record, fragment in retrieval_items])
+        if retrieve_knowledge is not None and retrieval_items else [[] for _ in retrieval_items]
+    )
+    fragments_by_index: dict[int, list[tuple[str, list[KnowledgeHit]]]] = {index: [] for index, *_ in prepared}
+    for (index, _, fragment), hits in zip(retrieval_items, retrieved, strict=True):
+        fragments_by_index.setdefault(index, []).append((fragment, hits))
+
+    for window_number, window in enumerate(windows):
+        unit_id = str(window_number)
+        cached = stage.get(unit_id)
+        if cached is not None:
+            for (index, *_), value in zip(window, cached, strict=True):
+                corrected[index] = value
             continue
-        entity_union = _unique_entities(
-            entity for _, _, _, candidates in window for entity in candidates
-        )
-        knowledge_union = _unique_knowledge(
-            hit
-            for index, _, _, _ in window
-            for _, hits in fragments_by_index[index]
-            for hit in hits
-        )
-        body = structured_request_body(
-            model=model,
-            prompt_name=_PROMPT,
-            prompt=render_user_prompt(
-                _PROMPT,
-                ENTITY_REFERENCE=_format_entities(entity_union),
-                TARGET=_format_correction_window(window, fragments_by_index),
-            ),
-            max_tokens=max_tokens,
-            temperature=0,
-            json_mode=True,
-            thinking=None,
-        )
+        def prepare_request():
+            entity_union = _unique_entities(
+                entity for _, _, _, candidates in window for entity in candidates
+            )
+            knowledge_union = _unique_knowledge(
+                hit
+                for index, _, _, _ in window
+                for _, hits in fragments_by_index[index]
+                for hit in hits
+            )
+            body = structured_request_body(
+                model=model,
+                prompt_name=_PROMPT,
+                prompt=render_user_prompt(
+                    _PROMPT,
+                    ENTITY_REFERENCE=_format_entities(entity_union),
+                    TARGET=_format_correction_window(window, fragments_by_index),
+                ),
+                max_tokens=max_tokens,
+                temperature=0,
+                json_mode=True,
+                thinking=None,
+            )
+            return {
+                "body": body, "knowledge_ids": [hit.record_id for hit in knowledge_union],
+                "fragments": {str(index): [{"text": fragment, "knowledge_ids": [hit.record_id for hit in hits]}
+                                           for fragment, hits in fragments]
+                              for index, *_ in window
+                              for fragments in [fragments_by_index[index]]},
+            }
+
+        stage.remember(f"request:{unit_id}", prepare_request)
+    logger.info("ASR correction retrieval completed; starting LLM correction")
+    for window_number, window in enumerate(windows):
+        unit_id = str(window_number)
+        if stage.get(unit_id) is not None:
+            continue
+        prepared_request = stage.get(f"request:{unit_id}")
+        logger.info("ASR correction LLM window %d/%d", window_number + 1, len(windows))
+        body = prepared_request["body"]
         response: dict[str, object] | None = None
         batch_error: str | None = None
         try:
@@ -168,10 +188,11 @@ def correct_asr_windows(
                 "request": body,
                 "response": response,
                 "error": batch_error,
-                "knowledge_ids": [hit.record_id for hit in knowledge_union],
+                "knowledge_ids": prepared_request["knowledge_ids"],
             },
         )
-        cached_values: list[str] = []
+        cached_values: list[dict[str, object]] = []
+        downgrade_reasons: list[str] = []
         for position, (index, record, deterministic, candidates) in enumerate(window):
             if parsed is None:
                 value = deterministic
@@ -187,7 +208,9 @@ def correct_asr_windows(
                     method = "llm" if value != deterministic else "unchanged"
                     error = None
             corrected[index] = _corrected_record(record, value, method)
-            cached_values.append(value)
+            cached_values.append(corrected[index])
+            if error:
+                downgrade_reasons.append(error)
             _append_audit(
                 audit_path,
                 {
@@ -201,26 +224,18 @@ def correct_asr_windows(
                     "method": method,
                     "error": error,
                     "candidates": [entity.surface for entity in candidates],
-                    "knowledge_ids": [
-                        hit.record_id
-                        for hit in _unique_knowledge(
-                            hit
-                            for _fragment, hits in fragments_by_index[index]
-                            for hit in hits
-                        )
-                    ],
-                    "retrieval_fragments": [
-                        {
-                            "text": fragment,
-                            "knowledge_ids": [hit.record_id for hit in hits],
-                        }
-                        for fragment, hits in fragments_by_index[index]
-                    ],
+                    "knowledge_ids": list(dict.fromkeys(
+                        record_id
+                        for fragment in prepared_request["fragments"][str(index)]
+                        for record_id in fragment["knowledge_ids"]
+                    )),
+                    "retrieval_fragments": prepared_request["fragments"][str(index)],
                 },
             )
-        cache["windows"][signature] = cached_values
-        _write_json(cache_path, cache)
-    return [value for value in corrected if value is not None]
+        stage.put(unit_id, cached_values, source="asr_correction", reason="; ".join(sorted(set(downgrade_reasons))) or None)
+    result = [value for value in corrected if value is not None]
+    stage.finish(result)
+    return result
 
 
 def _correction_windows(
@@ -420,38 +435,6 @@ def _unique_entities(values: object) -> list[ASREntity]:
     return output
 
 
-def _window_signature(
-    window: list[tuple[int, dict[str, object], str, list[ASREntity]]],
-    fragments_by_index: dict[int, list[tuple[str, list[KnowledgeHit]]]],
-    model: str,
-    correction_config: dict[str, int | float],
-) -> str:
-    payload = {
-        "version": _CACHE_VERSION,
-        "segments": [
-            {
-                "text": text,
-                "language": str(record.get("language") or ""),
-                "entities": [
-                    (item.surface, item.reading, item.aliases) for item in entities
-                ],
-                "knowledge": [
-                    (hit.record_id, hit.title, hit.body)
-                    for _fragment, hits in fragments_by_index[_index]
-                    for hit in hits
-                ],
-            }
-            for _index, record, text, entities in window
-        ],
-        "model": model,
-        "config": correction_config,
-        "prompt": prompt_templates_digest(_PROMPT),
-    }
-    return hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()
-    ).hexdigest()
-
-
 def _compact(value: str) -> str:
     return _SPACE_RE.sub("", unicodedata.normalize("NFKC", value))
 
@@ -474,27 +457,6 @@ def _reading_for_text(text: str) -> str:
 
     morphemes = _sudachi_tokenizer().tokenize(text, tokenizer.Tokenizer.SplitMode.A)
     return _normalize_kana("".join(morpheme.reading_form() for morpheme in morphemes))
-
-
-def _load_cache(path: Path) -> dict[str, object]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        value = {}
-    if value.get("version") != _CACHE_VERSION or not isinstance(
-        value.get("windows"), dict
-    ):
-        return {"version": _CACHE_VERSION, "windows": {}}
-    return value
-
-
-def _write_json(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    temporary.replace(path)
 
 
 def _append_audit(path: Path, value: object) -> None:

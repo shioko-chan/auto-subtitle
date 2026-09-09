@@ -107,47 +107,24 @@ def upload_videos_to_bilibili(
     if config.line:
         command.extend(["--line", config.line])
     command.extend(str(video) for video in videos)
-    for attempt in range(len(config.rate_limit_retry_delays_seconds) + 1):
-        try:
-            output = _run_biliup(command)
-            _record_upload_cooldown(config)
-            try:
-                aid, bvid = _submission_ids(output)
-            except RuntimeError as exc:
-                logger.warning(
-                    "upload succeeded, but aid/bvid could not be parsed; "
-                    "skipping the post-upload comment: %s",
-                    exc,
-                )
-                aid, bvid = None, None
-            return BilibiliSubmission(aid=aid, bvid=bvid, response=output)
-        except BiliupCommandError as exc:
-            code = _bilibili_failure_code(exc.output)
-            if code == 412:
-                _write_pause_marker(pause_marker, code, exc.output)
-                raise RuntimeError(
-                    f"Bilibili risk control returned 412; upload queue paused via "
-                    f"{pause_marker}"
-                ) from exc
-            if code not in {406, 429}:
-                raise
-            if attempt >= len(config.rate_limit_retry_delays_seconds):
-                raise RuntimeError(
-                    f"Bilibili upload remained rate-limited with code {code} after "
-                    f"{attempt + 1} attempts"
-                ) from exc
-            retry_after = _retry_after_from_output(exc.output)
-            delay = (
-                retry_after
-                if retry_after is not None
-                else config.rate_limit_retry_delays_seconds[attempt]
-            )
-            logger.warning(
-                "Bilibili upload returned %d; retrying the complete upload in %.1fs",
-                code,
-                delay,
-            )
-            time.sleep(delay)
+    try:
+        output = _run_biliup(command)
+    except BiliupCommandError as exc:
+        if _bilibili_failure_code(exc.output) == 412:
+            _write_pause_marker(pause_marker, 412, exc.output)
+        # A subprocess failure does not prove the remote submission failed.
+        # Retrying is an explicit publication-resolution operation.
+        raise
+    try:
+        aid, bvid = _submission_ids(output)
+    except RuntimeError:
+        logger.warning("upload succeeded without parseable aid/bvid")
+        aid, bvid = None, None
+    try:
+        _record_upload_cooldown(config)
+    except OSError as exc:
+        logger.warning("could not record upload cooldown after successful submission: %s", exc)
+    return BilibiliSubmission(aid=aid, bvid=bvid, response=output)
 
 
 def _submission_ids(output: str) -> tuple[int, str]:

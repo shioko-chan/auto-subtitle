@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BATCH_SCRIPT = ROOT / "scripts" / "upload-recent-yumemita.sh"
-DEFAULT_UPLOADED = ROOT / "work" / "yumemita-2026-08-10-uploaded.txt"
+DEFAULT_UPLOADED = ROOT / "work" / "uploaded.txt"
 JST = ZoneInfo("Asia/Tokyo")
 MEMBERS_ONLY_MARKERS = ("メン限", "メンバー限定", "members only", "member only")
 CHANNELS = (

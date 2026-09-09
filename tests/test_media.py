@@ -132,7 +132,7 @@ class SubtitleRenderTests(unittest.TestCase):
                     side_effect=CommandError("unsupported codec"),
                 ),
                 patch("subtitle_pipeline.media.require_command", return_value="ffmpeg"),
-                patch("subtitle_pipeline.media.run") as run,
+                patch("subtitle_pipeline.media.run", side_effect=lambda command, **kw: Path(command[-1]).write_bytes(b"rendered")) as run,
             ):
                 result = render_subtitles(
                     video,

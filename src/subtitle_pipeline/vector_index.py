@@ -60,10 +60,34 @@ class LocalVectorIndex:
         return len(missing), len(stale)
 
     def search(self, text: str, limit: int) -> dict[str, float]:
-        if limit < 1 or not text.strip():
-            return {}
+        return self.search_many([text], limit)[0]
+
+    def search_many(self, texts: list[str], limit: int) -> list[dict[str, float]]:
+        results: list[dict[str, float]] = [{} for _ in texts]
+        active = [(i, text) for i, text in enumerate(texts) if text.strip()]
+        if limit < 1 or not active:
+            return results
         with self._lock:
-            return self._search(text, limit)
+            self._load_index()
+            if self._index is None or not self._ids:
+                return results
+            model = self._load_model()
+            vectors = model.encode(
+                [f"query: {text}" for _, text in active],
+                batch_size=128 if self._device == "cuda" else 64,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            ).astype("float32", copy=False)
+            scores, ids = self._index.search(vectors, min(limit, len(self._ids)))
+            reverse = {value: key for key, value in self._ids.items()}
+            for (position, _), row_scores, row_ids in zip(active, scores, ids, strict=True):
+                results[position] = {
+                    reverse[int(vector_id)]: float(score)
+                    for score, vector_id in zip(row_scores, row_ids, strict=True)
+                    if int(vector_id) in reverse
+                }
+        return results
 
     def release_model(self) -> bool:
         with self._lock:
@@ -72,27 +96,6 @@ class LocalVectorIndex:
             self._model = None
             self._device = "cpu"
             return True
-
-    def _search(self, text: str, limit: int) -> dict[str, float]:
-        self._load_index()
-        if self._index is None or not self._ids:
-            return {}
-        vector = (
-            self._load_model()
-            .encode(
-                [f"query: {text}"],
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-            )
-            .astype("float32", copy=False)
-        )
-        scores, ids = self._index.search(vector, min(limit, len(self._ids)))
-        reverse = {value: key for key, value in self._ids.items()}
-        return {
-            reverse[int(vector_id)]: float(score)
-            for score, vector_id in zip(scores[0], ids[0])
-            if int(vector_id) in reverse
-        }
 
     def _load_model(self):
         if self._model is None:

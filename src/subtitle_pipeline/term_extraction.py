@@ -24,6 +24,7 @@ from .llm_response import (
     structured_request_body,
     structured_response_content,
 )
+from .prompt_budget import estimate_prompt_tokens
 from .prompt_templates import render_user_prompt
 from .translate import LLMHTTPError, is_llm_quota_exhausted
 
@@ -932,14 +933,14 @@ def _candidate_batches(
     target_input_tokens: int,
 ) -> list[tuple[LocalTermCandidate, ...]]:
     budget = max(1024, min(target_input_tokens, context_size - max_tokens))
-    base = _estimate_tokens(
+    base = estimate_prompt_tokens(
         render_user_prompt("extract-fan-terms.md", CANDIDATES_JSON="[]")
     )
     batches: list[tuple[LocalTermCandidate, ...]] = []
     current: list[LocalTermCandidate] = []
     tokens = base
     for candidate in candidates:
-        value_tokens = _estimate_tokens(
+        value_tokens = estimate_prompt_tokens(
             json.dumps(_candidate_prompt_value(candidate), ensure_ascii=False)
         )
         if current and tokens + value_tokens > budget:
@@ -1150,14 +1151,6 @@ def _request_json(
             ):
                 raise
     raise RuntimeError(f"{prompt_name} exhausted LLM retries") from last_error
-
-
-def _estimate_tokens(text: str) -> int:
-    cjk = sum(
-        "\u3040" <= character <= "\u30ff" or "\u3400" <= character <= "\u9fff"
-        for character in text
-    )
-    return cjk + (len(text) - cjk + 3) // 4
 
 
 def _write_audit(path: Path | None, value: dict[str, object]) -> None:

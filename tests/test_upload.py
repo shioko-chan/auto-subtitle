@@ -179,7 +179,7 @@ class UploadTests(unittest.TestCase):
                 config=UploadConfig(),
             )
 
-    def test_retries_rate_limited_complete_upload_with_configured_delays(self):
+    def test_does_not_retry_rate_limited_publication_without_resolution(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             cookie = root / "cookies.json"
@@ -206,7 +206,8 @@ class UploadTests(unittest.TestCase):
                 patch("subtitle_pipeline.upload.time.sleep") as sleep,
                 patch("subtitle_pipeline.upload._record_upload_cooldown"),
             ):
-                upload_to_bilibili(
+                with self.assertRaises(BiliupCommandError):
+                    upload_to_bilibili(
                     root / "video.mp4",
                     title="title",
                     description="description",
@@ -214,8 +215,8 @@ class UploadTests(unittest.TestCase):
                     tags=["中字"],
                     config=config,
                 )
-            self.assertEqual(run.call_count, 3)
-            self.assertEqual([item.args[0] for item in sleep.call_args_list], [2, 7])
+            self.assertEqual(run.call_count, 1)
+            sleep.assert_not_called()
 
     def test_412_writes_pause_marker_and_aborts(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -236,7 +237,7 @@ class UploadTests(unittest.TestCase):
                 ),
                 patch("subtitle_pipeline.upload._run_biliup", side_effect=error),
             ):
-                with self.assertRaisesRegex(RuntimeError, "queue paused"):
+                with self.assertRaises(BiliupCommandError):
                     upload_to_bilibili(
                         root / "video.mp4",
                         title="title",

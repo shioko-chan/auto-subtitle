@@ -69,7 +69,7 @@ VP9/H.264，已缓存的 AV1 视频仍可经 CPU 回退处理。
 缺失时才使用歌词专用 LLM 并写回库中。PaddleOCR、搜索和 pySHIRO 均运行在各自锁定的
 worker 环境中。
 原始 `source.qwen3-asr.srt` 始终保留；核验结果写入
-`song-identification-cache.json`，修正版写入 `source.lyrics-corrected.srt`。单首识别
+`song-identification.json`，修正版写入 `source.lyrics-corrected.srt`。单首识别
 失败会保留原 ASR 并继续，不会阻塞非歌曲内容。
 
 完整的 YouTube 格式解析还需要 JavaScript runtime。管线会依次自动寻找 Deno、Node
@@ -145,7 +145,7 @@ tokenizer；混合语言保留原始空格，仅对日语片段运行 Sudachi。
 仍分别保留，原标签继续写入音频分析缓存供审计。
 
 TARGET 以 160 个本地单元或 8000 源字符为上限，靠近上限时选择末段得分最高的本地边界。
-各窗口按 `llm.max_concurrency` 并行，不再运行 Map 边界 Reduce。`cue-joint-cache.json`
+各窗口按 `llm.max_concurrency` 并行，不再运行 Map 边界 Reduce。`cache.sqlite3`
 会在每个窗口成功后立即原子更新；签名包含本地单元、speaker 轨、Sudachi/词典版本、评分
 配置、提示词、模型、REFERENCE 和宽度限制。
 
@@ -194,7 +194,7 @@ URL 放在单引号中时不要再写 `\?` 或 `\=`。为兼容常见的复制�
 这两个位置的多余反斜杠。音轨按 170 秒分块，每个切点两侧额外提供 2 秒上下文，减少
 边界处截词。若检测到 ASR 连续生成同一长文本，当前块会自动递归二分并重新识别，最短约
 20 秒；仍然循环时整条任务失败，异常文本不会进入翻译。每个成功块会立即原子写入 job
-目录的 `asr-cache.json`；中断重跑时只转写
+目录的 `cache.sqlite3`；中断重跑时只转写
 缺失块。上下文区的时间戳只归属相应核心区间，因此不会产生重复 cue。分块总长度受
 forced aligner 的 180 秒输入限制约束。
 
@@ -325,7 +325,7 @@ uv run python scripts/update-recent-yumemita-tasks.py
 ```
 
 可先加 `--dry-run` 预览；通过 `--days`、`--browser` 调整时间范围和浏览器。
-脚本保留 `work/yumemita-2026-08-10-uploaded.txt` 中的成功投稿历史，并原子更新下面
+脚本保留 `work/uploaded.txt` 中的成功投稿历史，并原子更新下面
 批处理脚本的 `RECORDS` 队列。队列按发布时间从新到旧排列，优先处理最新视频。
 
 批量处理队列中的梦限大MewType公开直播录播：
@@ -464,3 +464,5 @@ uv run python -m compileall -q src tests
 
 外部命令均通过参数数组调用，不经 shell 展开；工作目录、API 密钥和 Cookie 已加入
 `.gitignore`。真实端到端测试需要自行提供 URL、API 凭据及转载授权。
+
+缓存现在仅按显式阶段版本失效；配置修改不会自动重算。查看进度、指定阶段重算、降级重试与投稿结果确认的命令见 [缓存与恢复](docs/current-pipeline.md#7-缓存与恢复)。

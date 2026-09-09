@@ -324,24 +324,42 @@ Retry-After 或带 jitter 的指数退避，耗尽后直接终止且不缩窗；
 
 ## 7. 缓存与恢复
 
-每个 URL 使用 SHA-256 前 12 位作为 `work/<job-id>/`。主要缓存如下：
+每个视频使用 `work/<video-id>/cache.sqlite3`。阶段版本及固定依赖表定义在
+`src/subtitle_pipeline/cache.py` 的 `STAGES` 中。SQLite 只保存计划、执行快照、单元结果及产物路径；
+模型推理和网络请求期间不持有事务。音视频文件留在任务目录。
 
-| 文件 | 内容 | 恢复粒度 |
-|---|---|---|
-| `audio-analysis.json` | speech、singing、ambiguous、diarization | 整个分析签名 |
-| `asr-analysis-cache.json` | 各讲话/歌唱区域及递归子范围结果 | 单窗口或子窗口 |
-| `conditioned-asr-cache.json` | DiCoW 重叠分路结果 | 全部重叠窗口签名 |
-| `song-ocr-cache.json` | 每首歌的 OCR 候选 | 歌曲集合签名 |
-| `song-identification-cache.json` | 歌名、来源与歌词对齐报告 | 歌曲集合及歌词库签名 |
-| `work/lyrics/library.sqlite3` | 完整标准歌词、逐行译词及来源 | 持久歌词库，不存 ASR |
-| `song-alignment/*/alignment.json` | pySHIRO 音素与歌词行时间 | 视频音频和歌词匹配 |
-| `local-segmentation.json` | 本地边界评分、Sudachi 形态与 speaker 轨 | 整个源时间轴 |
-| `cue-joint-cache.json` | 联合划句翻译窗口与最终结果 | 单 speaker 窗口 |
-| `manifest.json` | 最终产物与上传完成状态 | 整个作业 |
+缓存仅由显式阶段版本管理。配置、模型、知识库、弹幕、源码哈希和文件时间变化都不会自动失效。
+修改处理逻辑或提示词时，开发者必须提升相应阶段版本；依赖下游自动失效，上游仍然复用。
+同版本恢复使用已保存的窗口、请求分组和执行参数，凭据实时读取、不写入快照。
+成功、确认未命中、产出可用结果的降级都记为完成；普通重跑只补缺失单元。
 
-缓存签名包含相关模型、配置、源时间轴和提示词版本。签名变化时不会误用旧结果；成功结果
-使用临时文件原子替换，中断后只补未完成部分。共享内存只用于当前进程生命周期，不属于
-持久缓存，退出时由所有者 `close()` 并 `unlink()`。
+纠错与讲话对齐独立于原始 ASR，歌曲识别也不依赖纠错。
+分段按窗口、翻译按请求组、歌曲按搜索组、切片按候选及分 P 提交；递归拆窗保留子计划和已完成子窗。
+全部单元完成后提交阶段聚合结果。JSON、SRT、ASS 为审计或输出文件，不再作为计算缓存读取。
+旧计算缓存不迁移、不复用；下载文件、正式歌词、人工/官方译词、知识库、声纹和投稿记录保留。
+机器译词写入任务缓存，不写入正式歌词库。
+
+```bash
+subtitle-pipeline cache status 'https://www.youtube.com/watch?v=VIDEO_ID'
+subtitle-pipeline cache reset 'https://www.youtube.com/watch?v=VIDEO_ID' --stage asr_correction
+subtitle-pipeline cache reset 'https://www.youtube.com/watch?v=VIDEO_ID' --all
+subtitle-pipeline run 'https://www.youtube.com/watch?v=VIDEO_ID' --retry-degraded --stage translation --no-upload
+subtitle-pipeline clips 'https://www.youtube.com/watch?v=VIDEO_ID' --retry-degraded --stage clip_analysis --no-upload
+```
+
+重试只选择指定阶段的降级单元，并使下游失效。再次降级仍保存新的可用结果；没有有效新结果则
+保留原记录及失败审计。`run`、`clips` 和修改任务状态的命令使用同一个任务进程锁，重复启动立即报错。
+
+投稿独立保存于 `manifest.json` 和 `clips/upload.json`。上传前原子写入 `submitting`，
+成功返回后立即保存投稿 ID，再执行歌单评论。评论等待中断、重新渲染或清空计算缓存均不清除成功记录。
+残留 `submitting` 表示结果不明，禁止自动重投，由用户确认：
+
+```bash
+subtitle-pipeline publication resolve 'https://www.youtube.com/watch?v=VIDEO_ID' --target main --uploaded --aid 123 --bvid BVexample
+subtitle-pipeline publication resolve 'https://www.youtube.com/watch?v=VIDEO_ID' --target clips --not-uploaded
+```
+
+不会自动查询远端，也不会自动重试整个上传操作。共享内存只在当前进程内使用，持久结果引用磁盘文件。
 
 ## 8. 当前主要技术风险
 

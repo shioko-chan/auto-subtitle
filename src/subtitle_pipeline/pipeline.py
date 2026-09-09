@@ -4,15 +4,18 @@ import json
 import logging
 import re
 import time
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
+from .cache import CacheStore, config_snapshot, restore_config, job_lock
+from .publication import completed, publish_once, read_record, write_record
 from .asr import (
     read_cue_evidence,
     read_cue_sidecar,
@@ -38,6 +41,7 @@ from .local_llm_server import LocalLLMServer
 from .media import download_youtube, render_subtitles, subtitle_layout
 from .song_identification import (
     SongIdentificationResult,
+    decode_song_result,
     arbitrate_verified_lyrics,
     identify_and_align_songs,
     select_ocr_song_titles,
@@ -81,7 +85,18 @@ class PipelineResult:
     bilibili_bvid: str | None
 
 
-def run_pipeline(
+def run_pipeline(url: str, config: AppConfig, *, upload_override: bool | None = None,
+                 retry_degraded: str | None = None) -> PipelineResult:
+    directory = config.work_dir.resolve() / youtube_video_id(normalize_youtube_url(url))
+    with job_lock(directory):
+        store = CacheStore(directory / "cache.sqlite3")
+        store.restore_interrupted_retries()
+        if retry_degraded is not None:
+            store.retry_degraded(retry_degraded)
+        return _run_pipeline_locked(url, config, upload_override=upload_override)
+
+
+def _run_pipeline_locked(
     url: str,
     config: AppConfig,
     *,
@@ -93,8 +108,12 @@ def run_pipeline(
     job_dir.mkdir(parents=True, exist_ok=True)
     with _job_log(job_dir / "run.log"):
         logging.info("job directory: %s", job_dir)
-        _wait_for_deepseek_task_window(config.llm)
         local_llm_server = LocalLLMServer(config.llm, job_dir / "local-llm-server.log")
+        cache_store = CacheStore(job_dir / "cache.sqlite3")
+        needs_knowledge = any(
+            (stage := cache_store.existing(name)) is None or stage.get("__result__") is None
+            for name in ("asr_correction", "translation")
+        )
         fan_knowledge = (
             FanKnowledgeRetriever(
                 Path(config.fan_knowledge.database_path).expanduser(),
@@ -107,7 +126,7 @@ def run_pipeline(
                 reranker_model=config.fan_knowledge.reranker_model,
                 reranker_minimum_score=(config.fan_knowledge.reranker_minimum_score),
             )
-            if config.fan_knowledge.enabled
+            if config.fan_knowledge.enabled and needs_knowledge
             else None
         )
 
@@ -195,6 +214,7 @@ def _run_pipeline_stages(
     local_llm_server: LocalLLMServer,
     fan_knowledge: FanKnowledgeRetriever | None,
 ) -> PipelineResult:
+    store = CacheStore(job_dir / "cache.sqlite3")
     if fan_knowledge is not None:
         with stage_metrics("pipeline.knowledge_update"):
             update_knowledge_if_stale(config, fan_knowledge)
@@ -222,8 +242,6 @@ def _run_pipeline_stages(
                 )
             except (OSError, UnicodeError) as exc:
                 logging.warning("could not read current-video chat replay: %s", exc)
-            finally:
-                remove_youtube_chat_files(job_dir)
 
     translation_context = _translation_context(
         downloaded.metadata, config.translation.glossary_files
@@ -258,9 +276,18 @@ def _run_pipeline_stages(
     translator = OpenAICompatibleTranslator(
         config.llm,
         config.translation,
-        llm_api_key(config.llm),
+        lambda: llm_api_key(config.llm),
         audit_path=job_dir / "llm-audit.jsonl",
     )
+    request_start_lock = threading.Lock()
+    def before_request(llm_config):
+        with request_start_lock:
+            _wait_for_deepseek_task_window(llm_config)
+            if local_llm_server.config != llm_config:
+                local_llm_server.stop()
+                local_llm_server.config = llm_config
+            local_llm_server.start()
+    translator.before_request = before_request
     asr_entities = entities_from_context(translation_context)
     layout = subtitle_layout(downloaded.video, config.render)
     japanese_guidance_units = layout.max_line_units * 1.25
@@ -270,28 +297,18 @@ def _run_pipeline_stages(
         nonlocal early_song_result
 
         def select_titles(candidate_sets):
-            try:
-                if config.llm.local_server_enabled:
-                    local_llm_server.start()
-                return select_ocr_song_titles(
-                    candidate_sets,
-                    video_title=str(downloaded.metadata.get("title") or ""),
-                    request=translator.request,
-                    model=config.llm.model,
-                    json_mode=config.llm.json_mode,
-                    thinking=config.llm.thinking,
-                )
-            except Exception as exc:  # noqa: BLE001 - OCR remains optional evidence.
-                logging.warning(
-                    "LLM song-title selection failed; continuing without OCR "
-                    "titles: %s",
-                    exc,
-                )
-                return [None for _ in candidate_sets]
+            return select_ocr_song_titles(
+                candidate_sets,
+                video_title=str(downloaded.metadata.get("title") or ""),
+                request=translator.stage_request(job_dir / "cache.sqlite3", "song_identification"),
+                model=config.llm.model,
+                json_mode=config.llm.json_mode,
+                thinking=config.llm.thinking,
+                context_size=config.llm.local_server_context_size,
+            )
 
         with stage_metrics("pipeline.song_identification"):
-            if config.song_identification.enabled:
-                early_song_result = identify_and_align_songs(
+            early_song_result = identify_and_align_songs(
                     downloaded.video,
                     singing_cues,
                     downloaded.metadata,
@@ -299,9 +316,7 @@ def _run_pipeline_stages(
                     config.song_identification,
                     source_maximum_units=japanese_guidance_units,
                     select_ocr_titles=select_titles,
-                )
-            else:
-                early_song_result = SongIdentificationResult(singing_cues, [])
+            )
         return early_song_result.corrected_cues
 
     def correct_asr_text(records: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -319,39 +334,42 @@ def _run_pipeline_stages(
                 }
                 for index, record in enumerate(records)
             ]
-        if config.llm.local_server_enabled:
-            with stage_metrics("pipeline.local_llm_asr_correction_startup"):
-                local_llm_server.start()
 
         def retrieve_asr_knowledge(
-            record: dict[str, object], text: str
-        ) -> list[KnowledgeHit]:
+            items: list[tuple[dict[str, object], str]],
+        ) -> list[list[KnowledgeHit]]:
             if fan_knowledge is None:
-                return []
-            query = KnowledgeQuery(
-                text=text,
-                speaker=str(record.get("speaker") or "") or None,
-                video_date=video_date,
-                ocr_text=str(record.get("ocr_text") or ""),
-                chat_text=str(record.get("chat_text") or ""),
-                exclude_video_id=current_video_id,
-                top_k=config.fan_knowledge.top_k_asr,
-            )
-            values = [
-                *fan_knowledge.retrieve_asr_term_references(query)[:2],
-                *fan_knowledge.retrieve_background(query),
+                return [[] for _ in items]
+            queries = [
+                KnowledgeQuery(
+                    text=text,
+                    speaker=str(record.get("speaker") or "") or None,
+                    video_date=video_date,
+                    ocr_text=str(record.get("ocr_text") or ""),
+                    chat_text=str(record.get("chat_text") or ""),
+                    exclude_video_id=current_video_id,
+                    top_k=config.fan_knowledge.top_k_asr,
+                )
+                for record, text in items
             ]
-            return list({hit.record_id: hit for hit in values}.values())[
-                : config.fan_knowledge.top_k_asr
-            ]
+            try:
+                backgrounds = fan_knowledge.retrieve_background_many(queries)
+                return [
+                    list({hit.record_id: hit for hit in [
+                        *fan_knowledge.retrieve_asr_term_references(query)[:2], *background
+                    ]}.values())[: config.fan_knowledge.top_k_asr]
+                    for query, background in zip(queries, backgrounds, strict=True)
+                ]
+            finally:
+                fan_knowledge.release_models()
 
         try:
             return correct_asr_windows(
                 records,
                 entities=asr_entities,
-                request=translator.request,
+                request=translator.stage_request(job_dir / "cache.sqlite3", "asr_correction"),
                 model=config.llm.model,
-                cache_path=job_dir / "asr-correction-cache.json",
+                cache_path=job_dir / "cache.sqlite3",
                 audit_path=job_dir / "asr-correction-audit.jsonl",
                 window_chars=config.asr_correction.window_chars,
                 max_tokens=config.asr_correction.max_tokens,
@@ -373,6 +391,10 @@ def _run_pipeline_stages(
             process_song_cues,
         )
 
+    song_stage = CacheStore(job_dir / "cache.sqlite3").existing("song_identification")
+    saved_song = song_stage.get("__result__") if song_stage is not None else None
+    if saved_song is not None:
+        early_song_result = decode_song_result(saved_song)
     sidecar = source_subtitle.with_suffix(".cues.json")
     cues = (
         read_cue_sidecar(sidecar)
@@ -413,19 +435,17 @@ def _run_pipeline_stages(
         ],
         early_song_result.verified_lyric_spans,
     )
-    if config.llm.local_server_enabled:
-        with stage_metrics("pipeline.local_llm_startup"):
-            local_llm_server.start()
-    else:
-        local_llm_server.start()
     with stage_metrics("pipeline.song_lyrics_translation"):
         if song_result.reports:
             song_result = translate_aligned_song_lyrics(
                 song_result,
                 config.song_identification,
-                translator.translate_lyrics,
+                lambda *args, **kwargs: translator.translate_lyrics(
+                    *args, **kwargs, cache_path=job_dir / "cache.sqlite3"
+                ),
                 translation_context,
                 config.llm.model,
+                cache_path=job_dir / "cache.sqlite3",
             )
     song_result = split_aligned_song_cues(song_result, japanese_guidance_units)
     cues = song_result.corrected_cues
@@ -444,7 +464,7 @@ def _run_pipeline_stages(
             cues,
             config.segmentation,
             max_line_units=layout.max_line_units,
-            cache_path=job_dir / "cue-segmentation-cache.json",
+            cache_path=job_dir / "cache.sqlite3",
             audit_path=job_dir / "local-segmentation.json",
         )
     retrieve_translation_knowledge = None
@@ -481,7 +501,7 @@ def _run_pipeline_stages(
         translated = translator.translate_segmented_cues(
             segmented,
             translation_context=translation_context,
-            cache_path=job_dir / "cue-translation-cache.json",
+            cache_path=job_dir / "cache.sqlite3",
             audit_path=job_dir / "translation-audit.jsonl",
             retrieve_knowledge=retrieve_translation_knowledge,
             retrieve_chat=retrieve_translation_chat,
@@ -537,20 +557,35 @@ def _run_pipeline_stages(
     title, description = source_title, source_description
     content_summary = ""
     generated_tags: list[str] = []
+    metadata_stage = store.stage("metadata", lambda: {
+        "title": source_title, "description": source_description, "youtube_context": youtube_context,
+        "subtitle_evidence": subtitle_evidence, "ip_aliases": ip_aliases, "tag_catalog": tag_catalog,
+        "translation_context": translation_context,
+        "enabled": config.translation.translate_metadata,
+    })
+    metadata_cached = metadata_stage.get("metadata")
+    title, description = metadata_stage.plan["title"], metadata_stage.plan["description"]
     with stage_metrics("pipeline.metadata_translation"):
-        if config.translation.translate_metadata:
+        if metadata_cached is not None:
+            title, description, content_summary, generated_tags = metadata_cached
+        elif metadata_stage.plan["enabled"]:
             logging.info("translating video title and description and generating tags")
             title, description, content_summary, generated_tags = (
                 translator.translate_metadata(
-                    source_title,
-                    source_description,
-                    youtube_context=youtube_context,
-                    subtitle_evidence=subtitle_evidence,
-                    ip_aliases=ip_aliases,
-                    bilibili_tag_catalog=tag_catalog,
-                    translation_context=translation_context,
+                    metadata_stage.plan["title"],
+                    metadata_stage.plan["description"],
+                    youtube_context=metadata_stage.plan["youtube_context"],
+                    subtitle_evidence=metadata_stage.plan["subtitle_evidence"],
+                    ip_aliases=metadata_stage.plan["ip_aliases"],
+                    bilibili_tag_catalog=metadata_stage.plan["tag_catalog"],
+                    translation_context=metadata_stage.plan["translation_context"],
+                    cache_path=job_dir / "cache.sqlite3",
                 )
             )
+    if metadata_cached is None:
+        metadata_value = [title, description, content_summary, generated_tags]
+        metadata_stage.put("metadata", metadata_value)
+        metadata_stage.finish(metadata_value)
     generated_tags, tag_catalog_matches = _canonicalize_catalog_tags(
         generated_tags, tag_catalog
     )
@@ -608,14 +643,16 @@ def _run_pipeline_stages(
     comment_task = None
     if should_upload:
         with stage_metrics("pipeline.upload"):
-            submission = upload_to_bilibili(
+            submission = publish_once(
+                job_dir / "manifest.json", {"url": url, "title": title},
+                lambda: upload_to_bilibili(
                 rendered_path,
                 title=title,
                 description=description,
                 source_url=url,
                 tags=upload_tags,
                 config=config.upload,
-            )
+            ))
             setlist = (
                 build_song_setlist_comment(
                     downloaded.metadata,
@@ -647,6 +684,7 @@ def _run_pipeline_stages(
                     comment_status,
                 )
 
+    publication = read_record(job_dir / "manifest.json")
     result = PipelineResult(
         job_dir=job_dir,
         source_video=downloaded.video,
@@ -654,9 +692,9 @@ def _run_pipeline_stages(
         translated_subtitle=translated_path,
         translated_metadata=metadata_path,
         rendered_video=rendered_path,
-        uploaded=should_upload,
-        bilibili_aid=submission.aid if submission is not None else None,
-        bilibili_bvid=submission.bvid if submission is not None else None,
+        uploaded=completed(publication),
+        bilibili_aid=publication.get("bilibili_aid"),
+        bilibili_bvid=publication.get("bilibili_bvid"),
     )
     _write_manifest(result, url, title)
     return result
@@ -1158,7 +1196,5 @@ def _write_manifest(result: PipelineResult, url: str, title: str) -> None:
         key: str(value) if isinstance(value, Path) else value
         for key, value in values.items()
     }
-    (result.job_dir / "manifest.json").write_text(
-        json.dumps(serializable, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    path = result.job_dir / "manifest.json"
+    write_record(path, {**read_record(path), **serializable})

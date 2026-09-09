@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import subprocess
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from .cache import CacheStore, StageCache, config_snapshot, restore_config
 from .audio_buffer import AudioBuffer, AudioBufferPool
 from .commands import require_command, run
 from .config import AudioAnalysisConfig
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # hooks. Keep unrelated model construction out of that process-global context.
 _MODEL_LOAD_LOCK = threading.Lock()
 
-_CACHE_VERSION = 15
+_AUDIT_VERSION = 15
 _SINGING_LABELS = {
     "chant",
     "child singing",
@@ -105,16 +105,25 @@ def analyze_audio(
 ) -> AudioAnalysis:
     """Run reusable VAD/diarization and singing analysis before ASR."""
     job_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = job_dir / "audio-analysis.json"
-    signature = _signature(video, config, metadata or {})
-    cached = None if force_runtime_sources else _load_cache(cache_path, signature)
-    if cached is not None:
-        logger.info(
-            "audio analysis cache: %d speech turns, %d ALT phrases",
-            len(cached.speech),
-            len(cached.singing),
-        )
-        return cached
+    stage = CacheStore(job_dir / "cache.sqlite3").stage("audio_analysis", lambda: {
+        "config": config_snapshot(config), "metadata": metadata or {},
+    })
+    config = restore_config(config, stage.plan["config"])
+    metadata = stage.plan["metadata"]
+    value = stage.get("__result__")
+    if value is not None:
+        result = _decode_analysis(value)
+        paths = [region.source_path for region in result.singing if region.source_path]
+        if all(Path(path).is_file() for path in paths):
+            return result
+        ranges = stage.get("vocal_artifacts") or []
+        missing = [(item["start"], item["end"], Path(item["path"]))
+                   for item in ranges
+                   if not Path(item["path"]).is_file() or not Path(item["path"]).stat().st_size]
+        if missing:
+            separate_vocal_ranges(video, missing, config.device)
+        if all(Path(path).is_file() and Path(path).stat().st_size for path in paths):
+            return result
 
     if audio_pool is not None:
         import torch
@@ -134,6 +143,7 @@ def analyze_audio(
         config,
         metadata or {},
         audio_buffer=audio_pool.main() if audio_pool is not None else None,
+        cache=stage,
     )
     speech = _clean_speaker_timeline(ordinary_diarization)
     song_detection_audit: dict[str, object] = {}
@@ -162,6 +172,7 @@ def analyze_audio(
                     audio_pool,
                     # Persist candidate stems for later canonical-lyric alignment.
                     debug_dir=job_dir / "vocal-candidates",
+                    cache=stage,
                 )
             else:
                 vocals_path = job_dir / "source.vocals.wav"
@@ -175,6 +186,16 @@ def analyze_audio(
         config,
         allow_unbound_vocal_source=fallback_vocals_path is not None,
     )
+    persistent_sources = {
+        buffer.uri: str((job_dir / "vocal-candidates" / f"candidate-{index:04d}.vocals.wav").resolve())
+        for index, (_region, buffer) in enumerate(vocal_candidates)
+    }
+    acoustic_phrases = [replace(phrase, source_path=persistent_sources.get(phrase.source_path, phrase.source_path))
+                        for phrase in acoustic_phrases]
+    stage.put("vocal_artifacts", [
+        {"start": region.start, "end": region.end, "path": persistent_sources[buffer.uri]}
+        for region, buffer in vocal_candidates
+    ], kind="plan")
     alt_regions = [
         AudioRegion(phrase.start, phrase.end, "singing")
         for phrase in acoustic_phrases
@@ -221,20 +242,16 @@ def analyze_audio(
         acoustic_phrases=acoustic_phrases,
     )
     payload = {
-        "version": _CACHE_VERSION,
-        "signature": _signature(video, config, metadata or {}),
+        "version": _AUDIT_VERSION,
         "speech": [asdict(region) for region in speech],
         "singing": [asdict(region) for region in singing],
         "diarization": [asdict(region) for region in ordinary_diarization],
         "acoustic_phrases": [asdict(phrase) for phrase in acoustic_phrases],
         "song_detection": song_detection_audit,
     }
-    temporary = cache_path.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(cache_path)
+    stage.put("analysis", payload)
+    stage.finish(payload)
+    (job_dir / "audio-analysis.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info(
         "audio analysis wrote %d speech turns and %d ALT phrases",
         len(speech),
@@ -252,6 +269,7 @@ def _run_initial_audio_analysis(
     metadata: dict[str, object],
     *,
     audio_buffer: AudioBuffer | None = None,
+    cache: StageCache | None = None,
 ) -> tuple[list[AudioRegion], list[AudioRegion]]:
     def diarize() -> list[AudioRegion]:
         with stage_metrics("audio.diarization", config.device):
@@ -286,15 +304,24 @@ def _run_initial_audio_analysis(
         with stage_metrics("audio.raw_singing_detection", config.device):
             return _score_singing_windows(waveform, sample_rate, config)
 
+    def cached_analysis(key, compute):
+        saved = cache.get(key) if cache is not None else None
+        if saved is not None:
+            return [AudioRegion(**item) for item in saved]
+        result = compute()
+        if cache is not None:
+            cache.put(key, result)
+        return result
+
     if config.initial_analysis_concurrency == 1:
-        return diarize(), detect_singing()
+        return cached_analysis("diarization", diarize), cached_analysis("singing_scores", detect_singing)
     logger.info(
         "running %s diarization and raw-audio AST concurrently",
         config.diarization_backend,
     )
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="audio-analysis") as pool:
-        diarization = pool.submit(diarize)
-        singing = pool.submit(detect_singing)
+        diarization = pool.submit(cached_analysis, "diarization", diarize)
+        singing = pool.submit(cached_analysis, "singing_scores", detect_singing)
         return diarization.result(), singing.result()
 
 
@@ -781,6 +808,7 @@ def _separate_vocal_candidates(
     audio_pool: AudioBufferPool,
     *,
     debug_dir: Path | None = None,
+    cache: StageCache | None = None,
 ) -> list[tuple[AudioRegion, AudioBuffer]]:
     try:
         import soundfile as sf
@@ -795,10 +823,16 @@ def _separate_vocal_candidates(
         "separating vocals for %d source-quality song candidate ranges",
         len(candidates),
     )
-    separator = Separator(model="htdemucs", device=device, progress=True)
+    separator = None
     outputs: list[tuple[AudioRegion, AudioBuffer]] = []
     try:
         for index, candidate in enumerate(candidates):
+            saved = cache.get(f"vocals:{index}") if cache is not None else None
+            if saved is not None and Path(saved["path"]).is_file() and Path(saved["path"]).stat().st_size > 44:
+                outputs.append((candidate, audio_pool.source(Path(saved["path"]))))
+                continue
+            if separator is None:
+                separator = Separator(model="htdemucs", device=device, progress=True)
             waveform, sample_rate = _decode_stereo_range(
                 video,
                 candidate.start,
@@ -821,6 +855,11 @@ def _separate_vocal_candidates(
                     buffer.samples,
                     buffer.sample_rate,
                 )
+                if cache is not None:
+                    cache.put(f"vocals:{index}", {
+                        "path": str((debug_dir / f"candidate-{index:04d}.vocals.wav").resolve()),
+                        "start": candidate.start, "end": candidate.end,
+                    })
     finally:
         del separator
         _release_cuda()
@@ -1165,61 +1204,13 @@ def _release_cuda() -> None:
         pass
 
 
-def _signature(
-    video: Path, config: AudioAnalysisConfig, metadata: dict[str, object]
-) -> str:
-    stat = video.stat()
-    profile_dir = Path(config.speaker_profiles_dir).expanduser()
-    profile_state = (
-        [
-            (path.name, path.stat().st_size, path.stat().st_mtime_ns)
-            for path in sorted(profile_dir.glob("*.json"))
-        ]
-        if profile_dir.is_dir()
-        else []
+def _decode_analysis(value: dict) -> AudioAnalysis:
+    return AudioAnalysis(
+        speech=[_decode_audio_region(item) for item in value["speech"]],
+        singing=[_decode_audio_region(item) for item in value["singing"]],
+        diarization=[_decode_audio_region(item) for item in value.get("diarization", [])],
+        acoustic_phrases=[AcousticPhrase(**item) for item in value.get("acoustic_phrases", [])],
     )
-    payload = {
-        "version": _CACHE_VERSION,
-        "video_size": stat.st_size,
-        "video_mtime_ns": stat.st_mtime_ns,
-        "config": asdict(config),
-        "channel_identity": {
-            key: metadata.get(key)
-            for key in ("channel", "channel_id", "uploader", "uploader_id")
-        },
-        "speaker_profiles": profile_state,
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
-def _load_cache(path: Path, signature: str) -> AudioAnalysis | None:
-    if not path.is_file():
-        return None
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if (
-            value.get("version") != _CACHE_VERSION
-            or value.get("signature") != signature
-        ):
-            return None
-        result = AudioAnalysis(
-            speech=[_decode_audio_region(item) for item in value["speech"]],
-            singing=[_decode_audio_region(item) for item in value["singing"]],
-            diarization=[
-                _decode_audio_region(item) for item in value.get("diarization", [])
-            ],
-            acoustic_phrases=[
-                AcousticPhrase(**item)
-                for item in value.get("acoustic_phrases", [])
-                if isinstance(item, dict)
-            ],
-        )
-        return result
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-        logger.warning("ignoring unreadable audio analysis cache %s: %s", path, exc)
-        return None
 
 
 def _decode_audio_region(value: dict[str, object]) -> AudioRegion:

@@ -146,7 +146,9 @@ class EnglishJapaneseG2P:
             preserve_punctuation=False,
             with_stress=False,
         )
-        self._separator = Separator(phone=" ", word=None)
+        # Keep word boundaries for phonemizer's word-count check; _clean_phones
+        # splits both spaces and tabs when consuming the resulting phonemes.
+        self._separator = Separator(phone=" ", word="\t")
         self._cache: dict[str, str] = {}
 
     def katakana(self, word: str) -> str:

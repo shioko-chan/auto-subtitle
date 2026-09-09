@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import math
 import re
 import statistics
-from dataclasses import asdict, dataclass
+import threading
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .cache import CacheStore, config_snapshot, restore_config, job_lock
+from .publication import publish_once
 from .chat_context import (
     YouTubeChatMessage,
     read_youtube_live_chat,
@@ -26,7 +28,7 @@ from .llm_response import (
 from .local_llm_server import LocalLLMServer
 from .media import _download_youtube_chat_replay
 from .pipeline import normalize_youtube_url, youtube_video_id
-from .prompt_templates import prompt_templates_digest, render_user_prompt
+from .prompt_templates import render_user_prompt
 from .subtitles import Cue, read_subtitles
 from .upload import upload_videos_to_bilibili
 
@@ -83,7 +85,18 @@ class ClipsResult:
     bilibili_bvid: str | None = None
 
 
-def run_clips(
+def run_clips(url: str, config: AppConfig, *, upload_override: bool | None = None,
+              retry_degraded: str | None = None) -> ClipsResult:
+    directory = config.work_dir.resolve() / youtube_video_id(normalize_youtube_url(url))
+    with job_lock(directory):
+        store = CacheStore(directory / "cache.sqlite3")
+        store.restore_interrupted_retries()
+        if retry_degraded is not None:
+            store.retry_degraded(retry_degraded)
+        return _run_clips_locked(url, config, upload_override=upload_override)
+
+
+def _run_clips_locked(
     url: str,
     config: AppConfig,
     *,
@@ -108,12 +121,20 @@ def run_clips(
     clips_dir = job_dir / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
     analysis_path = clips_dir / "analysis.json"
-    signature = _analysis_signature(required, job_dir, config)
-    analysis = _load_cached_analysis(analysis_path, signature)
+    store = CacheStore(job_dir / "cache.sqlite3")
+    stage = store.stage("clip_analysis", lambda: {
+        "clips": config_snapshot(config.clips), "llm": config_snapshot(config.llm),
+        "translation": config_snapshot(config.translation),
+    })
+    config = replace(config, clips=restore_config(config.clips, stage.plan["clips"]),
+                     llm=restore_config(config.llm, stage.plan["llm"]),
+                     translation=restore_config(config.translation, stage.plan["translation"]))
+    analysis = stage.get("__result__")
     analysis_cached = analysis is not None
     if analysis is None:
-        analysis = _analyze(url, job_dir, clips_dir, required, config, signature)
-        _write_json_atomic(analysis_path, analysis)
+        analysis = _analyze(url, job_dir, clips_dir, required, config, stage)
+        stage.finish(analysis)
+    _write_json_atomic(analysis_path, analysis)
 
     part_records = _part_records(analysis)
     part_paths = _render_parts(
@@ -129,40 +150,19 @@ def run_clips(
     bvid: str | None = None
     uploaded = False
     if should_upload and part_paths:
-        if upload_path.is_file():
-            logger.info("clip upload record already exists; skipping Bilibili upload")
-            record = _load_json_object(upload_path, "clip upload record")
-            aid = _optional_int(record.get("aid"))
-            bvid = str(record.get("bvid") or "").strip() or None
-            uploaded = True
-        else:
-            metadata = analysis.get("upload_metadata")
-            if not isinstance(metadata, dict):
-                raise RuntimeError("clip analysis has no upload metadata")
-            tags = _upload_tags(required["translated metadata"], config.upload.tags)
-            submission = upload_videos_to_bilibili(
-                part_paths,
-                title=_required_text(metadata, "title"),
-                description=_required_text(metadata, "description"),
-                source_url=url,
-                tags=tags,
-                config=config.upload,
-            )
-            aid, bvid = submission.aid, submission.bvid
-            _write_json_atomic(
-                upload_path,
-                {
-                    "status": "success",
-                    "uploaded_at": datetime.now(UTC).isoformat(),
-                    "aid": aid,
-                    "bvid": bvid,
-                    "title": metadata["title"],
-                    "description": metadata["description"],
-                    "parts": [str(path.relative_to(job_dir)) for path in part_paths],
-                    "response": submission.response,
-                },
-            )
-            uploaded = True
+        metadata = analysis.get("upload_metadata")
+        if not isinstance(metadata, dict):
+            raise RuntimeError("clip analysis has no upload metadata")
+        tags = _upload_tags(required["translated metadata"], config.upload.tags)
+        submission = publish_once(upload_path, {
+            "title": metadata["title"], "description": metadata["description"],
+            "parts": [str(path.relative_to(job_dir)) for path in part_paths],
+        }, lambda: upload_videos_to_bilibili(
+            part_paths, title=_required_text(metadata, "title"),
+            description=_required_text(metadata, "description"), source_url=url,
+            tags=tags, config=config.upload,
+        ))
+        aid, bvid, uploaded = submission.aid, submission.bvid, True
 
     return ClipsResult(job_dir, analysis_path, tuple(part_paths), uploaded, aid, bvid)
 
@@ -285,7 +285,7 @@ def _analyze(
     clips_dir: Path,
     required: dict[str, Path],
     config: AppConfig,
-    signature: str,
+    stage,
 ) -> dict[str, object]:
     translated_cues = read_subtitles(required["translated subtitles"])
     source_metadata = _load_json_object(required["source metadata"], "source metadata")
@@ -298,7 +298,9 @@ def _analyze(
     if duration <= 0 or not translated_cues:
         raise RuntimeError("completed job has no usable duration or translated cues")
 
-    chat_messages = _download_chat(url, clips_dir, config)
+    chat_messages = [YouTubeChatMessage(**value) for value in stage.remember(
+        "chat", lambda: [asdict(value) for value in _download_chat(url, clips_dir, config)]
+    )]
     windows = analyze_chat_windows(chat_messages, duration=duration)
     peaks = select_chat_peaks(
         windows,
@@ -312,6 +314,12 @@ def _analyze(
         else _semantic_seeds(translated_cues, duration)
     )
 
+    seeds = stage.remember("candidates", lambda: {
+        "songs": song_seeds, "speech": speech_seeds,
+        "cues": [asdict(cue) for cue in translated_cues],
+    })
+    song_seeds, speech_seeds = seeds["songs"], seeds["speech"]
+    translated_cues = [Cue(**value) for value in seeds["cues"]]
     server = LocalLLMServer(config.llm, clips_dir / "local-llm-server.log")
     from .config import llm_api_key
     from .translate import OpenAICompatibleTranslator
@@ -319,24 +327,31 @@ def _analyze(
     translator = OpenAICompatibleTranslator(
         config.llm,
         config.translation,
-        llm_api_key(config.llm),
+        lambda: llm_api_key(config.llm),
         audit_path=clips_dir / "llm-audit.jsonl",
     )
+    request_start_lock = threading.Lock()
+    def before_request(llm_config):
+        with request_start_lock:
+            if server.config != llm_config:
+                server.stop()
+                server.config = llm_config
+            server.start()
+    translator.before_request = before_request
     try:
-        server.start()
         songs = _review_seeds(
             song_seeds,
             translated_cues,
             translator,
             config,
-            required=True,
+            required=True, cache=stage, prefix="song",
         )
         speech = _review_seeds(
             speech_seeds,
             translated_cues,
             translator,
             config,
-            required=False,
+            required=False, cache=stage, prefix="speech",
         )
         selected_songs = [part for part in songs if part is not None]
         selected_speech = _merge_speech_parts(
@@ -345,11 +360,7 @@ def _analyze(
             config.clips.max_speech_seconds,
         )
         parts = sorted([*selected_songs, *selected_speech], key=lambda item: item.start)
-        metadata = (
-            _generate_upload_metadata(parts, translated_metadata, translator, config)
-            if parts
-            else {}
-        )
+        metadata = _upload_metadata(translated_metadata) if parts else {}
     finally:
         server.stop()
 
@@ -359,7 +370,6 @@ def _analyze(
         records.append({**asdict(part), "file": f"parts/{filename}"})
     return {
         "version": _ANALYSIS_VERSION,
-        "signature": signature,
         "source_url": url,
         "created_at": datetime.now(UTC).isoformat(),
         "chat_available": bool(chat_messages),
@@ -556,16 +566,25 @@ def _review_seed(seed, cues, translator, config, *, required: bool) -> ClipPart 
     )
 
 
-def _review_seeds(seeds, cues, translator, config, *, required: bool):
-    results: list[ClipPart | None] = []
-    for seed in seeds:
+def _review_seeds(seeds, cues, translator, config, *, required: bool, cache=None, prefix="seed"):
+    results = []
+    for index, seed in enumerate(seeds):
+        key = f"{prefix}:{index}"
+        saved = cache.get(key) if cache is not None else None
+        if saved is not None:
+            results.append(ClipPart(**saved["part"]) if saved["part"] is not None else None)
+            continue
+        error = None
         try:
-            results.append(
-                _review_seed(seed, cues, translator, config, required=required)
-            )
+            part = _review_seed(seed, cues, translator, config, required=required)
         except (RuntimeError, TypeError, ValueError, KeyError) as exc:
             logger.warning("discarding invalid %s clip review: %s", seed["kind"], exc)
-            results.append(_required_song_fallback(seed) if required else None)
+            part = _required_song_fallback(seed) if required else None
+            error = f"{type(exc).__name__}: {exc}"
+        if cache is not None:
+            cache.put(key, {"part": asdict(part) if part is not None else None},
+                      source="clip_review", reason=error)
+        results.append(part)
     return results
 
 
@@ -646,36 +665,10 @@ def _merge_speech_parts(
     return merged
 
 
-def _generate_upload_metadata(parts, metadata, translator, config):
-    payload = {
-        "source_title": metadata.get("translated_title")
-        or metadata.get("source_title"),
-        "content_summary": metadata.get("content_summary"),
-        "parts": [
-            {
-                "index": index,
-                "kind": part.kind,
-                "title": part.title,
-                "song": part.song,
-                "artist": part.artist,
-                "start": part.start,
-                "end": part.end,
-                "reason": part.reason,
-            }
-            for index, part in enumerate(parts, 1)
-        ],
-    }
-    response = _request_json(
-        translator,
-        config,
-        "clip-metadata.md",
-        render_user_prompt(
-            "clip-metadata.md", METADATA_JSON=json.dumps(payload, ensure_ascii=False)
-        ),
-    )
+def _upload_metadata(metadata: dict[str, object]) -> dict[str, str]:
     return {
-        "title": _required_text(response, "title")[:70],
-        "description": _required_text(response, "description"),
+        "title": _required_text(metadata, "translated_title"),
+        "description": _required_text(metadata, "translated_description"),
     }
 
 
@@ -713,6 +706,11 @@ def _render_parts(
     *,
     force: bool = False,
 ) -> list[Path]:
+    stage = CacheStore(clips_dir.parent / "cache.sqlite3").stage("clip_render", lambda: {
+        "records": records, "render": config_snapshot(config.render),
+    })
+    records = stage.plan["records"]
+    config = replace(config, render=restore_config(config.render, stage.plan["render"]))
     parts_dir = clips_dir / "parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
     output: list[Path] = []
@@ -725,7 +723,7 @@ def _render_parts(
         ):
             raise RuntimeError("clip analysis contains an unsafe output path")
         destination = clips_dir / relative
-        if force or not destination.is_file() or destination.stat().st_size == 0:
+        if stage.get(str(relative)) is None or not destination.is_file() or destination.stat().st_size == 0:
             _render_clip(
                 source,
                 destination,
@@ -733,7 +731,9 @@ def _render_parts(
                 float(record["end"]),
                 config,
             )
+            stage.put(str(relative), {"path": str(destination)})
         output.append(destination)
+    stage.finish([str(path) for path in output])
     return output
 
 
@@ -781,43 +781,6 @@ def _render_clip(
         temporary.replace(destination)
     finally:
         temporary.unlink(missing_ok=True)
-
-
-def _analysis_signature(
-    required: dict[str, Path], job_dir: Path, config: AppConfig
-) -> str:
-    digest = hashlib.sha256()
-    for name, path in sorted(required.items()):
-        digest.update(name.encode())
-        digest.update(_file_digest(path).encode())
-    song_cache = job_dir / "song-identification-cache.json"
-    if song_cache.is_file():
-        digest.update(_file_digest(song_cache).encode())
-    digest.update(json.dumps(asdict(config.clips), sort_keys=True).encode())
-    digest.update(config.llm.model.encode())
-    digest.update(
-        prompt_templates_digest("clip-review.md", "clip-metadata.md").encode()
-    )
-    return digest.hexdigest()
-
-
-def _file_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _load_cached_analysis(path: Path, signature: str) -> dict[str, object] | None:
-    try:
-        value = _load_json_object(path, "clip analysis")
-    except (FileNotFoundError, RuntimeError):
-        return None
-    if value.get("version") != _ANALYSIS_VERSION or value.get("signature") != signature:
-        return None
-    _part_records(value)
-    return value
 
 
 def _part_records(analysis: dict[str, object]) -> list[dict[str, object]]:

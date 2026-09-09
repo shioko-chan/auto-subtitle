@@ -18,7 +18,7 @@ WORK_DIR="$ROOT_DIR/work"
 STATUS_PATH="$WORK_DIR/yumemita-2026-08-10-status.log"
 STOP_PATH="$WORK_DIR/yumemita-2026-08-10.stop"
 BILIBILI_PAUSE_PATH="$WORK_DIR/bilibili-upload-paused.json"
-UPLOADED_PATH="$WORK_DIR/yumemita-2026-08-10-uploaded.txt"
+UPLOADED_PATH="$WORK_DIR/uploaded.txt"
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/auto-subtitle-uv-cache}"
 

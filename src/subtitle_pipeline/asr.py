@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from .cache import StageCache, CacheStore, config_snapshot, restore_config
 from .audio_analysis import AudioAnalysis, AudioRegion, analyze_audio
 from .audio_buffer import AudioBuffer, AudioBufferPool, is_shared_audio_uri
 from .commands import require_command, run
@@ -23,7 +24,6 @@ from .source_language import language_for_text, normalize_source_language
 from .subtitles import Cue, write_srt
 from .telemetry import stage_metrics
 
-_CACHE_VERSION = 13
 _CUE_SIDECAR_VERSION = 7
 _MIN_RETRY_CHUNK_SECONDS = 15.0
 _MIN_SONG_RETRY_CHUNK_SECONDS = 8.0
@@ -67,6 +67,15 @@ def transcribe_with_qwen(
     asr_text_corrector: ASRTextCorrector | None = None,
     song_cue_processor: SongCueProcessor | None = None,
 ) -> Path:
+    source_stage = CacheStore(destination.parent / "cache.sqlite3").existing("source_cues")
+    saved = source_stage.get("__result__") if source_stage is not None else None
+    if saved is not None:
+        cues = [Cue(**value) for value in saved["cues"]]
+        write_srt(cues, destination)
+        _write_cue_sidecar(
+            cues, destination.with_suffix(".cues.json"), evidence=saved["evidence"]
+        )
+        return destination
     japanese_single_word_list = sorted(set(japanese_single_word_list or []))
     duration = _media_duration(video)
     skip_conditioned_asr = False
@@ -161,11 +170,14 @@ def _transcribe_unanalyzed(
     japanese_single_word_list: list[str] | None = None,
 ) -> Path:
     chunk_count = max(1, math.ceil(duration / config.chunk_seconds))
-    cache_path = destination.parent / "asr-cache.json"
-    signature = _cache_signature(video, duration, config, japanese_single_word_list)
-    cache = _load_cache(cache_path, signature)
-    cached_chunks = cache["chunks"]
-    assert isinstance(cached_chunks, dict)
+    stage = CacheStore(destination.parent / "cache.sqlite3").stage("raw_speech", lambda: {
+        "config": config_snapshot(config), "duration": duration,
+        "words": japanese_single_word_list, "chunk_count": chunk_count,
+    })
+    config = restore_config(config, stage.plan["config"])
+    duration, chunk_count = stage.plan["duration"], stage.plan["chunk_count"]
+    japanese_single_word_list = stage.plan["words"]
+    cached_chunks = {str(index): stage.get(str(index)) for index in range(chunk_count)}
 
     missing = [
         index
@@ -216,13 +228,14 @@ def _transcribe_unanalyzed(
             final_chunk=index == chunk_count - 1,
             label=f"{index:05d}",
             audio_buffer=audio_pool.main(),
+            cache=stage,
             empty_speech_audit_path=(
                 destination.parent / "asr-empty-speech-audit.jsonl"
             ),
             repetition_audit_path=(destination.parent / "asr-repetition-audit.jsonl"),
         )
         cached_chunks[str(index)] = record
-        _write_cache(cache_path, cache)
+        stage.put(str(index), record, kind="aggregate")
         logging.info(
             "cached Qwen3-ASR chunk %d/%d: %d aligned units",
             index + 1,
@@ -242,7 +255,11 @@ def _transcribe_unanalyzed(
         )
     if not all_cues:
         raise RuntimeError("Qwen3-ASR did not produce any aligned speech")
+    stage.finish([asdict(cue) for cue in all_cues])
+    source_stage = stage.store.stage("source_cues", lambda: {})
+    source_stage.finish({"cues": [asdict(cue) for cue in all_cues], "evidence": []})
     write_srt(all_cues, destination)
+    _write_cue_sidecar(all_cues, destination.with_suffix(".cues.json"), evidence=[])
     logging.info("Qwen3-ASR wrote %d aligned units: %s", len(all_cues), destination)
     return destination
 
@@ -394,24 +411,25 @@ def _transcribe_analyzed(
     if not regions:
         raise RuntimeError("audio analysis found no speech or singing regions")
     duration = _media_duration(video)
-    cache_path = destination.parent / "asr-analysis-cache.json"
-    signature = {
-        **_cache_signature(video, duration, config, japanese_single_word_list),
-        "analysis_version": 16,
-        "analysis_config": asdict(analysis_config),
-        "regions": [_analysis_region_signature(region) for region in regions],
-    }
-    cache = _load_cache(cache_path, signature)
-    cached = cache["chunks"]
-    assert isinstance(cached, dict)
-    completed_ranges = cache.setdefault("completed_ranges", {})
-    if not isinstance(completed_ranges, dict):
-        completed_ranges = {}
-        cache["completed_ranges"] = completed_ranges
-
-    def persist_completed_ranges() -> None:
-        _write_cache(cache_path, cache)
-
+    store = CacheStore(destination.parent / "cache.sqlite3")
+    raw_stage = store.stage("raw_speech", lambda: {
+        "config": config_snapshot(config), "analysis_config": config_snapshot(analysis_config),
+        "regions": [asdict(region) for region in regions], "duration": duration,
+        "words": japanese_single_word_list,
+    })
+    config = restore_config(config, raw_stage.plan["config"])
+    analysis_config = restore_config(analysis_config, raw_stage.plan["analysis_config"])
+    duration = raw_stage.plan["duration"]
+    japanese_single_word_list = raw_stage.plan["words"]
+    regions = [AudioRegion(**value) for value in raw_stage.plan["regions"]]
+    singing_stage = store.stage("singing_asr", lambda: {
+        "config": config_snapshot(config), "regions": [asdict(region) for region in regions],
+    })
+    alignment_stage = store.stage("speech_alignment", lambda: {
+        "config": config_snapshot(config), "words": japanese_single_word_list,
+    })
+    cached = {str(index): (singing_stage if region.kind == "singing" else alignment_stage).get(str(index))
+              for index, region in enumerate(regions)}
     missing = []
     for index, region in enumerate(regions):
         record = cached.get(str(index))
@@ -452,7 +470,7 @@ def _transcribe_analyzed(
             )
             record["singing_asr_model"] = config.singing_model
             cached[str(index)] = record
-            _write_cache(cache_path, cache)
+            singing_stage.put(str(index), record)
             logging.info(
                 "cached HeartTranscriptor region %d/%d speaker=%s cues=%d",
                 index + 1,
@@ -491,22 +509,12 @@ def _transcribe_analyzed(
         processed = song_cue_processor([*singing_cues, *supporting_cues])
         processed_singing_cues = [cue for cue in processed if cue.kind == "singing"]
 
-    speech_missing = [index for index in missing if regions[index].kind == "speech"]
+    speech_missing = [index for index, region in enumerate(regions) if region.kind == "speech"]
     raw_records: list[dict[str, object]] = []
     if speech_missing:
-        raw_cache_path = destination.parent / "asr-raw-speech-cache.json"
-        raw_signature = {
-            **_cache_signature(video, duration, config, japanese_single_word_list),
-            "raw_speech_version": 2,
-            "regions": [
-                _analysis_region_signature(regions[index]) for index in speech_missing
-            ],
-        }
-        raw_cache = _load_cache(raw_cache_path, raw_signature)
-        raw_chunks = raw_cache["chunks"]
-        assert isinstance(raw_chunks, dict)
+        raw_chunks = {str(index): raw_stage.get(str(index)) for index in speech_missing}
         raw_uncached = [
-            index for index in speech_missing if str(index) not in raw_chunks
+            index for index in speech_missing if raw_chunks.get(str(index)) is None
         ]
         raw_model = (
             _load_qwen_model(config, japanese_single_word_list, with_aligner=False)
@@ -520,7 +528,7 @@ def _transcribe_analyzed(
                 indices = speech_missing[
                     batch_start : batch_start + config.max_inference_batch_size
                 ]
-                uncached = [index for index in indices if str(index) not in raw_chunks]
+                uncached = [index for index in indices if raw_chunks.get(str(index)) is None]
                 if not uncached:
                     continue
                 assert raw_model is not None
@@ -528,6 +536,7 @@ def _transcribe_analyzed(
                     raw_model,
                     config,
                     [(index, regions[index]) for index in uncached],
+                    cache=raw_stage,
                     media_duration=duration,
                     audio_buffer=audio_pool.main(),
                     repetition_audit_path=(
@@ -536,7 +545,9 @@ def _transcribe_analyzed(
                 )
                 for index, record in records.items():
                     raw_chunks[str(index)] = record
-                _write_cache(raw_cache_path, raw_cache)
+                    raw_stage.put(str(index), record,
+                                  kind="aggregate" if raw_stage.get(f"raw_retry:{record['core_start']}:{record['core_end']}") else "result",
+                                  reason="repetition_discard" if record.get("discarded_repetition") else None)
         finally:
             if raw_model is not None:
                 del raw_model
@@ -580,12 +591,10 @@ def _transcribe_analyzed(
     if not song_cues_processed:
         process_songs(_cached_song_support_cues(cached, regions))
 
-    conditioned_signature = [asdict(cue) for cue in conditioned_transcription.cues]
-    conditioned_cache = cache.get("conditioned")
+    conditioned_cache = alignment_stage.get("conditioned")
     conditioned_cached_cues: list[Cue] | None = None
     if (
         isinstance(conditioned_cache, dict)
-        and conditioned_cache.get("raw_cues") == conditioned_signature
         and isinstance(conditioned_cache.get("cues"), list)
     ):
         conditioned_cached_cues = _decode_cached_cues(
@@ -594,10 +603,9 @@ def _transcribe_analyzed(
 
     conditioned_records: list[dict[str, object]] = []
     conditioned_regions: list[AudioRegion] = []
-    if conditioned_cached_cues is None:
-        conditioned_records, conditioned_regions = _conditioned_asr_records(
-            conditioned_transcription.cues, len(regions)
-        )
+    conditioned_records, conditioned_regions = _conditioned_asr_records(
+        conditioned_transcription.cues, len(regions)
+    )
 
     correctable_records = [
         record
@@ -628,19 +636,27 @@ def _transcribe_analyzed(
     ]
 
     alignment_records = [*records, *corrected_conditioned_records]
-    aligned_records: dict[int, dict[str, object]] = {}
-    if alignment_records:
+    aligned_records = {}
+    pending_alignment = []
+    for record in alignment_records:
+        index = int(record["window_id"])
+        saved = alignment_stage.get(str(index))
+        if saved is None:
+            pending_alignment.append(record)
+        else:
+            aligned_records[index] = saved
+    if pending_alignment:
         aligner = _load_qwen_aligner(config, japanese_single_word_list)
         try:
-            aligned_records = _align_speech_records(
-                aligner,
-                alignment_records,
-                [*regions, *conditioned_regions],
-                audio_pool.main(),
-                config,
-                duration,
-                destination.parent / "asr-speech-quality-audit.jsonl",
-            )
+            for record in pending_alignment:
+                completed = _align_speech_records(
+                    aligner, [record], [*regions, *conditioned_regions],
+                    audio_pool.main(), config, duration,
+                    destination.parent / "asr-speech-quality-audit.jsonl",
+                )
+                for index, value in completed.items():
+                    aligned_records[index] = value
+                    alignment_stage.put(str(index), value)
         finally:
             del aligner
             _release_cuda()
@@ -658,7 +674,7 @@ def _transcribe_analyzed(
                     cue["speaker_assignment"] = "acoustic_phrase_speech_fallback"
             record["window_kind"] = "mixed_speech"
             cached[str(index)] = record
-            _write_cache(cache_path, cache)
+            alignment_stage.put(str(index), record)
             logging.info(
                 "cached analyzed ASR region %d/%d kind=%s speaker=%s cues=%d",
                 index + 1,
@@ -676,11 +692,10 @@ def _transcribe_analyzed(
         conditioned_cached_cues = _conditioned_aligned_cues(
             conditioned_aligned_records, len(regions)
         )
-        cache["conditioned"] = {
-            "raw_cues": conditioned_signature,
+        conditioned_cache = {
             "cues": [asdict(cue) for cue in conditioned_cached_cues],
         }
-        _write_cache(cache_path, cache)
+        alignment_stage.put("conditioned", conditioned_cache)
 
     cues: list[Cue] = list(processed_singing_cues)
     for index in range(len(regions)):
@@ -733,6 +748,14 @@ def _transcribe_analyzed(
         evidence = conditioned.evidence
     else:
         evidence = []
+    source_stage = store.stage("source_cues", lambda: {})
+    raw_stage.finish(raw_records)
+    singing_stage.finish({str(index): cached[str(index)] for index, region in enumerate(regions)
+                          if region.kind == "singing"})
+    alignment_stage.finish({"speech": {str(index): cached[str(index)] for index, region in enumerate(regions)
+                                      if region.kind == "speech"}, "conditioned": conditioned_cache})
+    source_stage.put("cues", {"cues": [asdict(cue) for cue in cues], "evidence": evidence})
+    source_stage.finish({"cues": [asdict(cue) for cue in cues], "evidence": evidence})
     write_srt(cues, destination)
     _write_cue_sidecar(cues, destination.with_suffix(".cues.json"), evidence=evidence)
     return destination
@@ -1038,13 +1061,6 @@ def _analysis_regions(analysis: AudioAnalysis) -> list[AudioRegion]:
 
 def _speaker_assignment_timeline(analysis: AudioAnalysis) -> list[AudioRegion]:
     return analysis.diarization or analysis.speech
-
-
-def _analysis_region_signature(region: AudioRegion) -> dict[str, object]:
-    value = asdict(region)
-    if is_shared_audio_uri(region.source_path):
-        value["source_path"] = "shared-memory"
-    return value
 
 
 def _record_timeline_is_healthy(record: dict[str, object], region: AudioRegion) -> bool:
@@ -1488,7 +1504,47 @@ def _remove_text_overlap(previous: str, current: str) -> str:
     return current
 
 
-def _transcribe_range(
+def _transcribe_range(*args, cache: StageCache | None = None, **kwargs):
+    if cache is None:
+        return _transcribe_range_compute(*args, **kwargs)
+    key = _completed_range_key(kwargs["core_start"], kwargs["core_end"], kwargs["final_chunk"])
+    saved = cache.get("range:" + key)
+    if saved is not None:
+        return saved
+    with cache.attempt("range:" + key):
+        split = cache.get("split:" + key)
+        if split is None:
+            result = _transcribe_range_compute(*args, cache=cache, **kwargs)
+        else:
+            midpoint = split["midpoint"]
+            left = _transcribe_range(*args, cache=cache, **{
+                **kwargs, "core_end": midpoint, "final_chunk": False, "label": kwargs["label"] + "-0",
+            })
+            right = _transcribe_range(*args, cache=cache, **{
+                **kwargs, "core_start": midpoint, "label": kwargs["label"] + "-1",
+            })
+            result = {
+                "core_start": kwargs["core_start"], "core_end": kwargs["core_end"],
+                "language": right["language"] or left["language"],
+                "text": f"{left['text']}\n{right['text']}".strip(),
+                "cues": [*left["cues"], *right["cues"]],
+                "recovered_from_" + split["recovery"]: True,
+            }
+            if split["recovery"] == "repetition":
+                children = [*left.get("repetition_diagnostics", []), *right.get("repetition_diagnostics", [])]
+                result["repetition_diagnostics"] = [{
+                    "kind": "forced_aligned_speech", "start": round(kwargs["core_start"], 3),
+                    "end": round(kwargs["core_end"], 3), "pattern": split["pattern"],
+                    "repeats": split["repeats"], "retry_at": round(midpoint, 3),
+                    "minimal_reproducer": not children,
+                }, *children]
+        cache.put("range:" + key, result,
+                  reason="repetition_discard" if result.get("discarded_repetition") else None,
+                  kind="aggregate" if cache.get("split:" + key) is not None else "result")
+        return result
+
+
+def _transcribe_range_compute(
     model: Any,
     video: Path,
     chunk_dir: Path | None,
@@ -1505,6 +1561,7 @@ def _transcribe_range(
     completed_range_callback: Callable[[], None] | None = None,
     empty_speech_audit_path: Path | None = None,
     repetition_audit_path: Path | None = None,
+    cache: StageCache | None = None,
 ) -> dict[str, object]:
     range_key = _completed_range_key(core_start, core_end, final_chunk)
     if completed_ranges is not None:
@@ -1604,6 +1661,11 @@ def _transcribe_range(
                 )
                 return record
             midpoint = core_start + child_duration
+            if cache is not None:
+                cache.remember("split:" + range_key, lambda: {
+                    "midpoint": midpoint, "recovery": "repetition",
+                    "pattern": pattern[:200], "repeats": repeats,
+                })
             left = _transcribe_range(
                 model,
                 video,
@@ -1620,6 +1682,7 @@ def _transcribe_range(
                 completed_range_callback=completed_range_callback,
                 empty_speech_audit_path=empty_speech_audit_path,
                 repetition_audit_path=repetition_audit_path,
+                cache=cache,
             )
             right = _transcribe_range(
                 model,
@@ -1637,6 +1700,7 @@ def _transcribe_range(
                 completed_range_callback=completed_range_callback,
                 empty_speech_audit_path=empty_speech_audit_path,
                 repetition_audit_path=repetition_audit_path,
+                cache=cache,
             )
             recovered = {
                 "core_start": core_start,
@@ -1718,6 +1782,10 @@ def _transcribe_range(
                 core_end,
                 midpoint,
             )
+            if cache is not None:
+                cache.remember("split:" + range_key, lambda: {
+                    "midpoint": midpoint, "recovery": "timeline_failure",
+                })
             left = _transcribe_range(
                 model,
                 video,
@@ -1734,6 +1802,7 @@ def _transcribe_range(
                 completed_range_callback=completed_range_callback,
                 empty_speech_audit_path=empty_speech_audit_path,
                 repetition_audit_path=repetition_audit_path,
+                cache=cache,
             )
             right = _transcribe_range(
                 model,
@@ -1751,6 +1820,7 @@ def _transcribe_range(
                 completed_range_callback=completed_range_callback,
                 empty_speech_audit_path=empty_speech_audit_path,
                 repetition_audit_path=repetition_audit_path,
+                cache=cache,
             )
             recovered = {
                 "core_start": core_start,
@@ -1905,7 +1975,25 @@ def _transcribe_raw_speech_batch(
     media_duration: float,
     audio_buffer: AudioBuffer,
     repetition_audit_path: Path | None = None,
+    cache: StageCache | None = None,
 ) -> dict[int, dict[str, object]]:
+    if cache is not None:
+        resumable = [(index, region) for index, region in indexed_regions
+                     if cache.get(f"raw_split:{region.start}:{region.end}") is not None
+                     or cache.get(f"raw_retry:{region.start}:{region.end}") is not None]
+        if resumable:
+            resumed = {
+                index: _transcribe_raw_range(model, config, region.start, region.end,
+                                            media_duration, audio_buffer, repetition_audit_path,
+                                            cache=cache)
+                for index, region in resumable
+            }
+            pending = [(index, region) for index, region in indexed_regions if index not in resumed]
+            if pending:
+                resumed.update(_transcribe_raw_speech_batch(
+                    model, config, pending, media_duration=media_duration,
+                    audio_buffer=audio_buffer, repetition_audit_path=repetition_audit_path, cache=cache))
+            return resumed
     audio_inputs: list[object] = []
     extract_ranges: list[tuple[float, float]] = []
     token_limits: list[int] = []
@@ -1956,6 +2044,8 @@ def _transcribe_raw_speech_batch(
                 pattern[:80],
                 repeats,
             )
+            if cache is not None:
+                cache.remember(f"raw_retry:{region.start}:{region.end}", lambda: True)
             records[index] = _transcribe_raw_range(
                 model,
                 config,
@@ -1964,6 +2054,7 @@ def _transcribe_raw_speech_batch(
                 media_duration,
                 audio_buffer,
                 repetition_audit_path,
+                cache=cache,
             )
             continue
         records[index] = {
@@ -1976,10 +2067,32 @@ def _transcribe_raw_speech_batch(
             "text": text,
             "generation_token_limit": token_limits[position],
         }
+        if cache is not None:
+            cache.put(str(index), records[index])
     return records
 
 
-def _transcribe_raw_range(
+def _transcribe_raw_range(model, config, core_start, core_end, media_duration, audio_buffer,
+                          repetition_audit_path=None, *, cache: StageCache | None = None):
+    if cache is None:
+        return _transcribe_raw_range_compute(model, config, core_start, core_end, media_duration,
+                                             audio_buffer, repetition_audit_path)
+    key = f"raw_range:{core_start}:{core_end}"
+    saved = cache.get(key)
+    if saved is not None:
+        return saved
+    try:
+        result = _transcribe_raw_range_compute(model, config, core_start, core_end, media_duration,
+                                               audio_buffer, repetition_audit_path, cache=cache)
+        cache.put(key, result, reason="repetition_discard" if result.get("discarded_repetition") else None,
+                  kind="aggregate" if result.get("recovered_from_repetition") else "result")
+        return result
+    except BaseException as exc:
+        cache.failed(key, exc)
+        raise
+
+
+def _transcribe_raw_range_compute(
     model: Any,
     config: ASRConfig,
     core_start: float,
@@ -1987,6 +2100,7 @@ def _transcribe_raw_range(
     media_duration: float,
     audio_buffer: AudioBuffer,
     repetition_audit_path: Path | None = None,
+    cache: StageCache | None = None,
 ) -> dict[str, object]:
     extract_start = max(0.0, core_start - config.chunk_context_seconds)
     extract_end = min(media_duration, core_end + config.chunk_context_seconds)
@@ -1999,16 +2113,24 @@ def _transcribe_raw_range(
     changed = isinstance(previous_limit, int)
     if changed:
         model.max_new_tokens = token_limit
-    try:
-        results = model.transcribe(
-            audio=audio,
-            context=config.context,
-            language=config.language,
-            return_time_stamps=False,
-        )
-    finally:
+    split_key = f"raw_split:{core_start}:{core_end}"
+    split_plan = cache.get(split_key) if cache is not None else None
+    if split_plan is not None:
+        from types import SimpleNamespace
+        results = [SimpleNamespace(**split_plan)]
         if changed:
             model.max_new_tokens = previous_limit
+    else:
+        try:
+            results = model.transcribe(
+                audio=audio,
+                context=config.context,
+                language=config.language,
+                return_time_stamps=False,
+            )
+        finally:
+            if changed:
+                model.max_new_tokens = previous_limit
     if len(results) != 1:
         raise RuntimeError("Qwen3-ASR raw retry returned an invalid result count")
     result = results[0]
@@ -2038,6 +2160,8 @@ def _transcribe_raw_range(
                 "discarded_repetition": True,
                 "repetition_diagnostics": [diagnostic],
             }
+        if cache is not None:
+            cache.put(split_key, {"text": text, "language": str(getattr(result, "language", ""))}, kind="plan")
         midpoint = (core_start + core_end) / 2
         left = _transcribe_raw_range(
             model,
@@ -2047,6 +2171,7 @@ def _transcribe_raw_range(
             media_duration,
             audio_buffer,
             repetition_audit_path,
+            cache=cache,
         )
         right = _transcribe_raw_range(
             model,
@@ -2056,6 +2181,7 @@ def _transcribe_raw_range(
             media_duration,
             audio_buffer,
             repetition_audit_path,
+            cache=cache,
         )
         child_diagnostics = [
             *list(left.get("repetition_diagnostics", [])),
@@ -2103,7 +2229,11 @@ def _transcribe_raw_range(
 
 
 def _speech_candidate_quality(
-    record: dict[str, object], region: AudioRegion, *, song_context: bool | None = None
+    record: dict[str, object],
+    region: AudioRegion,
+    *,
+    song_context: bool | None = None,
+    strong_song_coverage: float = 0.0,
 ) -> dict[str, object]:
     if song_context is None:
         song_context = region.asr_route == "song_speech_fallback"
@@ -2167,11 +2297,17 @@ def _speech_candidate_quality(
         "korean" if value in {"ko", "kor", "korean", "한국어"} else value
         for value in languages
     }
-    if song_context and record.get("recovered_from_repetition") and (
-        len(language_keys) >= 3
-        or ("korean" in language_keys and len(language_keys) >= 2)
+    if (
+        song_context
+        and record.get("recovered_from_repetition")
+        and (
+            len(language_keys) >= 3
+            or ("korean" in language_keys and len(language_keys) >= 2)
+        )
     ):
         reasons.append("unstable_split_languages")
+    if strong_song_coverage >= 0.8:
+        reasons.append("dominant_singing_music_region")
     return {
         "accepted": not reasons,
         "reasons": reasons,
@@ -2188,8 +2324,29 @@ def _speech_candidate_quality(
             "speech_score": region.speech_confidence,
             "music_score": region.music_confidence,
             "song_context": song_context,
+            "strong_song_coverage": round(strong_song_coverage, 6),
         },
     }
+
+
+def _region_coverage(start: float, end: float, regions: list[AudioRegion]) -> float:
+    intervals = sorted(
+        (max(start, region.start), min(end, region.end))
+        for region in regions
+        if min(end, region.end) > max(start, region.start)
+    )
+    covered = 0.0
+    current_start = current_end = 0.0
+    for left, right in intervals:
+        if current_end > current_start and left <= current_end:
+            current_end = max(current_end, right)
+            continue
+        if current_end > current_start:
+            covered += current_end - current_start
+        current_start, current_end = left, right
+    if current_end > current_start:
+        covered += current_end - current_start
+    return covered
 
 
 def _write_speech_quality_audit(
@@ -2333,13 +2490,24 @@ def _align_speech_records(
                         "alignment_error": "corrected_and_original_timeline_invalid",
                     }
             if str(aligned.get("text") or "").strip():
-                song_context = region.asr_route == "song_speech_fallback" or any(
-                    other.kind == "singing"
-                    and min(region.end, other.end) - max(region.start, other.start) > 0
+                strong_song_regions = [
+                    other
                     for other in regions
+                    if other.kind == "singing"
+                    and float(other.music_confidence or 0.0) >= 0.05
+                    and min(region.end, other.end) - max(region.start, other.start) > 0
+                ]
+                strong_song_coverage = _region_coverage(
+                    region.start, region.end, strong_song_regions
+                ) / max(1e-6, region.end - region.start)
+                song_context = region.asr_route == "song_speech_fallback" or bool(
+                    strong_song_regions
                 )
                 quality = _speech_candidate_quality(
-                    aligned, region, song_context=song_context
+                    aligned,
+                    region,
+                    song_context=song_context,
+                    strong_song_coverage=strong_song_coverage,
                 )
                 _write_speech_quality_audit(
                     speech_quality_audit_path, aligned, region, quality
@@ -2815,54 +2983,6 @@ def _extract_audio_chunk(
             str(destination.resolve()),
         ]
     )
-
-
-def _cache_signature(
-    video: Path,
-    duration: float,
-    config: ASRConfig,
-    japanese_single_word_list: list[str] | None = None,
-) -> dict[str, object]:
-    return {
-        "video_name": video.name,
-        "video_size": video.stat().st_size,
-        "duration": round(duration, 3),
-        "config": asdict(config),
-        "japanese_single_word_list": sorted(set(japanese_single_word_list or [])),
-    }
-
-
-def _load_cache(path: Path, signature: dict[str, object]) -> dict[str, object]:
-    normalized_signature = json.loads(json.dumps(signature, ensure_ascii=False))
-    empty: dict[str, object] = {
-        "version": _CACHE_VERSION,
-        "signature": normalized_signature,
-        "chunks": {},
-    }
-    if not path.is_file():
-        return empty
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        logging.warning("ignoring unreadable Qwen3-ASR cache: %s", path)
-        return empty
-    if (
-        not isinstance(value, dict)
-        or value.get("version") != _CACHE_VERSION
-        or value.get("signature") != normalized_signature
-        or not isinstance(value.get("chunks"), dict)
-    ):
-        logging.info("Qwen3-ASR cache signature changed; starting a fresh cache")
-        return empty
-    return value
-
-
-def _write_cache(path: Path, cache: dict[str, object]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(cache, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    temporary.replace(path)
 
 
 def _decode_cached_cues(

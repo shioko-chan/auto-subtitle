@@ -16,6 +16,7 @@ from subtitle_pipeline.clips import (
     _review_seeds,
     _semantic_seeds,
     _song_seeds,
+    _upload_metadata,
     _validated_response_range,
     analyze_chat_windows,
     run_clips,
@@ -72,6 +73,17 @@ class ClipsTests(unittest.TestCase):
         self.assertEqual(peak.paid, 1)
         self.assertGreater(peak.zscore, 0)
         self.assertTrue(any(window.start == 5 for window in windows))
+
+    def test_upload_metadata_reuses_complete_video_title_and_description(self):
+        metadata = {
+            "translated_title": "完整翻译视频",
+            "translated_description": "完整翻译视频的简介\n包含原有链接",
+        }
+
+        result = _upload_metadata(metadata)
+
+        self.assertEqual(result["title"], metadata["translated_title"])
+        self.assertEqual(result["description"], metadata["translated_description"])
 
     def test_select_chat_peaks_merges_adjacent_qualifying_windows(self):
         windows = [
@@ -233,11 +245,7 @@ class ClipsTests(unittest.TestCase):
             submission = BilibiliSubmission(1, "BV1test", "ok")
             with (
                 patch(
-                    "subtitle_pipeline.clips._analysis_signature",
-                    return_value="signature",
-                ),
-                patch(
-                    "subtitle_pipeline.clips._load_cached_analysis",
+                    "subtitle_pipeline.clips._analyze",
                     return_value=analysis,
                 ),
                 patch("subtitle_pipeline.clips._render_clip", side_effect=render),
@@ -352,11 +360,7 @@ class ClipsTests(unittest.TestCase):
             config = AppConfig(work_dir=root, clips=ClipsConfig(upload=True))
             with (
                 patch(
-                    "subtitle_pipeline.clips._analysis_signature",
-                    return_value="signature",
-                ),
-                patch(
-                    "subtitle_pipeline.clips._load_cached_analysis",
+                    "subtitle_pipeline.clips._analyze",
                     return_value=analysis,
                 ),
                 patch("subtitle_pipeline.clips._render_clip", side_effect=fail_second),

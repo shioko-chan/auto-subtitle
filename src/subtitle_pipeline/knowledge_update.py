@@ -20,6 +20,7 @@ from .knowledge_ingestion import (
 
 logger = logging.getLogger(__name__)
 _LAST_SUCCESS_KEY = "automatic_update_last_success_at"
+_LAST_ATTEMPT_KEY = "automatic_update_last_attempt_at"
 
 
 def update_knowledge_if_stale(
@@ -63,7 +64,6 @@ def update_knowledge_if_stale(
                 exc,
             )
             return IngestionSummary()
-        retriever.set_metadata("automatic_update_last_error", "")
         return result
 
 
@@ -74,6 +74,7 @@ def _update_knowledge_if_stale(
     if not settings.auto_update_enabled:
         return IngestionSummary()
     previous = _parse_time(retriever.metadata(_LAST_SUCCESS_KEY))
+    last_attempt = _parse_time(retriever.metadata(_LAST_ATTEMPT_KEY))
     now = datetime.now(UTC)
     if previous is not None and now - previous < timedelta(
         hours=settings.update_interval_hours
@@ -81,6 +82,17 @@ def _update_knowledge_if_stale(
         logger.info("fan knowledge is current; last update %s", previous.isoformat())
         return IngestionSummary()
 
+    if last_attempt is not None and now - last_attempt < timedelta(
+        hours=settings.update_interval_hours
+    ):
+        logger.info(
+            "skipping automatic fan knowledge update; last attempt %s, next attempt after %s; using existing database",
+            last_attempt.isoformat(),
+            (last_attempt + timedelta(hours=settings.update_interval_hours)).isoformat(),
+        )
+        return IngestionSummary()
+
+    retriever.set_metadata(_LAST_ATTEMPT_KEY, now.isoformat())
     logger.info("fan knowledge is stale; starting synchronous incremental update")
     summary = IngestionSummary()
     known_youtube = retriever.external_ids(
@@ -192,6 +204,7 @@ def _update_knowledge_if_stale(
         removed_vectors,
     )
     retriever.set_metadata(_LAST_SUCCESS_KEY, datetime.now(UTC).isoformat())
+    retriever.set_metadata("automatic_update_last_error", "")
     logger.info(
         "fan knowledge update complete: scanned=%d changed=%d unchanged=%d chunks=%d",
         summary.scanned,

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import math
 import re
 import threading
 import time
@@ -13,6 +11,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .cache import CacheStore, StageCache, config_snapshot, restore_config
 from .config import LLMConfig, SegmentationConfig, TranslationConfig
 from .fan_knowledge import KnowledgeHit
 from .llm_response import (
@@ -20,7 +19,12 @@ from .llm_response import (
     structured_response_content,
 )
 from .local_segmentation import LocalUnit, SpeakerTrack
-from .prompt_templates import prompt_templates_digest, render_user_prompt
+from .prompt_budget import (
+    PromptBudgetExceeded,
+    estimate_prompt_tokens,
+    validate_prompt_budget,
+)
+from .prompt_templates import render_user_prompt
 from .reference_context import compact_translation_reference_context
 from .repetition import RepetitionLoopError
 from .source_language import (
@@ -43,7 +47,6 @@ from .translation_support import (
 )
 
 logger = logging.getLogger(__name__)
-_CACHE_VERSION = 4
 _SEGMENT_PROMPT = "segment-source-cues.md"
 _TRANSLATE_PROMPT = "translate-fixed-cues.md"
 _CONTENT_ATTEMPTS = 2
@@ -81,10 +84,6 @@ class _TopicEvidence:
     chat: str
 
 
-class PromptBudgetExceeded(RuntimeError):
-    pass
-
-
 def run_segmentation(
     *,
     tracks: list[SpeakerTrack],
@@ -103,22 +102,24 @@ def run_segmentation(
     cache_path: Path | None,
     sudachi_versions: dict[str, str],
 ) -> list[Cue]:
-    signature = _signature(
-        "segmentation-guidance-only",
-        {
+    stage = None
+    if cache_path is not None:
+        stage = CacheStore(cache_path).stage("segmentation", lambda: {
             "tracks": [asdict(track) for track in tracks],
-            "config": asdict(segmentation),
-            "model": llm.model,
-            "source_maximum_units": source_maximum_units,
-            "sudachi": sudachi_versions,
-            "prompt": prompt_templates_digest(_SEGMENT_PROMPT),
-        },
-    )
-    cached = _load_records(cache_path, signature, SegmentRecord)
-    if cached is not None:
-        records = [SegmentRecord(**value) for value in cached]
-        _validate_final_segments(records, tracks)
-        return _records_to_source_cues(source_cues, tracks, records)
+            "source": [asdict(cue) for cue in source_cues],
+            "segmentation": config_snapshot(segmentation),
+            "llm": config_snapshot(llm), "maximum_units": source_maximum_units,
+        })
+        plan = stage.plan
+        source_cues = [cue_from_mapping(value) for value in plan["source"]]
+        tracks = [SpeakerTrack(value["key"], value["speaker"], tuple(
+            LocalUnit(**unit) for unit in value["units"])) for value in plan["tracks"]]
+        segmentation = restore_config(segmentation, plan["segmentation"])
+        llm = restore_config(llm, plan["llm"])
+        source_maximum_units = plan["maximum_units"]
+        cached = stage.get("__result__")
+        if cached is not None:
+            return [cue_from_mapping(value) for value in cached]
 
     all_units = [unit for track in tracks for unit in track.units]
     windows = [
@@ -155,6 +156,7 @@ def run_segmentation(
             is_nontransient,
             log_invalid_response,
             source_maximum_units,
+            cache=stage,
         )
 
     records: list[SegmentRecord] = []
@@ -177,8 +179,10 @@ def run_segmentation(
                 records.extend(future.result())
     records.sort(key=lambda value: (value.track, value.start_id))
     _validate_final_segments(records, tracks)
-    _write_records(cache_path, signature, records)
-    return _records_to_source_cues(source_cues, tracks, records)
+    result = _records_to_source_cues(source_cues, tracks, records)
+    if stage is not None:
+        stage.finish(result)
+    return result
 
 
 def run_fixed_translation(
@@ -202,33 +206,30 @@ def run_fixed_translation(
     retrieve_chat: Callable[[list[Cue]], str] | None = None,
     audit_path: Path | None = None,
 ) -> list[Cue]:
-    signature = _signature(
-        "translation",
-        {
+    stage = None
+    if cache_path is not None:
+        stage = CacheStore(cache_path).stage("translation", lambda: {
             "source": [asdict(cue) for cue in source_cues],
-            "model": llm.model,
-            "target_language": translation.target_language,
-            "translation": asdict(translation),
-            "context": translation_context,
-            "prompt": prompt_templates_digest(_TRANSLATE_PROMPT),
-        },
-    )
-    cached = _load_records(cache_path, signature, Cue)
-    if cached is not None:
-        result = [cue_from_mapping(value) for value in cached]
-        _write_translation_audit(
-            audit_path,
-            [
-                _translation_audit_entry(
-                    index,
-                    source_cues[index],
-                    cue.text,
-                    "cache",
-                )
-                for index, cue in enumerate(result)
-            ],
-        )
-        return result
+            "translation": config_snapshot(translation), "llm": config_snapshot(llm),
+            "context": translation_context, "honorific_rules": honorific_rules,
+        })
+        plan = stage.plan
+        source_cues = [cue_from_mapping(value) for value in plan["source"]]
+        translation = restore_config(translation, plan["translation"])
+        llm = restore_config(llm, plan["llm"])
+        translation_context, honorific_rules = plan["context"], plan["honorific_rules"]
+        cached = stage.get("__result__")
+        if cached is not None:
+            outcomes = stage.get("__outcomes__") or {}
+            entries = []
+            for index, value in outcomes.items():
+                outcome = TranslationOutcome(**value)
+                entries.append({**_translation_audit_entry(
+                    int(index), source_cues[int(index)], outcome.text, outcome.source,
+                    llm_text=outcome.llm_text, downgrade_reason=outcome.downgrade_reason,
+                    request_id=outcome.request_id), "cache_hit": True})
+            _write_translation_audit(audit_path, entries)
+            return [cue_from_mapping(value) for value in cached]
 
     translations: dict[int, TranslationOutcome] = {}
     pending: list[int] = []
@@ -264,32 +265,44 @@ def run_fixed_translation(
 
     audit_outcomes(translations)
 
-    evidence_by_group = _prepare_topic_evidence(
-        groups,
-        source_cues,
-        retrieve_knowledge,
-        retrieve_chat,
-        metric_name="rag.fixed_translation",
-    )
+    def prepare(ids: list[int]):
+        key = ",".join(map(str, ids))
+        cached = stage.get("translate:" + key) if stage is not None else None
+        if cached is not None:
+            return None
+
+        def prepare_evidence():
+            evidence = _prepare_topic_evidence(
+                [ids], source_cues, retrieve_knowledge, retrieve_chat,
+                metric_name="rag.fixed_translation",
+            )[tuple(ids)]
+            return asdict(evidence)
+
+        if stage is None:
+            evidence = _prepare_topic_evidence(
+                [ids], source_cues, retrieve_knowledge, retrieve_chat,
+                metric_name="rag.fixed_translation",
+            )[tuple(ids)]
+        else:
+            from .fan_knowledge import KnowledgeScore
+            snapshot = stage.remember("evidence:" + key, prepare_evidence)
+            def hits(values):
+                return [KnowledgeHit(**{**value, "score": KnowledgeScore(**value["score"])}) for value in values]
+            evidence = _TopicEvidence(hits(snapshot["term_references"]), hits(snapshot["knowledge"]), snapshot["chat"])
+        return evidence
+
+    evidence_by_group = {tuple(ids): prepare(ids) for ids in groups}
 
     def process(ids: list[int]) -> dict[int, TranslationOutcome]:
+        cached = stage.get("translate:" + ",".join(map(str, ids))) if stage is not None else None
+        if cached is not None:
+            return {int(index): TranslationOutcome(**value) for index, value in cached.items()}
         evidence = evidence_by_group[tuple(ids)]
         return _translate_resilient(
-            ids,
-            source_cues,
-            llm,
-            request,
-            parse_content,
-            finish_reason,
-            retry_delay,
-            is_nontransient,
-            log_invalid_response,
-            local_translate,
-            translation_context,
-            replacements,
-            honorific_rules,
-            translation,
-            evidence,
+            ids, source_cues, llm, request, parse_content, finish_reason,
+            retry_delay, is_nontransient, log_invalid_response, local_translate,
+            translation_context, replacements, honorific_rules, translation, evidence,
+            cache=stage,
         )
 
     if groups:
@@ -321,11 +334,35 @@ def run_fixed_translation(
         replace(cue, text=translations[index].text, source_text=cue.text)
         for index, cue in enumerate(source_cues)
     ]
-    _write_records(cache_path, signature, result)
+    if stage is not None:
+        stage.put("__outcomes__", {index: asdict(value) for index, value in translations.items()}, kind="aggregate")
+        stage.finish(result)
     return result
 
 
-def _segment_resilient(
+def _segment_resilient(*args, cache: StageCache | None = None, **kwargs):
+    if cache is None:
+        return _segment_uncached(*args, **kwargs)
+    track, start, end = args[:3]
+    key = f"{track.key}:{start}:{end}"
+    saved = cache.get("segment:" + key)
+    if saved is not None:
+        return [SegmentRecord(**value) for value in saved]
+    split = cache.get("split:" + key)
+    try:
+        if split is not None:
+            result = [*_segment_resilient(track, start, split, *args[3:], cache=cache),
+                      *_segment_resilient(track, split, end, *args[3:], cache=cache)]
+        else:
+            result = _segment_uncached(*args, cache=cache, **kwargs)
+        cache.put("segment:" + key, result, kind="aggregate" if cache.get("split:" + key) is not None else "result")
+        return result
+    except Exception as exc:
+        cache.failed("segment:" + key, exc)
+        raise
+
+
+def _segment_uncached(
     track: SpeakerTrack,
     start: int,
     end: int,
@@ -341,6 +378,7 @@ def _segment_resilient(
         [str, Exception, object, dict[str, object] | None, object], None
     ],
     maximum_units: float,
+    cache: StageCache | None = None,
 ) -> list[SegmentRecord]:
     try:
         return _request_segmentation(
@@ -365,6 +403,8 @@ def _segment_resilient(
             unit = track.units[start]
             return [SegmentRecord(track.key, unit.local_id, unit.local_id + 1)]
         split = best_split(track.units, start, end)
+        if cache is not None:
+            cache.put(f"split:{track.key}:{start}:{end}", split, kind="plan")
         logger.warning(
             "shrinking failed source-segmentation window %s:%d-%d at %d: %s",
             track.key,
@@ -388,6 +428,7 @@ def _segment_resilient(
                 is_nontransient,
                 log_invalid_response,
                 maximum_units,
+                cache=cache,
             ),
             *_segment_resilient(
                 track,
@@ -403,6 +444,7 @@ def _segment_resilient(
                 is_nontransient,
                 log_invalid_response,
                 maximum_units,
+                cache=cache,
             ),
         ]
 
@@ -510,7 +552,33 @@ def _validate_segments(
     return records
 
 
-def _translate_resilient(
+def _translate_resilient(*args, cache: StageCache | None = None, **kwargs):
+    if cache is None:
+        return _translate_uncached(*args, **kwargs)
+    ids = args[0]
+    key = ",".join(map(str, ids))
+    saved = cache.get("translate:" + key)
+    if saved is not None:
+        return {int(index): TranslationOutcome(**value) for index, value in saved.items()}
+    middle = cache.get("split:" + key)
+    try:
+        if middle is not None:
+            tail = args[1:] if len(args) > 15 else (*args[1:], frozenset(ids))
+            result = {**_translate_resilient(ids[:middle], *tail, cache=cache),
+                      **_translate_resilient(ids[middle:], *tail, cache=cache)}
+        else:
+            result = _translate_uncached(*args, cache=cache, **kwargs)
+        reasons = sorted({value.downgrade_reason for value in result.values() if value.downgrade_reason})
+        cache.put("translate:" + key, {index: asdict(value) for index, value in result.items()},
+                  source="translation", reason="; ".join(reasons) or None,
+                  kind="aggregate" if cache.get("split:" + key) is not None else "result")
+        return result
+    except Exception as exc:
+        cache.failed("translate:" + key, exc)
+        raise
+
+
+def _translate_uncached(
     ids: list[int],
     cues: list[Cue],
     llm: LLMConfig,
@@ -529,6 +597,7 @@ def _translate_resilient(
     translation: TranslationConfig,
     evidence: _TopicEvidence,
     context_excluded_ids: frozenset[int] | None = None,
+    cache: StageCache | None = None,
 ) -> dict[int, TranslationOutcome]:
     excluded_ids = context_excluded_ids or frozenset(ids)
     try:
@@ -555,6 +624,8 @@ def _translate_resilient(
             if len(ids) == 1:
                 raise
             middle = len(ids) // 2
+            if cache is not None:
+                cache.put("split:" + ",".join(map(str, ids)), middle, kind="plan")
             logger.warning(
                 "splitting fixed-translation topic size=%d to satisfy token budget",
                 len(ids),
@@ -564,13 +635,13 @@ def _translate_resilient(
                     ids[:middle], cues, llm, request, parse_content, finish_reason,
                     retry_delay, is_nontransient, log_invalid_response,
                     local_translate, base_context, replacements, honorific_rules,
-                    translation, evidence, excluded_ids,
+                    translation, evidence, excluded_ids, cache=cache,
                 ),
                 **_translate_resilient(
                     ids[middle:], cues, llm, request, parse_content, finish_reason,
                     retry_delay, is_nontransient, log_invalid_response,
                     local_translate, base_context, replacements, honorific_rules,
-                    translation, evidence, excluded_ids,
+                    translation, evidence, excluded_ids, cache=cache,
                 ),
             }
         if is_nontransient(exc) or retry_delay(exc, 1) is not None:
@@ -683,6 +754,8 @@ def _translate_resilient(
                 }
             raise
         middle = len(ids) // 2
+        if cache is not None:
+            cache.put("split:" + ",".join(map(str, ids)), middle, kind="plan")
         logger.warning(
             "shrinking failed fixed-translation batch size=%d: %s", len(ids), exc
         )
@@ -704,6 +777,7 @@ def _translate_resilient(
                 translation,
                 evidence,
                 excluded_ids,
+                cache=cache,
             ),
             **_translate_resilient(
                 ids[middle:],
@@ -722,6 +796,7 @@ def _translate_resilient(
                 translation,
                 evidence,
                 excluded_ids,
+                cache=cache,
             ),
         }
 
@@ -1160,28 +1235,18 @@ def _format_term_references(references: list[KnowledgeHit]) -> str:
     )
 
 
-def _estimate_prompt_tokens(text: str) -> int:
-    cjk = sum(
-        "\u3040" <= character <= "\u30ff"
-        or "\u3400" <= character <= "\u9fff"
-        for character in text
-    )
-    return cjk + math.ceil((len(text) - cjk) / 4)
-
-
 def _validate_prompt_budget(
     prompt: str, llm: LLMConfig, translation: TranslationConfig
 ) -> None:
     if not llm.local_server_enabled:
         return
     reserve = min(_LOCAL_OUTPUT_RESERVE_TOKENS, translation.max_tokens)
-    budget = llm.local_server_context_size - reserve
-    estimated = _estimate_prompt_tokens(prompt)
-    if estimated > budget:
-        raise PromptBudgetExceeded(
-            f"estimated prompt tokens={estimated} exceed budget={budget} "
-            f"(context={llm.local_server_context_size}, output_reserve={reserve})"
-        )
+    validate_prompt_budget(
+        prompt,
+        context_size=llm.local_server_context_size,
+        max_output_tokens=reserve,
+        estimate_tokens=estimate_prompt_tokens,
+    )
 
 
 def _prompt_within_budget(
@@ -1352,44 +1417,3 @@ def _translation_dialogue_context(
     return kept
 
 
-def _signature(kind: str, payload: dict[str, object]) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            {"version": _CACHE_VERSION, "kind": kind, **payload},
-            ensure_ascii=False,
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
-
-
-def _load_records(
-    path: Path | None, signature: str, _kind: type[object]
-) -> list[dict[str, object]] | None:
-    if path is None or not path.is_file():
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if (
-            payload.get("version") != _CACHE_VERSION
-            or payload.get("signature") != signature
-        ):
-            return None
-        records = payload.get("records")
-        return records if isinstance(records, list) else None
-    except (OSError, ValueError, TypeError):
-        return None
-
-
-def _write_records(path: Path | None, signature: str, records: list[object]) -> None:
-    if path is None:
-        return
-    payload = {
-        "version": _CACHE_VERSION,
-        "signature": signature,
-        "records": [asdict(record) for record in records],
-    }
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    temporary.replace(path)

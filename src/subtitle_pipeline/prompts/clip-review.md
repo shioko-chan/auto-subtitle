@@ -21,7 +21,18 @@ and the immediate post-song reaction. Never cross the supplied context range.
 
 start_id and end_id must be IDs from transcript_cues, in order, and describe one
 contiguous range. If no surrounding subtitle cue is needed, use null; the required
-song range will still be kept. Use a short natural Simplified Chinese part title.
+song range will still be kept.
+
+Write the part title like a human fan-sub editor who knows why this exact moment is
+memorable, not like a content classifier or synopsis. For speech, prefer a short
+standout line actually present in the selected transcript, or a concrete setup plus
+its turn/punchline. Preserve the speaker's voice and comic timing. Do not invent a
+quotation; only use quotation marks for words present in the transcript. If no line
+works as a title, name the specific situation rather than its general topic or
+emotion. Avoid generic summary and promotional templates such as “聊聊…”, “…的故事”,
+“温馨互动”, “感人瞬间”, “精彩片段”, “高能时刻”, “爆笑名场面”, or “令人…”. For a
+song, use the verified song name as the core title and add surrounding banter only
+when it is genuinely distinctive. Use natural Simplified Chinese and keep it short.
 
 Return only:
 {"worthy":true,"confidence":"high","start_id":1,"end_id":8,"title":"...","reason":"..."}
