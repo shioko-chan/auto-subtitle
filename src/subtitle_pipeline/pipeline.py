@@ -354,11 +354,12 @@ def _run_pipeline_stages(
             ]
             try:
                 backgrounds = fan_knowledge.retrieve_background_many(queries)
+                terms = fan_knowledge.retrieve_asr_term_references_many(queries)
                 return [
                     list({hit.record_id: hit for hit in [
-                        *fan_knowledge.retrieve_asr_term_references(query)[:2], *background
+                        *term_hits[:2], *background
                     ]}.values())[: config.fan_knowledge.top_k_asr]
-                    for query, background in zip(queries, backgrounds, strict=True)
+                    for term_hits, background in zip(terms, backgrounds, strict=True)
                 ]
             finally:
                 fan_knowledge.release_models()

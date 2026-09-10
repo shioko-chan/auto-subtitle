@@ -20,6 +20,7 @@ dependencies = [
     "SudachiPy>=0.6.10",
     "yt-dlp[default,curl-cffi]>=2025.1.15",
     "wordfreq>=3.1,<4",
+    "rapidfuzz>=3.14,<4",
 ]
 
 [project.optional-dependencies]

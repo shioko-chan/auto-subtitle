@@ -18,6 +18,8 @@ from typing import Self
 
 from .cross_encoder import LocalCrossEncoderReranker
 from .vector_index import LocalVectorIndex
+from .phonetic_index import TermPhoneticIndex, match_readings
+from rapidfuzz import fuzz
 
 _LOGGER = logging.getLogger(__name__)
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_+.-]*|[\u3040-\u30ff\u3400-\u9fff]+")
@@ -205,6 +207,7 @@ class KnowledgeHit:
     score: KnowledgeScore
     matched_terms: tuple[str, ...]
     retrieval_ranks: dict[str, int] = field(default_factory=dict)
+    phonetic_match: dict[str, object] | None = None
 
     def prompt_value(self, maximum_body_chars: int = 360) -> dict[str, object]:
         return {
@@ -276,6 +279,10 @@ class FanKnowledgeRetriever:
         self._database = sqlite3.connect(database_path, check_same_thread=False)
         self._database.row_factory = sqlite3.Row
         self._initialize()
+        with self._database:
+            rebuilt = self._phonetic_index.sync()
+        if rebuilt:
+            _LOGGER.info("Persisted pronunciations for %d term records", rebuilt)
 
     def close(self) -> None:
         self.release_models()
@@ -364,6 +371,7 @@ class FanKnowledgeRetriever:
                         search_text,
                     ),
                 )
+                self._phonetic_index.sync_record(record.record_id)
                 count += 1
             self._database.execute(
                 "INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild')"
@@ -1226,6 +1234,7 @@ class FanKnowledgeRetriever:
                 search_text,
             ),
         )
+        self._phonetic_index.sync_record(f"extracted:{term_id}")
 
     def document_count(self) -> int:
         row = self._database.execute(
@@ -1460,42 +1469,58 @@ class FanKnowledgeRetriever:
     def retrieve_asr_term_references(
         self, query: KnowledgeQuery
     ) -> list[KnowledgeHit]:
-        """Return exact and phonetically close known terms for ASR correction."""
-        if query.top_k < 1 or not query.text.strip():
+        return self.retrieve_asr_term_references_many([query])[0]
+
+    def retrieve_asr_term_references_many(self, queries: list[KnowledgeQuery]) -> list[list[KnowledgeHit]]:
+        if not queries:
             return []
-        normalized = _normalize_query(query.text)
         with self._lock:
             rows = self._database.execute(
-                "SELECT *, NULL AS fts_rank FROM knowledge_records"
+                "SELECT records.*, pronunciations.forms_json FROM knowledge_records AS records "
+                "JOIN knowledge_term_pronunciations AS pronunciations USING(record_id) ORDER BY record_id"
             ).fetchall()
+        forms: list[str] = []
+        ranges = []
+        for row in rows:
+            start = len(forms)
+            forms.extend(json.loads(row['forms_json']))
+            ranges.append((start, len(forms)))
+        output: list[list[KnowledgeHit]] = []
+        _LOGGER.info("ASR phonetic matching: queries=%d persisted_forms=%d native_workers<=8", len(queries), len(forms))
+        for start in range(0, len(queries), 64):
+            batch = queries[start:start + 64]
+            normalized = [_normalize_query(query.text) for query in batch]
+            scores = match_readings([value.reading if query.top_k > 0 else "" for query, value in zip(batch, normalized)], forms)
+            for query, norm, values in zip(batch, normalized, scores, strict=True):
+                output.append(self._asr_term_hits(query, norm, rows, forms, ranges, values))
+        return output
 
+    def _asr_term_hits(self, query, normalized, rows, forms, ranges, scores):
+        if query.top_k < 1 or not query.text.strip():
+            return []
         candidates: list[
             tuple[bool, float, int, sqlite3.Row, tuple[str, ...]]
         ] = []
-        for row in rows:
-            if str(row["kind"]) not in _TERM_REFERENCE_KINDS:
+        matches = {}
+        for row, (start, end) in zip(rows, ranges, strict=True):
+            exact = _exact_entity_matches(normalized, _row_forms(row))
+            values = scores[start:end]
+            best = start + int(values.argmax()) if end > start else None
+            phonetic = float(scores[best]) if best is not None else 0.0
+            if not exact and phonetic == 0:
                 continue
-            forms = _row_forms(row)
-            exact = _exact_entity_matches(normalized, forms)
-            phonetic_forms = _term_phonetic_forms(
-                str(row["title"]),
-                str(row["reading"] or ""),
-                tuple(json.loads(str(row["aliases"]))),
-            )
-            phonetic = max(
-                (
-                    _best_window_ratio(normalized.reading, reading)
-                    for reading in phonetic_forms
-                ),
-                default=0.0,
-            )
-            if not exact and phonetic < 0.78:
-                continue
+            if best is not None and phonetic > 0:
+                alignment = fuzz.partial_ratio_alignment(normalized.reading, forms[best])
+                matches[row['record_id']] = {
+                    "reading": forms[best], "query_reading": normalized.reading,
+                    "start": alignment.src_start, "end": alignment.src_end,
+                    "score": phonetic,
+                }
             candidates.append(
                 (
                     bool(exact),
                     1.0 if exact else phonetic,
-                    max((len(value) for value in phonetic_forms), default=0),
+                    max((len(value) for value in forms[start:end]), default=0),
                     row,
                     exact,
                 )
@@ -1539,8 +1564,10 @@ class FanKnowledgeRetriever:
                         else (f"近音:{row['title']!s}",)
                     ),
                     retrieval_ranks={"entity" if exact else "kana": rank},
+                    phonetic_match=matches.get(row["record_id"]),
                 )
             )
+        self._audit(query, hits, [], len(candidates), event="fan_asr_term_reference_retrieval")
         return hits
 
     def sync_vector_index(self) -> tuple[int, int]:
@@ -1736,6 +1763,9 @@ class FanKnowledgeRetriever:
                 "INSERT OR REPLACE INTO knowledge_meta(key, value) "
                 "VALUES('schema_version', ?)",
                 (str(_SCHEMA_VERSION),),
+            )
+            self._phonetic_index = TermPhoneticIndex(
+                self._database, tuple(_TERM_REFERENCE_KINDS), _term_phonetic_forms
             )
             self._sync_term_forms()
             provisional = self._database.execute(
@@ -2076,6 +2106,7 @@ class FanKnowledgeRetriever:
                 {
                     **hit.prompt_value(),
                     "source_url": hit.source_url,
+                    "phonetic_match": hit.phonetic_match,
                     "retrieval_ranks": hit.retrieval_ranks,
                     "score_components": asdict(hit.score),
                     "gate_evidence": list(_relevance_evidence(hit)),
@@ -2392,7 +2423,7 @@ def _normalize_query(text: str) -> _NormalizedQuery:
                         value for value in (surface, dictionary_form) if value
                     )
                 reading = morpheme.reading_form()
-                if reading and reading != "*":
+                if part not in {"補助記号", "記号", "空白"} and reading and reading != "*":
                     readings.append(_kana(reading))
         except (ImportError, OSError):
             lexical.extend(_query_tokens(normalized))
@@ -2419,33 +2450,27 @@ def _sudachi_tokenizer() -> object:
     return instance
 
 
-@cache
 def _term_phonetic_forms(
     title: str, reading: str, aliases: tuple[str, ...]
 ) -> tuple[str, ...]:
+    """Index complete names/explicit aliases, never arbitrary title fragments."""
     from sudachipy import tokenizer
 
-    values: list[str] = []
-    if reading:
-        values.append(_kana(reading))
+    values: list[str] = [_kana(reading)] if reading else []
     for form in (title, *aliases):
         if not form:
             continue
         parts = [
             _kana(morpheme.reading_form())
             for morpheme in _sudachi_tokenizer().tokenize(
-                form, tokenizer.Tokenizer.SplitMode.A
+                unicodedata.normalize("NFKC", form).casefold(), tokenizer.Tokenizer.SplitMode.A
             )
-            if morpheme.reading_form() not in {"", "*"}
+            if morpheme.part_of_speech()[0] not in {"補助記号", "記号", "空白"}
+            and morpheme.reading_form() not in {"", "*"}
         ]
-        for start in range(len(parts)):
-            combined = ""
-            for part in parts[start:]:
-                combined += part
-                if len(combined) > 24:
-                    break
-                if len(combined) >= 5:
-                    values.append(combined)
+        combined = "".join(parts)
+        if combined:
+            values.append(combined)
     return tuple(dict.fromkeys(values))
 
 
