@@ -29,7 +29,9 @@ from .llm_response import (
 )
 from .local_segmentation import build_speaker_tracks
 from .local_translation import LocalJapaneseTranslator
-from .prompt_budget import estimate_prompt_tokens
+from .llm_stream import read_chat_stream, read_responses_stream
+from .repetition import RepetitionLoopError
+from .prompt_budget import count_llama_prompt_tokens, estimate_prompt_tokens, validate_request_budget
 from .prompt_templates import render_user_prompt
 from .reference_context import (
     compact_lyrics_reference_context,
@@ -114,19 +116,44 @@ class OpenAICompatibleTranslator:
             payload.setdefault("thinking", {"type": self.config.thinking})
         return self._request(payload)
 
+    def _stage_sender(self, cache_path: Path | None, name: str):
+        stage = CacheStore(cache_path).existing(name) if cache_path is not None else None
+        if stage is None:
+            return self
+        snapshot = stage.plan.get("llm") or stage.remember(
+            "request_config", lambda: config_snapshot(self.config)
+        )
+        sender = copy(self)
+        sender.config = restore_config(self.config, snapshot)
+        return sender
+
     def stage_request(self, cache_path: Path | None, name: str):
-        """Use the stage's saved transport settings, with live credentials."""
-        def request(body):
-            stage = CacheStore(cache_path).existing(name) if cache_path is not None else None
-            if stage is None:
-                return self._request(body)
-            snapshot = stage.plan.get("llm") or stage.remember(
-                "request_config", lambda: config_snapshot(self.config)
-            )
-            sender = copy(self)
-            sender.config = restore_config(self.config, snapshot)
-            return sender._request(body)
-        return request
+        return lambda body: self._stage_sender(cache_path, name)._request(body)
+
+    def stage_budget_validator(self, cache_path: Path | None, name: str):
+        return lambda body: self._stage_sender(cache_path, name).validate_request(body)
+
+    def validate_request(self, body: dict[str, object]) -> None:
+        if not self.config.local_server_enabled:
+            return
+        if self.before_request is not None:
+            self.before_request(self.config)
+        if callable(self.api_key):
+            self.api_key = self.api_key()
+        validate_request_budget(
+            body, context_size=self.config.local_server_context_size,
+            count_tokens=lambda value: count_llama_prompt_tokens(value, self._budget_post),
+        )
+
+    def _budget_post(self, path: str, payload: dict[str, object]) -> dict[str, object]:
+        base = self.config.base_url.rstrip('/').removesuffix('/v1')
+        request = urllib.request.Request(
+            base + path, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+            headers={'Authorization': f'Bearer {self.api_key}', 'Content-Type': 'application/json'},
+            method='POST',
+        )
+        with urllib.request.urlopen(request, timeout=self.config.timeout_seconds, context=self.ssl_context) as response:
+            return json.loads(response.read().decode('utf-8'))
 
     def _stage_executor(self, cache_path: Path | None, name: str):
         stage = CacheStore(cache_path).existing(name) if cache_path is not None else None
@@ -465,6 +492,7 @@ class OpenAICompatibleTranslator:
                 handle.write(json.dumps(entry, ensure_ascii=False, default=repr) + "\n")
 
     def _request(self, body: dict[str, object]) -> dict[str, object]:
+        self.validate_request(body)
         if self.before_request is not None:
             self.before_request(self.config)
         if callable(self.api_key):
@@ -472,6 +500,10 @@ class OpenAICompatibleTranslator:
         request_id = uuid.uuid4().hex
         self._audit_request_ids[id(body)] = request_id
         url, request_body = _prepare_api_request(self.config, body)
+        request_body = {**request_body, "stream": True}
+        if self.config.api_style == "chat_completions":
+            request_body["stream_options"] = {"include_usage": True}
+        read_stream = read_chat_stream if self.config.api_style == "chat_completions" else read_responses_stream
         request = urllib.request.Request(
             url,
             data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
@@ -481,43 +513,31 @@ class OpenAICompatibleTranslator:
             },
             method="POST",
         )
-        if self.config.local_server_enabled:
-            try:
-                with urllib.request.urlopen(
-                    request,
-                    context=self.ssl_context,
-                ) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-            except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", errors="replace")[:500]
-                raise LocalLLMError(f"local LLM request failed: {detail}") from exc
-            except urllib.error.URLError as exc:
-                raise LocalLLMError(f"local LLM request failed: {exc.reason}") from exc
-            normalized = _normalize_api_response(self.config, payload)
-            normalized["_audit_request_id"] = request_id
-            _log_response_usage(normalized)
-            self._log_request_context(body, normalized)
-            self._log_successful_response(request_id, body, normalized)
-            return normalized
+        options = {"context": self.ssl_context}
+        if not self.config.local_server_enabled:
+            options["timeout"] = self.config.timeout_seconds
         try:
-            with urllib.request.urlopen(
-                request,
-                timeout=self.config.timeout_seconds,
-                context=self.ssl_context,
-            ) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-                normalized = _normalize_api_response(self.config, payload)
-                normalized["_audit_request_id"] = request_id
-                _log_response_usage(normalized)
-                self._log_request_context(body, normalized)
-                self._log_successful_response(request_id, body, normalized)
-                return normalized
+            with urllib.request.urlopen(request, **options) as response:
+                payload = read_stream(response)
+        except RepetitionLoopError as exc:
+            self._log_invalid_response("stream_repetition", exc, None, body)
+            raise
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:500]
-            retry_after = None
-            if exc.headers is not None:
-                retry_after = _parse_retry_after(exc.headers.get("Retry-After"))
+            if self.config.local_server_enabled:
+                raise LocalLLMError(f"local LLM request failed: {detail}") from exc
+            retry_after = _parse_retry_after(exc.headers.get("Retry-After")) if exc.headers else None
             raise LLMHTTPError(exc.code, detail, retry_after) from exc
+        except urllib.error.URLError as exc:
+            if self.config.local_server_enabled:
+                raise LocalLLMError(f"local LLM request failed: {exc.reason}") from exc
+            raise
+        normalized = _normalize_api_response(self.config, payload)
+        normalized["_audit_request_id"] = request_id
+        _log_response_usage(normalized)
+        self._log_request_context(body, normalized)
+        self._log_successful_response(request_id, body, normalized)
+        return normalized
 
     def _log_successful_response(
         self,

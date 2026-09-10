@@ -24,7 +24,7 @@ from .prompt_budget import (
     estimate_prompt_tokens,
     validate_prompt_budget,
 )
-from .prompt_templates import render_user_prompt
+from .prompt_templates import prompt_system, render_user_prompt
 from .reference_context import compact_translation_reference_context
 from .repetition import RepetitionLoopError
 from .source_language import (
@@ -55,7 +55,6 @@ _TOPIC_MAX_SECONDS = 90.0
 _TOPIC_GAP_SECONDS = 5.0
 _TOPIC_KNOWLEDGE_HITS = 6
 _TOPIC_KNOWLEDGE_CHARS = 1800
-_LOCAL_OUTPUT_RESERVE_TOKENS = 4096
 _TOPIC_SHIFT = re.compile(
     r"^(?:そういえば|ところで|話(?:は|を)?変(?:わ|え)|次(?:に|は)|別の話)"
 )
@@ -503,7 +502,7 @@ def _request_segmentation(
             log_invalid_response(
                 "source cue segmentation", exc, content, body, response
             )
-            if is_nontransient(exc):
+            if isinstance(exc, PromptBudgetExceeded) or is_nontransient(exc):
                 raise
             delay = retry_delay(exc, transient_attempts + 1)
             if delay is not None:
@@ -912,7 +911,7 @@ def _request_translation(
             log_invalid_response("fixed cue translation", exc, content, body, response)
             if isinstance(exc, RepetitionLoopError):
                 raise
-            if is_nontransient(exc):
+            if isinstance(exc, PromptBudgetExceeded) or is_nontransient(exc):
                 raise
             delay = retry_delay(exc, transient_attempts + 1)
             if delay is not None:
@@ -1240,9 +1239,9 @@ def _validate_prompt_budget(
 ) -> None:
     if not llm.local_server_enabled:
         return
-    reserve = min(_LOCAL_OUTPUT_RESERVE_TOKENS, translation.max_tokens)
+    reserve = translation.max_tokens
     validate_prompt_budget(
-        prompt,
+        prompt_system(_TRANSLATE_PROMPT) + "\n" + prompt,
         context_size=llm.local_server_context_size,
         max_output_tokens=reserve,
         estimate_tokens=estimate_prompt_tokens,

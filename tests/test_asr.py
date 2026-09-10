@@ -1,3 +1,4 @@
+from subtitle_pipeline.repetition import find_repetition_loop
 from subtitle_pipeline.cache import CacheStore
 import json
 import tempfile
@@ -18,7 +19,6 @@ from subtitle_pipeline.asr import (
     _raw_song_support_cues,
     _record_timeline_is_healthy,
     _remove_text_overlap,
-    _repetition_hallucination,
     _result_to_cues,
     _song_cut_candidates,
     _song_windows,
@@ -115,7 +115,7 @@ class QwenASRTests(unittest.TestCase):
         self.assertTrue(quality["accepted"])
         self.assertEqual(quality["reasons"], [])
 
-    def test_speech_quality_rejects_repetition_outside_song_fallback(self):
+    def test_speech_quality_does_not_repeat_generation_check(self):
         text = "同じ文です。" * 40
         quality = _speech_candidate_quality(
             {
@@ -132,7 +132,7 @@ class QwenASRTests(unittest.TestCase):
         )
 
         self.assertFalse(quality["accepted"])
-        self.assertIn("repetition_loop", quality["reasons"])
+        self.assertNotIn("repetition_loop", quality["reasons"])
         self.assertFalse(quality["metrics"]["song_context"])
 
     def test_speech_quality_rejects_coherent_text_in_dominant_song_region(self):
@@ -333,7 +333,7 @@ class QwenASRTests(unittest.TestCase):
         self.assertEqual([cue.boundary_hint for cue in mismatched], [None, None, None])
 
     def test_forced_aligner_pos_is_preserved_on_aligned_units(self):
-        result = SimpleNamespace(
+        result = SimpleNamespace(repetition=find_repetition_loop("配信です"),
             text="配信です",
             language="Japanese",
             time_stamps=SimpleNamespace(
@@ -360,7 +360,7 @@ class QwenASRTests(unittest.TestCase):
         self.assertEqual([cue.language for cue in cues], ["Japanese", "Japanese"])
 
     def test_forced_aligner_language_is_recorded_per_source_unit(self):
-        result = SimpleNamespace(
+        result = SimpleNamespace(repetition=find_repetition_loop("Ready set"),
             text="Ready set",
             language="English",
             time_stamps=SimpleNamespace(
@@ -382,7 +382,7 @@ class QwenASRTests(unittest.TestCase):
         self.assertEqual([cue.language for cue in cues], ["English", "English"])
 
     def test_zero_duration_aligner_unit_uses_short_following_gap(self):
-        result = SimpleNamespace(
+        result = SimpleNamespace(repetition=find_repetition_loop("何話そうね"),
             text="何話そうね",
             language="Japanese",
             time_stamps=SimpleNamespace(
@@ -412,7 +412,7 @@ class QwenASRTests(unittest.TestCase):
         )
 
     def test_consecutive_zero_duration_units_merge_into_following_gap(self):
-        result = SimpleNamespace(
+        result = SimpleNamespace(repetition=find_repetition_loop("話そうかな"),
             text="話そうかな",
             language="Japanese",
             time_stamps=SimpleNamespace(
@@ -441,7 +441,7 @@ class QwenASRTests(unittest.TestCase):
     def test_zero_duration_unit_without_short_gap_attaches_to_previous_unit(self):
         for following_start in (0.4, 3.0):
             with self.subTest(following_start=following_start):
-                result = SimpleNamespace(
+                result = SimpleNamespace(repetition=find_repetition_loop("話そうね"),
                     text="話そうね",
                     language="Japanese",
                     time_stamps=SimpleNamespace(
@@ -485,7 +485,7 @@ class QwenASRTests(unittest.TestCase):
             def transcribe(self, **kwargs):
                 calls.append(kwargs)
                 return [
-                    SimpleNamespace(
+                    SimpleNamespace(repetition=find_repetition_loop(f"字幕{index}"),
                         language="Japanese",
                         text=f"字幕{index}",
                         time_stamps=SimpleNamespace(
@@ -539,7 +539,7 @@ class QwenASRTests(unittest.TestCase):
         )
 
     def test_empty_speech_is_audited_and_skipped_without_split(self):
-        empty = SimpleNamespace(
+        empty = SimpleNamespace(repetition=find_repetition_loop(""),
             language="Japanese",
             text="",
             time_stamps=SimpleNamespace(items=[]),
@@ -578,7 +578,7 @@ class QwenASRTests(unittest.TestCase):
         self.assertEqual(events[0]["core_end"], 40)
 
     def test_short_empty_speech_is_audited_and_skipped(self):
-        empty = SimpleNamespace(
+        empty = SimpleNamespace(repetition=find_repetition_loop(""),
             language="Japanese",
             text="",
             time_stamps=SimpleNamespace(items=[]),
@@ -613,7 +613,7 @@ class QwenASRTests(unittest.TestCase):
 
     def test_transcribe_range_temporarily_applies_dynamic_token_limit(self):
         observed_limits = []
-        result = SimpleNamespace(
+        result = SimpleNamespace(repetition=find_repetition_loop("短い音声"),
             language="Japanese",
             text="短い音声",
             time_stamps=SimpleNamespace(
@@ -1124,7 +1124,7 @@ class QwenASRTests(unittest.TestCase):
         repeated = "私が食べてるのでちょっとこっちに移動します" * 10
 
         def result(text, start, end):
-            return SimpleNamespace(
+            return SimpleNamespace(repetition=find_repetition_loop(text),
                 language="Japanese",
                 text=text,
                 time_stamps=SimpleNamespace(
@@ -1329,7 +1329,7 @@ class QwenASRTests(unittest.TestCase):
     def test_singing_asr_does_not_receive_general_stream_context(self):
         model = SimpleNamespace()
         model.transcribe = Mock(
-            return_value=[SimpleNamespace(text="聞こえた歌詞", language="Japanese")]
+            return_value=[SimpleNamespace(repetition=find_repetition_loop("聞こえた歌詞"), text="聞こえた歌詞", language="Japanese")]
         )
         audio = SimpleNamespace(
             sample_rate=16000,
@@ -1358,9 +1358,9 @@ class QwenASRTests(unittest.TestCase):
         model = SimpleNamespace()
         model.transcribe = Mock(
             side_effect=[
-                [SimpleNamespace(text=repeated, language="Japanese")],
-                [SimpleNamespace(text="前半の歌詞", language="Japanese")],
-                [SimpleNamespace(text="ready set and find out", language="English")],
+                [SimpleNamespace(repetition=find_repetition_loop(repeated), text=repeated, language="Japanese")],
+                [SimpleNamespace(repetition=find_repetition_loop("前半の歌詞"), text="前半の歌詞", language="Japanese")],
+                [SimpleNamespace(repetition=find_repetition_loop("ready set and find out"), text="ready set and find out", language="English")],
             ]
         )
         audio = SimpleNamespace(
@@ -1409,7 +1409,7 @@ class QwenASRTests(unittest.TestCase):
         repeated = "同じ長い歌詞を繰り返してしまう" * 12
         model = SimpleNamespace(
             transcribe=Mock(
-                return_value=[SimpleNamespace(text=repeated, language="Japanese")]
+                return_value=[SimpleNamespace(repetition=find_repetition_loop(repeated), text=repeated, language="Japanese")]
             )
         )
         audio = SimpleNamespace(
@@ -1454,7 +1454,7 @@ class QwenASRTests(unittest.TestCase):
         model = SimpleNamespace(
             max_new_tokens=128,
             transcribe=Mock(
-                return_value=[SimpleNamespace(text=repeated, language="Japanese")]
+                return_value=[SimpleNamespace(repetition=find_repetition_loop(repeated), text=repeated, language="Japanese")]
             ),
         )
         audio = SimpleNamespace(
@@ -1476,26 +1476,16 @@ class QwenASRTests(unittest.TestCase):
             audit = json.loads(audit_path.read_text(encoding="utf-8"))
 
         self.assertEqual(record["text"], "")
-        self.assertTrue(record["discarded_repetition"])
+        self.assertNotIn("discarded_repetition", record)
         self.assertEqual(audit["kind"], "raw_speech")
         self.assertEqual(audit["action"], "discard")
-        self.assertEqual(record["repetition_diagnostics"][0]["reason"], audit["reason"])
+        self.assertNotIn("repetition_diagnostics", record)
 
     def test_removes_repeated_text_from_overlapping_song_window(self):
         self.assertEqual(
             _remove_text_overlap("君とここで歌う", "ここで歌う明日へ"),
             "明日へ",
         )
-
-    def test_detects_repeated_asr_generation_loop(self):
-        phrase = "私が食べてるのでちょっとこっちに移動します"
-        repetition = _repetition_hallucination(phrase * 10)
-        self.assertIsNotNone(repetition)
-        assert repetition is not None
-        self.assertGreaterEqual(repetition[1], 4)
-
-    def test_does_not_flag_short_natural_repetition(self):
-        self.assertIsNone(_repetition_hallucination("はいはいはいはい、大丈夫です"))
 
     def test_aligner_cues_do_not_restore_asr_punctuation(self):
         result = SimpleNamespace(
@@ -1533,7 +1523,7 @@ class QwenASRTests(unittest.TestCase):
             video.write_bytes(b"video")
             config = ASRConfig(chunk_seconds=10, chunk_context_seconds=1)
             item = SimpleNamespace(text="一", start_time=1, end_time=2)
-            result = SimpleNamespace(
+            result = SimpleNamespace(repetition=find_repetition_loop("一。"),
                 language="Japanese",
                 text="一。",
                 time_stamps=SimpleNamespace(items=[item]),
@@ -1577,9 +1567,9 @@ class QwenASRTests(unittest.TestCase):
             _valid_cached_record({"cues": [{"start": 1.0, "end": 1.0, "text": "字幕"}]})
         )
 
-    def test_rejects_cached_chunk_with_repeated_generation_loop(self):
+    def test_success_cache_does_not_rescan_text(self):
         phrase = "私が食べてるのでちょっとこっちに移動します"
-        self.assertFalse(
+        self.assertTrue(
             _valid_cached_record(
                 {
                     "text": phrase * 10,
@@ -1596,19 +1586,19 @@ class QwenASRTests(unittest.TestCase):
             video.write_bytes(b"video")
             config = ASRConfig(chunk_seconds=40, chunk_context_seconds=1)
             phrase = "私が食べてるのでちょっとこっちに移動します"
-            looping = SimpleNamespace(
+            looping = SimpleNamespace(repetition=find_repetition_loop(phrase * 10),
                 language="Japanese",
                 text=phrase * 10,
                 time_stamps=SimpleNamespace(items=[]),
             )
-            left = SimpleNamespace(
+            left = SimpleNamespace(repetition=find_repetition_loop("左。"),
                 language="Japanese",
                 text="左。",
                 time_stamps=SimpleNamespace(
                     items=[SimpleNamespace(text="左", start_time=5, end_time=6)]
                 ),
             )
-            right = SimpleNamespace(
+            right = SimpleNamespace(repetition=find_repetition_loop("右。"),
                 language="Japanese",
                 text="右。",
                 time_stamps=SimpleNamespace(
@@ -1642,11 +1632,9 @@ class QwenASRTests(unittest.TestCase):
             self.assertIn("右", destination.read_text(encoding="utf-8"))
             self.assertNotIn("。", destination.read_text(encoding="utf-8"))
             cache = {"chunks": {"0": CacheStore(root / "cache.sqlite3").existing("raw_speech").get("0")}}
-            self.assertTrue(cache["chunks"]["0"]["recovered_from_repetition"])
-            diagnostics = cache["chunks"]["0"]["repetition_diagnostics"]
-            self.assertTrue(diagnostics[0]["minimal_reproducer"])
-            self.assertEqual(diagnostics[0]["start"], 0)
-            self.assertEqual(diagnostics[0]["end"], 40)
+            self.assertNotIn("recovered_from_repetition", cache["chunks"]["0"])
+            self.assertNotIn("repetition_diagnostics", cache["chunks"]["0"])
+
 
 
 if __name__ == "__main__":

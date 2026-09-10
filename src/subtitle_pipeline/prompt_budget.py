@@ -49,30 +49,86 @@ def batch_prompt_items(
     max_output_tokens: Callable[[int], int],
     estimate_tokens: Callable[[str], int] = estimate_prompt_tokens,
 ) -> list[tuple[Item, ...]]:
-    batches: list[tuple[Item, ...]] = []
+    return batch_requests(
+        items,
+        render_request=lambda values: {
+            "prompt": render_prompt(values), "max_tokens": max_output_tokens(len(values))
+        },
+        validate_request=lambda body: validate_prompt_budget(
+            body["prompt"], context_size=context_size,
+            max_output_tokens=body["max_tokens"], estimate_tokens=estimate_tokens,
+        ),
+    )
+
+
+def validate_request_budget(
+    body: dict[str, object], *, context_size: int,
+    count_tokens: Callable[[dict[str, object]], int],
+) -> None:
+    """Validate the complete rendered request, including its output allowance."""
+    reserve = int(body['max_tokens'])
+    if reserve < 1 or context_size <= reserve:
+        raise PromptBudgetExceeded(f"output_reserve={reserve} leaves no input capacity in context={context_size}")
+    tokens = count_tokens(body)
+    if tokens + reserve > context_size:
+        raise PromptBudgetExceeded(
+            f"prompt tokens={tokens} + output_reserve={reserve} exceed context={context_size}"
+        )
+
+
+def count_llama_prompt_tokens(body: dict[str, object], post: Callable) -> int:
+    """Use the serving model's template and tokenizer, without generation."""
+    formatted = post('/apply-template', body)
+    prompt = formatted.get('prompt')
+    if not isinstance(prompt, str):
+        raise ValueError('llama-server /apply-template returned no prompt')
+    tokenized = post('/tokenize', {'content': prompt, 'add_special': True, 'parse_special': True})
+    tokens = tokenized.get('tokens')
+    if not isinstance(tokens, list):
+        raise ValueError('llama-server /tokenize returned no tokens')
+    return len(tokens)
+
+
+def batch_requests(
+    items: Sequence[Item], *, render_request: Callable[[Sequence[Item]], dict[str, object]],
+    validate_request: Callable[[dict[str, object]], None],
+) -> list[tuple[Item, ...]]:
+    """Group complete requests; never silently drop an oversized single item."""
+    batches = []
     current: list[Item] = []
     for item in items:
         proposed = [*current, item]
         try:
-            validate_prompt_budget(
-                render_prompt(proposed),
-                context_size=context_size,
-                max_output_tokens=max_output_tokens(len(proposed)),
-                estimate_tokens=estimate_tokens,
-            )
+            validate_request(render_request(proposed))
         except PromptBudgetExceeded:
             if not current:
                 raise
             batches.append(tuple(current))
             current = [item]
-            validate_prompt_budget(
-                render_prompt(current),
-                context_size=context_size,
-                max_output_tokens=max_output_tokens(1),
-                estimate_tokens=estimate_tokens,
-            )
+            validate_request(render_request(current))
         else:
             current = proposed
     if current:
         batches.append(tuple(current))
     return batches
+
+
+def fit_optional_text(text: str, *, render_request: Callable[[str], dict[str, object]],
+                      validate_request: Callable[[dict[str, object]], None]) -> str:
+    """Trim only optional context, after proving the mandatory request fits."""
+    try:
+        validate_request(render_request(text))
+        return text
+    except PromptBudgetExceeded:
+        validate_request(render_request(''))
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        try:
+            validate_request(render_request(text[:middle]))
+            low = middle
+        except PromptBudgetExceeded:
+            high = middle - 1
+    fitted = text[:low]
+    validate_request(render_request(fitted))
+    return fitted

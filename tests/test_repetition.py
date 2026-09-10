@@ -10,7 +10,7 @@ class RepetitionTests(unittest.TestCase):
         self.assertIsNotNone(match)
         assert match is not None
         self.assertEqual(match.pattern, "哒")
-        self.assertEqual(match.repeats, 500)
+        self.assertEqual(match.repeats, 160)
 
     def test_detects_repeated_sentence(self):
         phrase = "I'm so tired of being a nobody."

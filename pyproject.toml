@@ -10,7 +10,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "certifi>=2025.1.31",
-    "gallery-dl>=1.30,<2",
+    # Instagram timeline API fix, not included in the 1.32.11 release.
+    "gallery-dl @ git+https://codeberg.org/mikf/gallery-dl.git@e7a78b857e7a5b24eef3bd5d7dfb0989cb4b9b2a",
     "faiss-cpu>=1.12,<2",
     "phonemizer>=3.3,<4",
     "playwright>=1.55,<2",

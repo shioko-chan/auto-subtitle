@@ -19,6 +19,7 @@ from .llm_response import (
     structured_response_content,
 )
 from .prompt_templates import render_user_prompt
+from .prompt_budget import batch_requests, fit_optional_text
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ def correct_asr_windows(
     audit_path: Path,
     window_chars: int = 3000,
     max_tokens: int = 8192,
+    validate_request: Callable[[dict[str, object]], None],
     retrieve_knowledge: Callable[[list[tuple[dict[str, object], str]]], list[list[KnowledgeHit]]]
     | None = None,
 ) -> list[dict[str, object]]:
@@ -98,70 +100,82 @@ def correct_asr_windows(
         candidates = _candidate_entities(deterministic, entities)
         prepared.append((index, record, deterministic, candidates))
 
-    windows = list(_correction_windows(prepared, window_chars))
-    retrieval_items = [
-        (index, record, fragment)
-        for window_number, window in enumerate(windows)
-        if stage.get(str(window_number)) is None and stage.get(f"request:{window_number}") is None
-        for index, record, text, _ in window
-        for fragment in _retrieval_fragments(text)
-    ]
-    logger.info("ASR correction preparing retrieval: windows=%d fragments=%d", len(windows), len(retrieval_items))
-    retrieved = (
-        retrieve_knowledge([(record, fragment) for _, record, fragment in retrieval_items])
-        if retrieve_knowledge is not None and retrieval_items else [[] for _ in retrieval_items]
-    )
-    fragments_by_index: dict[int, list[tuple[str, list[KnowledgeHit]]]] = {index: [] for index, *_ in prepared}
-    for (index, _, fragment), hits in zip(retrieval_items, retrieved, strict=True):
-        fragments_by_index.setdefault(index, []).append((fragment, hits))
+    def prepare_requests():
+        retrieval_items = [
+            (index, record, fragment)
+            for index, record, text, _ in prepared
+            for fragment in _retrieval_fragments(text)
+        ]
+        logger.info("ASR correction preparing retrieval: records=%d fragments=%d", len(prepared), len(retrieval_items))
+        retrieved = (
+            retrieve_knowledge([(record, fragment) for _, record, fragment in retrieval_items])
+            if retrieve_knowledge is not None else [[] for _ in retrieval_items]
+        )
+        fragments_by_index = {index: [] for index, *_ in prepared}
+        for (index, _, fragment), hits in zip(retrieval_items, retrieved, strict=True):
+            fragments_by_index[index].append((fragment, hits))
 
-    for window_number, window in enumerate(windows):
+        def render(window):
+            return structured_request_body(
+                model=model, prompt_name=_PROMPT,
+                prompt=render_user_prompt(
+                    _PROMPT,
+                    ENTITY_REFERENCE=_format_entities(_unique_entities(
+                        entity for _, _, _, candidates in window for entity in candidates
+                    )),
+                    TARGET=_format_correction_window(window, fragments_by_index),
+                ),
+                max_tokens=max_tokens, temperature=0, json_mode=True, thinking=None,
+            )
+
+        fitted = []
+        trimmed = {}
+        for index, record, text, candidates in prepared:
+            original = str(record.get('chat_text') or '')
+            def render_chat(chat):
+                return render([(index, {**record, 'chat_text': chat}, text, candidates)])
+            chat = fit_optional_text(original, render_request=render_chat, validate_request=validate_request)
+            fitted.append((index, {**record, 'chat_text': chat}, text, candidates))
+            if len(chat) < len(original):
+                trimmed[str(index)] = len(original) - len(chat)
+                logger.info("ASR correction trimmed optional chat: window_id=%s removed_chars=%d", record.get('window_id', index), len(original) - len(chat))
+        batches = [
+            batch
+            for window in _correction_windows(fitted, window_chars)
+            for batch in batch_requests(window, render_request=render, validate_request=validate_request)
+        ]
+        logger.info("ASR correction budgeted %d records into %d requests", len(prepared), len(batches))
+        return [
+            {
+                'indices': [index for index, *_ in window],
+                'body': render(window),
+                'knowledge_ids': [hit.record_id for hit in _unique_knowledge(
+                    hit for index, *_ in window for _, hits in fragments_by_index[index] for hit in hits
+                )],
+                'fragments': {
+                    str(index): [{'text': fragment, 'knowledge_ids': [hit.record_id for hit in hits]}
+                                 for fragment, hits in fragments_by_index[index]]
+                    for index, *_ in window
+                },
+                'trimmed_chat_chars': {str(index): trimmed[str(index)] for index, *_ in window if str(index) in trimmed},
+            }
+            for window in batches
+        ]
+
+    requests = stage.remember('requests', prepare_requests)
+    logger.info("ASR correction retrieval completed; starting LLM correction")
+    for window_number, prepared_request in enumerate(requests):
         unit_id = str(window_number)
+        window = [prepared[index] for index in prepared_request['indices']]
         cached = stage.get(unit_id)
         if cached is not None:
             for (index, *_), value in zip(window, cached, strict=True):
                 corrected[index] = value
             continue
-        def prepare_request():
-            entity_union = _unique_entities(
-                entity for _, _, _, candidates in window for entity in candidates
-            )
-            knowledge_union = _unique_knowledge(
-                hit
-                for index, _, _, _ in window
-                for _, hits in fragments_by_index[index]
-                for hit in hits
-            )
-            body = structured_request_body(
-                model=model,
-                prompt_name=_PROMPT,
-                prompt=render_user_prompt(
-                    _PROMPT,
-                    ENTITY_REFERENCE=_format_entities(entity_union),
-                    TARGET=_format_correction_window(window, fragments_by_index),
-                ),
-                max_tokens=max_tokens,
-                temperature=0,
-                json_mode=True,
-                thinking=None,
-            )
-            return {
-                "body": body, "knowledge_ids": [hit.record_id for hit in knowledge_union],
-                "fragments": {str(index): [{"text": fragment, "knowledge_ids": [hit.record_id for hit in hits]}
-                                           for fragment, hits in fragments]
-                              for index, *_ in window
-                              for fragments in [fragments_by_index[index]]},
-            }
-
-        stage.remember(f"request:{unit_id}", prepare_request)
-    logger.info("ASR correction retrieval completed; starting LLM correction")
-    for window_number, window in enumerate(windows):
-        unit_id = str(window_number)
-        if stage.get(unit_id) is not None:
-            continue
-        prepared_request = stage.get(f"request:{unit_id}")
-        logger.info("ASR correction LLM window %d/%d", window_number + 1, len(windows))
-        body = prepared_request["body"]
+        logger.info("ASR correction LLM window %d/%d", window_number + 1, len(requests))
+        body = prepared_request['body']
+        # Check cached requests too, before the downgrade-on-generation-error path.
+        validate_request(body)
         response: dict[str, object] | None = None
         batch_error: str | None = None
         try:
@@ -186,6 +200,7 @@ def correct_asr_windows(
                     record.get("window_id", index) for index, record, _, _ in window
                 ],
                 "request": body,
+                "trimmed_chat_chars": prepared_request["trimmed_chat_chars"],
                 "response": response,
                 "error": batch_error,
                 "knowledge_ids": prepared_request["knowledge_ids"],

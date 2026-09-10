@@ -375,6 +375,7 @@ def _run_pipeline_stages(
                 window_chars=config.asr_correction.window_chars,
                 max_tokens=config.asr_correction.max_tokens,
                 retrieve_knowledge=retrieve_asr_knowledge,
+                validate_request=translator.stage_budget_validator(job_dir / "cache.sqlite3", "asr_correction"),
             )
         finally:
             if fan_knowledge is not None:

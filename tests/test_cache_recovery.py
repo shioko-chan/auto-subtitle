@@ -1,3 +1,4 @@
+from subtitle_pipeline.repetition import find_repetition_loop
 """Offline recovery checks across cache, model, media and publication boundaries."""
 import json
 import re
@@ -11,7 +12,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from subtitle_pipeline.asr import _transcribe_raw_range, _transcribe_range, transcribe_with_qwen
-from subtitle_pipeline.asr_correction import correct_asr_windows
+from subtitle_pipeline.asr_correction import correct_asr_windows as _correct_asr_windows
 from subtitle_pipeline.audio_analysis import AudioAnalysis, AudioRegion, analyze_audio
 from subtitle_pipeline.bilibili_comments import create_comment_task, publish_comment_task
 from subtitle_pipeline.cache import CacheStore, STAGES, StageDefinition
@@ -20,6 +21,16 @@ from subtitle_pipeline.media import DownloadResult, download_youtube, render_sub
 from subtitle_pipeline.publication import write_record
 from subtitle_pipeline.staged_translation import run_fixed_translation
 from subtitle_pipeline.subtitles import Cue
+
+
+from functools import partial
+from subtitle_pipeline.prompt_budget import estimate_prompt_tokens, validate_request_budget
+
+def validate_test_request(body):
+    validate_request_budget(body, context_size=16384,
+        count_tokens=lambda value: estimate_prompt_tokens(json.dumps(value['messages'], ensure_ascii=False)))
+
+correct_asr_windows = partial(_correct_asr_windows, validate_request=validate_test_request)
 
 
 def response(cues):
@@ -45,9 +56,9 @@ class CacheRecoveryTests(unittest.TestCase):
 
     def test_raw_recursive_resume_reuses_parent_plan_and_completed_child(self):
         stage = self.store.stage("raw_speech", lambda: {})
-        repeated = SimpleNamespace(text="私が食べてるのでちょっとこっちに移動します" * 10, language="Japanese")
-        left = SimpleNamespace(text="左です", language="Japanese")
-        right = SimpleNamespace(text="右です", language="Japanese")
+        repeated = SimpleNamespace(repetition=find_repetition_loop("私が食べてるのでちょっとこっちに移動します" * 10), text="私が食べてるのでちょっとこっちに移動します" * 10, language="Japanese")
+        left = SimpleNamespace(repetition=find_repetition_loop("左です"), text="左です", language="Japanese")
+        right = SimpleNamespace(repetition=find_repetition_loop("右です"), text="右です", language="Japanese")
         model = SimpleNamespace(max_new_tokens=128, transcribe=Mock(side_effect=[[repeated], [left], KeyboardInterrupt()]))
         with self.assertRaises(KeyboardInterrupt):
             _transcribe_raw_range(model, ASRConfig(), 0, 40, 40, self.audio, cache=stage)
@@ -60,7 +71,7 @@ class CacheRecoveryTests(unittest.TestCase):
     def test_aligned_recursive_resume_does_not_request_parent_or_left(self):
         stage = self.store.stage("raw_speech", lambda: {})
         def result(text):
-            return SimpleNamespace(text=text, language="Japanese", time_stamps=SimpleNamespace(items=[SimpleNamespace(text=text, start_time=5, end_time=6)]))
+            return SimpleNamespace(repetition=find_repetition_loop(text), text=text, language="Japanese", time_stamps=SimpleNamespace(items=[SimpleNamespace(text=text, start_time=5, end_time=6)]))
         model = SimpleNamespace(transcribe=Mock(side_effect=[[result("私が食べてるのでちょっとこっちに移動します" * 10)], [result("左")], KeyboardInterrupt()]))
         kwargs = dict(core_start=0, core_end=40, media_duration=40, final_chunk=True, label="0", audio_buffer=self.audio, cache=stage)
         with self.assertRaises(KeyboardInterrupt):
@@ -79,7 +90,7 @@ class CacheRecoveryTests(unittest.TestCase):
         request.return_value = {"choices": [{"message": {"content": '{"windows":[{"window_id":0,"text":"訂正"}]}'}}]}
         first = correct_asr_windows(**kwargs, request=request)
         self.store.stage("translation", lambda: {}).finish(["old"])
-        with patch.dict(STAGES, {"asr_correction": StageDefinition(2, STAGES["asr_correction"].parents)}):
+        with patch.dict(STAGES, {"asr_correction": StageDefinition(STAGES["asr_correction"].version + 1, STAGES["asr_correction"].parents)}):
             store = CacheStore(self.path)
             self.assertEqual(store.existing("raw_speech").get("0")["text"], "原文")
             self.assertIsNotNone(store.existing("song_identification").get("__result__"))

@@ -19,6 +19,16 @@ from subtitle_pipeline.translate import (
 
 
 class PromptBudgetTests(unittest.TestCase):
+    def test_auxiliary_and_stage_requests_cannot_bypass_local_budget(self):
+        from subtitle_pipeline.prompt_budget import PromptBudgetExceeded
+        translator = OpenAICompatibleTranslator(LLMConfig(local_server_enabled=True, local_server_context_size=100), TranslationConfig(), '')
+        body = {'messages': [{'role': 'system', 'content': 'rules'}, {'role': 'user', 'content': 'context'}], 'max_tokens': 40}
+        for send in (translator.request, translator.stage_request(None, 'asr_correction')):
+            with patch.object(translator, '_budget_post', side_effect=[{'prompt': 'formatted'}, {'tokens': list(range(61))}]), patch('subtitle_pipeline.translate.urllib.request.urlopen') as network:
+                with self.assertRaises(PromptBudgetExceeded):
+                    send(body)
+                network.assert_not_called()
+
     def test_only_http_402_is_balance_exhaustion(self) -> None:
         quota = LLMHTTPError(402, "insufficient balance")
         wrapped = RuntimeError("term extraction failed")
@@ -30,12 +40,13 @@ class PromptBudgetTests(unittest.TestCase):
     @patch("subtitle_pipeline.translate.urllib.request.urlopen")
     def test_local_request_has_no_network_timeout(self, urlopen) -> None:
         response = urlopen.return_value.__enter__.return_value
-        response.read.return_value = json.dumps(_response("{}")).encode()
+        response.__iter__.return_value = iter(_stream_lines("{}"))
         translator = OpenAICompatibleTranslator(
-            LLMConfig(local_server_enabled=True), TranslationConfig(), ""
+            LLMConfig(local_server_enabled=True, local_server_context_size=16384), TranslationConfig(), ""
         )
 
-        translator.request({"messages": []})
+        with patch.object(translator, "_budget_post", side_effect=[{"prompt": "test"}, {"tokens": [1]}]):
+            translator.request({"messages": []})
 
         self.assertNotIn("timeout", urlopen.call_args.kwargs)
 
@@ -91,16 +102,17 @@ class PromptBudgetTests(unittest.TestCase):
         self, urlopen
     ) -> None:
         response = urlopen.return_value.__enter__.return_value
-        response.read.return_value = json.dumps(_response('{"cues":[]}')).encode()
+        response.__iter__.return_value = iter(_stream_lines('{"cues":[]}'))
         with tempfile.TemporaryDirectory() as temporary:
             audit = Path(temporary) / "llm-audit.jsonl"
             translator = OpenAICompatibleTranslator(
-                LLMConfig(local_server_enabled=True),
+                LLMConfig(local_server_enabled=True, local_server_context_size=16384),
                 TranslationConfig(),
                 "secret",
                 audit_path=audit,
             )
-            translator.request({"messages": [{"role": "user", "content": "test"}]})
+            with patch.object(translator, "_budget_post", side_effect=[{"prompt": "test"}, {"tokens": [1]}]):
+                translator.request({"messages": [{"role": "user", "content": "test"}]})
             events = [json.loads(line) for line in audit.read_text().splitlines()]
 
         success = next(event for event in events if event["event"] == "llm_response")
@@ -226,6 +238,51 @@ class ApiCompatibilityTests(unittest.TestCase):
             },
         )
         self.assertEqual(normalized["choices"][0]["message"]["content"], "ok")
+
+
+def _stream_lines(content):
+    chunk = {"choices": [{"index": 0, "delta": {"content": content}, "finish_reason": "stop"}]}
+    return [("data: " + json.dumps(chunk) + "\n").encode(), b"\n", b"data: [DONE]\n", b"\n"]
+
+
+class RemoteStreamingTests(unittest.TestCase):
+    @patch("subtitle_pipeline.translate.urllib.request.urlopen")
+    def test_remote_interfaces_stream_and_preserve_response(self, urlopen):
+        import io
+        for style in ("chat_completions", "responses"):
+            translator = OpenAICompatibleTranslator(LLMConfig(api_style=style), TranslationConfig(), "secret")
+            if style == "chat_completions":
+                raw = b"".join(_stream_lines('{"ok":true}'))
+            else:
+                payload = {"status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": '{"ok":true}'}]}]}
+                raw = ("data: " + json.dumps({"type": "response.completed", "response": payload}) + "\n\n").encode()
+            response = io.BytesIO(raw)
+            urlopen.return_value = response
+            result = translator.request({"messages": []})
+            self.assertTrue(response.closed)
+            sent = json.loads(urlopen.call_args.args[0].data)
+            self.assertTrue(sent["stream"])
+            self.assertEqual("stream_options" in sent, style == "chat_completions")
+            self.assertIn("timeout", urlopen.call_args.kwargs)
+            self.assertEqual(result["choices"][0]["message"]["content"], '{"ok":true}')
+
+    @patch("subtitle_pipeline.translate.urllib.request.urlopen")
+    def test_remote_loop_closes_connection_without_success_audit(self, urlopen):
+        import io
+        from subtitle_pipeline.repetition import RepetitionLoopError
+        for style in ("chat_completions", "responses"):
+            if style == "chat_completions":
+                raw = b"".join(_stream_lines("前" * 160))
+            else:
+                raw = ("data: " + json.dumps({"type": "response.output_text.delta", "item_id": "a", "delta": "前" * 160}) + "\n\n").encode()
+            response = io.BytesIO(raw)
+            urlopen.return_value = response
+            translator = OpenAICompatibleTranslator(LLMConfig(api_style=style), TranslationConfig(), "secret")
+            with patch.object(translator, "_log_successful_response") as success:
+                with self.assertRaises(RepetitionLoopError):
+                    translator.request({"messages": []})
+                success.assert_not_called()
+            self.assertTrue(response.closed)
 
 
 if __name__ == "__main__":

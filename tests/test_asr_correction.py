@@ -8,13 +8,55 @@ from pathlib import Path
 from subtitle_pipeline.asr_correction import (
     ASREntity,
     _correction_windows,
-    correct_asr_windows,
+    correct_asr_windows as _correct_asr_windows,
     entities_from_context,
 )
 from subtitle_pipeline.fan_knowledge import KnowledgeHit, KnowledgeScore
 
 
+from functools import partial
+from subtitle_pipeline.prompt_budget import estimate_prompt_tokens, validate_request_budget
+
+def validate_test_request(body):
+    validate_request_budget(body, context_size=16384,
+        count_tokens=lambda value: estimate_prompt_tokens(json.dumps(value['messages'], ensure_ascii=False)))
+
+correct_asr_windows = partial(_correct_asr_windows, validate_request=validate_test_request)
+
+
 class ASRCorrectionTests(unittest.TestCase):
+    def test_complete_prompt_budget_splits_windows_and_trims_only_chat(self):
+        import re
+        records = [{'text': f'原文{i}', 'window_id': i, 'chat_text': '参考情報'*1500} for i in range(3)]
+        sent = []
+        def validate(body):
+            validate_request_budget(body, context_size=5000,
+                count_tokens=lambda b: sum(len(m['content']) for m in b['messages']))
+        def request(body):
+            validate(body)
+            sent.append(body)
+            source = re.findall(r'ASR_TEXT:\n(.*?)\n</SEGMENT>', body['messages'][-1]['content'], re.S)
+            return {'choices': [{'message': {'content': json.dumps({'segments': [
+                {'segment_id': i, 'corrected_text': text} for i, text in enumerate(source)
+            ]})}}]}
+        with tempfile.TemporaryDirectory() as temp:
+            result = correct_asr_windows(records, entities=[], request=request, model='test', max_tokens=512,
+                cache_path=Path(temp)/'cache.sqlite3', audit_path=Path(temp)/'audit.jsonl', validate_request=validate)
+            audit = [json.loads(line) for line in (Path(temp)/'audit.jsonl').read_text().splitlines()]
+        self.assertEqual([r['text'] for r in result], [r['text'] for r in records])
+        self.assertEqual(len(sent), 3)
+        self.assertTrue(all(event['trimmed_chat_chars'] for event in audit if event.get('event') == 'asr_correction_window'))
+
+    def test_oversized_mandatory_text_never_sends_or_downgrades(self):
+        from unittest.mock import Mock
+        from subtitle_pipeline.prompt_budget import PromptBudgetExceeded
+        send = Mock()
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(PromptBudgetExceeded):
+                correct_asr_windows([{'text': '原文'*5000}], entities=[], request=send, model='test',
+                    cache_path=Path(temp)/'cache.sqlite3', audit_path=Path(temp)/'audit.jsonl')
+        send.assert_not_called()
+
     def test_all_retrieval_precedes_llm_and_survives_interruption(self):
         events = []
         records = [{"text": value, "language": "Japanese"} for value in ["あ", "い"]]

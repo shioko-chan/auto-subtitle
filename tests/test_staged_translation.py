@@ -1,3 +1,4 @@
+from subtitle_pipeline.repetition import RepetitionLoopError, RepetitionMatch
 import json
 import tempfile
 import unittest
@@ -170,7 +171,7 @@ class StagedTranslationTests(unittest.TestCase):
         def request(_body):
             nonlocal calls
             calls += 1
-            return {"choices": [{"message": {"content": "哒" * 500}}]}
+            raise RepetitionLoopError(RepetitionMatch("哒", 160, 0, 160))
 
         result = run_fixed_translation(
             source_cues=source,
@@ -203,10 +204,10 @@ class StagedTranslationTests(unittest.TestCase):
             nonlocal calls
             calls += 1
             prompt = body["messages"][1]["content"]
+            if "会触发循环的聊天" in prompt:
+                raise RepetitionLoopError(RepetitionMatch("哒", 160, 0, 160))
             content = (
-                "哒" * 500
-                if "会触发循环的聊天" in prompt
-                else json.dumps(
+                json.dumps(
                     {"cues": [{"cue_id": 0, "text": "无聊天译文"}]},
                     ensure_ascii=False,
                 )
@@ -254,10 +255,10 @@ class StagedTranslationTests(unittest.TestCase):
             nonlocal calls
             calls += 1
             prompt = body["messages"][1]["content"]
+            if "会触发循环的知识正文" in prompt:
+                raise RepetitionLoopError(RepetitionMatch("哒", 160, 0, 160))
             content = (
-                "哒" * 500
-                if "会触发循环的知识正文" in prompt
-                else json.dumps(
+                json.dumps(
                     {"cues": [{"cue_id": 0, "text": "无知识译文"}]},
                     ensure_ascii=False,
                 )

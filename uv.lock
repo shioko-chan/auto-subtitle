@@ -1440,14 +1440,10 @@ wheels = [
 
 [[package]]
 name = "gallery-dl"
-version = "1.32.9"
-source = { registry = "https://pypi.org/simple" }
+version = "1.32.12.dev0"
+source = { git = "https://codeberg.org/mikf/gallery-dl.git?rev=e7a78b857e7a5b24eef3bd5d7dfb0989cb4b9b2a#e7a78b857e7a5b24eef3bd5d7dfb0989cb4b9b2a" }
 dependencies = [
     { name = "requests" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/b1/60/5131cd00162b86dbf3f4528d348eba2f97bc22e2b452855b23c51d5fe340/gallery_dl-1.32.9.tar.gz", hash = "sha256:6847cf1b8fcb231b3a214965470ac64bfbe4f63e92f1d7dbda2d533c3930f07d", size = 735350, upload-time = "2026-08-01T09:47:04.677Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/4e/0b/766ddfd2035b6fb354b57fe4cdf620cd84f9eba3efe5701049a93602a7e4/gallery_dl-1.32.9-py3-none-any.whl", hash = "sha256:271d18fed61e0b9f006d4944be59341b9af136576382e237aa08ba6d060a0e9a", size = 914866, upload-time = "2026-08-01T09:47:00.771Z" },
 ]
 
 [[package]]
@@ -6273,7 +6269,7 @@ requires-dist = [
     { name = "demucs", marker = "extra == 'asr'", specifier = ">=4,<5" },
     { name = "easyocr", marker = "extra == 'asr'", specifier = ">=1.7,<2" },
     { name = "faiss-cpu", specifier = ">=1.12,<2" },
-    { name = "gallery-dl", specifier = ">=1.30,<2" },
+    { name = "gallery-dl", git = "https://codeberg.org/mikf/gallery-dl.git?rev=e7a78b857e7a5b24eef3bd5d7dfb0989cb4b9b2a" },
     { name = "ja-ginza", specifier = ">=5.2,<6" },
     { name = "librosa", marker = "extra == 'asr'", specifier = ">=0.11,<1" },
     { name = "phonemizer", specifier = ">=3.3,<4" },

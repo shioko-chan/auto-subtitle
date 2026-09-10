@@ -99,15 +99,15 @@ def repair_long_overlaps(
 
 
 def _without_repetition_hallucinations(cues: list[Cue]) -> list[Cue]:
-    from .asr import _repetition_hallucination
+    from .repetition import find_repetition_loop
 
     usable = []
     for cue in cues:
-        repetition = _repetition_hallucination(cue.text)
+        repetition = find_repetition_loop(cue.text)
         if repetition is None:
             usable.append(cue)
             continue
-        pattern, repeats = repetition
+        pattern, repeats = repetition.pattern, repetition.repeats
         logger.warning(
             "DiCoW repetition hallucination in %.3f-%.3fs speaker=%s "
             "pattern=%r repeats=%d; preserving Qwen baseline",

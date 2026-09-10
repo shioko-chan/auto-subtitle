@@ -19,7 +19,6 @@ from .audio_analysis import AudioAnalysis, AudioRegion, analyze_audio
 from .audio_buffer import AudioBuffer, AudioBufferPool, is_shared_audio_uri
 from .commands import require_command, run
 from .config import ASRConfig, AudioAnalysisConfig
-from .repetition import find_repetition_loop
 from .source_language import language_for_text, normalize_source_language
 from .subtitles import Cue, write_srt
 from .telemetry import stage_metrics
@@ -185,15 +184,6 @@ def _transcribe_unanalyzed(
         if not _valid_cached_record(cached_chunks.get(str(index)))
     ]
     for index in missing:
-        record = cached_chunks.get(str(index))
-        if isinstance(record, dict) and _repetition_hallucination(
-            str(record.get("text") or "")
-        ):
-            logging.warning(
-                "discarding Qwen3-ASR chunk %d/%d with repeated-loop text",
-                index + 1,
-                chunk_count,
-            )
         cached_chunks.pop(str(index), None)
     model = None
     if missing:
@@ -547,7 +537,7 @@ def _transcribe_analyzed(
                     raw_chunks[str(index)] = record
                     raw_stage.put(str(index), record,
                                   kind="aggregate" if raw_stage.get(f"raw_retry:{record['core_start']}:{record['core_end']}") else "result",
-                                  reason="repetition_discard" if record.get("discarded_repetition") else None)
+                                  )
         finally:
             if raw_model is not None:
                 del raw_model
@@ -1069,8 +1059,6 @@ def _record_timeline_is_healthy(record: dict[str, object], region: AudioRegion) 
     if record.get("skipped_empty") is True:
         return record.get("cues") == []
     text = str(record.get("text") or "")
-    if _repetition_hallucination(text):
-        return False
     values = record.get("cues")
     if not isinstance(values, list) or not values:
         return False
@@ -1219,12 +1207,13 @@ def _transcribe_song_range(
                 )
             if len(results) != 1:
                 raise RuntimeError(f"Qwen3-ASR returned {len(results)} song results")
-            text = str(getattr(results[0], "text", "")).strip()
+            result = results[0]
+            text = str(getattr(result, "text", "")).strip()
             detected_language = str(getattr(results[0], "language", "")).strip()
         finally:
             if chunk_path is not None:
                 chunk_path.unlink(missing_ok=True)
-        repetition = _repetition_hallucination(text)
+        repetition = _generation_repetition(result)
         if repetition is not None:
             pattern, repeats = repetition
             child_duration = (end - start) / 2
@@ -1528,18 +1517,8 @@ def _transcribe_range(*args, cache: StageCache | None = None, **kwargs):
                 "language": right["language"] or left["language"],
                 "text": f"{left['text']}\n{right['text']}".strip(),
                 "cues": [*left["cues"], *right["cues"]],
-                "recovered_from_" + split["recovery"]: True,
             }
-            if split["recovery"] == "repetition":
-                children = [*left.get("repetition_diagnostics", []), *right.get("repetition_diagnostics", [])]
-                result["repetition_diagnostics"] = [{
-                    "kind": "forced_aligned_speech", "start": round(kwargs["core_start"], 3),
-                    "end": round(kwargs["core_end"], 3), "pattern": split["pattern"],
-                    "repeats": split["repeats"], "retry_at": round(midpoint, 3),
-                    "minimal_reproducer": not children,
-                }, *children]
         cache.put("range:" + key, result,
-                  reason="repetition_discard" if result.get("discarded_repetition") else None,
                   kind="aggregate" if cache.get("split:" + key) is not None else "result")
         return result
 
@@ -1621,7 +1600,7 @@ def _transcribe_range_compute(
             )
         result = results[0]
         text = str(getattr(result, "text", "")).strip()
-        repetition = _repetition_hallucination(text)
+        repetition = _generation_repetition(result)
         if repetition is not None:
             pattern, repeats = repetition
             duration = core_end - core_start
@@ -1650,8 +1629,6 @@ def _transcribe_range_compute(
                     "text": "",
                     "cues": [],
                     "skipped_empty": True,
-                    "discarded_repetition": True,
-                    "repetition_diagnostics": [diagnostic],
                 }
                 _store_completed_range(
                     completed_ranges,
@@ -1663,8 +1640,7 @@ def _transcribe_range_compute(
             midpoint = core_start + child_duration
             if cache is not None:
                 cache.remember("split:" + range_key, lambda: {
-                    "midpoint": midpoint, "recovery": "repetition",
-                    "pattern": pattern[:200], "repeats": repeats,
+                    "midpoint": midpoint,
                 })
             left = _transcribe_range(
                 model,
@@ -1708,24 +1684,7 @@ def _transcribe_range_compute(
                 "language": right["language"] or left["language"],
                 "text": f"{left['text']}\n{right['text']}".strip(),
                 "cues": [*left["cues"], *right["cues"]],
-                "recovered_from_repetition": True,
             }
-            child_diagnostics = [
-                *list(left.get("repetition_diagnostics", [])),
-                *list(right.get("repetition_diagnostics", [])),
-            ]
-            recovered["repetition_diagnostics"] = [
-                {
-                    "kind": "forced_aligned_speech",
-                    "start": round(core_start, 3),
-                    "end": round(core_end, 3),
-                    "pattern": pattern[:200],
-                    "repeats": repeats,
-                    "retry_at": round(midpoint, 3),
-                    "minimal_reproducer": not child_diagnostics,
-                },
-                *child_diagnostics,
-            ]
             _store_completed_range(
                 completed_ranges,
                 range_key,
@@ -1927,9 +1886,9 @@ def _transcribe_speech_batch(
                 "cues": [asdict(cue) for cue in cues],
                 "generation_token_limit": token_limits[position],
             }
-            valid = _repetition_hallucination(
-                text
-            ) is None and _record_timeline_is_healthy(record, region)
+            valid = _generation_repetition(result) is None and _record_timeline_is_healthy(
+                record, region
+            )
         except RuntimeError:
             valid = False
             record = {}
@@ -2033,7 +1992,7 @@ def _transcribe_raw_speech_batch(
     records: dict[int, dict[str, object]] = {}
     for position, ((index, region), result) in enumerate(zip(indexed_regions, results)):
         text = str(getattr(result, "text", "")).strip()
-        repetition = _repetition_hallucination(text)
+        repetition = _generation_repetition(result)
         if repetition is not None:
             pattern, repeats = repetition
             logging.warning(
@@ -2084,8 +2043,8 @@ def _transcribe_raw_range(model, config, core_start, core_end, media_duration, a
     try:
         result = _transcribe_raw_range_compute(model, config, core_start, core_end, media_duration,
                                                audio_buffer, repetition_audit_path, cache=cache)
-        cache.put(key, result, reason="repetition_discard" if result.get("discarded_repetition") else None,
-                  kind="aggregate" if result.get("recovered_from_repetition") else "result")
+        cache.put(key, result,
+                  kind="aggregate" if cache.get(f"raw_split:{core_start}:{core_end}") else "result")
         return result
     except BaseException as exc:
         cache.failed(key, exc)
@@ -2115,12 +2074,8 @@ def _transcribe_raw_range_compute(
         model.max_new_tokens = token_limit
     split_key = f"raw_split:{core_start}:{core_end}"
     split_plan = cache.get(split_key) if cache is not None else None
-    if split_plan is not None:
-        from types import SimpleNamespace
-        results = [SimpleNamespace(**split_plan)]
-        if changed:
-            model.max_new_tokens = previous_limit
-    else:
+    repetition = None
+    if split_plan is None:
         try:
             results = model.transcribe(
                 audio=audio,
@@ -2131,37 +2086,30 @@ def _transcribe_raw_range_compute(
         finally:
             if changed:
                 model.max_new_tokens = previous_limit
-    if len(results) != 1:
-        raise RuntimeError("Qwen3-ASR raw retry returned an invalid result count")
-    result = results[0]
-    text = str(getattr(result, "text", "")).strip()
-    repetition = _repetition_hallucination(text)
-    if repetition is not None:
-        pattern, repeats = repetition
+        if len(results) != 1:
+            raise RuntimeError("Qwen3-ASR raw retry returned an invalid result count")
+        result = results[0]
+        text = str(getattr(result, "text", "")).strip()
+        repetition = _generation_repetition(result)
+    elif changed:
+        model.max_new_tokens = previous_limit
+    if split_plan is not None or repetition is not None:
         duration = core_end - core_start
-        if duration / 2 < _MIN_RETRY_CHUNK_SECONDS:
-            diagnostic = _write_repetition_discard_audit(
-                repetition_audit_path,
-                kind="raw_speech",
-                start=core_start,
-                end=core_end,
-                pattern=pattern,
-                repeats=repeats,
-            )
-            return {
-                "core_start": core_start,
-                "core_end": core_end,
-                "extract_start": extract_start,
-                "extract_end": extract_end,
-                "language": str(getattr(result, "language", "")),
-                "detected_languages": [str(getattr(result, "language", ""))],
-                "text": "",
-                "generation_token_limit": token_limit,
-                "discarded_repetition": True,
-                "repetition_diagnostics": [diagnostic],
-            }
-        if cache is not None:
-            cache.put(split_key, {"text": text, "language": str(getattr(result, "language", ""))}, kind="plan")
+        if repetition is not None:
+            pattern, repeats = repetition
+            if duration / 2 < _MIN_RETRY_CHUNK_SECONDS:
+                _write_repetition_discard_audit(
+                    repetition_audit_path, kind="raw_speech", start=core_start,
+                    end=core_end, pattern=pattern, repeats=repeats,
+                )
+                return {
+                    "core_start": core_start, "core_end": core_end,
+                    "extract_start": extract_start, "extract_end": extract_end,
+                    "language": "", "detected_languages": [], "text": "",
+                    "generation_token_limit": token_limit,
+                }
+            if cache is not None:
+                cache.put(split_key, {"midpoint": (core_start + core_end) / 2}, kind="plan")
         midpoint = (core_start + core_end) / 2
         left = _transcribe_raw_range(
             model,
@@ -2183,10 +2131,6 @@ def _transcribe_raw_range_compute(
             repetition_audit_path,
             cache=cache,
         )
-        child_diagnostics = [
-            *list(left.get("repetition_diagnostics", [])),
-            *list(right.get("repetition_diagnostics", [])),
-        ]
         detected_languages = [
             str(language)
             for child in (left, right)
@@ -2202,19 +2146,7 @@ def _transcribe_raw_range_compute(
             "detected_languages": detected_languages,
             "text": f"{left.get('text', '')}\n{right.get('text', '')}".strip(),
             "generation_token_limit": token_limit,
-            "recovered_from_repetition": True,
-            "repetition_diagnostics": [
-                {
-                    "kind": "raw_speech",
-                    "start": round(core_start, 3),
-                    "end": round(core_end, 3),
-                    "pattern": pattern[:200],
-                    "repeats": repeats,
-                    "retry_at": round(midpoint, 3),
-                    "minimal_reproducer": not child_diagnostics,
-                },
-                *child_diagnostics,
-            ],
+
         }
     return {
         "core_start": core_start,
@@ -2279,8 +2211,6 @@ def _speech_candidate_quality(
             merged.append([start, end])
     aligned_seconds = sum(end - start for start, end in merged)
     reasons: list[str] = []
-    if _repetition_hallucination(text) is not None:
-        reasons.append("repetition_loop")
     if text and not _record_timeline_is_healthy(record, region):
         reasons.append("forced_alignment_unhealthy")
     density = len(compact) / duration
@@ -2299,7 +2229,6 @@ def _speech_candidate_quality(
     }
     if (
         song_context
-        and record.get("recovered_from_repetition")
         and (
             len(language_keys) >= 3
             or ("korean" in language_keys and len(language_keys) >= 2)
@@ -2605,8 +2534,8 @@ def _region_audio_buffer(
     return audio_pool.source(video)
 
 
-def _repetition_hallucination(text: str) -> tuple[str, int] | None:
-    match = find_repetition_loop(text)
+def _generation_repetition(result) -> tuple[str, int] | None:
+    match = result.repetition
     return (match.pattern, match.repeats) if match is not None else None
 
 
@@ -2618,7 +2547,7 @@ def _load_qwen_model(
 ) -> Any:
     try:
         import torch
-        from qwen_asr import Qwen3ASRModel
+        from .asr_generation import RepetitionGuardedASRModel
     except ImportError as exc:
         raise RuntimeError(
             "Qwen3-ASR is not installed; run `uv sync --extra asr`"
@@ -2647,7 +2576,7 @@ def _load_qwen_model(
                 "japanese_single_word_list": japanese_single_word_list or [],
             },
         }
-    return Qwen3ASRModel.from_pretrained(
+    return RepetitionGuardedASRModel.from_pretrained(
         config.model,
         dtype=dtype,
         device_map=config.device,
@@ -3158,8 +3087,6 @@ def read_cue_evidence(path: Path) -> list[dict[str, object]]:
 
 def _valid_cached_record(value: object) -> bool:
     if not isinstance(value, dict) or not isinstance(value.get("cues"), list):
-        return False
-    if _repetition_hallucination(str(value.get("text") or "")) is not None:
         return False
     try:
         for cue in value["cues"]:
