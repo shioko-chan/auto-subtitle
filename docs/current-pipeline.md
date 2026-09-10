@@ -253,51 +253,28 @@ English tokenizer；混合语言保留原始空格，仅对日语字符片段运
 删除记录，以及每个边界候选的总分、命中因素、两侧形态证据、Nagisa POS 和最终
 本地单元范围。Sudachi、GiNZA 或所需词典不可用时直接终止，不静默退化。
 
-LLM 使用单阶段划句与翻译。每个请求只覆盖一条 speaker 轨，TARGET 采用紧凑格式：
-
-```text
-DIALOGUE_CONTEXT:
-<speaker_b>只读的邻近发言
-
-TARGET:
-<speaker_a>
-<0>本地源语言单元
-<1>下一个本地源语言单元
-```
-
-Context 按真实时间排列，覆盖目标前后各 5 秒且最多 4000 字符；超限时优先保留最近内容。
-TARGET 最多 160 个本地单元或 8000 个源字符，触及上限时在末段选择评分最高的边界作为
-硬窗口边缘，不再运行 Boundary Reduce。
-
-模型同时选择自然 cue 范围并翻译，返回左闭右闭的 JSON：
+LLM 使用单阶段划句与翻译。每个请求覆盖一条 speaker 轨，输入为编号 `<CUE>`，
+包含 speaker、language 和 ASR_TEXT。源文不回传，模型返回闭区间范围与译文：
 
 ```json
 {"cues":[{"start_id":0,"end_id":2,"text":"中文字幕"}]}
 ```
 
-每个请求窗口都使用从 0 开始的相对 ID；范围必须连续、无遗漏、无重复地覆盖 TARGET，且
-单单元 cue 使用 `end_id = start_id`。下一条 cue 的 `start_id` 必须等于上一条的
-`end_id + 1`。校验成功后闭区间相对 ID 转换为内部半开范围，再映射回 speaker 轨全局 ID；缓存和最终字幕
-仍保存全局 ID。每个窗口显式附带 `SOURCE_LANGUAGE`，TARGET 被说明为
-`source-language ASR evidence`。源文由本地按范围恢复，模型不能回传或修改源文；ASR 纠错只反映在中文译文。`singing` 与
-`conditioned_speech` 各自作为不可拆分、不可跨越的单单元 TARGET，但仍使用同一契约。
+每个窗口从 0 编号，范围必须连续、完整、无重叠。程序按范围还原原文和时间轴，保持
+双语字幕一一对应。已翻译歌词直接复用；singing 与 conditioned_speech 保持原子边界。
+本地单元的宽度目标为最终日语指导宽度的一半，最终译文必须满足两行容量。
 
-JSON 等结构错误立即重试一次，再失败便递归缩窗。整数形式的字符串 ID 会先归一化。范围
-遗漏、重复、乱序或结尾未覆盖时，程序计算最长可信前缀和后缀，从已确认 cue 边界取错误区
-及前后各一条作为局部补丁；补丁成功后覆盖该区，窗口其余结果保持不变。
+请求同时遵守 segmentation 的窗口限制、translation 的批量限制与话题边界。
+只读上下文使用 translation.context_*；提示词输出预算统一使用 translation.max_tokens。
+所有窗口先检索 RAG，再按 llm.max_concurrency 并发生成。提示词为
+`src/subtitle_pipeline/prompts/segment-translate-cues.md`，使用严格 JSON Schema。
 
-空译文不会重试 LLM：程序记录轨道、全局单元范围和源文，再调用按需加载的本地
-`facebook/m2m100_418M` 机翻。源语言为英语时使用 `en`，其他日语/混合情况使用 `ja`。译文残留日文时，
-先把 REFERENCE 中的姓名、昵称和术语
-切出保护，再仅机翻未保护部分并拼回。默认在 CPU 推理，避免与 ASR 争用显存。超宽译文
-记录实际宽度、限制和文本后照常进入字幕，不再触发重试。网络超时、HTTP 429 和 5xx 沿用
-Retry-After 或带 jitter 的指数退避，耗尽后直接终止且不缩窗；HTTP 400、401、403 等
-非暂时错误立即终止。
+范围、空译文或超宽校验失败后先重试，再递归拆小窗口；单单元仍失败时尝试保护术语的
+本地机翻，仍超宽则报错。请求预算不足也会拆窗，单单元预算不足直接报错。
+HTTP 错误沿用统一重试策略，耗尽后终止，不通过拆窗放大请求数。
 
-运行时字幕提示词为 `src/subtitle_pipeline/prompts/joint-segment-translate.md` 和批量小窗口使用的
-`src/subtitle_pipeline/prompts/joint-segment-translate-batch.md`。模板哈希、
-本地单元、评分配置、Sudachi/词典版本、本地机翻模型、LLM、REFERENCE 和显示宽度都进入
-缓存签名。
+`translation` 阶段同时缓存源文范围与译文，保存配置和 RAG 快照，并复用已完成子窗口。
+旧的独立 segmentation 阶段已删除，translation 缓存版本已更新。
 
 ## 6. 字幕、元数据与渲染
 

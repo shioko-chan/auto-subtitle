@@ -143,10 +143,6 @@ class SegmentationConfig:
     speaker_episode_gap_seconds: float = 2.0
     model_window_units: int = 240
     model_window_chars: int = 3000
-    max_tokens: int = 8192
-    dialogue_context_before_seconds: float = 20.0
-    dialogue_context_after_seconds: float = 10.0
-    dialogue_context_max_chars: int = 4000
 
 
 @dataclass(frozen=True)
@@ -221,7 +217,6 @@ class LLMConfig:
     local_server_parallel: int = 2
     local_server_reasoning: str = "off"
     local_server_startup_timeout_seconds: int = 1800
-    json_mode: bool = True
     thinking: str | None = None
     reasoning_effort: str | None = None
 
@@ -346,7 +341,6 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("llm.max_concurrency must be at least 1")
     for section_name, max_tokens in (
         ("asr_correction", config.asr_correction.max_tokens),
-        ("segmentation", config.segmentation.max_tokens),
         ("translation", config.translation.max_tokens),
     ):
         if max_tokens < 1:
@@ -693,16 +687,6 @@ def load_config(path: Path) -> AppConfig:
         raise ConfigError("segmentation.model_window_units must be at least 1")
     if segmentation.model_window_chars < 1:
         raise ConfigError("segmentation.model_window_chars must be at least 1")
-    if segmentation.dialogue_context_before_seconds < 0:
-        raise ConfigError(
-            "segmentation.dialogue_context_before_seconds cannot be negative"
-        )
-    if segmentation.dialogue_context_after_seconds < 0:
-        raise ConfigError(
-            "segmentation.dialogue_context_after_seconds cannot be negative"
-        )
-    if segmentation.dialogue_context_max_chars < 1:
-        raise ConfigError("segmentation.dialogue_context_max_chars must be at least 1")
     translation = config.translation
     if not translation.target_language.strip():
         raise ConfigError("translation.target_language cannot be empty")

@@ -1118,7 +1118,7 @@ def _request_json(
         prompt=prompt,
         max_tokens=max_tokens,
         temperature=0.1,
-        json_mode=True,
+
         thinking=thinking,
     )
     last_error: Exception | None = None

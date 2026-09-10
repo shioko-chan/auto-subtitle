@@ -125,7 +125,7 @@ def correct_asr_windows(
                     )),
                     TARGET=_format_correction_window(window, fragments_by_index),
                 ),
-                max_tokens=max_tokens, temperature=0, json_mode=True, thinking=None,
+                max_tokens=max_tokens, temperature=0, thinking=None,
             )
 
         fitted = []

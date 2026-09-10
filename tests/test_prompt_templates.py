@@ -11,8 +11,7 @@ class PromptTemplateTests(unittest.TestCase):
     def test_runtime_prompt_documents_have_system_and_user_sections(self):
         for name in (
             "asr-correct.md",
-            "segment-source-cues.md",
-            "translate-fixed-cues.md",
+            "segment-translate-cues.md",
             "lyrics-translate.md",
             "metadata-translate.md",
         ):
@@ -23,22 +22,21 @@ class PromptTemplateTests(unittest.TestCase):
 
     def test_render_requires_exact_placeholder_values(self):
         with self.assertRaisesRegex(RuntimeError, "missing="):
-            render_user_prompt("segment-source-cues.md")
+            render_user_prompt("segment-translate-cues.md")
         with self.assertRaisesRegex(RuntimeError, "unexpected=EXTRA"):
             render_user_prompt(
-                "segment-source-cues.md",
-                SOURCE_MAXIMUM_UNITS="20.000",
-                SOURCE_LANGUAGE="English",
-                DIALOGUE_CONTEXT="(none)",
-                TARGET_TEXT="<unknown>\n<0>source",
-                RETRY_SECTION="",
+                "segment-translate-cues.md",
+                SOURCE_MAXIMUM_UNITS="20", MAXIMUM_UNITS="16",
+                TARGET_LANGUAGE="Chinese", HONORIFIC_TRANSLATION_RULES="",
+                REFERENCE_TEXT="", TERM_REFERENCE="", CHAT_EVIDENCE="",
+                DIALOGUE_CONTEXT="", SOURCE_TEXT="", RETRY_SECTION="",
                 EXTRA="value",
             )
 
     def test_digest_covers_runtime_sections(self):
-        digest = prompt_templates_digest("segment-source-cues.md")
+        digest = prompt_templates_digest("segment-translate-cues.md")
         self.assertEqual(len(digest), 64)
-        self.assertEqual(digest, prompt_templates_digest("segment-source-cues.md"))
+        self.assertEqual(digest, prompt_templates_digest("segment-translate-cues.md"))
 
 
 if __name__ == "__main__":

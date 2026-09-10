@@ -136,7 +136,7 @@ tokenizer；混合语言保留原始空格，仅对日语片段运行 Sudachi。
 每个 LLM 请求只处理一条 speaker 轨，模型同时选择左闭右闭的本地单元范围并翻译，例如
 `{"start_id":0,"end_id":2,"text":"中文字幕"}` 表示覆盖 0、1、2。每个窗口都从 0 重新编号，范围必须连续、
 无遗漏、无重复；单单元 cue 合法。响应通过校验后映射回 speaker 轨的全局单元 ID，缓存与
-最终字幕仍使用全局 ID。源语言文本由本地按范围恢复，模型只返回中文。请求附带目标前后 5 秒的只读
+最终字幕仍使用全局 ID。源语言文本由本地按范围恢复，模型只返回中文。请求附带目标前 20 秒、后 10 秒的只读
 对话上下文、视频信息和术语表，并明确 ASR 可能误听。歌声与 DiCoW `conditioned_speech`
 保持不可拆分的原子单元，但使用相同响应契约。
 
@@ -144,25 +144,21 @@ tokenizer；混合语言保留原始空格，仅对日语片段运行 Sudachi。
 多个匿名标签合并为一条人物活动掩码，再判断真正的多人重叠。无法确认人物的匿名标签
 仍分别保留，原标签继续写入音频分析缓存供审计。
 
-TARGET 以 160 个本地单元或 8000 源字符为上限，靠近上限时选择末段得分最高的本地边界。
-各窗口按 `llm.max_concurrency` 并行，不再运行 Map 边界 Reduce。`cache.sqlite3`
-会在每个窗口成功后立即原子更新；签名包含本地单元、speaker 轨、Sudachi/词典版本、评分
-配置、提示词、模型、REFERENCE 和宽度限制。
+窗口同时遵守 `segmentation.model_window_units/model_window_chars` 和
+`translation.batch_cues/batch_chars` 的限制，并按话题进一步分组。先完成所有窗口的 RAG，
+再按 `llm.max_concurrency` 并发请求。合并阶段使用 `translation` 缓存，保存本地单元、
+配置与证据快照，以及每个窗口的范围和译文；中断后复用已完成窗口。
 
-JSON 等结构错误立即重试一次，再失败便递归缩窗。可无损转换为整数的字符串 ID 会先归一化。
-范围遗漏、重复或乱序时，程序保留最长可信前后缀，并从已经确认的 cue 边界取错误区及前后
-各一条作局部联合补丁，不重发整个窗口。空译文记录轨道、范围和源文后使用本地
-`facebook/m2m100_418M` 本地机翻，并按 cue 语言选择 `ja` 或 `en` 源语言；残留日文先保护
-REFERENCE 中的姓名、昵称和术语，再对未保护部分执行机翻。模型按需在 CPU 加载。
-超宽译文只记录实际宽度和限制并继续，
-不再触发 LLM 重试。
+输出通过 JSON Schema 约束；范围必须是整数、连续且完整，译文必须非空且不超过两行容量。
+校验失败先重试，再递归缩窗。单单元仍失败时尝试保护术语的本地机翻；若仍超宽则明确报错，
+不静默输出超宽字幕。已翻译的歌词保留，不重复请求 LLM。
 网络错误和超时使用带随机抖动的指数退避；HTTP 5xx 也采用相同策略，但耗尽重试后直接
 终止而不缩小窗口。HTTP 429 优先遵守服务端的 `Retry-After` 响应头，并在规定等待时间
 之后增加少量随机抖动；缺失该响应头时才使用带抖动的指数退避，同样在耗尽后直接终止而
 不缩窗。其他 HTTP 状态视为非暂时性错误，首次遇到便直接终止。本地输出校验失败会立即
 重试。
 
-联合输入使用紧凑的 `<speaker>` 与 `<id>text`，绝对时间只在本地保存。固定规则、
+联合输入使用包含 speaker、language 和 ASR_TEXT 的编号 `<CUE>`，绝对时间只在本地保存。固定规则、
 术语表和视频信息位于请求前缀，只读对话上下文与窗口数据随后，重试错误放在末尾，以提高 DeepSeek
 上下文缓存命中。日志会记录 `prompt_cache_hit_tokens`、`prompt_cache_miss_tokens`、
 命中率及输出 token。
@@ -374,9 +370,6 @@ PyTorch、CUDA 和 `libstdc++` 等运行库会由开发环境提供。
   候选中选择最高分边界。
 - `segmentation.model_window_units` / `model_window_chars`：划句请求的本地单元和源字符上限，
   默认 `240` / `3000`。
-- `segmentation.max_tokens`：划句响应的输出 token 上限，默认 `8192`。
-- `segmentation.dialogue_context_before_seconds` / `dialogue_context_after_seconds` /
-  `dialogue_context_max_chars`：划句阶段的只读前后文范围和字符上限。
 - `translation.batch_cues` / `batch_chars`：单次固定 cue 翻译请求的 cue 数和源字符上限，
   默认 `32` / `3000`。
 - `translation.max_tokens`：翻译、歌词和元数据响应的输出 token 上限，默认 `8192`。

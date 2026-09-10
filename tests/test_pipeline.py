@@ -420,13 +420,9 @@ class PipelineTests(unittest.TestCase):
                 def __init__(self, config, translation, api_key, *, audit_path=None):
                     FakeTranslator.audit_path = audit_path
 
-                def segment_cues(self, cues, config, **context):
-                    FakeTranslator.segmentation_context = context
-                    return cues
-
-                def translate_segmented_cues(self, cues, **context):
+                def segment_and_translate_cues(self, cues, config, **context):
                     FakeTranslator.translation_context = context
-                    return [Cue(cue.start, cue.end, "你好") for cue in cues]
+                    return cues, [Cue(cue.start, cue.end, "你好") for cue in cues]
 
                 def translate_metadata(self, title, description, **context):
                     self.context = context
@@ -489,8 +485,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(performance["summary"]["pipeline.total"]["calls"], 1)
             self.assertIn("pipeline.download", performance["summary"])
             self.assertIn("pipeline.audio_and_asr", performance["summary"])
-            self.assertIn("pipeline.llm_cue_segmentation", performance["summary"])
-            self.assertIn("pipeline.llm_cue_translation", performance["summary"])
+            self.assertIn("pipeline.llm_cue_segmentation_translation", performance["summary"])
             self.assertNotIn("pipeline.llm_translation_review", performance["summary"])
             self.assertIn("pipeline.metadata_translation", performance["summary"])
             self.assertIn("pipeline.render", performance["summary"])
@@ -503,11 +498,11 @@ class PipelineTests(unittest.TestCase):
             asr.assert_called_once()
             self.assertEqual(asr.call_args.args[5], [])
             self.assertEqual(
-                FakeTranslator.segmentation_context["cache_path"].name,
+                FakeTranslator.translation_context["cache_path"].name,
                 "cache.sqlite3",
             )
             self.assertEqual(
-                FakeTranslator.segmentation_context["audit_path"].name,
+                FakeTranslator.translation_context["local_audit_path"].name,
                 "local-segmentation.json",
             )
             self.assertEqual(

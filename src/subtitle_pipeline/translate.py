@@ -37,7 +37,7 @@ from .reference_context import (
     compact_lyrics_reference_context,
     compact_reference_context,
 )
-from .subtitles import Cue, cue_from_mapping
+from .subtitles import Cue
 from .cache import CacheStore, config_snapshot, restore_config
 from .telemetry import stage_metrics
 
@@ -170,88 +170,37 @@ class OpenAICompatibleTranslator:
             sender.local_translator = LocalJapaneseTranslator(sender.translation.local_model, sender.translation.local_device)
         return sender
 
-    def segment_cues(
-        self,
-        cues: list[Cue],
-        config: SegmentationConfig,
-        *,
-        max_line_units: float,
-        cache_path: Path | None = None,
-        audit_path: Path | None = None,
-    ) -> list[Cue]:
-        if not cues:
-            return []
-        if cache_path is not None:
-            saved_stage = CacheStore(cache_path).existing("segmentation")
-            if saved_stage is not None:
-                cached = saved_stage.get("__result__")
-                if cached is not None:
-                    return [cue_from_mapping(value) for value in cached]
-                from .staged_translation import run_segmentation
-                return run_segmentation(
-                    tracks=[], source_cues=cues, segmentation=config, llm=self.config,
-                    request=self.stage_request(cache_path, "segmentation"), source_maximum_units=max_line_units * 1.25,
-                    cache_path=cache_path, sudachi_versions={}, parse_content=_parse_cue_records,
-                    finish_reason=_finish_reason, retry_delay=_transient_retry_delay,
-                    is_nontransient=_is_nontransient_http_error, log_invalid_response=self._log_invalid_response,
-                )
-        source_maximum_units = max_line_units * 1.25
-        with stage_metrics("subtitle.local_segmentation"):
-            tracks, sudachi_versions = build_speaker_tracks(
-                cues,
-                config,
-                audit_path=audit_path,
-                source_maximum_units=source_maximum_units,
-            )
-        from .staged_translation import run_segmentation
-
-        return run_segmentation(
-            tracks=tracks,
-            source_cues=cues,
-            segmentation=config,
-            llm=self.config,
-            request=self.stage_request(cache_path, "segmentation"),
-            source_maximum_units=source_maximum_units,
-            cache_path=cache_path,
-            sudachi_versions=sudachi_versions,
-            parse_content=_parse_cue_records,
-            finish_reason=_finish_reason,
-            retry_delay=_transient_retry_delay,
-            is_nontransient=_is_nontransient_http_error,
-            log_invalid_response=self._log_invalid_response,
-        )
-
-    def translate_segmented_cues(
-        self,
-        cues: list[Cue],
-        *,
-        translation_context: dict[str, object] | None = None,
-        cache_path: Path | None = None,
-        audit_path: Path | None = None,
-        retrieve_knowledge: Callable[[list[Cue], str], list[KnowledgeHit]]
-        | None = None,
+    def segment_and_translate_cues(
+        self, cues: list[Cue], config: SegmentationConfig, *,
+        max_line_units: float, translation_context: dict[str, object] | None = None,
+        cache_path: Path | None = None, audit_path: Path | None = None,
+        local_audit_path: Path | None = None,
+        retrieve_knowledge: Callable[[list[Cue], str], list[KnowledgeHit]] | None = None,
         retrieve_chat: Callable[[list[Cue]], str] | None = None,
-    ) -> list[Cue]:
-        if not cues:
-            return []
-        from .staged_translation import run_fixed_translation
+    ) -> tuple[list[Cue], list[Cue]]:
+        from .staged_translation import run_joint_translation
 
-        return run_fixed_translation(
-            source_cues=cues,
-            translation=self.translation,
-            llm=self.config,
+        self = self._stage_executor(cache_path, "translation")
+        tracks = []
+        if cache_path is None or CacheStore(cache_path).existing("translation") is None:
+            if not cues:
+                return [], []
+            with stage_metrics("subtitle.local_segmentation"):
+                tracks, _ = build_speaker_tracks(
+                    cues, config, audit_path=local_audit_path,
+                    source_maximum_units=max_line_units * 1.25 / 2,
+                )
+        return run_joint_translation(
+            tracks=tracks, source_cues=cues, segmentation=config,
+            translation=self.translation, llm=self.config,
             request=self.stage_request(cache_path, "translation"),
-            translation_context=translation_context or {},
-            cache_path=cache_path,
-            honorific_rules=_HONORIFIC_TRANSLATION_RULES,
-            parse_content=_parse_cue_records,
-            finish_reason=_finish_reason,
-            retry_delay=_transient_retry_delay,
-            is_nontransient=_is_nontransient_http_error,
+            translation_context=translation_context or {}, cache_path=cache_path,
+            maximum_units=max_line_units, honorific_rules=_HONORIFIC_TRANSLATION_RULES,
+            parse_content=_parse_cue_records, finish_reason=_finish_reason,
+            retry_delay=_transient_retry_delay, is_nontransient=_is_nontransient_http_error,
             log_invalid_response=self._log_invalid_response,
             local_translate=self.local_translator.translate,
-            retrieve_knowledge=retrieve_knowledge,
-            retrieve_chat=retrieve_chat,
+            retrieve_knowledge=retrieve_knowledge, retrieve_chat=retrieve_chat,
             audit_path=audit_path,
         )
 
@@ -286,7 +235,7 @@ class OpenAICompatibleTranslator:
             prompt=prompt,
             max_tokens=self.translation.max_tokens,
             temperature=0.2,
-            json_mode=True,
+
             thinking=self.config.thinking,
         )
         last_error: Exception | None = None
@@ -368,7 +317,7 @@ class OpenAICompatibleTranslator:
             prompt=prompt,
             max_tokens=self.translation.max_tokens,
             temperature=0.2,
-            json_mode=self.config.json_mode,
+
             thinking=self.config.thinking,
         )
 
@@ -669,7 +618,10 @@ def _responses_request_body(
 
     response_format = body.get("response_format")
     if isinstance(response_format, dict):
-        converted["text"] = {"format": response_format}
+        if response_format.get("type") == "json_schema":
+            converted["text"] = {"format": {"type": "json_schema", **response_format["json_schema"]}}
+        else:
+            converted["text"] = {"format": response_format}
     tools = body.get("tools")
     if isinstance(tools, list):
         converted["tools"] = [_responses_tool_definition(tool) for tool in tools]

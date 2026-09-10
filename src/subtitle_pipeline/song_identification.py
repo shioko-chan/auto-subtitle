@@ -1254,7 +1254,7 @@ def select_ocr_song_titles(
     video_title: str,
     request: Callable[[dict[str, object]], dict[str, object]],
     model: str,
-    json_mode: bool,
+
     thinking: str | None,
     context_size: int,
 ) -> list[str | None]:
@@ -1319,7 +1319,7 @@ def select_ocr_song_titles(
             prompt=prompt,
             max_tokens=output_tokens(len(batch)),
             temperature=0,
-            json_mode=json_mode,
+
             thinking=thinking,
         )
         response = request(body)

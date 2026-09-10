@@ -156,10 +156,6 @@ local_unit_max_seconds = 6.0
 speaker_episode_gap_seconds = 2.0
 model_window_units = 240
 model_window_chars = 3000
-max_tokens = 8192
-dialogue_context_before_seconds = 20.0
-dialogue_context_after_seconds = 10.0
-dialogue_context_max_chars = 4000
 
 [translation]
 target_language = "简体中文"
@@ -169,7 +165,7 @@ max_tokens = 8192
 context_before_seconds = 20.0
 context_after_seconds = 10.0
 context_max_chars = 4000
-# Loaded lazily only when an LLM cue is empty or still contains Japanese kana.
+# Loaded lazily when a single-unit LLM translation fails validation after retries.
 local_model = "facebook/m2m100_418M"
 local_device = "cpu"
 translate_metadata = true
@@ -267,11 +263,9 @@ local_server_gpu_layers = 56
 local_server_parallel = 3
 local_server_reasoning = "off"
 local_server_startup_timeout_seconds = 1800
-# Joint subtitles and metadata use json_object.
-# Set false if an OpenAI-compatible provider rejects response_format=json_object.
-json_mode = true
-# DeepSeek example: disable local_server_enabled, restore its URL, credentials
-# and model, then set thinking = "disabled".
+# All LLM tasks require strict JSON Schema structured outputs.
+# Remote providers must support response_format.json_schema (Chat Completions)
+# or text.format.json_schema (Responses), in addition to streaming.
 # OpenAI Responses API example:
 # base_url = "https://api.openai.com/v1"
 # api_style = "responses"

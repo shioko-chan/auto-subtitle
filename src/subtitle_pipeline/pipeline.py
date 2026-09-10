@@ -302,7 +302,7 @@ def _run_pipeline_stages(
                 video_title=str(downloaded.metadata.get("title") or ""),
                 request=translator.stage_request(job_dir / "cache.sqlite3", "song_identification"),
                 model=config.llm.model,
-                json_mode=config.llm.json_mode,
+
                 thinking=config.llm.thinking,
                 context_size=config.llm.local_server_context_size,
             )
@@ -461,14 +461,6 @@ def _run_pipeline_stages(
             "song identification produced %d search-group reports",
             len(song_result.reports),
         )
-    with stage_metrics("pipeline.llm_cue_segmentation"):
-        segmented = translator.segment_cues(
-            cues,
-            config.segmentation,
-            max_line_units=layout.max_line_units,
-            cache_path=job_dir / "cache.sqlite3",
-            audit_path=job_dir / "local-segmentation.json",
-        )
     retrieve_translation_knowledge = None
     if fan_knowledge is not None:
 
@@ -499,9 +491,11 @@ def _run_pipeline_stages(
         if current_chat
         else None
     )
-    with stage_metrics("pipeline.llm_cue_translation"):
-        translated = translator.translate_segmented_cues(
-            segmented,
+    with stage_metrics("pipeline.llm_cue_segmentation_translation"):
+        segmented, translated = translator.segment_and_translate_cues(
+            cues, config.segmentation,
+            max_line_units=layout.max_line_units,
+            local_audit_path=job_dir / "local-segmentation.json",
             translation_context=translation_context,
             cache_path=job_dir / "cache.sqlite3",
             audit_path=job_dir / "translation-audit.jsonl",
@@ -509,7 +503,7 @@ def _run_pipeline_stages(
             retrieve_chat=retrieve_translation_chat,
         )
     logging.info(
-        "staged cue segmentation and ASR-aware translation: "
+        "joint cue segmentation and ASR-aware translation: "
         "%d aligned cues -> %d subtitle cues",
         original_cue_count,
         len(segmented),

@@ -4,6 +4,7 @@ import json
 from collections.abc import Callable
 
 from .prompt_templates import prompt_system
+from .response_schemas import response_format
 
 
 def strip_markdown_code_fence(content: object) -> str:
@@ -30,7 +31,7 @@ def structured_request_body(
     prompt: str,
     max_tokens: int,
     temperature: float,
-    json_mode: bool,
+
     thinking: str | None,
 ) -> dict[str, object]:
     body: dict[str, object] = {
@@ -44,8 +45,7 @@ def structured_request_body(
     }
     if thinking:
         body["thinking"] = {"type": thinking}
-    if json_mode:
-        body["response_format"] = {"type": "json_object"}
+    body["response_format"] = response_format(prompt_name)
     return body
 
 

@@ -1,25 +1,33 @@
-# Fixed Cue Translation Prompt
+# Joint Segmentation and Translation Prompt
 
 This is a runtime prompt template. Only text inside the SYSTEM_PROMPT and
 USER_PROMPT markers is sent to the LLM.
 
 <!-- SYSTEM_PROMPT_START -->
-You translate fixed source subtitle cues into natural Chinese subtitles.
+You group adjacent source units into subtitle cues and translate them into natural Chinese.
 <!-- SYSTEM_PROMPT_END -->
 
 <!-- USER_PROMPT_START -->
-Translate every numbered SOURCE cue into {{TARGET_LANGUAGE}} without changing,
-merging, splitting, omitting, duplicating, or reordering cue IDs.
+Group the numbered SOURCE units into subtitle cues and translate each group into
+{{TARGET_LANGUAGE}}. Choose boundaries using both source meaning and translated length.
+Each unit is indivisible. Merge only adjacent units; cover every unit exactly once
+in order, without gaps or overlaps. IDs are local to this request.
 
 Return exactly one JSON object and no explanation:
-{"cues":[{"cue_id":0,"text":"中文字幕"}]}
+{"cues":[{"start_id":0,"end_id":2,"text":"中文字幕"}]}
 
-Return every cue_id exactly once. Do not return source text, timestamps,
-speakers, Markdown, or extra fields. Each translation must be non-empty,
-faithful, natural, and concise. Each CUE's ASR_TEXT is source-language ASR
-evidence and may contain misheard words, names, homophones, omissions, or
-repetitions. Use DIALOGUE_CONTEXT and REFERENCE to infer the intended Chinese
-meaning, but never alter cue coverage.
+start_id and end_id are inclusive. Return only these three fields per cue.
+Do not return source text, timestamps, speakers, or Markdown.
+Aim for one natural subtitle sentence per group. The source guidance width is
+{{SOURCE_MAXIMUM_UNITS}} full-width characters. The translation must fit at most
+two lines of {{MAXIMUM_UNITS}} full-width characters each (ASCII counts as 0.55 and whitespace as 0.35).
+Split groups earlier when necessary; do not omit meaning merely to fit the width.
+Do not insert line breaks; the renderer wraps the translation.
+
+Each translation must be non-empty, faithful, natural, and concise. ASR_TEXT is
+source-language ASR evidence and may contain misheard words, names, homophones,
+omissions, or repetitions. Use DIALOGUE_CONTEXT and REFERENCE to infer the
+intended meaning, but never alter unit coverage.
 
 Translate all source-language content into natural Chinese. Do not leave
 Japanese words or phrases untranslated. Render names, titles and established

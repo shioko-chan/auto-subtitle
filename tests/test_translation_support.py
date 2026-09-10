@@ -3,7 +3,6 @@ import unittest
 from subtitle_pipeline.config import SegmentationConfig
 from subtitle_pipeline.local_segmentation import LocalUnit
 from subtitle_pipeline.translation_support import (
-    dialogue_context,
     window_ranges,
 )
 
@@ -46,18 +45,6 @@ class TranslationSupportTests(unittest.TestCase):
         config = SegmentationConfig(model_window_units=4)
 
         self.assertEqual(window_ranges(units, config)[0], (0, 3))
-
-    def test_dialogue_context_excludes_target_and_remains_chronological(self) -> None:
-        before = _unit(0, 0, 1, "前")
-        target = _unit(1, 1, 2, "対象")
-        after = _unit(2, 2, 3, "後")
-
-        context = dialogue_context(
-            [after, target, before], (target,), SegmentationConfig()
-        )
-
-        self.assertLess(context.index("前"), context.index("後"))
-        self.assertNotIn("対象", context)
 
 if __name__ == "__main__":
     unittest.main()

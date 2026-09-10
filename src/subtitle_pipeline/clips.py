@@ -681,7 +681,7 @@ def _request_json(
         prompt=prompt,
         max_tokens=min(4096, config.translation.max_tokens),
         temperature=0.1,
-        json_mode=True,
+
         thinking=config.llm.thinking,
     )
     last_error: Exception | None = None

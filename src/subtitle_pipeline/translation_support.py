@@ -9,7 +9,6 @@ from .config import SegmentationConfig
 from .local_segmentation import LocalUnit
 from .reference_context import compact_reference_context
 from .source_language import (
-    combine_source_languages,
     language_for_text,
     source_separator,
 )
@@ -33,58 +32,6 @@ _DEPENDENT_PARTICLE_PREFIXES = (
 
 class LocalFallbackError(RuntimeError):
     pass
-
-
-def best_split(units: tuple[LocalUnit, ...], start: int, end: int) -> int:
-    candidates = list(range(start + 1, end))
-    safe_candidates = [
-        value
-        for value in candidates
-        if not _starts_dependent_particle(units[value].text)
-    ]
-    return max(
-        safe_candidates or candidates,
-        key=lambda value: (
-            units[value - 1].boundary_score_after
-            if units[value - 1].boundary_score_after is not None
-            else -10_000,
-            -abs(value - (start + end) / 2),
-        ),
-    )
-
-
-def dialogue_context(
-    all_units: list[LocalUnit],
-    selected: tuple[LocalUnit, ...],
-    config: SegmentationConfig,
-) -> str:
-    lower = selected[0].start - config.dialogue_context_before_seconds
-    upper = selected[-1].end + config.dialogue_context_after_seconds
-    selected_keys = {(unit.track, unit.local_id) for unit in selected}
-    candidates = [
-        unit
-        for unit in all_units
-        if unit.end > lower
-        and unit.start < upper
-        and (unit.track, unit.local_id) not in selected_keys
-    ]
-    center = (selected[0].start + selected[-1].end) / 2
-    candidates.sort(key=lambda unit: abs((unit.start + unit.end) / 2 - center))
-    kept: list[LocalUnit] = []
-    used = 0
-    for unit in candidates:
-        unit_language = language_for_text(unit.text, unit.language) or "unknown"
-        line = f"<{unit.track} language={unit_language}>{escape_prompt_text(unit.text)}"
-        if used + len(line) + 1 > config.dialogue_context_max_chars:
-            continue
-        kept.append(unit)
-        used += len(line) + 1
-    kept.sort(key=lambda unit: (unit.start, unit.end, unit.track))
-    return "\n".join(
-        f"<{unit.track} language={language_for_text(unit.text, unit.language) or 'unknown'}>"
-        f"{escape_prompt_text(unit.text)}"
-        for unit in kept
-    )
 
 
 def escape_prompt_text(text: str) -> str:
@@ -253,15 +200,6 @@ def window_ranges(
         ranges.append((start, max(start + 1, end)))
         start = max(start + 1, end)
     return ranges
-
-
-def window_source_language(units: tuple[LocalUnit, ...]) -> str:
-    return (
-        combine_source_languages(
-            language_for_text(unit.text, unit.language) for unit in units
-        )
-        or "unknown"
-    )
 
 
 def _machine_translate(

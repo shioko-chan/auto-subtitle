@@ -16,10 +16,10 @@ from subtitle_pipeline.asr_correction import correct_asr_windows as _correct_asr
 from subtitle_pipeline.audio_analysis import AudioAnalysis, AudioRegion, analyze_audio
 from subtitle_pipeline.bilibili_comments import create_comment_task, publish_comment_task
 from subtitle_pipeline.cache import CacheStore, STAGES, StageDefinition
-from subtitle_pipeline.config import ASRConfig, AudioAnalysisConfig, DownloadConfig, LLMConfig, RenderConfig, TranslationConfig, UploadConfig
+from subtitle_pipeline.config import ASRConfig, AudioAnalysisConfig, DownloadConfig, LLMConfig, RenderConfig, TranslationConfig, SegmentationConfig, UploadConfig
 from subtitle_pipeline.media import DownloadResult, download_youtube, render_subtitles
 from subtitle_pipeline.publication import write_record
-from subtitle_pipeline.staged_translation import run_fixed_translation
+from subtitle_pipeline.staged_translation import run_joint_translation
 from subtitle_pipeline.subtitles import Cue
 
 
@@ -102,7 +102,11 @@ class CacheRecoveryTests(unittest.TestCase):
     def translation(self, request, **changes):
         args = dict(source_cues=[Cue(0, 1, "原文一"), Cue(1, 2, "原文二")], llm=LLMConfig(max_concurrency=1, max_retries=1), translation=TranslationConfig(batch_cues=1), request=request, parse_content=lambda value: json.loads(value)["cues"], finish_reason=lambda _: "stop", retry_delay=lambda *_: None, is_nontransient=lambda _: True, log_invalid_response=lambda *_: None, local_translate=lambda text: "回退" + text, translation_context={}, honorific_rules="", cache_path=self.path)
         args.update(changes)
-        return run_fixed_translation(**args)
+        from subtitle_pipeline.local_segmentation import LocalUnit, SpeakerTrack
+        args["tracks"] = [SpeakerTrack("A", "A", tuple(
+            LocalUnit("A", i, (i,), cue.start, cue.end, cue.text, "A", cue.kind, 0.0)
+            for i, cue in enumerate(args["source_cues"])))]
+        return run_joint_translation(**args, segmentation=SegmentationConfig(), maximum_units=20)[1]
 
     def test_partial_translation_freezes_groups_evidence_and_settings(self):
         count = 0
@@ -111,19 +115,19 @@ class CacheRecoveryTests(unittest.TestCase):
             count += 1
             if count == 2:
                 raise KeyboardInterrupt()
-            return response([{"cue_id": 0, "text": "第一行"}])
+            return response([{"start_id": 0, "end_id": 0, "text": "第一行"}])
         retrieval = Mock(return_value=[])
         with self.assertRaises(KeyboardInterrupt):
             self.translation(interrupted, retrieve_knowledge=retrieval)
-        pending = Mock(return_value=response([{"cue_id": 0, "text": "第二行"}]))
+        pending = Mock(return_value=response([{"start_id": 0, "end_id": 0, "text": "第二行"}]))
         result = self.translation(pending, translation=TranslationConfig(batch_cues=20), retrieve_knowledge=Mock(side_effect=AssertionError("evidence changed")))
         self.assertEqual(pending.call_count, 1)
         self.assertEqual([cue.text for cue in result], ["第一行", "第二行"])
         self.assertEqual(self.store.existing("translation").plan["translation"]["batch_cues"], 1)
 
     def test_degraded_retry_keeps_good_group_and_failed_retry_keeps_fallback(self):
-        request = Mock(side_effect=[response([{"cue_id": 0, "text": "第一行"}]), response([{"cue_id": 0, "text": ""}])])
-        first = self.translation(request)
+        request = Mock(side_effect=[response([{"start_id": 0, "end_id": 0, "text": "第一行"}]), response([{"start_id": 0, "end_id": 0, "text": ""}])])
+        first = self.translation(request, is_nontransient=lambda exc: str(exc) == "offline")
         self.translation(Mock(side_effect=AssertionError("complete")))
         self.assertEqual(self.store.retry_degraded("translation"), 1)
         with self.assertRaises(RuntimeError):
@@ -131,7 +135,7 @@ class CacheRecoveryTests(unittest.TestCase):
         restored = self.translation(Mock(side_effect=AssertionError("fallback preserved")))
         self.assertEqual(restored, first)
         self.store.retry_degraded("translation")
-        retry = Mock(return_value=response([{"cue_id": 0, "text": "第二行"}]))
+        retry = Mock(return_value=response([{"start_id": 0, "end_id": 0, "text": "第二行"}]))
         result = self.translation(retry)
         self.assertEqual(retry.call_count, 1)
         self.assertEqual([cue.text for cue in result], ["第一行", "第二行"])

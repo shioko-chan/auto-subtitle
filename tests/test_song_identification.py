@@ -1037,7 +1037,7 @@ class SongIdentificationTests(unittest.TestCase):
             video_title="【歌枠】test",
             request=request,
             model="test-model",
-            json_mode=True,
+
             thinking=None,
             context_size=16384,
         )
@@ -1091,7 +1091,7 @@ class SongIdentificationTests(unittest.TestCase):
             video_title="【歌枠】test",
             request=request,
             model="test-model",
-            json_mode=True,
+
             thinking=None,
             context_size=4096,
         )
