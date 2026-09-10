@@ -317,7 +317,10 @@ def match_song(
                         24, len(hypothesis) * _MAX_LYRIC_LENGTH_RATIO
                     ):
                         break
-        anchors = _semiglobal_anchor_paths(choices, minimum_anchors)
+        anchors = _continuous_anchor_path(
+            choices, [len(text) for text in normalized_asr],
+            [len(text) for text in normalized_lyrics], minimum_anchors
+        )
         if len(anchors) >= minimum_anchors:
             score = sum(anchor.score for anchor in anchors) / len(anchors)
             coverage = min(1.0, len(anchors) / max(1, len(normalized_asr)))
@@ -332,79 +335,56 @@ def match_song(
     return candidates[0]
 
 
-def _semiglobal_anchor_paths(
-    choices: list[LyricAnchor], minimum_anchors: int
-) -> list[LyricAnchor]:
-    """Extract independent chronological takes from one singing episode."""
-    remaining = list(choices)
-    paths: list[list[LyricAnchor]] = []
-    minimum_take_anchors = min(2, minimum_anchors)
-    while remaining:
-        path = _semiglobal_anchor_path(remaining)
-        if len(path) < minimum_take_anchors:
-            break
-        paths.append(path)
-        used_cues = {anchor.cue_index for anchor in path}
-        remaining = [
-            anchor for anchor in remaining if anchor.cue_index not in used_cues
-        ]
-    paths.sort(key=lambda path: path[0].cue_index)
-    return [
-        LyricAnchor(
-            anchor.cue_index,
-            anchor.line_start,
-            anchor.line_end,
-            anchor.score,
-            take_index,
-        )
-        for take_index, path in enumerate(paths)
-        for anchor in path
-    ]
-
-
-def _semiglobal_anchor_path(
+def _continuous_anchor_path(
     choices: list[LyricAnchor],
+    cue_lengths: list[int],
+    lyric_lengths: list[int],
+    minimum_anchors: int,
 ) -> list[LyricAnchor]:
-    """Choose an ordered ASR path while leaving lyric prefix/suffix unpenalized."""
-    ordered = sorted(
-        choices,
-        key=lambda value: (value.cue_index, value.line_start, value.line_end),
-    )
+    """Choose one forward ALT path, rewarding supported lyric coverage.
+
+    Entry/exit are free, so an excerpt may start anywhere in the song. Missing
+    evidence may be skipped, but is penalized by its length, not its cue count.
+    Multi-line anchors earn coverage for all supported lyrics rather than one
+    vote competing against several single-line anchors.
+    """
+    ordered = sorted(choices, key=lambda a: (a.cue_index, a.line_start, a.line_end))
     if not ordered:
         return []
-    scores = [value.score for value in ordered]
+    cue_prefix = [0]
+    lyric_prefix = [0]
+    for length in cue_lengths:
+        cue_prefix.append(cue_prefix[-1] + length)
+    for length in lyric_lengths:
+        lyric_prefix.append(lyric_prefix[-1] + length)
+    # SequenceMatcher ratio = 2 * matched / (ALT length + lyric length).
+    # Reward matched reading units and penalize unmatched units, so appending
+    # unperformed lyrics cannot inflate coverage merely by making an anchor long.
+    weights = [
+        (a.score - 0.5) * (
+            lyric_prefix[a.line_end] - lyric_prefix[a.line_start] + cue_lengths[a.cue_index]
+        )
+        for a in ordered
+    ]
+    scores = weights.copy()
     previous: list[int | None] = [None] * len(ordered)
     lengths = [1] * len(ordered)
-    for current_index, current in enumerate(ordered):
-        for prior_index in range(current_index):
-            prior = ordered[prior_index]
-            if (
-                prior.cue_index >= current.cue_index
-                or prior.line_end > current.line_start
-            ):
+    for i, current in enumerate(ordered):
+        for j, prior in enumerate(ordered[:i]):
+            if prior.cue_index >= current.cue_index or prior.line_end > current.line_start:
                 continue
-            skipped_cues = current.cue_index - prior.cue_index - 1
-            skipped_lines = current.line_start - prior.line_end
-            transition = (
-                scores[prior_index]
-                + current.score
-                - 0.18 * skipped_cues
-                - 0.06 * skipped_lines
-            )
-            candidate_length = lengths[prior_index] + 1
-            if (transition, candidate_length) > (
-                scores[current_index],
-                lengths[current_index],
-            ):
-                scores[current_index] = transition
-                lengths[current_index] = candidate_length
-                previous[current_index] = prior_index
-    best = max(
-        range(len(ordered)),
-        key=lambda index: (lengths[index] >= 2, scores[index], lengths[index]),
-    )
-    path: list[LyricAnchor] = []
-    cursor: int | None = best
+            missing_audio = cue_prefix[current.cue_index] - cue_prefix[prior.cue_index + 1]
+            missing_lyrics = lyric_prefix[current.line_start] - lyric_prefix[prior.line_end]
+            score = scores[j] + weights[i] - 0.18 * missing_audio - 0.06 * missing_lyrics
+            if (score, lengths[j] + 1) > (scores[i], lengths[i]):
+                scores[i] = score
+                lengths[i] = lengths[j] + 1
+                previous[i] = j
+    eligible = [i for i in range(len(ordered)) if lengths[i] >= minimum_anchors]
+    if not eligible:
+        return []
+    cursor = max(eligible, key=lambda i: (scores[i], lengths[i]))
+    path = []
     while cursor is not None:
         path.append(ordered[cursor])
         cursor = previous[cursor]

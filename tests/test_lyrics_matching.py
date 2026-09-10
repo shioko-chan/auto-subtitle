@@ -250,7 +250,7 @@ class JapaneseNormalizerTests(unittest.TestCase):
         assert match is not None
         self.assertEqual(match.song.song_id, "source-a")
 
-    def test_semiglobal_match_extracts_repeated_short_version_as_separate_takes(self):
+    def test_match_keeps_one_continuous_path_instead_of_mining_leftovers(self):
         song = LibrarySong(
             "song",
             "title",
@@ -293,12 +293,6 @@ class JapaneseNormalizerTests(unittest.TestCase):
                 (0, 0, 0),
                 (1, 1, 0),
                 (2, 2, 0),
-                (3, 0, 1),
-                (4, 1, 1),
-                (5, 2, 1),
-                (6, 0, 2),
-                (7, 1, 2),
-                (8, 2, 2),
             ],
         )
 
@@ -357,6 +351,27 @@ class JapaneseNormalizerTests(unittest.TestCase):
             [(anchor.line_start, anchor.line_end) for anchor in match.anchors],
             [(0, 6), (6, 12)],
         )
+
+    def test_alt_windows_cover_successive_lyrics_without_speech_candidates(self):
+        lines = [
+            "心で歌うよ 心に届いてほしいよ",
+            "仮想も現実も真実だよ",
+            "鳴らせ Hi-Fiな想いと",
+            "次元を超え胸打つメロディー",
+            "そして現実的な秘密教えよう",
+            "この歌は永遠に生きてくよ",
+            "だから会いたいなんてナンセンス",
+        ]
+        song = LibrarySong("song", "title", "artist", (), "https://example.com", "hash",
+                           tuple(LyricLine(i, line) for i, line in enumerate(lines)))
+        match = match_song([
+            "心に届いてほしいよ 夢もリアルも本当だよ",
+            "鳴らせ ハイファイな想いと 次元の声 胸を詰める鼓動",
+            "そしてリアルな秘密教えよう この歌は永遠に生きてくよ だから会いたいなんてないぜ",
+        ], [song], minimum_anchors=3, minimum_score=0.4)
+        self.assertIsNotNone(match)
+        self.assertEqual([(a.cue_index, a.line_start, a.line_end) for a in match.anchors],
+                         [(0, 0, 2), (1, 2, 4), (2, 4, 7)])
 
     def test_two_anchor_take_does_not_bypass_total_song_minimum(self):
         song = LibrarySong(

@@ -29,7 +29,7 @@ STAGES = {
     "raw_speech": StageDefinition(1, ("audio_analysis",)),
     "singing_asr": StageDefinition(1, ("audio_analysis",)),
     "conditioned_asr": StageDefinition(1, ("audio_analysis",)),
-    "song_identification": StageDefinition(1, ("raw_speech", "singing_asr")),
+    "song_identification": StageDefinition(3, ("raw_speech", "singing_asr")),
     "asr_correction": StageDefinition(1, ("raw_speech", "conditioned_asr")),
     "speech_alignment": StageDefinition(1, ("asr_correction",)),
     "source_cues": StageDefinition(1, ("speech_alignment", "song_identification", "conditioned_asr")),

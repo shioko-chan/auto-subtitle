@@ -279,7 +279,6 @@ def identify_and_align_songs(
                             video,
                             cues,
                             singing_ids,
-                            speech_ids,
                             candidate_match,
                             config,
                             source_maximum_units,
@@ -346,7 +345,6 @@ def identify_and_align_songs(
                                     video,
                                     cues,
                                     singing_ids,
-                                    speech_ids,
                                     candidate_match,
                                     config,
                                     source_maximum_units,
@@ -450,6 +448,16 @@ def identify_and_align_songs(
                     consumed_ids.update(
                         cue_id for cue_id in replacements if cue_id in pending_ids
                     )
+                    # Do not rematch holes inside the selected continuous episode
+                    # as independent paths over the same audio.
+                    if consumed_ids:
+                        start = min(cues[cue_id].start for cue_id in consumed_ids)
+                        end = max(cues[cue_id].end for cue_id in consumed_ids)
+                        consumed_ids.update(
+                            cue_id for cue_id in singing_ids
+                            if start <= cues[cue_id].start < end
+                        )
+                    discarded_song_region_cues.update(consumed_ids - replacements.keys())
                     pending_ids.difference_update(consumed_ids)
                     report_group = _expanded_report_group(group, alignment_ids, match, cues)
                     reports.append(
@@ -541,7 +549,27 @@ def decode_song_result(value: dict) -> SongIdentificationResult:
 def arbitrate_verified_lyrics(
     cues: list[Cue], verified_spans: list[VerifiedLyricSpan]
 ) -> tuple[list[Cue], list[dict[str, object]]]:
-    spans = sorted(verified_spans, key=lambda value: (value.start, value.end))
+    spans: list[VerifiedLyricSpan] = []
+    for span in sorted(verified_spans, key=lambda value: (value.start, value.end)):
+        if span.end <= span.start:
+            continue
+        previous = spans[-1] if spans else None
+        if (
+            previous is not None
+            and previous.song_id == span.song_id
+            and span.start - previous.end <= 2.0
+            and previous.lyric_line_ids
+            and span.lyric_line_ids
+            and min(span.lyric_line_ids) <= max(previous.lyric_line_ids) + 1
+            and max(span.lyric_line_ids) >= max(previous.lyric_line_ids)
+        ):
+            spans[-1] = replace(
+                previous,
+                end=max(previous.end, span.end),
+                lyric_line_ids=tuple(sorted({*previous.lyric_line_ids, *span.lyric_line_ids})),
+            )
+        else:
+            spans.append(span)
     if not spans:
         return cues, []
     result: list[Cue] = []
@@ -560,28 +588,35 @@ def arbitrate_verified_lyrics(
             continue
         units = tuple(cue.source_units)
         if not units:
-            covered = _covered_duration(cue.start, cue.end, overlapping)
-            ratio = covered / max(1e-6, cue.end - cue.start)
-            action = "discarded_without_units" if ratio >= 0.8 else "kept_conflict"
             audit.append(
                 {
                     "start": cue.start,
                     "end": cue.end,
-                    "action": action,
-                    "lyric_coverage": round(ratio, 6),
+                    "action": "discarded_without_units",
                 }
             )
-            if ratio < 0.8:
-                result.append(cue)
             continue
-        retained = [
-            unit
-            for unit in units
-            if _covered_duration(unit.start, unit.end, overlapping)
-            / max(1e-6, unit.end - unit.start)
-            < 0.8
-        ]
-        if not retained:
+        runs: list[list[TimedTextUnit]] = []
+        current: list[TimedTextUnit] = []
+        for unit in units:
+            blocked = any(
+                unit.start < span.end and unit.end > span.start
+                or unit.start == unit.end and span.start <= unit.start < span.end
+                for span in overlapping
+            )
+            if blocked:
+                if current:
+                    runs.append(current)
+                    current = []
+                continue
+            if current and unit.start - current[-1].end > 0.25:
+                runs.append(current)
+                current = []
+            current.append(unit)
+        if current:
+            runs.append(current)
+        retained_count = sum(len(run) for run in runs)
+        if not runs:
             audit.append(
                 {
                     "start": cue.start,
@@ -591,12 +626,6 @@ def arbitrate_verified_lyrics(
                 }
             )
             continue
-        runs: list[list[TimedTextUnit]] = [[retained[0]]]
-        for unit in retained[1:]:
-            if unit.start - runs[-1][-1].end <= 0.25:
-                runs[-1].append(unit)
-            else:
-                runs.append([unit])
         for run in runs:
             text = "".join(unit.text for unit in run).strip()
             if not text:
@@ -615,29 +644,12 @@ def arbitrate_verified_lyrics(
                 "start": cue.start,
                 "end": cue.end,
                 "action": "trimmed_at_aligner_units",
-                "retained_units": len(retained),
-                "removed_units": len(units) - len(retained),
+                "retained_units": retained_count,
+                "removed_units": len(units) - retained_count,
             }
         )
     result.sort(key=lambda cue: (cue.start, cue.end, cue.kind, cue.speaker or ""))
     return result, audit
-
-
-def _covered_duration(
-    start: float, end: float, spans: list[VerifiedLyricSpan]
-) -> float:
-    intersections = sorted(
-        (max(start, span.start), min(end, span.end))
-        for span in spans
-        if min(end, span.end) - max(start, span.start) > 0
-    )
-    merged: list[list[float]] = []
-    for left, right in intersections:
-        if merged and left <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], right)
-        else:
-            merged.append([left, right])
-    return sum(right - left for left, right in merged)
 
 
 def translate_aligned_song_lyrics(
@@ -1596,7 +1608,6 @@ def _validate_song_match(
     video: Path,
     cues: list[Cue],
     singing_ids: list[int],
-    speech_ids: list[int],
     match: SongMatch,
     config: SongIdentificationConfig,
     source_maximum_units: float | None,
@@ -1607,13 +1618,7 @@ def _validate_song_match(
     list[dict[str, object]],
     list[dict[str, object]],
 ]:
-    alignment_ids, refined_match = _refine_match_with_speech_support(
-        cues, singing_ids, speech_ids, match, config
-    )
-    if refined_match is not None:
-        match = refined_match
-    else:
-        alignment_ids = singing_ids
+    alignment_ids = singing_ids
     timing, audits = _align_match_with_pyshiro(
         job_dir,
         video,
@@ -2650,59 +2655,6 @@ def _routed_speech_cue_ids(
     return result
 
 
-def _refine_match_with_speech_support(
-    cues: list[Cue],
-    singing_ids: list[int],
-    speech_ids: list[int],
-    match: SongMatch,
-    config: SongIdentificationConfig,
-) -> tuple[list[int], SongMatch | None]:
-    support_ids = [
-        cue_id
-        for cue_id in speech_ids
-        if (cues[cue_id].speaker_assignment or "").startswith("song_alignment_support:")
-    ]
-    groups_by_window: dict[str, list[int]] = {}
-    for cue_id in sorted(support_ids, key=lambda value: cues[value].start):
-        assignment = cues[cue_id].speaker_assignment or ""
-        groups_by_window.setdefault(assignment, []).append(cue_id)
-    supported_ids: list[int] = []
-    for group_ids in groups_by_window.values():
-        if (
-            _match_candidates(
-                [cues[cue_id].text for cue_id in group_ids], [match.song], config
-            )
-            is not None
-        ):
-            supported_ids.extend(group_ids)
-    if not supported_ids:
-        return singing_ids, None
-
-    anchored_singing_ids = [singing_ids[anchor.cue_index] for anchor in match.anchors]
-    selected_ids = sorted(
-        set([*anchored_singing_ids, *supported_ids]),
-        key=lambda cue_id: (cues[cue_id].start, cues[cue_id].end),
-    )
-    refined = _match_candidates(
-        [cues[cue_id].text for cue_id in selected_ids], [match.song], config
-    )
-    if refined is None:
-        return singing_ids, None
-
-    alignment_ids = sorted(
-        set([*singing_ids, *speech_ids]),
-        key=lambda cue_id: (cues[cue_id].start, cues[cue_id].end),
-    )
-    alignment_positions = {cue_id: index for index, cue_id in enumerate(alignment_ids)}
-    anchors = tuple(
-        replace(
-            anchor,
-            cue_index=alignment_positions[selected_ids[anchor.cue_index]],
-        )
-        for anchor in refined.anchors
-    )
-    return alignment_ids, SongMatch(refined.song, anchors, refined.score)
-
 
 def collect_ocr_candidates(
     video: Path,
@@ -3087,5 +3039,4 @@ def _public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> b
 
 def _normalize_ocr_text(text: str) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", text)).strip()
-
 

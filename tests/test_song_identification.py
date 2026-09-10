@@ -28,7 +28,7 @@ from subtitle_pipeline.song_identification import (
     _rank_candidate_matches,
     _rank_lyric_search_results,
     _recover_lyric_ranges,
-    _refine_match_with_speech_support,
+    _validate_song_match,
     _routed_speech_cue_ids,
     _run_pyshiro_lines,
     _search_canonical_lyrics,
@@ -117,59 +117,21 @@ class SongIdentificationTests(unittest.TestCase):
             self.assertEqual(separate.call_args.args[1][0][:2], (10, 15))
             self.assertEqual(probes[0]["wav"], output_dir / "range-0000.vocals.wav")
 
-    @patch("subtitle_pipeline.song_identification._match_candidates")
-    def test_song_match_refinement_excludes_unmatched_support_group(self, matcher):
-        song = LibrarySong(
-            "song",
-            "title",
-            "artist",
-            (),
-            "https://example.com/song",
-            "hash",
-            tuple(LyricLine(index, f"line {index}") for index in range(4)),
-        )
-        original = SongMatch(song, (LyricAnchor(0, 2, 3, 0.8),), 0.8)
-        support_match = SongMatch(song, (LyricAnchor(0, 0, 1, 0.7),), 0.7)
-        refined = SongMatch(
-            song,
-            (
-                LyricAnchor(0, 0, 1, 0.7),
-                LyricAnchor(1, 2, 3, 0.8),
-            ),
-            0.75,
-        )
-        matcher.side_effect = [support_match, None, refined]
-        cues = [
-            Cue(
-                0,
-                10,
-                "support",
-                kind="speech",
-                speaker_assignment="song_alignment_support:0",
-            ),
-            Cue(
-                60,
-                70,
-                "unrelated credits",
-                kind="speech",
-                speaker_assignment="song_alignment_support:1",
-            ),
-            Cue(20, 30, "alt anchor", kind="singing"),
-        ]
-
-        alignment_ids, result = _refine_match_with_speech_support(
-            cues,
-            [2],
-            [0, 1],
-            original,
-            SongIdentificationConfig(song_search_group_gap_seconds=35),
-        )
-
-        self.assertEqual(alignment_ids, [0, 2, 1])
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual([anchor.cue_index for anchor in result.anchors], [0, 1])
-        self.assertEqual(matcher.call_args.args[0], ["support", "alt anchor"])
+    @patch("subtitle_pipeline.song_identification._recover_lyric_ranges", return_value=({}, [], []))
+    @patch("subtitle_pipeline.song_identification._apply_local_match", return_value=({}, []))
+    @patch("subtitle_pipeline.song_identification._align_match_with_pyshiro", return_value=({}, []))
+    def test_song_validation_uses_only_alt_ids(self, align, apply, recover):
+        song = LibrarySong("song", "title", "artist", (), "https://example.com", "hash",
+                           (LyricLine(0, "歌詞"),))
+        match = SongMatch(song, (LyricAnchor(0, 0, 1, 0.9),), 0.9)
+        cues = [Cue(0, 10, "歌詞", kind="singing"),
+                Cue(0, 10, "歌詞", kind="speech", speaker_assignment="song_alignment_support:0")]
+        result = _validate_song_match(Path("unused"), Path("video.mp4"), cues, [0], match,
+                                      SongIdentificationConfig(), None)
+        self.assertEqual(result[1], [0])
+        self.assertEqual(align.call_args.args[3], [0])
+        self.assertEqual(recover.call_args.args[2], [0])
+        self.assertIs(result[0], match)
 
     @patch("subtitle_pipeline.song_identification._public_http_url", return_value=True)
     def test_supported_lyrics_url_requires_song_detail_page(self, _public_url):
@@ -577,7 +539,6 @@ class SongIdentificationTests(unittest.TestCase):
             _video,
             cues,
             singing_ids,
-            _speech_ids,
             match,
             _config,
             _source_maximum_units,
@@ -1463,14 +1424,40 @@ class SongIdentificationTests(unittest.TestCase):
         )
         self.assertEqual(audit[0]["action"], "trimmed_at_aligner_units")
 
-    def test_verified_lyrics_keep_unitless_speech_below_eighty_percent(self):
+    def test_verified_lyrics_block_short_gap_but_keep_long_gap(self):
+        spans = [
+            VerifiedLyricSpan(0, 2, 1, "song", (0,), -15),
+            VerifiedLyricSpan(3, 5, 2, "song", (1,), -15),
+            VerifiedLyricSpan(10, 12, 3, "song", (2,), -15),
+        ]
+        short_gap = Cue(2.2, 2.8, "残留歌词", kind="speech")
+        long_gap = Cue(6, 8, "间奏说话", kind="speech")
+
+        result, _ = arbitrate_verified_lyrics([short_gap, long_gap], spans)
+
+        self.assertEqual(result, [long_gap])
+
+    def test_verified_lyrics_remove_partial_boundary_unit(self):
+        speech = Cue(0, 4, "前歌后", kind="speech", source_units=(
+            TimedTextUnit("前", 0, 1),
+            TimedTextUnit("歌", 1, 3),
+            TimedTextUnit("后", 3, 4),
+        ))
+        spans = [VerifiedLyricSpan(2, 2.1, 1, "song", (0,), -15)]
+
+        result, _ = arbitrate_verified_lyrics([speech], spans)
+
+        self.assertEqual([(cue.text, cue.start, cue.end) for cue in result],
+                         [("前", 0, 1), ("后", 3, 4)])
+
+    def test_verified_lyrics_discard_unitless_speech_with_any_overlap(self):
         speech = Cue(0, 10, "途中の話", kind="speech")
         spans = [VerifiedLyricSpan(0, 7.9, 1, "song", (0,), -15.0)]
 
         result, audit = arbitrate_verified_lyrics([speech], spans)
 
-        self.assertEqual(result, [speech])
-        self.assertEqual(audit[0]["action"], "kept_conflict")
+        self.assertEqual(result, [])
+        self.assertEqual(audit[0]["action"], "discarded_without_units")
 
     def test_verified_lyrics_discard_unitless_speech_at_eighty_percent(self):
         speech = Cue(0, 10, "误识别为讲话", kind="speech")
