@@ -9,9 +9,9 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from subtitle_pipeline.cache import CacheStore, STAGES, config_snapshot, job_lock
-from subtitle_pipeline.config import LLMConfig
+from subtitle_pipeline.config import LLMConfig, UploadConfig
 from subtitle_pipeline.publication import publish_once, read_record, resolve
-from subtitle_pipeline.upload import BilibiliSubmission
+from subtitle_pipeline.upload import BilibiliSubmission, BiliupCommandError, UploadNotStartedError, upload_to_bilibili
 
 
 class CacheTests(unittest.TestCase):
@@ -116,6 +116,51 @@ class CacheTests(unittest.TestCase):
         restored = publish_once(path, {}, lambda: self.fail('already uploaded'))
         self.assertEqual(restored.aid, 12)
         self.assertTrue(read_record(path)['uploaded'])
+
+    def test_rejected_publication_can_be_retried(self):
+        path = self.root / 'manifest.json'
+        error = BiliupCommandError(1, 'ResponseData { code: 21021, data: None, message: "missing source" }')
+        with self.assertRaises(BiliupCommandError):
+            publish_once(path, {}, Mock(side_effect=error))
+        self.assertEqual(read_record(path)['status'], 'not_uploaded')
+        publish_once(path, {}, lambda: BilibiliSubmission(12, 'BVexample', 'ok'))
+        self.assertEqual(read_record(path)['status'], 'success')
+
+    def test_preparation_and_process_start_failures_allow_retry(self):
+        path = self.root / 'manifest.json'
+        cookie = self.root / 'cookies.json'
+        config = UploadConfig(cookie_file=str(cookie),
+                              pause_marker_file=str(self.root / 'paused.json'),
+                              throttle_state_file=str(self.root / 'throttle.json'))
+        def submit():
+            return upload_to_bilibili(self.root / 'video.mp4', title='test',
+                                     description='', source_url='https://example.com/video',
+                                     tags=['test'], config=config)
+        with patch('subtitle_pipeline.upload.require_command', return_value='biliup'), \
+             patch('subtitle_pipeline.upload.subprocess.Popen', side_effect=OSError('cannot start')) as popen:
+            with self.assertRaises(UploadNotStartedError):
+                publish_once(path, {}, submit)
+            popen.assert_not_called()
+            self.assertEqual(read_record(path)['status'], 'not_uploaded')
+            cookie.write_text('{}')
+            with self.assertRaises(UploadNotStartedError):
+                publish_once(path, {}, submit)
+            popen.assert_called_once()
+            self.assertEqual(read_record(path)['status'], 'not_uploaded')
+        publish_once(path, {}, lambda: BilibiliSubmission(12, 'BVexample', 'ok'))
+        self.assertEqual(read_record(path)['status'], 'success')
+
+    def test_transport_failure_and_conflicting_responses_remain_unknown(self):
+        for output in ('connection timed out',
+                       'ResponseData { code: 0, data: Some(x) } ResponseData { code: 21021, data: None }'):
+            with self.subTest(output=output):
+                path = self.root / 'manifest.json'
+                path.unlink(missing_ok=True)
+                with self.assertRaises(BiliupCommandError):
+                    publish_once(path, {}, Mock(side_effect=BiliupCommandError(1, output)))
+                self.assertEqual(read_record(path)['status'], 'unknown')
+                with self.assertRaisesRegex(RuntimeError, 'unknown'):
+                    publish_once(path, {}, lambda: self.fail('must not upload'))
 
     def test_unknown_publication_requires_resolution(self):
         path = self.root / 'manifest.json'

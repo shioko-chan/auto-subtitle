@@ -8,7 +8,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .upload import BilibiliSubmission
+from .upload import BilibiliSubmission, BiliupCommandError, UploadNotStartedError
 
 
 def read_record(path: Path) -> dict:
@@ -54,7 +54,7 @@ def publish_once(path: Path, intent: dict, submit: Callable[[], BilibiliSubmissi
         return BilibiliSubmission(previous.get("bilibili_aid", previous.get("aid")),
                                  previous.get("bilibili_bvid", previous.get("bvid")),
                                  str(previous.get("response", "")))
-    if previous.get("status") == "submitting":
+    if previous.get("status") in {"submitting", "unknown"}:
         raise RuntimeError(f"publication outcome is unknown; use publication resolve after checking Bilibili: {path}")
     record = {**previous, **intent, "status": "submitting", "uploaded": False,
               "submitted_at": datetime.now(UTC).isoformat()}
@@ -62,7 +62,11 @@ def publish_once(path: Path, intent: dict, submit: Callable[[], BilibiliSubmissi
     try:
         submission = submit()
     except Exception as exc:
-        write_record(path, {**record, "error": f"{type(exc).__name__}: {exc}"})
+        not_uploaded = isinstance(exc, UploadNotStartedError) or (
+            isinstance(exc, BiliupCommandError) and exc.submission_rejected
+        )
+        status = "not_uploaded" if not_uploaded else "unknown"
+        write_record(path, {**record, "status": status, "error": f"{type(exc).__name__}: {exc}"})
         raise
     write_record(path, {**record, "status": "success", "uploaded": True,
                         "aid": submission.aid, "bvid": submission.bvid,

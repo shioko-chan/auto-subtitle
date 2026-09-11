@@ -17,11 +17,22 @@ from .config import UploadConfig
 logger = logging.getLogger(__name__)
 
 
+class UploadNotStartedError(RuntimeError):
+    """Upload preparation or process creation failed before biliup started."""
+
+
 class BiliupCommandError(RuntimeError):
     def __init__(self, returncode: int, output: str):
         super().__init__(f"biliup failed with exit code {returncode}")
         self.returncode = returncode
         self.output = output
+
+    @property
+    def submission_rejected(self) -> bool:
+        responses = re.findall(r"ResponseData\s*\{\s*code:\s*(-?\d+),\s*data:\s*(None|Some)", self.output)
+        # An explicit rejection is different from a transport failure. If any
+        # response reports success, do not authorize a duplicate submission.
+        return bool(responses) and all(int(code) != 0 and data == "None" for code, data in responses)
 
 
 @dataclass(frozen=True)
@@ -59,6 +70,36 @@ def upload_videos_to_bilibili(
     tags: list[str],
     config: UploadConfig,
 ) -> BilibiliSubmission:
+    try:
+        command, pause_marker = _prepare_upload_command(
+            videos, title=title, description=description, source_url=source_url,
+            tags=tags, config=config,
+        )
+    except Exception as exc:
+        raise UploadNotStartedError(str(exc)) from exc
+    try:
+        output = _run_biliup(command)
+    except BiliupCommandError as exc:
+        if _bilibili_failure_code(exc.output) == 412:
+            _write_pause_marker(pause_marker, 412, exc.output)
+        # Publication records distinguish explicit rejection from unknown outcomes.
+        raise
+    try:
+        aid, bvid = _submission_ids(output)
+    except RuntimeError:
+        logger.warning("upload succeeded without parseable aid/bvid")
+        aid, bvid = None, None
+    try:
+        _record_upload_cooldown(config)
+    except OSError as exc:
+        logger.warning("could not record upload cooldown after successful submission: %s", exc)
+    return BilibiliSubmission(aid=aid, bvid=bvid, response=output)
+
+
+def _prepare_upload_command(
+    videos: Sequence[Path], *, title: str, description: str, source_url: str,
+    tags: list[str], config: UploadConfig,
+) -> tuple[list[str], Path]:
     if not videos:
         raise ValueError("at least one video is required for Bilibili upload")
     biliup = require_command("biliup")
@@ -109,24 +150,7 @@ def upload_videos_to_bilibili(
     if config.line:
         command.extend(["--line", config.line])
     command.extend(str(video) for video in videos)
-    try:
-        output = _run_biliup(command)
-    except BiliupCommandError as exc:
-        if _bilibili_failure_code(exc.output) == 412:
-            _write_pause_marker(pause_marker, 412, exc.output)
-        # A subprocess failure does not prove the remote submission failed.
-        # Retrying is an explicit publication-resolution operation.
-        raise
-    try:
-        aid, bvid = _submission_ids(output)
-    except RuntimeError:
-        logger.warning("upload succeeded without parseable aid/bvid")
-        aid, bvid = None, None
-    try:
-        _record_upload_cooldown(config)
-    except OSError as exc:
-        logger.warning("could not record upload cooldown after successful submission: %s", exc)
-    return BilibiliSubmission(aid=aid, bvid=bvid, response=output)
+    return command, pause_marker
 
 
 def _submission_ids(output: str) -> tuple[int, str]:
@@ -147,14 +171,17 @@ def _submission_ids(output: str) -> tuple[int, str]:
 
 def _run_biliup(command: Sequence[str]) -> str:
     logger.info("running biliup upload")
-    process = subprocess.Popen(
-        list(command),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        errors="replace",
-        bufsize=1,
-    )
+    try:
+        process = subprocess.Popen(
+            list(command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            bufsize=1,
+        )
+    except OSError as exc:
+        raise UploadNotStartedError(str(exc)) from exc
     output: deque[str] = deque(maxlen=2000)
     assert process.stdout is not None
     for line in process.stdout:

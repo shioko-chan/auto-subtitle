@@ -7,6 +7,7 @@ from unittest.mock import patch
 from subtitle_pipeline.config import UploadConfig
 from subtitle_pipeline.upload import (
     BiliupCommandError,
+    UploadNotStartedError,
     _bilibili_failure_code,
     _prepare_description,
     _record_upload_cooldown,
@@ -93,8 +94,7 @@ class UploadTests(unittest.TestCase):
             self.assertEqual(
                 command[:4], ["/bin/biliup", "--user-cookie", str(cookie), "upload"]
             )
-            self.assertNotIn("--source", command)
-            self.assertNotIn("https://youtube.test/watch?v=1", command)
+            self.assertEqual(command[command.index("--source") + 1], "https://youtube.test/watch?v=1")
             self.assertIn("中字,自动生成", command)
             description = command[command.index("--desc") + 1]
             self.assertEqual(description, "Description")
@@ -169,7 +169,7 @@ class UploadTests(unittest.TestCase):
             self.assertEqual(command[-2:], [str(parts[0]), str(parts[1])])
 
     def test_rejects_empty_multi_part_upload(self):
-        with self.assertRaisesRegex(ValueError, "at least one video"):
+        with self.assertRaisesRegex(UploadNotStartedError, "at least one video"):
             upload_videos_to_bilibili(
                 [],
                 title="empty",
