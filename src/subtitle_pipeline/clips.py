@@ -32,6 +32,8 @@ from .prompt_templates import render_user_prompt
 from .subtitles import Cue, read_subtitles
 from .upload import upload_videos_to_bilibili
 
+from .prompt_budget import batch_requests, request_budget_validator
+
 logger = logging.getLogger(__name__)
 
 _ANALYSIS_VERSION = 1
@@ -515,6 +517,25 @@ def _review_seed(seed, cues, translator, config, *, required: bool) -> ClipPart 
         for index, cue in enumerate(cues)
         if cue.end > context_start and cue.start < context_end
     ]
+    def render(values):
+        return _clip_request_body(config, "clip-review.md", _clip_prompt(seed, values, config))
+    validate = (translator.validate_request if config.llm.local_server_enabled
+                else request_budget_validator(config.llm.local_server_context_size))
+    batches = batch_requests(selected, render_request=render, validate_request=validate)
+    if not batches:
+        validate(render([]))
+        batches = [()]
+    parts = [_review_seed_chunk(seed, list(batch), translator, config, required=required)
+             for batch in batches]
+    parts = [part for part in parts if part is not None]
+    if not parts:
+        return None
+    if required:
+        return replace(parts[0], start=min(part.start for part in parts), end=max(part.end for part in parts))
+    return max(parts, key=lambda part: (part.score, part.end - part.start))
+
+
+def _clip_prompt(seed, selected, config):
     payload = {
         **seed,
         "transcript_cues": [
@@ -527,19 +548,14 @@ def _review_seed(seed, cues, translator, config, *, required: bool) -> ClipPart 
             for index, cue in selected
         ],
     }
+    return render_user_prompt("clip-review.md", KIND=str(seed["kind"]),
+        CANDIDATE_JSON=json.dumps(payload, ensure_ascii=False), MAX_SECONDS=config.clips.max_speech_seconds)
+
+
+def _review_seed_chunk(seed, selected, translator, config, *, required):
     if not selected and not required:
         return None
-    response = _request_json(
-        translator,
-        config,
-        "clip-review.md",
-        render_user_prompt(
-            "clip-review.md",
-            KIND=str(seed["kind"]),
-            CANDIDATE_JSON=json.dumps(payload, ensure_ascii=False),
-            MAX_SECONDS=config.clips.max_speech_seconds,
-        ),
-    )
+    response = _request_json(translator, config, "clip-review.md", _clip_prompt(seed, selected, config))
     worthy = response.get("worthy") is True
     confidence = str(response.get("confidence") or "").strip().lower()
     if required and (not worthy or confidence != "high"):
@@ -672,10 +688,8 @@ def _upload_metadata(metadata: dict[str, object]) -> dict[str, str]:
     }
 
 
-def _request_json(
-    translator, config, prompt_name: str, prompt: str
-) -> dict[str, object]:
-    body = structured_request_body(
+def _clip_request_body(config, prompt_name, prompt):
+    return structured_request_body(
         model=config.llm.model,
         prompt_name=prompt_name,
         prompt=prompt,
@@ -684,6 +698,10 @@ def _request_json(
 
         thinking=config.llm.thinking,
     )
+
+
+def _request_json(translator, config, prompt_name: str, prompt: str) -> dict[str, object]:
+    body = _clip_request_body(config, prompt_name, prompt)
     last_error: Exception | None = None
     for attempt in range(1, config.llm.max_retries + 1):
         try:

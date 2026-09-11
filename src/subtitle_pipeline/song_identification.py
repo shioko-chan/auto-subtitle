@@ -30,8 +30,8 @@ from .llm_response import (
 )
 from .lyrics_library import LibrarySong, LyricLine, LyricsLibrary
 from .lyrics_matching import JapaneseNormalizer, LyricAnchor, SongMatch, match_song
-from .prompt_budget import batch_prompt_items
-from .prompt_templates import prompt_system, render_user_prompt
+from .prompt_budget import batch_requests, request_budget_validator
+from .prompt_templates import render_user_prompt
 from .source_language import language_for_text
 from .subtitles import Cue, TimedTextUnit, cue_from_mapping, text_display_width
 
@@ -1257,6 +1257,7 @@ def select_ocr_song_titles(
 
     thinking: str | None,
     context_size: int,
+    validate_request: Callable[[dict[str, object]], None] | None = None,
 ) -> list[str | None]:
     groups: list[dict[str, object]] = []
     for group_id, candidates in enumerate(candidate_sets):
@@ -1273,47 +1274,16 @@ def select_ocr_song_titles(
         ]
         groups.append({"group_id": group_id, "ocr_lines": lines})
 
-    def render(groups_batch: Sequence[dict[str, object]]) -> str:
-        return "\n\n".join(
-            (
-                prompt_system(_OCR_TITLE_PROMPT),
-                render_user_prompt(
-                    _OCR_TITLE_PROMPT,
-                    VIDEO_TITLE=video_title,
-                    OCR_GROUPS=json.dumps(
-                        groups_batch,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
-                ),
-            )
-        )
-
     def output_tokens(group_count: int) -> int:
         return max(512, min(4096, group_count * 48))
 
-    # OCR JSON is dominated by coordinates and punctuation, which tokenize much
-    # more densely than prose. One character per token is a conservative bound.
-    batches = batch_prompt_items(
-        groups,
-        render_prompt=render,
-        context_size=context_size,
-        max_output_tokens=output_tokens,
-        estimate_tokens=len,
-    )
-    logging.info(
-        "split %d OCR search groups into %d prompt batch(es)",
-        len(groups),
-        len(batches),
-    )
-    titles: list[str | None] = [None for _ in candidate_sets]
-    for batch in batches:
+    def render_request(batch):
         prompt = render_user_prompt(
             _OCR_TITLE_PROMPT,
             VIDEO_TITLE=video_title,
             OCR_GROUPS=json.dumps(batch, ensure_ascii=False, separators=(",", ":")),
         )
-        body = structured_request_body(
+        return structured_request_body(
             model=model,
             prompt_name=_OCR_TITLE_PROMPT,
             prompt=prompt,
@@ -1322,6 +1292,16 @@ def select_ocr_song_titles(
 
             thinking=thinking,
         )
+    # OCR coordinates and punctuation tokenize densely: use a conservative
+    # character bound plus the provider's exact validator when available.
+    validate = request_budget_validator(context_size,
+        count_tokens=lambda body: sum(len(message["content"]) for message in body["messages"]) + 2,
+        validate_request=validate_request)
+    batches = batch_requests(groups, render_request=render_request, validate_request=validate)
+    logging.info("split %d OCR search groups into %d prompt batch(es)", len(groups), len(batches))
+    titles: list[str | None] = [None for _ in candidate_sets]
+    for batch in batches:
+        body = render_request(batch)
         response = request(body)
         content = structured_response_content(response, finish_reason=finish_reason)
         parsed = parse_json_object(content)

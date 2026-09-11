@@ -111,7 +111,9 @@ def _run_pipeline_locked(
         local_llm_server = LocalLLMServer(config.llm, job_dir / "local-llm-server.log")
         cache_store = CacheStore(job_dir / "cache.sqlite3")
         needs_knowledge = any(
-            (stage := cache_store.existing(name)) is None or stage.get("__result__") is None
+            (stage := cache_store.existing(name)) is None
+            or (record := stage.record("__result__")) is None
+            or record["payload"] is None
             for name in ("asr_correction", "translation")
         )
         fan_knowledge = (
@@ -301,6 +303,7 @@ def _run_pipeline_stages(
                 candidate_sets,
                 video_title=str(downloaded.metadata.get("title") or ""),
                 request=translator.stage_request(job_dir / "cache.sqlite3", "song_identification"),
+                validate_request=translator.stage_budget_validator(job_dir / "cache.sqlite3", "song_identification"),
                 model=config.llm.model,
 
                 thinking=config.llm.thinking,

@@ -21,10 +21,10 @@ from .llm_response import (
 from .local_segmentation import LocalUnit, SpeakerTrack
 from .prompt_budget import (
     PromptBudgetExceeded,
-    estimate_prompt_tokens,
-    validate_prompt_budget,
+    request_budget_validator,
+    request_fits,
 )
-from .prompt_templates import prompt_system, render_user_prompt
+from .prompt_templates import render_user_prompt
 from .reference_context import compact_translation_reference_context
 from .source_language import (
     combine_source_languages,
@@ -111,7 +111,10 @@ def _fit_translation_prompt(
     honorific_rules: str,
     previous_error: Exception | None,
     maximum_units: float,
+    validate_request: Callable | None = None,
 ) -> str:
+    validate = (request_budget_validator(llm.local_server_context_size, validate_request=validate_request)
+                if llm.local_server_enabled else validate_request)
     active_knowledge = list(evidence.knowledge)
     active_chat = evidence.chat.splitlines()
     active_dialogue = list(dialogue)
@@ -145,7 +148,9 @@ def _fit_translation_prompt(
                 else f"\n\nPREVIOUS_RESPONSE_ERROR: {previous_error}"
             ),
         )
-        if _prompt_within_budget(prompt, llm, translation):
+        body = structured_request_body(model=llm.model, prompt_name=_TRANSLATE_PROMPT,
+            prompt=prompt, max_tokens=translation.max_tokens, temperature=0.1, thinking=llm.thinking)
+        if validate is None or request_fits(body, validate):
             reduced_counts = (
                 len(active_knowledge),
                 len(active_chat),
@@ -175,7 +180,8 @@ def _fit_translation_prompt(
         elif active_dialogue:
             active_dialogue.pop(_farthest_dialogue_index(active_dialogue, selected))
         else:
-            _validate_prompt_budget(prompt, llm, translation)
+            if validate is not None:
+                validate(body)
             return prompt
 
 
@@ -342,30 +348,6 @@ def _format_term_references(references: list[KnowledgeHit]) -> str:
     )
 
 
-def _validate_prompt_budget(
-    prompt: str, llm: LLMConfig, translation: TranslationConfig
-) -> None:
-    if not llm.local_server_enabled:
-        return
-    reserve = translation.max_tokens
-    validate_prompt_budget(
-        prompt_system(_TRANSLATE_PROMPT) + "\n" + prompt,
-        context_size=llm.local_server_context_size,
-        max_output_tokens=reserve,
-        estimate_tokens=estimate_prompt_tokens,
-    )
-
-
-def _prompt_within_budget(
-    prompt: str, llm: LLMConfig, translation: TranslationConfig
-) -> bool:
-    try:
-        _validate_prompt_budget(prompt, llm, translation)
-    except PromptBudgetExceeded:
-        return False
-    return True
-
-
 def _records_to_source_cues(
     source: list[Cue], tracks: list[SpeakerTrack], records: list[SegmentRecord]
 ) -> list[Cue]:
@@ -502,6 +484,7 @@ def run_joint_translation(
     is_nontransient: Callable, log_invalid_response: Callable,
     local_translate: Callable[[str], str], translation_context: dict[str, object],
     honorific_rules: str, maximum_units: float, cache_path: Path | None,
+    validate_request: Callable | None = None,
     retrieve_knowledge: Callable | None = None,
     retrieve_chat: Callable | None = None, audit_path: Path | None = None,
 ) -> tuple[list[Cue], list[Cue]]:
@@ -586,7 +569,7 @@ def run_joint_translation(
                 ids=ids, cues=cues, selected=selected, dialogue=dialogue,
                 evidence=evidence, context=translation_context, llm=llm,
                 translation=translation, honorific_rules=honorific_rules,
-                previous_error=previous_error, maximum_units=maximum_units)
+                previous_error=previous_error, maximum_units=maximum_units, validate_request=validate_request)
             body = structured_request_body(
                 model=llm.model, prompt_name=_TRANSLATE_PROMPT, prompt=prompt,
                 max_tokens=translation.max_tokens, temperature=0.1, thinking=llm.thinking)

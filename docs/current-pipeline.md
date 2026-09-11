@@ -363,3 +363,22 @@ subtitle-pipeline publication resolve 'https://www.youtube.com/watch?v=VIDEO_ID'
 - 联合划句与翻译：`src/subtitle_pipeline/joint_translation.py`
 - ASS 与视频渲染：`src/subtitle_pipeline/media.py`
 - Bilibili 投稿：`src/subtitle_pipeline/upload.py`
+
+### 请求预算与分块
+
+输出上限保持各任务现有配置。请求构造阶段将系统提示、模板、上下文和输出预留一起计入预算，
+本地请求使用服务模型的模板与 tokenizer 校验，发送前仍保留最终检查。
+
+- 歌词按行分批，保留全局行 ID；单行放不下时在生成前报错。
+- 元数据优先一次请求；放不下时，在已有配置选取的输入范围内分别分块处理简介和辅助证据，
+  然后按预算汇总摘要、标题与标签。简介译文按源顺序拼接，已完成分块保存到 metadata 缓存。
+- 术语按候选分批，搜索审查按结果列表分批；不同批次支持的译名冲突时不自动接受。
+- 切片按字幕 cue 分批，保留每批 ID；歌曲保留已验证完整范围，讲话候选取有效结果中评分最高者。
+- OCR 在保守估算分组后进一步按实际请求预算分批；联合断句翻译在裁减可选证据时检查完整请求。
+
+本次不改变缓存版本，已有完成结果可继续复用。
+
+预算公共实现集中在 `prompt_budget.py`：`request_budget_validator` 统一容量、输入目标和
+服务端 tokenizer 校验；`request_fits` 仅捕获预算不足；`batch_requests` 按业务单元分批；
+`chunk_text` 无损分块，复用 `fit_optional_text` 的前缀搜索。业务模块只提供请求构造函数、
+切分单位与聚合规则，不自行计算输入加输出的容量关系。

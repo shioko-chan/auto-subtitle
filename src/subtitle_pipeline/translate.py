@@ -31,7 +31,7 @@ from .local_segmentation import build_speaker_tracks
 from .local_translation import LocalJapaneseTranslator
 from .llm_stream import read_chat_stream, read_responses_stream
 from .repetition import RepetitionLoopError
-from .prompt_budget import count_llama_prompt_tokens, estimate_prompt_tokens, validate_request_budget
+from .prompt_budget import count_llama_prompt_tokens, estimate_prompt_tokens, validate_request_budget, batch_requests, chunk_text, PromptBudgetExceeded, request_fits
 from .prompt_templates import render_user_prompt
 from .reference_context import (
     compact_lyrics_reference_context,
@@ -194,6 +194,7 @@ class OpenAICompatibleTranslator:
             tracks=tracks, source_cues=cues, segmentation=config,
             translation=self.translation, llm=self.config,
             request=self.stage_request(cache_path, "translation"),
+            validate_request=self.stage_budget_validator(cache_path, "translation"),
             translation_context=translation_context or {}, cache_path=cache_path,
             maximum_units=max_line_units, honorific_rules=_HONORIFIC_TRANSLATION_RULES,
             parse_content=_parse_cue_records, finish_reason=_finish_reason,
@@ -217,27 +218,36 @@ class OpenAICompatibleTranslator:
         self = self._stage_executor(cache_path, "lyrics_translation")
         if not lines:
             return {}, "llm"
-        prompt = render_user_prompt(
-            "lyrics-translate.md",
-            SONG_TITLE=title,
-            ARTIST=artist or "(unknown)",
-            REFERENCE_TEXT=json.dumps(
-                compact_lyrics_reference_context(translation_context or {}),
-                ensure_ascii=False,
-            ),
-            LYRICS_TEXT="\n".join(
-                f"<{index}>{line}" for index, line in enumerate(lines)
-            ),
-        )
-        body = structured_request_body(
-            model=self.config.model,
-            prompt_name="lyrics-translate.md",
-            prompt=prompt,
-            max_tokens=self.translation.max_tokens,
-            temperature=0.2,
+        def render(selected):
+            prompt = render_user_prompt(
+                "lyrics-translate.md",
+                SONG_TITLE=title,
+                ARTIST=artist or "(unknown)",
+                REFERENCE_TEXT=json.dumps(
+                    compact_lyrics_reference_context(translation_context or {}),
+                    ensure_ascii=False,
+                ),
+                LYRICS_TEXT="\n".join(
+                    f"<{index}>{line}" for index, line in selected
+                ),
+            )
+            return structured_request_body(
+                model=self.config.model,
+                prompt_name="lyrics-translate.md",
+                prompt=prompt,
+                max_tokens=self.translation.max_tokens,
+                temperature=0.2,
 
-            thinking=self.config.thinking,
-        )
+                thinking=self.config.thinking,
+            )
+        batches = batch_requests(list(enumerate(lines)), render_request=render,
+                                 validate_request=self.validate_request)
+        translated = {}
+        for selected in batches:
+            translated.update(self._translate_lyric_batch(render(selected), {index for index, _ in selected}))
+        return translated, "llm"
+
+    def _translate_lyric_batch(self, body, expected_ids):
         last_error: Exception | None = None
         for attempt in range(1, self.config.max_retries + 1):
             response: object = None
@@ -262,11 +272,11 @@ class OpenAICompatibleTranslator:
                     if not isinstance(line_id, int) or not isinstance(text, str):
                         raise ValueError("invalid lyrics line_id or text")
                     translated[line_id] = text.strip()
-                if set(translated) != set(range(len(lines))) or any(
+                if set(translated) != expected_ids or any(
                     not value for value in translated.values()
                 ):
                     raise ValueError("lyrics translation did not cover every line")
-                return translated, "llm"
+                return translated
             except Exception as exc:
                 last_error = exc
                 self._log_invalid_response(
@@ -305,13 +315,68 @@ class OpenAICompatibleTranslator:
             "bilibili_tag_catalog": bilibili_tag_catalog or {},
             "translation_context": compact_reference_context(translation_context or {}),
         }
+        stage = CacheStore(cache_path).existing("metadata") if cache_path else None
+
+        def ask(value):
+            import hashlib
+            key = "chunk:" + hashlib.sha256(json.dumps(self._metadata_body(value), ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+            cached = stage.get(key) if stage else None
+            if cached is not None:
+                return tuple(cached)
+            result = self._translate_metadata_source(value)
+            if stage:
+                stage.put(key, result)
+            return result
+
+        if request_fits(self._metadata_body(source), self.validate_request):
+            return ask(source)
+
+        # Translate description fragments and summarize auxiliary evidence separately.
+        # All source pieces are planned before generation; no tail is discarded.
+        requests = []
+        for field, value in source.items():
+            if field == "title" or not value:
+                continue
+            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            def render(part):
+                return self._metadata_body({"title": title, field: part, "partial_input": True})
+            for part in chunk_text(text, render_request=render, validate_request=self.validate_request):
+                requests.append((field, {"title": title, field: part, "partial_input": True}))
+        descriptions, summaries = [], []
+        for field, value in requests:
+            translated_title, description_part, summary, tags = ask(value)
+            if field == "description":
+                if not description_part.strip():
+                    raise ValueError("metadata description fragment translation is empty")
+                original = str(value["description"])
+                separator = original[len(original.rstrip()):]
+                descriptions.append(description_part.rstrip() + separator)
+            summaries.append({"source_field": field, "summary": summary, "tags": tags})
+
+        def render_summary(values):
+            return self._metadata_body({"title": title, "description": "", "evidence_summaries": list(values)})
+        while True:
+            batches = batch_requests(summaries, render_request=render_summary,
+                                     validate_request=self.validate_request)
+            if len(batches) <= 1:
+                final = ask({"title": title, "description": "", "evidence_summaries": summaries})
+                return final[0], "".join(descriptions).strip(), final[2], final[3]
+            reduced = []
+            for batch in batches:
+                result = ask({"title": title, "description": "", "evidence_summaries": list(batch)})
+                reduced.append({"summary": result[2], "tags": result[3]})
+            if len(json.dumps(reduced, ensure_ascii=False)) >= len(json.dumps(summaries, ensure_ascii=False)):
+                raise PromptBudgetExceeded("metadata evidence summaries did not shrink enough for final synthesis")
+            summaries = reduced
+
+    def _metadata_body(self, source):
         prompt = render_user_prompt(
             "metadata-translate.md",
             TARGET_LANGUAGE=self.translation.target_language,
             TAG_COUNT=self.translation.metadata_tag_count,
             SOURCE_TEXT=json.dumps(source, ensure_ascii=False),
         )
-        body = structured_request_body(
+        return structured_request_body(
             model=self.config.model,
             prompt_name="metadata-translate.md",
             prompt=prompt,
@@ -321,6 +386,9 @@ class OpenAICompatibleTranslator:
             thinking=self.config.thinking,
         )
 
+    def _translate_metadata_source(self, source):
+        body = self._metadata_body(source)
+        self.validate_request(body)
         last_error: Exception | None = None
         for attempt in range(1, self.config.max_retries + 1):
             content: object = None

@@ -22,6 +22,7 @@ from .config import ASRConfig, AudioAnalysisConfig
 from .source_language import language_for_text, normalize_source_language
 from .subtitles import Cue, write_srt
 from .telemetry import stage_metrics
+from .repetition import RepetitionLoopError
 
 _CUE_SIDECAR_VERSION = 7
 _MIN_RETRY_CHUNK_SECONDS = 15.0
@@ -1197,6 +1198,7 @@ def _transcribe_song_range(
                 )
             _extract_audio_chunk(video, chunk_path, start=start, duration=end - start)
             audio = str(chunk_path)
+        repetition = None
         try:
             with stage_metrics("asr.singing_chunk", config.device):
                 results = model.transcribe(
@@ -1206,19 +1208,20 @@ def _transcribe_song_range(
                     return_time_stamps=False,
                 )
             if len(results) != 1:
-                raise RuntimeError(f"Qwen3-ASR returned {len(results)} song results")
+                raise RuntimeError(f"ALT returned {len(results)} song results")
             result = results[0]
             text = str(getattr(result, "text", "")).strip()
             detected_language = str(getattr(results[0], "language", "")).strip()
+        except RepetitionLoopError as exc:
+            repetition = (exc.match.pattern, exc.match.repeats)
         finally:
             if chunk_path is not None:
                 chunk_path.unlink(missing_ok=True)
-        repetition = _generation_repetition(result)
         if repetition is not None:
             pattern, repeats = repetition
             child_duration = (end - start) / 2
             logging.warning(
-                "Qwen3-ASR repetition loop in singing phrase %.3f-%.3fs: "
+                "ALT generation repetition loop in singing phrase %.3f-%.3fs: "
                 "pattern=%r repeats=%d; retrying with shorter song windows",
                 start,
                 end,
@@ -2639,6 +2642,8 @@ class _HeartTranscriptorAdapter:
         return_time_stamps: bool = False,
     ) -> list[SimpleNamespace]:
         import numpy as np
+        from transformers import StoppingCriteriaList
+        from .alt_generation import ALTRepetitionStoppingCriteria
 
         del context, language, return_time_stamps
         source: object = audio
@@ -2652,6 +2657,9 @@ class _HeartTranscriptorAdapter:
             source,
             return_timestamps=False,
             generate_kwargs={
+                "stopping_criteria": StoppingCriteriaList([
+                    ALTRepetitionStoppingCriteria(self._pipeline.tokenizer),
+                ]),
                 "max_new_tokens": self._max_new_tokens,
                 "num_beams": self._num_beams,
                 "task": "transcribe",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from subtitle_pipeline.prompt_budget import request_budget_validator
+
 import json
 import tempfile
 import unittest
@@ -697,9 +699,8 @@ class TermExtractionTests(unittest.TestCase):
 
         batches = _candidate_batches(
             candidates,
-            context_size=4096,
-            max_tokens=512,
-            target_input_tokens=2500,
+            model="test", max_tokens=512, thinking=None,
+            validate_request=request_budget_validator(4096, input_token_limit=2500),
         )
 
         self.assertGreater(len(batches), 1)

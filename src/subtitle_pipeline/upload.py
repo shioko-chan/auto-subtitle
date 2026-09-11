@@ -104,6 +104,8 @@ def upload_videos_to_bilibili(
         "--limit",
         str(config.limit),
     ]
+    if config.copyright == 2:
+        command.extend(["--source", source_url])
     if config.line:
         command.extend(["--line", config.line])
     command.extend(str(video) for video in videos)

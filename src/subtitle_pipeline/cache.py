@@ -6,6 +6,7 @@ deliberately not hashed: an existing plan is the execution snapshot on resume.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -78,6 +79,7 @@ def restore_config(config: Any, snapshot: dict[str, Any]) -> Any:
 class CacheStore:
     def __init__(self, path: Path):
         self.path = path
+        self._reported_hits: set[tuple[str, str]] = set()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with _STORE_LOCKS_GUARD:
             key = str(path.resolve())
@@ -225,7 +227,21 @@ class StageCache:
 
     def get(self, unit: str) -> Any | None:
         value = self.record(unit)
-        return value["payload"] if value is not None else None
+        if value is None:
+            return None
+        if value["payload"] is not None and value["kind"] != "plan":
+            scope = "stage" if str(unit) == "__result__" else "unit"
+            with self.store._lock:
+                key = (self.name, scope)
+                first_hit = key not in self.store._reported_hits
+                self.store._reported_hits.add(key)
+            logging.log(
+                logging.INFO if first_hit else logging.DEBUG,
+                "cache hit stage=%s scope=%s unit=%s status=%s source=%s%s",
+                self.name, scope, unit, value["status"], value["source"],
+                " (further unit hits logged at DEBUG)" if first_hit and scope == "unit" else "",
+            )
+        return value["payload"]
 
     def put(self, unit: str, payload: Any, *, source: str = "computed", reason: str | None = None,
             kind: str = "result") -> None:

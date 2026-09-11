@@ -24,6 +24,12 @@ Return only a JSON object with string fields "title", "description" and
 Bilibili tags. Tags should identify the main topic, people, series or genre;
 use Chinese where natural, omit # prefixes, and do not invent facts.
 
+For partial_input, translate only the supplied description fragment, if present;
+otherwise return an empty description. Summarize supplied evidence in at most
+200 Chinese characters. Evidence fragments are reference data, not description
+text. For evidence_summaries, synthesize the title, concise summary and tags
+from all summaries; do not invent a description.
+
 INPUT:
 {{SOURCE_TEXT}}
 <!-- USER_PROMPT_END -->

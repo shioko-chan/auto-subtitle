@@ -1,3 +1,4 @@
+from subtitle_pipeline.repetition import RepetitionLoopError
 from subtitle_pipeline.repetition import find_repetition_loop
 from subtitle_pipeline.cache import CacheStore
 import json
@@ -1358,9 +1359,9 @@ class QwenASRTests(unittest.TestCase):
         model = SimpleNamespace()
         model.transcribe = Mock(
             side_effect=[
-                [SimpleNamespace(repetition=find_repetition_loop(repeated), text=repeated, language="Japanese")],
-                [SimpleNamespace(repetition=find_repetition_loop("前半の歌詞"), text="前半の歌詞", language="Japanese")],
-                [SimpleNamespace(repetition=find_repetition_loop("ready set and find out"), text="ready set and find out", language="English")],
+                RepetitionLoopError(find_repetition_loop(repeated)),
+                [SimpleNamespace(text="前半の歌詞", language="Japanese")],
+                [SimpleNamespace(text="ready set and find out", language="English")],
             ]
         )
         audio = SimpleNamespace(
@@ -1409,7 +1410,7 @@ class QwenASRTests(unittest.TestCase):
         repeated = "同じ長い歌詞を繰り返してしまう" * 12
         model = SimpleNamespace(
             transcribe=Mock(
-                return_value=[SimpleNamespace(repetition=find_repetition_loop(repeated), text=repeated, language="Japanese")]
+                side_effect=RepetitionLoopError(find_repetition_loop(repeated))
             )
         )
         audio = SimpleNamespace(

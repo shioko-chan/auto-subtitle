@@ -287,6 +287,7 @@ def _knowledge(config: AppConfig, args: argparse.Namespace) -> int:
                 summary = extract_pending_terms(
                     retriever,
                     request=translator.request,
+                    validate_request=translator.validate_request,
                     model=config.llm.model,
                     max_tokens=term_max_output_tokens,
                     thinking=config.llm.thinking,

@@ -24,7 +24,7 @@ from .llm_response import (
     structured_request_body,
     structured_response_content,
 )
-from .prompt_budget import estimate_prompt_tokens
+from .prompt_budget import batch_requests, request_budget_validator
 from .prompt_templates import render_user_prompt
 from .translate import LLMHTTPError, is_llm_quota_exhausted
 
@@ -153,6 +153,7 @@ def extract_pending_terms(
     search_web: Callable[[str], dict[str, object]] | None = None,
     context_size: int = _DEFAULT_CONTEXT_SIZE,
     target_input_tokens: int = _DEFAULT_TARGET_INPUT_TOKENS,
+    validate_request: Callable[[dict[str, object]], None] | None = None,
 ) -> TermExtractionSummary:
     preparation = prepare_pending_terms(
         retriever,
@@ -174,6 +175,7 @@ def extract_pending_terms(
         include_backfill=include_backfill,
         maximum_candidates=maximum_candidates,
         maximum_new_terms=maximum_new_terms,
+        validate_request=validate_request,
     )
     return replace(validation, documents=preparation.documents)
 
@@ -194,6 +196,7 @@ def validate_pending_terms(
     search_web: Callable[[str], dict[str, object]] | None = None,
     context_size: int = _DEFAULT_CONTEXT_SIZE,
     target_input_tokens: int = _DEFAULT_TARGET_INPUT_TOKENS,
+    validate_request: Callable[[dict[str, object]], None] | None = None,
 ) -> TermExtractionSummary:
     queued_forms = retriever.pending_term_review_forms(
         maximum_candidates, include_backfill=include_backfill
@@ -250,6 +253,9 @@ def validate_pending_terms(
                 "evidence_count": len(candidate.occurrences),
             },
         )
+    validate = request_budget_validator(context_size, input_token_limit=target_input_tokens,
+                                        validate_request=validate_request)
+
     request_options = {
         "request": request,
         "model": model,
@@ -260,13 +266,11 @@ def validate_pending_terms(
         "search_web": search_web,
         "context_size": context_size,
         "target_input_tokens": target_input_tokens,
+        "validate_request": validate,
     }
-    batches = _candidate_batches(
-        pending_candidates,
-        context_size=context_size,
-        max_tokens=max_tokens,
-        target_input_tokens=target_input_tokens,
-    )
+    batches = _candidate_batches(pending_candidates, model=model, max_tokens=max_tokens,
+                                thinking=thinking, validate_request=validate)
+
     errors: list[Exception] = []
     if batches:
         with ThreadPoolExecutor(
@@ -926,32 +930,15 @@ def _source_context_priority(source_type: str) -> int:
 
 
 def _candidate_batches(
-    candidates: list[LocalTermCandidate],
-    *,
-    context_size: int,
-    max_tokens: int,
-    target_input_tokens: int,
+    candidates: list[LocalTermCandidate], *, model: str, max_tokens: int,
+    thinking: str | None, validate_request: Callable,
 ) -> list[tuple[LocalTermCandidate, ...]]:
-    budget = max(1024, min(target_input_tokens, context_size - max_tokens))
-    base = estimate_prompt_tokens(
-        render_user_prompt("extract-fan-terms.md", CANDIDATES_JSON="[]")
-    )
-    batches: list[tuple[LocalTermCandidate, ...]] = []
-    current: list[LocalTermCandidate] = []
-    tokens = base
-    for candidate in candidates:
-        value_tokens = estimate_prompt_tokens(
-            json.dumps(_candidate_prompt_value(candidate), ensure_ascii=False)
-        )
-        if current and tokens + value_tokens > budget:
-            batches.append(tuple(current))
-            current = []
-            tokens = base
-        current.append(candidate)
-        tokens += value_tokens
-    if current:
-        batches.append(tuple(current))
-    return batches
+    return batch_requests(candidates, render_request=lambda values: structured_request_body(
+        model=model, prompt_name="extract-fan-terms.md", max_tokens=max_tokens,
+        temperature=0.1, thinking=thinking,
+        prompt=render_user_prompt("extract-fan-terms.md", CANDIDATES_JSON=json.dumps(
+            [_candidate_prompt_value(value) for value in values], ensure_ascii=False))),
+        validate_request=validate_request)
 
 
 def _screen_candidate_batch(
@@ -1057,22 +1044,23 @@ def _confirm_searched_candidate(
             "results": results,
         },
     )
-    prompt = render_user_prompt(
-        "review-fan-terms.md",
-        CANDIDATE_JSON=json.dumps(
-            {
-                **_candidate_prompt_value(candidate),
-                "proposed_canonical_zh": proposed_zh,
-                "web_results": results,
-            },
-            ensure_ascii=False,
-        ),
-    )
-    parsed = _request_json("review-fan-terms.md", prompt=prompt, **request_options)
-    if parsed.get("decision") != "accept":
-        return None
-    canonical_zh = parsed.get("canonical_zh")
-    return canonical_zh.strip() if isinstance(canonical_zh, str) and canonical_zh.strip() else None
+    def prompt(values):
+        return render_user_prompt("review-fan-terms.md", CANDIDATE_JSON=json.dumps({
+            **_candidate_prompt_value(candidate), "proposed_canonical_zh": proposed_zh,
+            "web_results": list(values)}, ensure_ascii=False))
+    def render(values):
+        return structured_request_body(model=request_options["model"], prompt_name="review-fan-terms.md",
+            prompt=prompt(values), max_tokens=request_options["max_tokens"], temperature=0.1,
+            thinking=request_options["thinking"])
+    batches = batch_requests(results, render_request=render,
+                            validate_request=request_options["validate_request"])
+    accepted = set()
+    for values in batches:
+        parsed = _request_json("review-fan-terms.md", prompt=prompt(values), **request_options)
+        value = parsed.get("canonical_zh")
+        if parsed.get("decision") == "accept" and isinstance(value, str) and value.strip():
+            accepted.add(value.strip())
+    return next(iter(accepted)) if len(accepted) == 1 else None
 
 
 def _compact_web_results(response: dict[str, object]) -> list[dict[str, str]]:
@@ -1111,6 +1099,7 @@ def _request_json(
     max_retries: int,
     audit_path: Path | None,
     batch_index: int,
+    validate_request: Callable,
 ) -> dict[str, object]:
     body = structured_request_body(
         model=model,
@@ -1121,6 +1110,7 @@ def _request_json(
 
         thinking=thinking,
     )
+    validate_request(body)
     last_error: Exception | None = None
     for attempt in range(1, max_retries + 1):
         response: dict[str, object] | None = None
