@@ -30,6 +30,7 @@ _RENDER_TERMINAL_ASCII_PERIOD_RE = re.compile(r"""(?<!\.)\.(?=["'”’」』）
 _WRAP_PUNCTUATION = frozenset("，、；：。！？!?…—,;:")
 _SINGING_GRADIENT_MARKER = "#F9A8D4"
 _KARAOKE_HIGHLIGHT_COLOR = "#AFFF5C"
+_DOWNLOAD_VIDEO_NAMES = ("source.mp4", "source.webm", "source.mkv")
 
 
 @dataclass(frozen=True)
@@ -69,7 +70,7 @@ def download_youtube(url: str, directory: Path, config: DownloadConfig) -> Downl
     })
     config = restore_config(config, stage.plan["config"])
     value = stage.get("media")
-    if value is None or not Path(value["video"]).is_file() or not Path(value["video"]).stat().st_size:
+    if value is None or not _valid_download_video(Path(value["video"])):
         with stage.attempt("media"):
             downloaded = _download_youtube(stage.plan["url"], directory, replace(
                 config, download_chat_replay=False, download_top_comments=False,
@@ -101,19 +102,24 @@ def download_youtube(url: str, directory: Path, config: DownloadConfig) -> Downl
     return result
 
 
+def _valid_download_video(path: Path) -> bool:
+    if path.name not in _DOWNLOAD_VIDEO_NAMES or not path.is_file() or not path.stat().st_size:
+        return False
+    # A failed probe can indicate a broken ffprobe environment. Preserve nonempty
+    # files and propagate that failure instead of treating them as disposable.
+    _video_dimensions(path)
+    return True
+
+
 def _download_youtube(
     url: str, directory: Path, config: DownloadConfig
 ) -> DownloadResult:
     directory.mkdir(parents=True, exist_ok=True)
     info_path = directory / "source.info.json"
-    candidates = [
-        path
-        for path in directory.glob("source.*")
-        if path.suffix.lower()
-        not in {".json", ".srt", ".vtt", ".part", ".ytdl", ".description"}
-    ]
-    if info_path.is_file() and candidates:
-        video = max(candidates, key=lambda path: path.stat().st_size)
+    candidates = [directory / name for name in _DOWNLOAD_VIDEO_NAMES]
+    valid = [path for path in candidates if _valid_download_video(path)]
+    if info_path.is_file() and valid:
+        video = valid[0]
         logging.info("using existing downloaded video: %s", video)
         return DownloadResult(
             video,
@@ -125,6 +131,12 @@ def _download_youtube(
             if (directory / "comments.info.json").is_file()
             else None,
         )
+
+    # yt-dlp otherwise treats an existing final filename as an already completed
+    # download, even when it contains no data.
+    for path in candidates:
+        if path.is_file() and path.stat().st_size == 0:
+            path.unlink()
 
     yt_dlp = require_command("yt-dlp")
     output = directory / "source.%(ext)s"
@@ -159,15 +171,10 @@ def _download_youtube(
     if not info_path.exists():
         raise RuntimeError("yt-dlp completed but did not create source.info.json")
     metadata = json.loads(info_path.read_text(encoding="utf-8"))
-    candidates = [
-        path
-        for path in directory.glob("source.*")
-        if path.suffix.lower()
-        not in {".json", ".srt", ".vtt", ".part", ".ytdl", ".description"}
-    ]
-    if not candidates:
-        raise RuntimeError("yt-dlp completed but no downloaded video was found")
-    video = max(candidates, key=lambda path: path.stat().st_size)
+    valid = [path for path in candidates if _valid_download_video(path)]
+    if not valid:
+        raise RuntimeError("yt-dlp completed but no valid final video was found")
+    video = valid[0]
 
     logging.info("downloaded video: %s", video)
     return DownloadResult(video, metadata, chat_replay, comments)

@@ -11,11 +11,13 @@ import os
 import sqlite3
 import threading
 import weakref
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
+
+from .config import LLMConfig
 
 
 @dataclass(frozen=True)
@@ -25,11 +27,11 @@ class StageDefinition:
 
 
 STAGES = {
-    "download": StageDefinition(1),
+    "download": StageDefinition(2),
     "audio_analysis": StageDefinition(1, ("download",)),
-    "raw_speech": StageDefinition(3, ("audio_analysis",)),
+    "raw_speech": StageDefinition(4, ("audio_analysis",)),
     "singing_asr": StageDefinition(1, ("audio_analysis",)),
-    "conditioned_asr": StageDefinition(1, ("audio_analysis",)),
+    "conditioned_asr": StageDefinition(2, ("audio_analysis",)),
     "song_identification": StageDefinition(4, ("raw_speech", "singing_asr")),
     "asr_correction": StageDefinition(3, ("raw_speech", "conditioned_asr")),
     "speech_alignment": StageDefinition(2, ("asr_correction",)),
@@ -38,7 +40,7 @@ STAGES = {
     "translation": StageDefinition(2, ("source_cues", "lyrics_translation")),
     "metadata": StageDefinition(4, ("source_cues", "song_identification")),
     "render": StageDefinition(1, ("translation",)),
-    "clip_analysis": StageDefinition(1, ("render", "metadata")),
+    "clip_analysis": StageDefinition(2, ("render", "metadata")),
     "clip_render": StageDefinition(1, ("clip_analysis", "render")),
 }
 
@@ -74,6 +76,29 @@ def config_snapshot(config: Any) -> dict[str, Any]:
 def restore_config(config: Any, snapshot: dict[str, Any]) -> Any:
     from dataclasses import replace
     return replace(config, **snapshot)
+
+
+class CachedProviderMismatchError(RuntimeError):
+    pass
+
+
+def restore_llm_config(config: LLMConfig, snapshot: dict[str, object]) -> LLMConfig:
+    """Restore model settings only when current credentials target the same service."""
+    restored = restore_config(config, snapshot)
+
+    def provider(value: LLMConfig) -> tuple[object, ...]:
+        endpoint = value.base_url.rstrip("/").removesuffix("/v1")
+        identity = (endpoint, value.local_server_enabled)
+        if value.local_server_enabled:
+            identity += (value.local_server_host, value.local_server_port)
+        return identity
+
+    if provider(restored) != provider(config):
+        raise CachedProviderMismatchError(
+            "cached LLM provider differs from the current provider; "
+            "restore the original provider configuration or reset the affected cache stage"
+        )
+    return restored
 
 
 class CacheStore:
@@ -196,6 +221,18 @@ class CacheStore:
     def status(self) -> list[dict[str, Any]]:
         with self._connection() as db:
             return self._status(db)
+
+    def require_completed(self, names: Sequence[str]) -> None:
+        for name in names:
+            if name not in STAGES:
+                raise ValueError(f"unknown cache stage: {name}")
+        with self._connection() as db:
+            completed = {row["name"] for row in db.execute(
+                "SELECT name FROM stages WHERE complete=1 AND plan IS NOT NULL"
+            )}
+        missing = [name for name in names if name not in completed]
+        if missing:
+            raise RuntimeError("cache stages are incomplete: " + ", ".join(missing))
 
     @staticmethod
     def _status(db) -> list[dict[str, Any]]:

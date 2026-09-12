@@ -1,10 +1,12 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
 from subtitle_pipeline.chat_context import YouTubeChatMessage
+from subtitle_pipeline.cache import CacheStore
 from subtitle_pipeline.cli import main
 from subtitle_pipeline.clips import (
     ChatWindow,
@@ -28,6 +30,12 @@ from subtitle_pipeline.upload import BilibiliSubmission
 
 
 class ClipsTests(unittest.TestCase):
+    def _complete_pipeline_stages(self, job):
+        store = CacheStore(job / "cache.sqlite3")
+        for name in ("translation", "render", "metadata"):
+            store.stage(name, lambda: {}).finish({"completed": True})
+        return store
+
     def test_cli_clips_is_independent_from_main_pipeline(self):
         result = ClipsResult(
             Path("work/video123"),
@@ -211,6 +219,7 @@ class ClipsTests(unittest.TestCase):
             (job / "source.info.json").write_text(
                 json.dumps({"duration": 60}), encoding="utf-8"
             )
+            self._complete_pipeline_stages(job)
             config = AppConfig(
                 work_dir=root,
                 clips=ClipsConfig(upload=True),
@@ -271,6 +280,49 @@ class ClipsTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "completed pipeline job"):
                 run_clips("https://www.youtube.com/watch?v=missing", config)
 
+    def test_reset_parent_rejects_stale_files_until_pipeline_completes(self):
+        for parent in ("translation", "metadata"):
+            with self.subTest(parent=parent), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                job = root / "video123"
+                job.mkdir()
+                for name in ("translated.mp4", "translated.zh-CN.srt",
+                             "translated.metadata.json", "source.info.json"):
+                    (job / name).write_text("old")
+                store = self._complete_pipeline_stages(job)
+                config = AppConfig(work_dir=root)
+                def analyze(*args):
+                    return {"parts": [], "subtitle": (job / "translated.zh-CN.srt").read_text()}
+                with patch("subtitle_pipeline.clips._analyze", side_effect=analyze) as analysis:
+                    run_clips("https://youtu.be/video123", config, upload_override=False)
+                    store.reset(parent)
+                    with self.assertRaisesRegex(RuntimeError, "completed pipeline job"):
+                        run_clips("https://youtu.be/video123", config, upload_override=False)
+                    self.assertIsNone(store.existing("clip_analysis"))
+                    analysis.assert_called_once()
+                    (job / "translated.zh-CN.srt").write_text("new")
+                    self._complete_pipeline_stages(job)
+                    result = run_clips("https://youtu.be/video123", config, upload_override=False)
+                    self.assertEqual(analysis.call_count, 2)
+                self.assertEqual(json.loads(result.analysis.read_text())["subtitle"], "new")
+
+    def test_cached_clips_reject_a_different_llm_provider(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            job = root / "video123"
+            job.mkdir()
+            for name in ("translated.mp4", "translated.zh-CN.srt",
+                         "translated.metadata.json", "source.info.json"):
+                (job / name).write_text("artifact")
+            self._complete_pipeline_stages(job)
+            config = AppConfig(work_dir=root)
+            with patch("subtitle_pipeline.clips._analyze", return_value={"parts": []}) as analysis:
+                run_clips("https://youtu.be/video123", config, upload_override=False)
+                changed = replace(config, llm=replace(config.llm, base_url="https://different.invalid/v1"))
+                with self.assertRaisesRegex(RuntimeError, "cached LLM provider differs"):
+                    run_clips("https://youtu.be/video123", changed, upload_override=False)
+                analysis.assert_called_once()
+
     def test_chat_download_failure_uses_fallback_and_removes_raw_files(self):
         with tempfile.TemporaryDirectory() as temp:
             clips_dir = Path(temp)
@@ -328,6 +380,7 @@ class ClipsTests(unittest.TestCase):
             (job / "source.info.json").write_text(
                 json.dumps({"duration": 60}), encoding="utf-8"
             )
+            self._complete_pipeline_stages(job)
             analysis = {
                 "version": 1,
                 "signature": "signature",

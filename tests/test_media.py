@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from subtitle_pipeline.cache import CacheStore
 from subtitle_pipeline.commands import CommandError
 from subtitle_pipeline.config import DownloadConfig, RenderConfig
 from subtitle_pipeline.media import (
@@ -54,6 +55,7 @@ class MediaDownloadTests(unittest.TestCase):
                 ),
                 patch("subtitle_pipeline.media.run", side_effect=fake_run) as run,
                 patch("subtitle_pipeline.media.shutil.which", side_effect=find_runtime),
+                patch("subtitle_pipeline.media._video_dimensions", return_value=(1920, 1080)),
             ):
                 result = download_youtube(
                     "https://www.youtube.com/watch?v=test",
@@ -96,6 +98,7 @@ class MediaDownloadTests(unittest.TestCase):
             with (
                 patch("subtitle_pipeline.media.require_command", return_value="yt-dlp"),
                 patch("subtitle_pipeline.media.run", side_effect=fake_run) as run,
+                patch("subtitle_pipeline.media._video_dimensions", return_value=(1920, 1080)),
             ):
                 result = download_youtube(
                     "https://youtu.be/test",
@@ -109,6 +112,87 @@ class MediaDownloadTests(unittest.TestCase):
 
             self.assertEqual(result.video, directory / "source.mp4")
             run.assert_called_once()
+
+    def test_empty_final_video_is_downloaded_again(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            video = directory / "source.mp4"
+            video.write_bytes(b"")
+            metadata = {"title": "Video"}
+            (directory / "source.info.json").write_text(json.dumps(metadata))
+            store = CacheStore(directory / "cache.sqlite3")
+            config = DownloadConfig(js_runtime=None, download_chat_replay=False, download_top_comments=False)
+            stage = store.stage("download", lambda: {"url": "url", "config": {}})
+            stage.put("media", {"video": str(video), "metadata": metadata})
+            def download(command):
+                self.assertFalse(video.exists(), "empty final file must not make yt-dlp skip downloading")
+                video.write_bytes(b"valid video")
+            with patch("subtitle_pipeline.media.require_command", return_value="yt-dlp"), \
+                 patch("subtitle_pipeline.media._video_dimensions", return_value=(1920, 1080)), \
+                 patch("subtitle_pipeline.media.run", side_effect=download) as run:
+                result = download_youtube("url", directory, config)
+            run.assert_called_once()
+            self.assertEqual(result.video.read_bytes(), b"valid video")
+            store.require_completed(("download",))
+
+    def test_failed_ffprobe_preserves_nonempty_media_and_does_not_redownload(self):
+        failures = [
+            subprocess.CalledProcessError(127, ["ffprobe"], stderr="error while loading shared libraries"),
+            subprocess.CompletedProcess(["ffprobe"], 0, stdout="malformed json"),
+        ]
+        for failure in failures:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temp:
+                directory = Path(temp)
+                video = directory / "source.mp4"
+                video.write_bytes(b"existing video data")
+                (directory / "source.info.json").write_text('{"title":"Video"}')
+                probe_result = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+                with patch("subtitle_pipeline.media.require_command", return_value="ffprobe"), \
+                     patch("subtitle_pipeline.media.subprocess.run", **probe_result), \
+                     patch("subtitle_pipeline.media.run") as downloader, \
+                     self.assertRaisesRegex(RuntimeError, "could not determine video dimensions"):
+                    download_youtube("url", directory, DownloadConfig(
+                        js_runtime=None, download_chat_replay=False, download_top_comments=False))
+                downloader.assert_not_called()
+                self.assertEqual(video.read_bytes(), b"existing video data")
+                stage = CacheStore(directory / "cache.sqlite3").existing("download")
+                self.assertIsNone(stage.get("media"))
+                self.assertIsNone(stage.get("__result__"))
+
+    def test_download_never_reuses_audio_stems_or_unmerged_format_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            (directory / "source.info.json").write_text('{"title":"Video"}')
+            for name in ("source.analysis.wav", "source.f137.mp4", "source.f140.m4a"):
+                (directory / name).write_bytes(b"large derived file" * 100)
+            def download(command):
+                (directory / "source.webm").write_bytes(b"final video")
+            with patch("subtitle_pipeline.media.require_command", return_value="yt-dlp"), \
+                 patch("subtitle_pipeline.media._video_dimensions", return_value=(1920, 1080)) as probe, \
+                 patch("subtitle_pipeline.media.run", side_effect=download) as run:
+                result = download_youtube("url", directory, DownloadConfig(
+                    js_runtime=None, download_chat_replay=False, download_top_comments=False))
+            run.assert_called_once()
+            self.assertEqual(result.video.name, "source.webm")
+            probe.assert_called_once_with(directory / "source.webm")
+
+    def test_invalid_downloader_output_is_not_committed(self):
+        for content in (b"", b"corrupt video"):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as temp:
+                directory = Path(temp)
+                def download(command):
+                    (directory / "source.info.json").write_text('{"title":"Video"}')
+                    (directory / "source.mp4").write_bytes(content)
+                with patch("subtitle_pipeline.media.require_command", return_value="yt-dlp"), \
+                     patch("subtitle_pipeline.media.run", side_effect=download), \
+                     patch("subtitle_pipeline.media._video_dimensions", side_effect=RuntimeError("unreadable video")), \
+                     self.assertRaises(RuntimeError):
+                    download_youtube("url", directory, DownloadConfig(
+                        js_runtime=None, download_chat_replay=False, download_top_comments=False))
+                self.assertEqual((directory / "source.mp4").read_bytes(), content)
+                stage = CacheStore(directory / "cache.sqlite3").existing("download")
+                self.assertIsNone(stage.get("media"))
+                self.assertIsNone(stage.get("__result__"))
 
 
 class SubtitleRenderTests(unittest.TestCase):

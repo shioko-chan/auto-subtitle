@@ -20,6 +20,7 @@ from copy import copy
 
 from .config import LLMConfig, SegmentationConfig, TranslationConfig
 from .fan_knowledge import KnowledgeHit
+from .llm_errors import LLMResponseError, LLMStreamError
 from .llm_response import finish_reason as _finish_reason
 from .llm_response import parse_json_object as _parse_json_object
 from .llm_response import (
@@ -37,7 +38,7 @@ from .reference_context import (
     compact_lyrics_reference_context,
 )
 from .subtitles import Cue
-from .cache import CacheStore, config_snapshot, restore_config
+from .cache import CachedProviderMismatchError, CacheStore, config_snapshot, restore_config, restore_llm_config
 from .telemetry import stage_metrics
 
 
@@ -123,7 +124,7 @@ class OpenAICompatibleTranslator:
             "request_config", lambda: config_snapshot(self.config)
         )
         sender = copy(self)
-        sender.config = restore_config(self.config, snapshot)
+        sender.config = restore_llm_config(self.config, snapshot)
         return sender
 
     def stage_request(self, cache_path: Path | None, name: str):
@@ -163,7 +164,7 @@ class OpenAICompatibleTranslator:
             "translation": stage.plan.get("translation", config_snapshot(self.translation)),
         })
         sender = copy(self)
-        sender.config = restore_config(self.config, execution["llm"])
+        sender.config = restore_llm_config(self.config, execution["llm"])
         sender.translation = restore_config(self.translation, execution["translation"])
         if (sender.translation.local_model, sender.translation.local_device) != (self.translation.local_model, self.translation.local_device):
             sender.local_translator = LocalJapaneseTranslator(sender.translation.local_model, sender.translation.local_device)
@@ -350,6 +351,7 @@ class OpenAICompatibleTranslator:
                 urllib.error.URLError,
                 TimeoutError,
                 TranslationError,
+                LLMResponseError,
             ) as exc:
                 last_error = exc
                 self._log_invalid_response("metadata", exc, content, body, response)
@@ -708,14 +710,14 @@ def _transient_retry_delay(exc: Exception, attempt: int) -> float | None:
         if 500 <= exc.status < 600:
             return _jittered_exponential_backoff(attempt)
         return None
-    if isinstance(exc, (urllib.error.URLError, TimeoutError)):
+    if isinstance(exc, (urllib.error.URLError, TimeoutError, LLMStreamError)):
         return _jittered_exponential_backoff(attempt)
     return None
 
 
 def _is_transient_failure(exc: Exception) -> bool:
     return (
-        isinstance(exc, (urllib.error.URLError, TimeoutError))
+        isinstance(exc, (urllib.error.URLError, TimeoutError, LLMStreamError))
         or isinstance(exc, LLMHTTPError)
         and (exc.status == 429 or 500 <= exc.status < 600)
     )
@@ -755,7 +757,7 @@ def _parse_retry_after(
 
 def _is_nontransient_http_error(exc: Exception) -> bool:
     return (
-        isinstance(exc, LocalLLMError)
+        isinstance(exc, (LocalLLMError, CachedProviderMismatchError))
         or isinstance(exc, LLMHTTPError)
         and not (exc.status == 429 or 500 <= exc.status < 600)
     )

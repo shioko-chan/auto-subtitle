@@ -396,7 +396,9 @@ def _transcribe_analyzed(
 ) -> Path:
     speech_windows = _speech_asr_windows(analysis, config)
     routed_regions = [
-        region for region in _analysis_regions(analysis) if region.kind != "speech"
+        region
+        for region in _analysis_regions(analysis)
+        if region.kind != "speech" or region.asr_route == "song_speech_fallback"
     ]
     regions = sorted([*speech_windows, *routed_regions], key=lambda item: item.start)
     if not regions:
@@ -713,7 +715,14 @@ def _transcribe_analyzed(
                 replace(
                     cue,
                     speaker=assignment.speaker,
-                    speaker_assignment=assignment.reason,
+                    speaker_assignment=(
+                        assignment.reason
+                        or (
+                            cue.speaker_assignment
+                            if cue.speaker_assignment == "acoustic_phrase_speech_fallback"
+                            else None
+                        )
+                    ),
                     speaker_fallback=assignment.fallback_speaker,
                     speaker_fallback_distance=assignment.fallback_distance,
                 )

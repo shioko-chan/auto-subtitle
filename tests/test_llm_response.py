@@ -1,5 +1,6 @@
 import unittest
 
+from subtitle_pipeline.llm_errors import LLMResponseError
 from subtitle_pipeline.llm_response import (
     finish_reason,
     structured_request_body,
@@ -39,7 +40,7 @@ class StructuredLLMResponseTests(unittest.TestCase):
         )
 
         response["choices"][0]["finish_reason"] = "length"
-        with self.assertRaisesRegex(RuntimeError, "finish_reason=length"):
+        with self.assertRaisesRegex(LLMResponseError, "finish_reason=length"):
             structured_response_content(response, finish_reason=finish_reason)
 
 

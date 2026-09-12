@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .cache import CacheStore, config_snapshot, restore_config, job_lock
+from .cache import CacheStore, config_snapshot, restore_config, restore_llm_config, job_lock
 from .publication import publish_once
 from .chat_context import (
     YouTubeChatMessage,
@@ -120,16 +120,21 @@ def _run_clips_locked(
             "clips requires a completed pipeline job; missing " + "; ".join(missing)
         )
 
+    store = CacheStore(job_dir / "cache.sqlite3")
+    try:
+        store.require_completed(("render", "metadata"))
+    except RuntimeError as exc:
+        raise RuntimeError(f"clips requires a completed pipeline job; {exc}") from exc
+
     clips_dir = job_dir / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
     analysis_path = clips_dir / "analysis.json"
-    store = CacheStore(job_dir / "cache.sqlite3")
     stage = store.stage("clip_analysis", lambda: {
         "clips": config_snapshot(config.clips), "llm": config_snapshot(config.llm),
         "translation": config_snapshot(config.translation),
     })
     config = replace(config, clips=restore_config(config.clips, stage.plan["clips"]),
-                     llm=restore_config(config.llm, stage.plan["llm"]),
+                     llm=restore_llm_config(config.llm, stage.plan["llm"]),
                      translation=restore_config(config.translation, stage.plan["translation"]))
     analysis = stage.get("__result__")
     analysis_cached = analysis is not None

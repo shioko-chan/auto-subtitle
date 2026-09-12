@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .cache import CacheStore, config_snapshot, restore_config
+from .cache import CacheStore, config_snapshot, restore_config, restore_llm_config
 from .config import LLMConfig, SegmentationConfig, TranslationConfig
 from .fan_knowledge import KnowledgeHit
 from .llm_response import (
@@ -504,7 +504,7 @@ def run_joint_translation(
             LocalUnit(**unit) for unit in value["units"])) for value in plan["tracks"]]
         segmentation = restore_config(segmentation, plan["segmentation"])
         translation = restore_config(translation, plan["translation"])
-        llm = restore_config(llm, plan["llm"])
+        llm = restore_llm_config(llm, plan["llm"])
         translation_context, honorific_rules = plan["context"], plan["honorific_rules"]
         maximum_units = plan["maximum_units"]
         cached = stage.get("__result__")

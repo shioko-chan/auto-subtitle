@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .llm_errors import LLMResponseError
+
 _MIN_REPETITION_SPAN_CHARACTERS = 160
 _MAX_STREAM_PERIOD = 200
 _MIN_STREAM_REPEATS = 4
@@ -19,7 +21,7 @@ class RepetitionMatch:
     end: int
 
 
-class RepetitionLoopError(RuntimeError):
+class RepetitionLoopError(LLMResponseError):
     def __init__(self, match: RepetitionMatch):
         self.match = match
         super().__init__(

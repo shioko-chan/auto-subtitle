@@ -1,34 +1,48 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
+from contextlib import closing
 from pathlib import Path
 
 
 class LocalVectorIndex:
     def __init__(self, path: Path, model_name: str) -> None:
         self.path = path
-        self.metadata_path = path.with_suffix(path.suffix + ".json")
         self.model_name = model_name
         self._model = None
         self._device = "cpu"
         self._index = None
         self._ids: dict[str, int] = {}
+        self._loaded = False
         self._lock = threading.Lock()
 
     def sync(self, values: list[tuple[str, str]]) -> tuple[int, int]:
         with self._lock:
-            return self._sync(values)
+            try:
+                return self._sync(values)
+            except BaseException:
+                # A failed write must not leave uncommitted vectors in use.
+                self._index = None
+                self._ids = {}
+                self._loaded = False
+                raise
 
     def _sync(self, values: list[tuple[str, str]]) -> tuple[int, int]:
         import faiss
         import numpy as np
 
-        model = self._load_model()
         current = {chunk_id: text for chunk_id, text in values}
         self._load_index()
-        if self._index is None:
-            dimension = int(model.get_embedding_dimension())
+        if not current and self._index is None:
+            if not self._loaded:
+                self._save()
+                self._loaded = True
+            return 0, 0
+        initialized = self._index is None
+        if initialized:
+            dimension = int(self._load_model().get_embedding_dimension())
             self._index = faiss.IndexIDMap2(faiss.IndexFlatIP(dimension))
         stale = set(self._ids) - set(current)
         if stale:
@@ -40,7 +54,7 @@ class LocalVectorIndex:
                 del self._ids[value]
         missing = [value for value in values if value[0] not in self._ids]
         if missing:
-            vectors = model.encode(
+            vectors = self._load_model().encode(
                 [f"passage: {text}" for _chunk_id, text in missing],
                 batch_size=128 if self._device == "cuda" else 64,
                 normalize_embeddings=True,
@@ -56,8 +70,15 @@ class LocalVectorIndex:
                     for (chunk_id, _text), vector_id in zip(missing, numeric)
                 }
             )
-        self._save()
+        if initialized or missing or stale:
+            self._save()
+        self._loaded = True
         return len(missing), len(stale)
+
+    def is_ready(self) -> bool:
+        with self._lock:
+            self._load_index()
+            return self._index is not None or self._loaded
 
     def search(self, text: str, limit: int) -> dict[str, float]:
         return self.search_many([text], limit)[0]
@@ -112,31 +133,40 @@ class LocalVectorIndex:
         return self._model
 
     def _load_index(self) -> None:
-        if self._index is not None:
+        if self._index is not None or self._loaded:
             return
-        if not self.path.is_file() or not self.metadata_path.is_file():
+        if not self.path.is_file():
             return
         import faiss
+        import numpy as np
 
-        metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
-        if metadata.get("model") != self.model_name:
+        with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            if db.execute("SELECT name FROM sqlite_master WHERE name='vector_snapshot'").fetchone() is None:
+                return
+            row = db.execute("SELECT model, ids, vectors FROM vector_snapshot WHERE id=1").fetchone()
+        if row is None or row[0] != self.model_name:
             return
-        self._ids = {str(key): int(value) for key, value in metadata["ids"].items()}
-        self._index = faiss.read_index(str(self.path))
+        ids = {str(key): int(value) for key, value in json.loads(row[1]).items()}
+        index = faiss.deserialize_index(np.frombuffer(row[2], dtype=np.uint8)) if row[2] is not None else None
+        self._ids, self._index = ids, index
+        self._loaded = True
 
     def _save(self) -> None:
         import faiss
 
-        assert self._index is not None
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_index = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary_metadata = self.metadata_path.with_suffix(
-            self.metadata_path.suffix + ".tmp"
-        )
-        faiss.write_index(self._index, str(temporary_index))
-        temporary_metadata.write_text(
-            json.dumps({"model": self.model_name, "ids": self._ids}, sort_keys=True),
-            encoding="utf-8",
-        )
-        temporary_index.replace(self.path)
-        temporary_metadata.replace(self.metadata_path)
+        vectors = faiss.serialize_index(self._index).tobytes() if self._index is not None else None
+        with closing(sqlite3.connect(self.path, timeout=30)) as db, db:
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS vector_snapshot (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    model TEXT NOT NULL,
+                    ids TEXT NOT NULL,
+                    vectors BLOB
+                )
+            """)
+            db.execute("""
+                INSERT INTO vector_snapshot(id, model, ids, vectors) VALUES(1, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    model=excluded.model, ids=excluded.ids, vectors=excluded.vectors
+            """, (self.model_name, json.dumps(self._ids, sort_keys=True), vectors))

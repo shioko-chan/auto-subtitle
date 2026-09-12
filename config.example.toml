@@ -231,7 +231,8 @@ sns_sources = [
   "https://www.instagram.com/yunoch1/",
 ]
 embedding_model = "intfloat/multilingual-e5-base"
-vector_index_path = "databases/fan-knowledge.faiss"
+# FAISS vectors, model and document IDs are committed as one SQLite snapshot.
+vector_index_path = "databases/fan-knowledge-vectors.sqlite3"
 vector_minimum_score = 0.62
 reranker_model = "BAAI/bge-reranker-v2-m3"
 reranker_minimum_score = 0.05

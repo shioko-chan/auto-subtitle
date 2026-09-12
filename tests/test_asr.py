@@ -44,7 +44,8 @@ from subtitle_pipeline.conditioned_asr import (
     ConditionedASRTranscription,
     ConditionedWindow,
 )
-from subtitle_pipeline.config import ASRConfig, AudioAnalysisConfig
+from subtitle_pipeline.config import ASRConfig, AudioAnalysisConfig, SegmentationConfig
+from subtitle_pipeline.local_segmentation import build_speaker_tracks
 from subtitle_pipeline.subtitles import Cue
 
 
@@ -1219,6 +1220,55 @@ class QwenASRTests(unittest.TestCase):
             [(item.kind, item.asr_route) for item in result],
             [("speech", "song_speech_fallback"), ("singing", "qwen")],
         )
+
+    def test_supplemental_speech_is_transcribed_and_retained_in_unknown_track(self):
+        phrase = AcousticPhrase(12, 20, "strong", 0.1, 0.9, 0.9, 0.0, False, True)
+        for diarization in ([], [AudioRegion(0, 2, "speech", "A")]):
+            with self.subTest(diarization=diarization), tempfile.TemporaryDirectory() as temp:
+                destination = Path(temp) / "source.srt"
+                buffer = SimpleNamespace(duration=30.0)
+                pool = SimpleNamespace(main=lambda: buffer)
+
+                def transcribe(_model, _config, indexed_regions, **_kwargs):
+                    return {
+                        index: {"core_start": region.start, "core_end": region.end, "text": "聞こえる言葉", "language": "Japanese"}
+                        for index, region in indexed_regions
+                    }
+
+                def align(_model, records, _regions, *_args):
+                    return {
+                        int(record["window_id"]): {
+                            **record,
+                            "cues": [{"start": record["core_start"], "end": record["core_end"], "text": record["text"]}],
+                        }
+                        for record in records
+                    }
+
+                with (
+                    patch("subtitle_pipeline.asr._media_duration", return_value=30),
+                    patch("subtitle_pipeline.asr._load_qwen_model", return_value=object()),
+                    patch("subtitle_pipeline.asr._load_qwen_aligner", return_value=object()),
+                    patch("subtitle_pipeline.asr._transcribe_raw_speech_batch", side_effect=transcribe) as raw,
+                    patch("subtitle_pipeline.asr._align_speech_records", side_effect=align),
+                ):
+                    _transcribe_analyzed(
+                        Path(temp) / "video.mp4", destination, ASRConfig(), AudioAnalysisConfig(),
+                        AudioAnalysis([], [], diarization=diarization, acoustic_phrases=[phrase]), pool,
+                        skip_conditioned_asr=True,
+                    )
+                scheduled = [region for call in raw.call_args_list for _index, region in call.args[2]]
+                self.assertIn("song_speech_fallback", [region.asr_route for region in scheduled])
+                cues = read_cue_sidecar(destination.with_suffix(".cues.json"))
+                supplemental = next(cue for cue in cues if cue.start == 12)
+                self.assertEqual(supplemental.speaker_assignment, "acoustic_phrase_speech_fallback")
+                self.assertIsNone(supplemental.speaker)
+                analyzer = SimpleNamespace(
+                    versions={}, analyze=lambda _text: [],
+                    dependency_boundary_strengths=lambda *_args: (0, 0),
+                )
+                tracks, _ = build_speaker_tracks(cues, SegmentationConfig(), analyzer=analyzer)
+                unknown = next(track for track in tracks if track.speaker is None)
+                self.assertEqual("".join(unit.text for unit in unknown.units), "聞こえる言葉")
 
     def test_aligner_cues_are_clamped_to_owned_analysis_region(self):
         result = SimpleNamespace(

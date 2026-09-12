@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from http.client import IncompleteRead
 
+from .llm_errors import LLMResponseError, LLMStreamError
 from .repetition import RepetitionLoopError, StreamingRepetitionDetector
 
 
@@ -16,7 +18,7 @@ def read_chat_stream(response) -> dict[str, object]:
     for event in _sse_data(response):
         if event == '[DONE]':
             if finish is None:
-                raise RuntimeError('LLM stream ended without a finish reason')
+                raise LLMResponseError('LLM stream ended without a finish reason')
             message = {'role': 'assistant', 'content': ''.join(content)}
             if reasoning:
                 message['reasoning_content'] = ''.join(reasoning)
@@ -26,7 +28,7 @@ def read_chat_stream(response) -> dict[str, object]:
             return payload
         chunk = json.loads(event)
         if 'error' in chunk:
-            raise RuntimeError(f"LLM stream error: {chunk['error']}")
+            raise LLMStreamError(f"LLM stream error: {chunk['error']}")
         for key in ('id', 'model', 'created', 'usage', 'timings'):
             if chunk.get(key) is not None:
                 payload[key] = chunk[key]
@@ -55,18 +57,21 @@ def read_chat_stream(response) -> dict[str, object]:
                     target['function'][key] += value
             if choice.get('finish_reason') is not None:
                 finish = choice['finish_reason']
-    raise RuntimeError('LLM stream disconnected before [DONE]')
+    raise LLMStreamError('LLM stream disconnected before [DONE]')
 
 
 def _sse_data(response):
     data = []
-    for raw_line in response:
-        line = raw_line.decode('utf-8').rstrip('\r\n')
-        if line.startswith('data:'):
-            data.append(line[5:].lstrip(' '))
-        elif not line and data:
-            yield '\n'.join(data)
-            data.clear()
+    try:
+        for raw_line in response:
+            line = raw_line.decode('utf-8').rstrip('\r\n')
+            if line.startswith('data:'):
+                data.append(line[5:].lstrip(' '))
+            elif not line and data:
+                yield '\n'.join(data)
+                data.clear()
+    except (IncompleteRead, ConnectionError) as exc:
+        raise LLMStreamError('LLM stream disconnected while reading') from exc
 
 
 def read_responses_stream(response) -> dict[str, object]:
@@ -92,11 +97,11 @@ def read_responses_stream(response) -> dict[str, object]:
             if match is not None:
                 raise RepetitionLoopError(match)
         elif kind in ('error', 'response.failed'):
-            raise RuntimeError(f"Responses stream failed: {event}")
+            raise LLMStreamError(f"Responses stream failed: {event}")
         elif kind in ('response.completed', 'response.incomplete'):
             payload = event['response']
             expected = kind.removeprefix('response.')
             if payload.get('status') != expected:
-                raise RuntimeError('Responses stream terminal status mismatch')
+                raise LLMResponseError('Responses stream terminal status mismatch')
             return payload
-    raise RuntimeError('Responses stream disconnected before terminal event')
+    raise LLMStreamError('Responses stream disconnected before terminal event')

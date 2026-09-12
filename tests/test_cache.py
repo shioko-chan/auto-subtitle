@@ -77,12 +77,30 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(CacheStore(self.path).existing('translation').get('1'), 'fallback')
 
     def test_concurrent_unit_commits_survive_interruption(self):
-        stage = self.store.stage('segmentation', lambda: {'windows': list(range(24))})
+        stage = self.store.stage('translation', lambda: {'windows': list(range(24))})
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(lambda index: stage.put(str(index), {'value': index}), range(24)))
-        restored = CacheStore(self.path).existing('segmentation')
+        restored = CacheStore(self.path).existing('translation')
         self.assertIsNone(restored.get('__result__'))
         self.assertEqual([restored.get(str(index))['value'] for index in range(24)], list(range(24)))
+
+    def test_require_completed_rejects_missing_partial_and_reset_stages(self):
+        with self.assertRaisesRegex(RuntimeError, 'render, metadata'):
+            self.store.require_completed(('render', 'metadata'))
+        self.store.stage('metadata', lambda: {}).finish('title')
+        render = self.store.stage('render', lambda: {})
+        render.put('video', 'unfinished.mp4')
+        with self.assertRaisesRegex(RuntimeError, 'incomplete: render$'):
+            self.store.require_completed(('render', 'metadata'))
+        render.finish('video.mp4')
+        self.store.require_completed(('render', 'metadata'))
+        self.store.reset('translation')
+        with self.assertRaisesRegex(RuntimeError, 'incomplete: render$'):
+            self.store.require_completed(('render', 'metadata'))
+
+    def test_require_completed_rejects_unknown_stage(self):
+        with self.assertRaisesRegex(ValueError, 'unknown cache stage'):
+            self.store.require_completed(('missing-stage',))
 
     def test_unserializable_result_is_not_committed(self):
         stage = self.store.stage('translation', lambda: {})

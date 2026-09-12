@@ -1,5 +1,9 @@
 import json
+import select
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +19,7 @@ from subtitle_pipeline.upload import (
     _submission_ids,
     _truncate_utf16,
     _utf16_units,
+    _upload_lock,
     _wait_for_upload_cooldown,
     upload_to_bilibili,
     upload_videos_to_bilibili,
@@ -55,7 +60,9 @@ class UploadTests(unittest.TestCase):
             cookie = root / "cookies.json"
             cookie.write_text("{}", encoding="utf-8")
             video = root / "video.mp4"
-            config = UploadConfig(cookie_file=str(cookie), tags=["中字", "科技"])
+            config = UploadConfig(cookie_file=str(cookie), tags=["中字", "科技"],
+                                  throttle_state_file=str(root / "throttle.json"),
+                                  pause_marker_file=str(root / "paused.json"))
             with (
                 patch(
                     "subtitle_pipeline.upload.require_command",
@@ -96,6 +103,8 @@ class UploadTests(unittest.TestCase):
             source_url = "https://www.youtube.com/watch?v=example"
             config = UploadConfig(
                 cookie_file=str(cookie),
+                throttle_state_file=str(root / "throttle.json"),
+                pause_marker_file=str(root / "paused.json"),
                 description_prefix="原视频：{youtube_url}\n字幕说明",
             )
             with (
@@ -131,7 +140,9 @@ class UploadTests(unittest.TestCase):
             cookie = root / "cookies.json"
             cookie.write_text("{}", encoding="utf-8")
             parts = [root / "001_first.mp4", root / "002_second.mp4"]
-            config = UploadConfig(cookie_file=str(cookie))
+            config = UploadConfig(cookie_file=str(cookie),
+                                  throttle_state_file=str(root / "throttle.json"),
+                                  pause_marker_file=str(root / "paused.json"))
             with (
                 patch(
                     "subtitle_pipeline.upload.require_command",
@@ -264,6 +275,106 @@ class UploadTests(unittest.TestCase):
         self.assertIsNone(_bilibili_failure_code('{"code":500}'))
         self.assertEqual(_retry_after_from_output("Retry-After: 12.5"), 12.5)
         self.assertEqual(_retry_after_from_output('"retry_after": "7"'), 7)
+
+    def test_pause_created_during_cooldown_or_retry_prevents_submission(self):
+        for waiting in ("cooldown", "retry"):
+            with self.subTest(waiting=waiting), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                cookie = root / "cookies.json"
+                marker = root / "paused.json"
+                cookie.write_text("{}")
+                config = UploadConfig(cookie_file=str(cookie),
+                    throttle_state_file=str(root / "throttle.json"),
+                    pause_marker_file=str(marker), rate_limit_retry_delays_seconds=[1])
+                wait_target = ("_wait_for_upload_cooldown" if waiting == "cooldown" else "time.sleep")
+                with patch("subtitle_pipeline.upload.require_command", return_value="biliup"), \
+                     patch("subtitle_pipeline.upload." + wait_target,
+                           side_effect=lambda _: marker.write_text("paused")), \
+                     patch("subtitle_pipeline.upload._run_biliup",
+                           side_effect=BiliupCommandError(1, '{"code":429}')) as submit, \
+                     self.assertRaisesRegex(UploadNotStartedError, "uploads are paused"):
+                    upload_to_bilibili(root / "video.mp4", title="test", source_url="url",
+                                       tags=["test"], config=config)
+                self.assertEqual(submit.call_count, 0 if waiting == "cooldown" else 1)
+
+    def test_process_lock_covers_cooldown_submission_and_state_update(self):
+        code = textwrap.dedent('''
+            import fcntl
+            import sys
+            from pathlib import Path
+            from unittest.mock import patch
+            from subtitle_pipeline.config import UploadConfig
+            from subtitle_pipeline.upload import upload_to_bilibili, _record_upload_cooldown
+
+            root = Path(sys.argv[1])
+            config = UploadConfig(cookie_file=str(root / 'cookies.json'),
+                throttle_state_file=str(root / 'throttle.json'),
+                pause_marker_file=str(root / 'paused.json'),
+                cooldown_min_seconds=60, cooldown_max_seconds=60)
+            def locked_event(name):
+                with (root / 'throttle.json.lock').open('a+') as handle:
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        print(name, flush=True)
+                        return
+                raise AssertionError(name + ' ran outside the shared process lock')
+            def submit(command):
+                locked_event('submit')
+                return '{"aid":123,"bvid":"BV123"}'
+            def record(config):
+                locked_event('record')
+                _record_upload_cooldown(config)
+            print('ready', flush=True)
+            with patch('subtitle_pipeline.upload.require_command', return_value='biliup'), \\
+                 patch('subtitle_pipeline.upload._run_biliup', side_effect=submit), \\
+                 patch('subtitle_pipeline.upload.time.time', return_value=1020), \\
+                 patch('subtitle_pipeline.upload.time.sleep', side_effect=lambda seconds: locked_event('sleep:' + str(seconds))), \\
+                 patch('subtitle_pipeline.upload._record_upload_cooldown', side_effect=record):
+                upload_to_bilibili(root / 'video.mp4', title='test', source_url='url', tags=['test'], config=config)
+        ''')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "cookies.json").write_text("{}")
+            state = root / "throttle.json"
+            child = None
+            try:
+                with _upload_lock(state):
+                    state.write_text('{"next_allowed_at":1060}')
+                    child = subprocess.Popen([sys.executable, "-c", code, str(root)],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    self.assertEqual(child.stdout.readline().strip(), "ready")
+                    self.assertFalse(select.select([child.stdout], [], [], 0.2)[0],
+                                     "another process entered upload while the lock was held")
+                stdout, stderr = child.communicate(timeout=10)
+                self.assertEqual(child.returncode, 0, stderr)
+                self.assertEqual(stdout.splitlines(), ["sleep:40.0", "submit", "record"])
+                self.assertEqual(json.loads(state.read_text())["next_allowed_at"], 1080)
+            finally:
+                if child is not None and child.poll() is None:
+                    child.kill()
+                    child.communicate()
+
+    def test_failed_submission_releases_lock_for_another_process(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cookie = root / "cookies.json"
+            cookie.write_text("{}")
+            state = root / "throttle.json"
+            config = UploadConfig(cookie_file=str(cookie), throttle_state_file=str(state),
+                                  pause_marker_file=str(root / "paused.json"))
+            with patch("subtitle_pipeline.upload.require_command", return_value="biliup"), \
+                 patch("subtitle_pipeline.upload._run_biliup",
+                       side_effect=BiliupCommandError(1, "transport failed")), \
+                 self.assertRaises(BiliupCommandError):
+                upload_to_bilibili(root / "video.mp4", title="test", source_url="url",
+                                   tags=["test"], config=config)
+            code = ("from pathlib import Path; from subtitle_pipeline.upload import _upload_lock; "
+                    "import sys\nwith _upload_lock(Path(sys.argv[1])): print('acquired')")
+            result = subprocess.run([sys.executable, "-c", code, str(state)],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "acquired")
 
 
 if __name__ == "__main__":

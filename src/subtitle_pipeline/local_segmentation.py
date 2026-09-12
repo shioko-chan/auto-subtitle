@@ -533,6 +533,9 @@ def _resolve_remaining_unknown_speakers(
                 }
             )
             continue
+        # AST-backed speech remains valid even when diarization missed the voice.
+        if cue.speaker_assignment == "acoustic_phrase_speech_fallback":
+            continue
         resolved[index] = replace(cue, speaker_assignment="discarded")
         audit.append(
             {

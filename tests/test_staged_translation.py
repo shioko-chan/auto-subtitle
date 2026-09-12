@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
+from subtitle_pipeline.cache import CachedProviderMismatchError
 from subtitle_pipeline.config import LLMConfig, SegmentationConfig, TranslationConfig
 from subtitle_pipeline.local_segmentation import LocalUnit, SpeakerTrack
 from subtitle_pipeline.song_identification import SongIdentificationResult, split_aligned_song_cues
@@ -109,6 +110,19 @@ class StagedTranslationTests(unittest.TestCase):
             first = self.run_joint(Mock(return_value=response(translated(0, 1))), cache_path=path)
             second = self.run_joint(Mock(side_effect=AssertionError("request")), cues=[], cache_path=path)
             self.assertEqual(first, second)
+
+    def test_resumed_joint_translation_rejects_a_different_provider_before_retrieval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cache.sqlite3"
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_joint(Mock(side_effect=KeyboardInterrupt()), cache_path=path)
+            request = Mock()
+            retrieve = Mock()
+            with self.assertRaises(CachedProviderMismatchError):
+                self.run_joint(request, cache_path=path, retrieve_knowledge=retrieve,
+                               llm=LLMConfig(base_url="https://another-provider.example/v1"))
+            request.assert_not_called()
+            retrieve.assert_not_called()
 
     def test_split_resume_reuses_completed_child(self):
         with tempfile.TemporaryDirectory() as directory:

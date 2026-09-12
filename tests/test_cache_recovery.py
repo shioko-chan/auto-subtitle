@@ -146,7 +146,7 @@ class CacheRecoveryTests(unittest.TestCase):
         comments = self.root / "comments.info.json"
         comments.write_text('{"comments": []}')
         config = DownloadConfig(download_chat_replay=False, download_top_comments=True)
-        with patch("subtitle_pipeline.media._download_youtube", return_value=DownloadResult(video, {"title": "old"})) as downloader, patch("subtitle_pipeline.media._download_youtube_top_comments", return_value=comments) as fetch:
+        with patch("subtitle_pipeline.media._download_youtube", return_value=DownloadResult(video, {"title": "old"})) as downloader, patch("subtitle_pipeline.media._download_youtube_top_comments", return_value=comments) as fetch, patch("subtitle_pipeline.media._video_dimensions", return_value=(1920, 1080)):
             download_youtube("url", self.root, config)
             comments.unlink()
             (self.root / "source.info.json").unlink()

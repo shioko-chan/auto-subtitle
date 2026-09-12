@@ -23,6 +23,18 @@ from subtitle_pipeline.fan_knowledge import (
 
 
 class FanKnowledgeRetrieverTests(unittest.TestCase):
+    def test_empty_database_retrieval_does_not_load_embedding_model(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with FanKnowledgeRetriever(
+                root / 'knowledge.sqlite3', embedding_model='unavailable-model',
+                vector_index_path=root / 'vectors.sqlite3',
+            ) as retriever:
+                with patch.object(retriever._vector_index, '_load_model',
+                                  side_effect=AssertionError('model load')):
+                    self.assertEqual(retriever.retrieve(KnowledgeQuery('abc')), [])
+                    self.assertTrue(retriever._vector_index.is_ready())
+
     def test_release_models_releases_vector_and_reranker_models(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             retriever = FanKnowledgeRetriever(Path(temporary) / "knowledge.sqlite3")
@@ -548,7 +560,7 @@ class FanKnowledgeRetrieverTests(unittest.TestCase):
             retriever = FanKnowledgeRetriever(
                 root / "knowledge.sqlite3",
                 embedding_model="fake-model",
-                vector_index_path=root / "knowledge.faiss",
+                vector_index_path=root / "vectors.sqlite3",
             )
             retriever.upsert_document(
                 KnowledgeDocument(
@@ -562,9 +574,10 @@ class FanKnowledgeRetrieverTests(unittest.TestCase):
             )
             assert retriever._vector_index is not None
             retriever._vector_index._model = FakeEmbeddingModel()
-            retriever.sync_vector_index()
+            self.assertFalse(retriever._vector_index.is_ready())
 
             hits = retriever.retrieve(KnowledgeQuery("expensive figure"))
+            self.assertTrue(retriever._vector_index.is_ready())
             retriever.close()
 
         self.assertEqual(hits[0].kind, "document_chunk")

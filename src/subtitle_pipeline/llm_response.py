@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 
+from .llm_errors import LLMResponseError
 from .prompt_templates import prompt_system
 from .response_schemas import response_format
 
@@ -56,14 +57,14 @@ def structured_response_content(
 ) -> object:
     choices = response.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        raise ValueError("LLM response has no choices")
+        raise LLMResponseError("LLM response has no choices")
     message = choices[0].get("message")
     if not isinstance(message, dict) or "content" not in message:
-        raise ValueError("LLM response has no message content")
+        raise LLMResponseError("LLM response has no message content")
     content = message["content"]
     reason = finish_reason(response)
     if reason not in (None, "stop"):
-        raise RuntimeError(f"finish_reason={reason}")
+        raise LLMResponseError(f"finish_reason={reason}")
     return content
 
 

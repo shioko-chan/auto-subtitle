@@ -55,6 +55,18 @@ class ParticleAnalyzer(FakeAnalyzer):
 
 
 class LocalSegmentationTests(unittest.TestCase):
+    def test_ast_backed_speech_keeps_unknown_track_without_nearby_speaker(self):
+        for fallback, distance in ((None, None), ("A", 5.0)):
+            with self.subTest(fallback=fallback):
+                cue = Cue(
+                    10, 12, "聞こえる言葉", speaker_assignment="acoustic_phrase_speech_fallback",
+                    speaker_fallback=fallback, speaker_fallback_distance=distance,
+                )
+                tracks, _ = build_speaker_tracks([cue], SegmentationConfig(), analyzer=FakeAnalyzer())
+                self.assertEqual(len(tracks), 1)
+                self.assertIsNone(tracks[0].speaker)
+                self.assertEqual("".join(unit.text for unit in tracks[0].units), cue.text)
+
     def test_four_gap_bands_score_one_through_four(self):
         for gap, expected in [(0.12, 1), (0.25, 2), (0.4, 3), (0.6, 4)]:
             cues = [Cue(0, 0.1, "左", "A"), Cue(0.1 + gap, 0.4 + gap, "右", "A")]

@@ -164,6 +164,9 @@ singing、speech、music 分数、状态和转换原因都会写入 `audio-analy
 超过 0.5 秒则记为 `discarded`，不进入本地划句、LLM 或渲染。具名与匿名 speaker 都能
 成为归属目标。
 
+AST 确认讲话、但 diarization 漏检的补充片段也进入普通 ASR。它们携带声学证据标记；
+找不到可靠人物时保留在匿名轨，不因缺少 speaker 而删除。
+
 本地检查非单调时间、相同起点坍缩、异常长词素、空结果和重复循环。异常窗口优先在已有
 时间边界附近递归缩短，子窗口不能短于约 15 秒；仍不能得到可信时间轴时整条任务停止，
 不会带着缺失字幕继续渲染。
@@ -172,16 +175,19 @@ singing、speech、music 分数、状态和转换原因都会写入 `audio-analy
 
 ordinary diarization 中真实同时讲话达到 `0.5` 秒时，管线把重叠前后各 2 秒的完整讲话
 上下文交给固定 revision 的 `BUT-FIT/DiCoW_v3_3`。当前批量大小为 4，单窗口不能超过
-30 秒。
+30 秒。连续重叠和密集插话形成的长区间会切成不超过 30 秒的连续窗口，同时裁切人物活动时间轴。
+一次运行把所有缺失窗口交给同一个 worker；模型只加载一次，内部按配置批处理。
+worker 逐窗口返回结果并立即写入缓存，中断后只处理尚未返回的窗口；退出时清理整个 worker 进程组。
 
 DiCoW 输出按 speaker 分路的**段级**日文文本与时间，不经过 Qwen Forced Aligner。
 这些段落标记为 `conditioned_speech`，并作为联合翻译中的不可拆分原子单元：
 
 - 在建立 DiCoW 窗口前，先将 ERes2NetV2 映射到同一人物的多个 pyannote 匿名标签合并为
   一条人物活动掩码；重叠判断和条件转写使用人物 ID，原匿名标签仅保留作审计。
-- DiCoW 正常时，用其分路结果替换相应 speaker 的局部 Qwen 基线。
+- DiCoW 正常时，仅在同 speaker 的有效输出覆盖整个基线 cue 时替换该 cue。
 - DiCoW 遗漏某个活跃 speaker 时，保留该 speaker 的 Qwen 基线。
-- DiCoW 出现强重复循环时，丢弃异常结果并保留 Qwen 基线。
+- DiCoW 出现强重复循环时，丢弃异常结果，并保留没有有效替换覆盖的局部 Qwen 基线。
+- 只覆盖部分基线 cue 时保留整条原文以免截断内容，因此局部边界可能同时出现两份识别结果。
 - 正常 DiCoW 段直接进入联合翻译，翻译模型结合术语和相邻 cue 处理可能的误听，
   但不能合并或拆分 DiCoW 时间段。
 
@@ -308,6 +314,8 @@ HTTP 错误沿用统一重试策略，耗尽后终止，不通过拆窗放大请
 缓存仅由显式阶段版本管理。配置、模型、知识库、弹幕、源码哈希和文件时间变化都不会自动失效。
 修改处理逻辑或提示词时，开发者必须提升相应阶段版本；依赖下游自动失效，上游仍然复用。
 同版本恢复使用已保存的窗口、请求分组和执行参数，凭据实时读取、不写入快照。
+恢复时要求缓存与当前配置指向同一个 LLM 服务；切换供应商或本地/远程模式后，需恢复原服务
+配置或显式重置对应阶段。同一服务允许轮换密钥。
 成功、确认未命中、产出可用结果的降级都记为完成；普通重跑只补缺失单元。
 
 纠错与讲话对齐独立于原始 ASR，歌曲识别也不依赖纠错。
@@ -315,6 +323,13 @@ HTTP 错误沿用统一重试策略，耗尽后终止，不通过拆窗放大请
 全部单元完成后提交阶段聚合结果。JSON、SRT、ASS 为审计或输出文件，不再作为计算缓存读取。
 旧计算缓存不迁移、不复用；下载文件、正式歌词、人工/官方译词、知识库、声纹和投稿记录保留。
 机器译词写入任务缓存，不写入正式歌词库。
+
+切片启动前校验 `render` 和 `metadata` 已完成。重置父阶段后，即使旧 MP4/SRT 仍在，
+也必须先重新完成主任务，才能分析、渲染或上传切片。
+
+知识库向量使用单文件 `databases/fan-knowledge-vectors.sqlite3`，将 FAISS 序列化结果、
+文档 ID 映射和模型名在同一个事务内提交，避免中断产生错配。索引缺失或模型改变时，首次
+检索从知识库重建；旧 `.faiss` 和 `.faiss.json` 格式不再读取或迁移。
 
 ```bash
 subtitle-pipeline cache status 'https://www.youtube.com/watch?v=VIDEO_ID'
@@ -326,6 +341,8 @@ subtitle-pipeline clips 'https://www.youtube.com/watch?v=VIDEO_ID' --retry-degra
 
 重试只选择指定阶段的降级单元，并使下游失效。再次降级仍保存新的可用结果；没有有效新结果则
 保留原记录及失败审计。`run`、`clips` 和修改任务状态的命令使用同一个任务进程锁，重复启动立即报错。
+不同视频使用同一账号上传时，还会通过共享冷却状态文件的进程锁串行执行暂停检查、冷却等待、
+投稿和状态更新；冷却结束后再次检查暂停标记。
 
 投稿独立保存于 `manifest.json` 和 `clips/upload.json`。上传前原子写入 `submitting`，
 成功返回后立即保存投稿 ID，再执行歌单评论。评论等待中断、重新渲染或清空计算缓存均不清除成功记录。
@@ -360,7 +377,7 @@ subtitle-pipeline publication resolve 'https://www.youtube.com/watch?v=VIDEO_ID'
 - DiCoW 重叠修复：`src/subtitle_pipeline/conditioned_asr.py`
 - 歌名识别：`src/subtitle_pipeline/song_identification.py`
 - 本地候选分段：`src/subtitle_pipeline/local_segmentation.py`
-- 联合划句与翻译：`src/subtitle_pipeline/joint_translation.py`
+- 联合划句与翻译：`src/subtitle_pipeline/staged_translation.py`
 - ASS 与视频渲染：`src/subtitle_pipeline/media.py`
 - Bilibili 投稿：`src/subtitle_pipeline/upload.py`
 
@@ -371,11 +388,12 @@ subtitle-pipeline publication resolve 'https://www.youtube.com/watch?v=VIDEO_ID'
 
 - 歌词按行分批，保留全局行 ID；单行放不下时在生成前报错。
 - 元数据只用原标题及匹配的人物、术语词表，LLM 只返回标题译文，标签由本地人物、企划及内容关键词规则生成；不生成摘要，不拆分汇总参考材料。投稿简介仅使用配置的 description_prefix。
+- 标题翻译会重试流中断、输出截断和重复输出，并记录失败审计；非暂时性 HTTP 错误立即失败。
 - 术语按候选分批，搜索审查按结果列表分批；不同批次支持的译名冲突时不自动接受。
 - 切片按字幕 cue 分批，保留每批 ID；歌曲保留已验证完整范围，讲话候选取有效结果中评分最高者。
 - OCR 在保守估算分组后进一步按实际请求预算分批；联合断句翻译在裁减可选证据时检查完整请求。
 
-本次不改变缓存版本，已有完成结果可继续复用。
+阶段版本以 `cache.py` 为准；处理契约改变时提升版本并使依赖结果失效。
 
 预算公共实现集中在 `prompt_budget.py`：`request_budget_validator` 统一容量、输入目标和
 服务端 tokenizer 校验；`request_fits` 仅捕获预算不足；`batch_requests` 按业务单元分批；

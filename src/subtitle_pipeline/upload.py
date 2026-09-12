@@ -7,7 +7,8 @@ import re
 import subprocess
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -69,6 +70,37 @@ def upload_videos_to_bilibili(
     tags: list[str],
     config: UploadConfig,
 ) -> BilibiliSubmission:
+    if not videos:
+        raise UploadNotStartedError("at least one video is required for Bilibili upload")
+    with _upload_lock(Path(config.throttle_state_file)):
+        return _upload_videos_locked(
+            videos, title=title, source_url=source_url, tags=tags, config=config,
+        )
+
+
+@contextmanager
+def _upload_lock(state_path: Path) -> Iterator[None]:
+    import fcntl
+
+    try:
+        state_path = state_path.resolve()
+        path = state_path.with_name(state_path.name + ".lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+")
+    except OSError as exc:
+        raise UploadNotStartedError(f"cannot lock Bilibili upload state: {state_path}") from exc
+    with handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        except OSError as exc:
+            raise UploadNotStartedError(f"cannot lock Bilibili upload state: {path}") from exc
+        yield
+
+
+def _upload_videos_locked(
+    videos: Sequence[Path], *, title: str, source_url: str,
+    tags: list[str], config: UploadConfig,
+) -> BilibiliSubmission:
     try:
         command, pause_marker = _prepare_upload_command(
             videos, title=title, source_url=source_url,
@@ -78,6 +110,8 @@ def upload_videos_to_bilibili(
         raise UploadNotStartedError(str(exc)) from exc
     delays = config.rate_limit_retry_delays_seconds
     for attempt in range(len(delays) + 1):
+        # A pause can be requested while the cooldown or retry delay is sleeping.
+        _check_upload_pause(pause_marker)
         try:
             output = _run_biliup(command)
             break
@@ -124,11 +158,7 @@ def _prepare_upload_command(
             f"Bilibili cookie file not found: {cookie_file}; run 'biliup login' first"
         )
     pause_marker = Path(config.pause_marker_file)
-    if pause_marker.is_file():
-        raise RuntimeError(
-            f"Bilibili uploads are paused by {pause_marker}; inspect and remove it "
-            "before resuming"
-        )
+    _check_upload_pause(pause_marker)
     _wait_for_upload_cooldown(Path(config.throttle_state_file))
     description_prefix = config.description_prefix.replace("{youtube_url}", source_url)
     upload_description = _prepare_description(
@@ -165,6 +195,13 @@ def _prepare_upload_command(
         command.extend(["--line", config.line])
     command.extend(str(video) for video in videos)
     return command, pause_marker
+
+
+def _check_upload_pause(path: Path) -> None:
+    if path.is_file():
+        raise UploadNotStartedError(
+            f"Bilibili uploads are paused by {path}; inspect and remove it before resuming"
+        )
 
 
 def _submission_ids(output: str) -> tuple[int, str]:
@@ -256,7 +293,7 @@ def _record_upload_cooldown(config: UploadConfig) -> None:
         config.cooldown_min_seconds,
         config.cooldown_max_seconds,
     )
-    path = Path(config.throttle_state_file)
+    path = Path(config.throttle_state_file).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(

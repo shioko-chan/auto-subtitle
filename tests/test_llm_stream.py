@@ -1,8 +1,10 @@
 import io
 import json
 import unittest
+from http.client import IncompleteRead
 
-from subtitle_pipeline.llm_stream import read_chat_stream
+from subtitle_pipeline.llm_errors import LLMStreamError
+from subtitle_pipeline.llm_stream import read_chat_stream, read_responses_stream
 from subtitle_pipeline.repetition import RepetitionLoopError, StreamingRepetitionDetector
 
 
@@ -46,8 +48,19 @@ class StreamTests(unittest.TestCase):
         self.assertTrue(stream.closed)
 
     def test_truncated_stream_is_not_success(self):
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(LLMStreamError):
             read_chat_stream(io.BytesIO(event({'choices': [{'delta': {'content': '{}'}, 'finish_reason': 'stop'}]})))
+
+    def test_connection_failures_are_retryable_stream_errors(self):
+        for read in (read_chat_stream, read_responses_stream):
+            for error in (ConnectionResetError("connection reset"), IncompleteRead(b"partial")):
+                with self.subTest(reader=read.__name__, error=type(error).__name__):
+                    def lines():
+                        yield b": keepalive\n\n"
+                        raise error
+                    with self.assertRaises(LLMStreamError) as raised:
+                        read(lines())
+                    self.assertIs(raised.exception.__cause__, error)
 
 
 class ResponsesStreamTests(unittest.TestCase):
@@ -71,7 +84,7 @@ class ResponsesStreamTests(unittest.TestCase):
         payload = {'status': 'incomplete', 'output': [], 'incomplete_details': {'reason': 'max_output_tokens'}}
         self.assertEqual(read_responses_stream(io.BytesIO(event({'type': 'response.incomplete', 'response': payload}))), payload)
         for raw in (b'', b'data: [DONE]\n\n', event({'type': 'response.failed', 'response': {'error': 'failed'}})):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(LLMStreamError):
                 read_responses_stream(io.BytesIO(raw))
 
     def test_chat_tool_call_arguments_are_assembled(self):

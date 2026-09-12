@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import os
 import shutil
+import signal
 import subprocess
+import tempfile
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -52,20 +57,34 @@ def transcribe_long_overlaps(
     config = restore_config(config, stage.plan["config"])
     windows = [ConditionedWindow(value["start"], value["end"], tuple(value["speakers"]),
                tuple(AudioRegion(**turn) for turn in value["turns"])) for value in stage.plan["windows"]]
-    transcribed = []
-    for index, window in enumerate(windows):
-        value = stage.get(str(index))
-        if value is None:
-            with stage.attempt(str(index)):
-                if config.conditioned_asr_backend == "disabled":
-                    raise RuntimeError("long overlapping speech requires conditioned ASR, but the backend is disabled")
-                raw = [Cue(cue.start, cue.end, cue.text, cue.speaker, _CONDITIONED_CUE_KIND, language="Japanese")
-                       for cue in _run_dicow(audio, [window], config)]
-                clean = _without_repetition_hallucinations(raw)
-                reason = "repetition_loop" if len(clean) != len(raw) else None
-                stage.put(str(index), [asdict(cue) for cue in clean], source="dicow", reason=reason)
-                value = [asdict(cue) for cue in clean]
-        transcribed.extend(cue_from_mapping(item) for item in value)
+    cached = {index: stage.get(str(index)) for index in range(len(windows))}
+    missing = [index for index, value in cached.items() if value is None]
+
+    def save_window(position: int, cues: list[Cue]) -> None:
+        index = missing[position]
+        raw = [Cue(cue.start, cue.end, cue.text, cue.speaker, _CONDITIONED_CUE_KIND, language="Japanese")
+               for cue in cues]
+        clean = _without_repetition_hallucinations(raw)
+        reason = "repetition_loop" if len(clean) != len(raw) else None
+        value = [asdict(cue) for cue in clean]
+        stage.put(str(index), value, source="dicow", reason=reason)
+        cached[index] = value
+
+    if missing:
+        try:
+            if config.conditioned_asr_backend == "disabled":
+                raise RuntimeError("long overlapping speech requires conditioned ASR, but the backend is disabled")
+            _run_dicow(audio, [windows[index] for index in missing], config, save_window)
+        except BaseException as exc:
+            for index in missing:
+                if cached[index] is None:
+                    stage.failed(str(index), exc)
+            raise
+    transcribed = [
+        cue_from_mapping(item)
+        for index in range(len(windows))
+        for item in cached[index]
+    ]
     stage.finish([asdict(cue) for cue in transcribed])
     return ConditionedASRTranscription(windows, transcribed)
 
@@ -207,22 +226,24 @@ def _conditioned_windows(
         _expand_overlap(item, diarization, duration, config.overlap_context_seconds)
         for item in intersections
     ]
-    merged: list[ConditionedWindow] = []
-    for window in windows:
-        if merged and window.start <= merged[-1].end:
-            previous = merged[-1]
-            combined = ConditionedWindow(
-                previous.start,
-                max(previous.end, window.end),
-                tuple(sorted({*previous.speakers, *window.speakers})),
-                _unique_turns((*previous.turns, *window.turns)),
-            )
-            _validate_window_length(combined)
-            merged[-1] = combined
+    merged: list[tuple[float, float]] = []
+    for window in sorted(windows, key=lambda item: (item.start, item.end)):
+        if merged and window.start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], window.end))
         else:
-            _validate_window_length(window)
-            merged.append(window)
-    return merged
+            merged.append((window.start, window.end))
+    bounded = []
+    for start, end in merged:
+        count = max(1, math.ceil((end - start) / _MAX_WINDOW_SECONDS))
+        for index in range(count):
+            left = start + (end - start) * index / count
+            right = start + (end - start) * (index + 1) / count
+            bounded.append(
+                _expand_overlap(
+                    AudioRegion(left, right, "overlap"), diarization, duration, 0.0
+                )
+            )
+    return bounded
 
 
 def _expand_overlap(
@@ -231,8 +252,8 @@ def _expand_overlap(
     duration: float,
     context_seconds: float,
 ) -> ConditionedWindow:
-    start = max(0.0, overlap.start - context_seconds)
-    end = min(duration, overlap.end + context_seconds)
+    start = round(max(0.0, overlap.start - context_seconds), 3)
+    end = round(min(duration, overlap.end + context_seconds), 3)
     turns = tuple(
         AudioRegion(
             max(start, region.start),
@@ -252,31 +273,12 @@ def _expand_overlap(
     return ConditionedWindow(round(start, 3), round(end, 3), speakers, turns)
 
 
-def _validate_window_length(window: ConditionedWindow) -> None:
-    if window.end - window.start > _MAX_WINDOW_SECONDS + 1e-3:
-        raise RuntimeError(
-            "conditioned ASR context exceeds the 30-second model window: "
-            f"{window.start:.3f}-{window.end:.3f}s"
-        )
-
-
-def _unique_turns(regions: tuple[AudioRegion, ...]) -> tuple[AudioRegion, ...]:
-    values = {
-        (region.start, region.end, region.speaker, region.anonymous_speaker): region
-        for region in regions
-    }
-    return tuple(
-        sorted(
-            values.values(), key=lambda item: (item.start, item.end, item.speaker or "")
-        )
-    )
-
-
 def _run_dicow(
     audio: AudioBuffer,
     windows: list[ConditionedWindow],
     config: AudioAnalysisConfig,
-) -> list[Cue]:
+    on_window: Callable[[int, list[Cue]], None],
+) -> None:
     uv = shutil.which("uv")
     project = Path(config.conditioned_asr_worker_project).resolve()
     worker = project / "worker.py"
@@ -291,24 +293,58 @@ def _run_dicow(
         "audio": audio.descriptor.as_dict(),
         "windows": [_window_payload(window) for window in windows],
     }
-    completed = subprocess.run(
-        [uv, "run", "--project", str(project), "python", str(worker)],
-        input=json.dumps(payload, ensure_ascii=False),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(
-            "DiCoW worker failed: " + (completed.stderr or completed.stdout)[-3000:]
+    with tempfile.TemporaryFile(mode="w+t") as errors:
+        process = subprocess.Popen(
+            [uv, "run", "--project", str(project), "python", str(worker)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=errors,
+            text=True,
+            start_new_session=True,
         )
-    try:
-        response = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("DiCoW worker returned malformed JSON") from exc
-    if not isinstance(response, dict) or response.get("error"):
-        raise RuntimeError(f"DiCoW inference failed: {response.get('error')}")
-    return _decode_cues(response.get("cues"), windows)
+        succeeded = False
+        try:
+            assert process.stdin is not None and process.stdout is not None
+            process.stdin.write(json.dumps(payload, ensure_ascii=False))
+            process.stdin.close()
+            seen: set[int] = set()
+            complete = False
+            for line in process.stdout:
+                try:
+                    response = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("DiCoW worker returned malformed JSON") from exc
+                if not isinstance(response, dict):
+                    raise RuntimeError("DiCoW worker returned a non-object result")
+                if response.get("error"):
+                    raise RuntimeError(f"DiCoW inference failed: {response['error']}")
+                if response.get("complete") is True:
+                    complete = True
+                    continue
+                index = response.get("window_index")
+                if complete or type(index) is not int or index in seen or not 0 <= index < len(windows):
+                    raise RuntimeError("DiCoW worker returned an invalid window index")
+                cues = _decode_cues(response.get("cues"), [windows[index]])
+                on_window(index, cues)
+                seen.add(index)
+            return_code = process.wait()
+            if return_code != 0:
+                errors.seek(0)
+                raise RuntimeError("DiCoW worker failed: " + errors.read()[-3000:])
+            if not complete or len(seen) != len(windows):
+                raise RuntimeError("DiCoW worker ended before all windows completed")
+            succeeded = True
+        finally:
+            if not succeeded or process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            process.wait()
+            if process.stdin is not None:
+                process.stdin.close()
+            if process.stdout is not None:
+                process.stdout.close()
 
 
 def _window_payload(window: ConditionedWindow) -> dict[str, object]:
@@ -371,6 +407,11 @@ def _decode_cues(value: object, windows: list[ConditionedWindow]) -> list[Cue]:
             for cue in cues
             if cue.end > window.start and cue.start < window.end
         }
+        if not returned:
+            raise RuntimeError(
+                "DiCoW returned no speech for a long-overlap window: "
+                f"{window.start:.3f}-{window.end:.3f}s"
+            )
         expected = {
             label_to_character.get(speaker, speaker) for speaker in window.speakers
         }
@@ -389,14 +430,9 @@ def _decode_cues(value: object, windows: list[ConditionedWindow]) -> list[Cue]:
 def _replace_windows(
     baseline: list[Cue], repaired: list[Cue], windows: list[ConditionedWindow]
 ) -> list[Cue]:
-    repaired_speakers = {
-        (window.start, window.end): {
-            cue.speaker
-            for cue in repaired
-            if cue.end > window.start and cue.start < window.end
-        }
-        for window in windows
-    }
+    repaired_by_speaker: dict[str | None, list[Cue]] = {}
+    for cue in sorted(repaired, key=lambda item: (item.start, item.end)):
+        repaired_by_speaker.setdefault(cue.speaker, []).append(cue)
     retained = []
     for cue in baseline:
         if cue.kind == "singing":
@@ -406,15 +442,15 @@ def _replace_windows(
         matching = [
             window for window in windows if window.start <= midpoint <= window.end
         ]
-        if (
-            matching
-            and cue.speaker is None
-            and any(_simultaneous_speakers(window, midpoint) > 1 for window in matching)
-        ):
-            continue
-        if not matching or all(
-            cue.speaker not in repaired_speakers[(window.start, window.end)]
+        speakers = {cue.speaker} if cue.speaker is not None else {
+            _condition_label(turn)
             for window in matching
+            for turn in window.turns
+            if turn.start <= midpoint < turn.end and _condition_label(turn)
+        }
+        if not matching or not speakers or not all(
+            _covered_by_cues(cue, repaired_by_speaker.get(speaker, []))
+            for speaker in speakers
         ):
             retained.append(cue)
     return sorted(
@@ -422,18 +458,20 @@ def _replace_windows(
     )
 
 
-def _simultaneous_speakers(window: ConditionedWindow, timestamp: float) -> int:
-    return len(
-        {
-            _condition_label(turn)
-            for turn in window.turns
-            if turn.start <= timestamp <= turn.end and _condition_label(turn)
-        }
-    )
+def _covered_by_cues(baseline: Cue, repaired: list[Cue]) -> bool:
+    """Only replace a baseline unit when usable output covers its whole span."""
+    cursor = baseline.start
+    for cue in repaired:
+        if cue.end <= cursor:
+            continue
+        if cue.start > cursor + 1e-3:
+            return False
+        cursor = max(cursor, cue.end)
+        if cursor >= baseline.end - 1e-3:
+            return True
+    return False
 
 
 def _condition_label(region: AudioRegion) -> str | None:
     """Use resolved identity for DiCoW, retaining anonymous labels for audit."""
     return region.speaker or region.anonymous_speaker
-
-

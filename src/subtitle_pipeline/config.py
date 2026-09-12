@@ -187,7 +187,7 @@ class FanKnowledgeConfig:
     official_sources: list[str] = field(default_factory=list)
     sns_sources: list[str] = field(default_factory=list)
     embedding_model: str | None = "intfloat/multilingual-e5-base"
-    vector_index_path: str = "databases/fan-knowledge.faiss"
+    vector_index_path: str = "databases/fan-knowledge-vectors.sqlite3"
     vector_minimum_score: float = 0.62
     reranker_model: str | None = "BAAI/bge-reranker-v2-m3"
     reranker_minimum_score: float = 0.05

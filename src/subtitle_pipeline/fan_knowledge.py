@@ -1306,6 +1306,8 @@ class FanKnowledgeRetriever:
             return results
         _LOGGER.info("Knowledge batch retrieval: encoding %d queries", len(active))
         normalized = [_normalize_query(query.text) for _, query in active]
+        if self._vector_index is not None and not self._vector_index.is_ready():
+            self.sync_vector_index()
         vector_rows = (
             self._vector_index.search_many([value.text for value in normalized], _VECTOR_CANDIDATES)
             if self._vector_index is not None else [{} for _ in active]

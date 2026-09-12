@@ -5,6 +5,7 @@ import re
 import shutil
 import sys
 from contextlib import redirect_stdout
+from collections.abc import Callable
 from multiprocessing import resource_tracker, shared_memory
 from pathlib import Path
 from typing import Any
@@ -202,7 +203,7 @@ def _transcribe_windows(
     return cues
 
 
-def _handle(request: dict[str, object]) -> dict[str, object]:
+def _handle(request: dict[str, object], emit: Callable[[dict[str, object]], None]) -> None:
     import numpy as np
     import torch
     from transformers import (
@@ -250,7 +251,6 @@ def _handle(request: dict[str, object]) -> dict[str, object]:
         _case_mapping(tokenizer)
         if hasattr(model, "set_tokenizer"):
             model.set_tokenizer(tokenizer)
-        cues: list[dict[str, object]] = []
         windows = list(request["windows"])
         batch_size = max(1, int(request.get("batch_size") or 1))
         for batch_start in range(0, len(windows), batch_size):
@@ -262,17 +262,22 @@ def _handle(request: dict[str, object]) -> dict[str, object]:
                 left = max(0, round(start * 16000))
                 right = min(len(source), round(end * 16000))
                 audio.append(np.asarray(source[left:right], dtype=np.float32).copy())
-            cues.extend(
-                _transcribe_windows(
-                    model,
-                    feature_extractor,
-                    tokenizer,
-                    audio,
-                    batch,
-                    str(request.get("language") or "ja"),
-                )
+            cues = _transcribe_windows(
+                model,
+                feature_extractor,
+                tokenizer,
+                audio,
+                batch,
+                str(request.get("language") or "ja"),
             )
-        return {"cues": cues}
+            for index, window in enumerate(batch):
+                emit({
+                    "window_index": batch_start + index,
+                    "cues": [
+                        cue for cue in cues
+                        if float(window["start"]) <= (float(cue["start"]) + float(cue["end"])) / 2 < float(window["end"])
+                    ],
+                })
     finally:
         name = memory._name
         del source
@@ -281,13 +286,19 @@ def _handle(request: dict[str, object]) -> dict[str, object]:
 
 
 def main() -> None:
+    output = sys.stdout
+
+    def emit(value: dict[str, object]) -> None:
+        print(json.dumps(value, ensure_ascii=False, separators=(",", ":")), file=output, flush=True)
+
     try:
         request = json.loads(sys.stdin.read())
         with redirect_stdout(sys.stderr):
-            response = _handle(request)
+            _handle(request, emit)
     except Exception as exc:  # noqa: BLE001 - worker boundary reports JSON failures
-        response = {"error": str(exc)}
-    print(json.dumps(response, ensure_ascii=False, separators=(",", ":")))
+        emit({"error": str(exc)})
+        raise SystemExit(1) from exc
+    emit({"complete": True})
 
 
 if __name__ == "__main__":
