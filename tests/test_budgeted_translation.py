@@ -47,35 +47,21 @@ class BudgetedTranslationTests(unittest.TestCase):
         self.assertEqual(send.call_count, 3)
         self.assertNotIn('validate', events[events.index('generate'):])
 
-    def test_metadata_chunks_preserve_description_and_cache_completed_pieces(self):
+    def test_metadata_uses_one_request_with_matching_terms_and_characters(self):
         translator = OpenAICompatibleTranslator(LLMConfig(), TranslationConfig(), '')
-        sources = []
-        def source(body):
-            return json.loads(body['messages'][-1]['content'].split('INPUT:\n', 1)[1])
-        def validate(body):
-            if len(json.dumps(source(body), ensure_ascii=False)) > 360:
-                raise PromptBudgetExceeded('limit')
-        def request(body):
-            validate(body)
-            value = source(body)
-            sources.append(value)
-            return response({'title': '标题', 'description': value.get('description', ''),
-                             'content_summary': '摘要', 'tags': ['标签']})
-        description = ''.join(f'正文{index}\n' for index in range(200))
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'cache.sqlite3'
-            CacheStore(path).stage('metadata', lambda: {})
-            with patch.object(translator, 'validate_request', side_effect=validate), patch.object(translator, '_request', side_effect=request):
-                first = translator.translate_metadata('title', description, subtitle_evidence=''.join(f'证据{i}\n' for i in range(100)), cache_path=path)
-                count = len(sources)
-                second = translator.translate_metadata('title', description, subtitle_evidence=''.join(f'证据{i}\n' for i in range(100)), cache_path=path)
-        self.assertEqual(first, second)
-        self.assertEqual(count, len(sources))
-        self.assertGreater(count, 2)
-        self.assertEqual(''.join(value.get('description', '') for value in sources if value.get('partial_input')), description)
-        self.assertEqual(''.join(value.get('subtitle_evidence', '') for value in sources if value.get('partial_input')), ''.join(f'证据{i}\n' for i in range(100)))
-        self.assertEqual(first[0], '标题')
-        self.assertEqual(first[1].replace('\n', ''), description.replace('\n', ''))
+        title = '【千石ユノ / バンドリ】3回目'
+        context = {'terms': {'バンドリ': 'BanG Dream!', '無関係': '无关'},
+                   'characters': [{'source_name': '千石ユノ', 'canonical': '千石由乃'}],
+                   'video': {'description': '宣传' * 10000}}
+        with patch.object(translator, '_request', return_value=response(
+                {'title': '千石由乃第3回', 'tags': ['千石由乃']})) as send:
+            result = translator.translate_metadata(title, translation_context=context)
+        send.assert_called_once()
+        body = send.call_args.args[0]
+        value = json.loads(body['messages'][1]['content'].split('INPUT:\n', 1)[1])
+        self.assertEqual(value, {'title': title, 'terms': {
+            '千石ユノ': '千石由乃', 'バンドリ': 'BanG Dream!'}})
+        self.assertEqual(result, '千石由乃第3回')
 
     def test_oversized_single_lyric_fails_before_any_generation(self):
         translator = OpenAICompatibleTranslator(LLMConfig(), TranslationConfig(), '')

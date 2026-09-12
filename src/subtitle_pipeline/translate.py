@@ -31,11 +31,10 @@ from .local_segmentation import build_speaker_tracks
 from .local_translation import LocalJapaneseTranslator
 from .llm_stream import read_chat_stream, read_responses_stream
 from .repetition import RepetitionLoopError
-from .prompt_budget import count_llama_prompt_tokens, estimate_prompt_tokens, validate_request_budget, batch_requests, chunk_text, PromptBudgetExceeded, request_fits
+from .prompt_budget import count_llama_prompt_tokens, estimate_prompt_tokens, validate_request_budget, batch_requests, PromptBudgetExceeded
 from .prompt_templates import render_user_prompt
 from .reference_context import (
     compact_lyrics_reference_context,
-    compact_reference_context,
 )
 from .subtitles import Cue
 from .cache import CacheStore, config_snapshot, restore_config
@@ -290,90 +289,21 @@ class OpenAICompatibleTranslator:
         raise RuntimeError("lyrics translation exhausted LLM retries") from last_error
 
     def translate_metadata(
-        self,
-        title: str,
-        description: str,
-        *,
-        youtube_context: dict[str, object] | None = None,
-        subtitle_evidence: str = "",
-        ip_aliases: dict[str, object] | None = None,
-        bilibili_tag_catalog: dict[str, object] | None = None,
+        self, title: str, *,
         translation_context: dict[str, object] | None = None,
         cache_path: Path | None = None,
-    ) -> tuple[str, str, str, list[str]]:
+    ) -> str:
+        from .translation_support import reference_replacements
+
         self = self._stage_executor(cache_path, "metadata")
-        source = {
-            "title": title,
-            "description": description[
-                : self.translation.metadata_description_max_chars
-            ],
-            "youtube_context": youtube_context or {},
-            "subtitle_evidence": subtitle_evidence[
-                : self.translation.metadata_subtitle_max_chars
-            ],
-            "known_ip_aliases": ip_aliases or {},
-            "bilibili_tag_catalog": bilibili_tag_catalog or {},
-            "translation_context": compact_reference_context(translation_context or {}),
-        }
-        stage = CacheStore(cache_path).existing("metadata") if cache_path else None
-
-        def ask(value):
-            import hashlib
-            key = "chunk:" + hashlib.sha256(json.dumps(self._metadata_body(value), ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-            cached = stage.get(key) if stage else None
-            if cached is not None:
-                return tuple(cached)
-            result = self._translate_metadata_source(value)
-            if stage:
-                stage.put(key, result)
-            return result
-
-        if request_fits(self._metadata_body(source), self.validate_request):
-            return ask(source)
-
-        # Translate description fragments and summarize auxiliary evidence separately.
-        # All source pieces are planned before generation; no tail is discarded.
-        requests = []
-        for field, value in source.items():
-            if field == "title" or not value:
-                continue
-            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-            def render(part):
-                return self._metadata_body({"title": title, field: part, "partial_input": True})
-            for part in chunk_text(text, render_request=render, validate_request=self.validate_request):
-                requests.append((field, {"title": title, field: part, "partial_input": True}))
-        descriptions, summaries = [], []
-        for field, value in requests:
-            translated_title, description_part, summary, tags = ask(value)
-            if field == "description":
-                if not description_part.strip():
-                    raise ValueError("metadata description fragment translation is empty")
-                original = str(value["description"])
-                separator = original[len(original.rstrip()):]
-                descriptions.append(description_part.rstrip() + separator)
-            summaries.append({"source_field": field, "summary": summary, "tags": tags})
-
-        def render_summary(values):
-            return self._metadata_body({"title": title, "description": "", "evidence_summaries": list(values)})
-        while True:
-            batches = batch_requests(summaries, render_request=render_summary,
-                                     validate_request=self.validate_request)
-            if len(batches) <= 1:
-                final = ask({"title": title, "description": "", "evidence_summaries": summaries})
-                return final[0], "".join(descriptions).strip(), final[2], final[3]
-            reduced = []
-            for batch in batches:
-                result = ask({"title": title, "description": "", "evidence_summaries": list(batch)})
-                reduced.append({"summary": result[2], "tags": result[3]})
-            if len(json.dumps(reduced, ensure_ascii=False)) >= len(json.dumps(summaries, ensure_ascii=False)):
-                raise PromptBudgetExceeded("metadata evidence summaries did not shrink enough for final synthesis")
-            summaries = reduced
+        terms = {source: target for source, target in reference_replacements(translation_context or {})
+                 if source.casefold() in title.casefold()}
+        return self._translate_metadata_source({"title": title, "terms": terms})
 
     def _metadata_body(self, source):
         prompt = render_user_prompt(
             "metadata-translate.md",
             TARGET_LANGUAGE=self.translation.target_language,
-            TAG_COUNT=self.translation.metadata_tag_count,
             SOURCE_TEXT=json.dumps(source, ensure_ascii=False),
         )
         return structured_request_body(
@@ -406,29 +336,12 @@ class OpenAICompatibleTranslator:
                 )
                 parsed = _parse_json_object(content)
                 translated_title = parsed.get("title")
-                translated_description = parsed.get("description")
-                content_summary = parsed.get("content_summary")
-                translated_tags = parsed.get("tags")
                 if (
                     not isinstance(translated_title, str)
                     or not translated_title.strip()
                 ):
                     raise ValueError("translated metadata title must be non-empty text")
-                if not isinstance(translated_description, str):
-                    raise ValueError("translated metadata description must be text")
-                if not isinstance(content_summary, str) or not content_summary.strip():
-                    raise ValueError("metadata content_summary must be non-empty text")
-                if not isinstance(translated_tags, list):
-                    raise ValueError("translated metadata tags must be a list")
-                tags = _clean_tags(translated_tags, self.translation.metadata_tag_count)
-                if not tags:
-                    raise ValueError("translated metadata tags must not be empty")
-                return (
-                    translated_title.strip(),
-                    translated_description.strip(),
-                    content_summary.strip(),
-                    tags,
-                )
+                return translated_title.strip()
             except (
                 KeyError,
                 IndexError,
@@ -983,23 +896,3 @@ def _create_ssl_context() -> ssl.SSLContext:
     context = ssl.create_default_context()
     context.load_verify_locations(cafile=certifi.where())
     return context
-
-
-def _clean_tags(values: list[object], limit: int) -> list[str]:
-    tags: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        if not isinstance(value, str):
-            continue
-        for candidate in value.split(","):
-            tag = candidate.strip().lstrip("#").strip()
-            if not tag:
-                continue
-            tag = tag[:20]
-            key = tag.casefold()
-            if key not in seen:
-                seen.add(key)
-                tags.append(tag)
-            if len(tags) >= limit:
-                return tags
-    return tags

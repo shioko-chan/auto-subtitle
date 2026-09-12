@@ -192,8 +192,6 @@ class ApiCompatibilityTests(unittest.TestCase):
             json.dumps(
                 {
                     "title": "标题",
-                    "description": "简介",
-                    "content_summary": "摘要",
                     "tags": ["标签"],
                 },
                 ensure_ascii=False,
@@ -201,8 +199,7 @@ class ApiCompatibilityTests(unittest.TestCase):
         )
         with patch.object(translator, "_request", return_value=response) as request:
             translator.translate_metadata(
-                "title",
-                "description",
+                "ミヤコ",
                 translation_context={
                     "terms": {"ミヤコ": "都子"},
                     "identified_songs": [{"alignment": "large"}],

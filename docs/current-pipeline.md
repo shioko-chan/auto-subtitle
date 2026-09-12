@@ -66,7 +66,7 @@ flowchart TD
     AF --> AG[同轨局部联合修复<br/>完整性与宽度校验]
 
     AG --> AH[source.semantic.srt<br/>translated.zh-CN.srt]
-    AH --> AI[翻译标题、简介并生成标签]
+    AH --> AI[翻译标题并按规则生成标签]
     AH --> AJ[ASS 自适应布局与人物样式]
     AJ --> AK{渲染后端}
     AK -->|优先| AL[libass 稀疏位图 + CUDA 混合<br/>NVDEC + NVENC]
@@ -282,7 +282,7 @@ HTTP 错误沿用统一重试策略，耗尽后终止，不通过拆窗放大请
 
 - `source.semantic.srt`：按最终 cue 边界恢复的日文审计字幕；
 - `translated.zh-CN.srt`：简体中文字幕；
-- `translated.metadata.json`：标题、简介、内容摘要、歌曲报告和 B 站标签。
+- `translated.metadata.json`：标题、原简介记录、歌曲报告和 B 站标签。
 
 相邻 cue 时间重叠时，前一条在后一条开始时立即结束。最终 cue 的人物取其中已知源单元
 数量最多的人物，unknown 不参与多数计算；并列或全部 unknown 时使用默认白字黑边样式。
@@ -370,8 +370,7 @@ subtitle-pipeline publication resolve 'https://www.youtube.com/watch?v=VIDEO_ID'
 本地请求使用服务模型的模板与 tokenizer 校验，发送前仍保留最终检查。
 
 - 歌词按行分批，保留全局行 ID；单行放不下时在生成前报错。
-- 元数据优先一次请求；放不下时，在已有配置选取的输入范围内分别分块处理简介和辅助证据，
-  然后按预算汇总摘要、标题与标签。简介译文按源顺序拼接，已完成分块保存到 metadata 缓存。
+- 元数据只用原标题及匹配的人物、术语词表，LLM 只返回标题译文，标签由本地人物、企划及内容关键词规则生成；不生成摘要，不拆分汇总参考材料。投稿简介仅使用配置的 description_prefix。
 - 术语按候选分批，搜索审查按结果列表分批；不同批次支持的译名冲突时不自动接受。
 - 切片按字幕 cue 分批，保留每批 ID；歌曲保留已验证完整范围，讲话候选取有效结果中评分最高者。
 - OCR 在保守估算分组后进一步按实际请求预算分批；联合断句翻译在裁减可选证据时检查完整请求。

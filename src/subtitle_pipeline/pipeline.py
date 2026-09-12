@@ -38,6 +38,7 @@ from .fan_knowledge import (
 from .knowledge_ingestion import ingest_youtube_top_comments
 from .knowledge_update import update_knowledge_if_stale
 from .local_llm_server import LocalLLMServer
+from .video_tags import video_tags
 from .media import download_youtube, render_subtitles, subtitle_layout
 from .song_identification import (
     SongIdentificationResult,
@@ -544,52 +545,38 @@ def _run_pipeline_stages(
     translated_path = job_dir / "translated.zh-CN.srt"
     write_srt(translated, translated_path)
 
-    subtitle_evidence = _subtitle_evidence(
-        cues, config.translation.metadata_subtitle_max_chars
-    )
-    ip_aliases = _load_optional_json_object(
-        config.translation.ip_aliases_file, "IP aliases"
-    )
     tag_catalog = _load_optional_json_object(
         config.upload.tag_catalog_file, "Bilibili tag catalog"
     )
-    title, description = source_title, source_description
-    content_summary = ""
-    generated_tags: list[str] = []
+    title = source_title
     metadata_stage = store.stage("metadata", lambda: {
-        "title": source_title, "description": source_description, "youtube_context": youtube_context,
-        "subtitle_evidence": subtitle_evidence, "ip_aliases": ip_aliases, "tag_catalog": tag_catalog,
+        "title": source_title,
         "translation_context": translation_context,
         "enabled": config.translation.translate_metadata,
     })
     metadata_cached = metadata_stage.get("metadata")
-    title, description = metadata_stage.plan["title"], metadata_stage.plan["description"]
+    title = metadata_stage.plan["title"]
     with stage_metrics("pipeline.metadata_translation"):
         if metadata_cached is not None:
-            title, description, content_summary, generated_tags = metadata_cached
+            title = metadata_cached
         elif metadata_stage.plan["enabled"]:
-            logging.info("translating video title and description and generating tags")
-            title, description, content_summary, generated_tags = (
+            logging.info("translating video title")
+            title = (
                 translator.translate_metadata(
                     metadata_stage.plan["title"],
-                    metadata_stage.plan["description"],
-                    youtube_context=metadata_stage.plan["youtube_context"],
-                    subtitle_evidence=metadata_stage.plan["subtitle_evidence"],
-                    ip_aliases=metadata_stage.plan["ip_aliases"],
-                    bilibili_tag_catalog=metadata_stage.plan["tag_catalog"],
                     translation_context=metadata_stage.plan["translation_context"],
                     cache_path=job_dir / "cache.sqlite3",
                 )
             )
     if metadata_cached is None:
-        metadata_value = [title, description, content_summary, generated_tags]
+        metadata_value = title
         metadata_stage.put("metadata", metadata_value)
         metadata_stage.finish(metadata_value)
     generated_tags, tag_catalog_matches = _canonicalize_catalog_tags(
-        generated_tags, tag_catalog
+        video_tags(source_title, downloaded.metadata, translation_context), tag_catalog
     )
     upload_tags = _merge_tags(
-        config.upload.tags, generated_tags, config.upload.max_tags
+        ["中文字幕", *config.upload.tags], generated_tags, config.upload.max_tags
     )
     metadata_path = job_dir / "translated.metadata.json"
     metadata_path.write_text(
@@ -598,13 +585,11 @@ def _run_pipeline_stages(
                 "source_title": source_title,
                 "source_description": source_description,
                 "translated_title": title,
-                "translated_description": description,
                 "youtube_context": youtube_context,
                 "translation_glossaries": [
                     item["name"] for item in translation_context.get("franchises", [])
                 ],
                 "identified_songs": song_result.reports,
-                "content_summary": content_summary,
                 "generated_tags": generated_tags,
                 "tag_catalog_matches": tag_catalog_matches,
                 "upload_tags": upload_tags,
@@ -647,7 +632,6 @@ def _run_pipeline_stages(
                 lambda: upload_to_bilibili(
                 rendered_path,
                 title=title,
-                description=description,
                 source_url=url,
                 tags=upload_tags,
                 config=config.upload,

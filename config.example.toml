@@ -298,7 +298,7 @@ nvenc_cq = 20
 enabled = false
 cookie_file = "cookies.json"
 copyright = 2
-tid = 2047
+tid_v2 = 2047
 tags = ["中文字幕", "YouTube"]
 max_tags = 10
 # Import a tag/heat catalog obtained through an authorized source.

@@ -244,7 +244,7 @@ class UploadConfig:
     enabled: bool = False
     cookie_file: str = "cookies.json"
     copyright: int = 2
-    tid: int = 2047
+    tid_v2: int = 2047
     tags: list[str] = field(default_factory=lambda: ["中文字幕"])
     max_tags: int = 10
     tag_catalog_file: str | None = None

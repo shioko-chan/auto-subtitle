@@ -36,7 +36,7 @@ STAGES = {
     "source_cues": StageDefinition(1, ("speech_alignment", "song_identification", "conditioned_asr")),
     "lyrics_translation": StageDefinition(1, ("song_identification",)),
     "translation": StageDefinition(2, ("source_cues", "lyrics_translation")),
-    "metadata": StageDefinition(1, ("source_cues", "song_identification")),
+    "metadata": StageDefinition(4, ("source_cues", "song_identification")),
     "render": StageDefinition(1, ("translation",)),
     "clip_analysis": StageDefinition(1, ("render", "metadata")),
     "clip_render": StageDefinition(1, ("clip_analysis", "render")),

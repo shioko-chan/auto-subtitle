@@ -134,7 +134,7 @@ class CacheTests(unittest.TestCase):
                               throttle_state_file=str(self.root / 'throttle.json'))
         def submit():
             return upload_to_bilibili(self.root / 'video.mp4', title='test',
-                                     description='', source_url='https://example.com/video',
+                                     source_url='https://example.com/video',
                                      tags=['test'], config=config)
         with patch('subtitle_pipeline.upload.require_command', return_value='biliup'), \
              patch('subtitle_pipeline.upload.subprocess.Popen', side_effect=OSError('cannot start')) as popen:

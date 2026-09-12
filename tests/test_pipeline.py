@@ -424,9 +424,9 @@ class PipelineTests(unittest.TestCase):
                     FakeTranslator.translation_context = context
                     return cues, [Cue(cue.start, cue.end, "你好") for cue in cues]
 
-                def translate_metadata(self, title, description, **context):
+                def translate_metadata(self, title, **context):
                     self.context = context
-                    return "中文标题", "中文简介", "内容摘要", ["动画", "音乐企划"]
+                    return "中文标题"
 
             config = AppConfig(
                 work_dir=root / "work",
@@ -492,9 +492,9 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn("pipeline.upload", performance["summary"])
             metadata = result.translated_metadata.read_text(encoding="utf-8")
             self.assertIn("中文标题", metadata)
-            self.assertIn("中文简介", metadata)
-            self.assertIn("内容摘要", metadata)
-            self.assertIn("音乐企划", metadata)
+            self.assertNotIn("translated_description", metadata)
+            self.assertNotIn("content_summary", metadata)
+            self.assertIn("中文字幕", metadata)
             asr.assert_called_once()
             self.assertEqual(asr.call_args.args[5], [])
             self.assertEqual(

@@ -19,7 +19,7 @@ _SCHEMAS = {
     "asr-correct": _object(segments=_array(_object(segment_id=_ID, corrected_text=_TEXT))),
     "segment-translate-cues": _object(cues=_array(_object(start_id=_ID, end_id=_ID, text=_TEXT))),
     "lyrics-translate": _object(lines=_array(_object(line_id=_ID, text=_TEXT))),
-    "metadata-translate": _object(title=_TEXT, description=_TEXT, content_summary=_TEXT, tags=_array(_TEXT)),
+    "metadata-translate": _object(title=_TEXT),
     "select-ocr-song-titles": _object(groups=_array(_object(
         group_id=_ID, song_title={"type": ["string", "null"]},
     ))),

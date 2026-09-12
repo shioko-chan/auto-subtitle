@@ -32,7 +32,9 @@ class BiliupCommandError(RuntimeError):
         responses = re.findall(r"ResponseData\s*\{\s*code:\s*(-?\d+),\s*data:\s*(None|Some)", self.output)
         # An explicit rejection is different from a transport failure. If any
         # response reports success, do not authorize a duplicate submission.
-        return bool(responses) and all(int(code) != 0 and data == "None" for code, data in responses)
+        if responses:
+            return all(int(code) != 0 and data == "None" for code, data in responses)
+        return _bilibili_failure_code(self.output) in {406, 429, 21566}
 
 
 @dataclass(frozen=True)
@@ -46,7 +48,6 @@ def upload_to_bilibili(
     video: Path,
     *,
     title: str,
-    description: str,
     source_url: str,
     tags: list[str],
     config: UploadConfig,
@@ -54,7 +55,6 @@ def upload_to_bilibili(
     return upload_videos_to_bilibili(
         [video],
         title=title,
-        description=description,
         source_url=source_url,
         tags=tags,
         config=config,
@@ -65,25 +65,40 @@ def upload_videos_to_bilibili(
     videos: Sequence[Path],
     *,
     title: str,
-    description: str,
     source_url: str,
     tags: list[str],
     config: UploadConfig,
 ) -> BilibiliSubmission:
     try:
         command, pause_marker = _prepare_upload_command(
-            videos, title=title, description=description, source_url=source_url,
+            videos, title=title, source_url=source_url,
             tags=tags, config=config,
         )
     except Exception as exc:
         raise UploadNotStartedError(str(exc)) from exc
-    try:
-        output = _run_biliup(command)
-    except BiliupCommandError as exc:
-        if _bilibili_failure_code(exc.output) == 412:
-            _write_pause_marker(pause_marker, 412, exc.output)
-        # Publication records distinguish explicit rejection from unknown outcomes.
-        raise
+    delays = config.rate_limit_retry_delays_seconds
+    for attempt in range(len(delays) + 1):
+        try:
+            output = _run_biliup(command)
+            break
+        except BiliupCommandError as exc:
+            code = _bilibili_failure_code(exc.output)
+            if code == 412:
+                _write_pause_marker(pause_marker, code, exc.output)
+                raise
+            if code not in {406, 429, 21566} or not exc.submission_rejected:
+                raise
+            if attempt == len(delays):
+                _write_pause_marker(pause_marker, code, exc.output)
+                logger.error("Bilibili rate limit persisted after %d attempts; batch paused via %s",
+                             attempt + 1, pause_marker)
+                raise
+            retry_after = _retry_after_from_output(exc.output)
+            delay = retry_after if retry_after is not None else delays[attempt]
+            logger.warning("Bilibili rate limit code=%d; retry %d/%d in %.1fs (%s)",
+                           code, attempt + 1, len(delays), delay,
+                           "Retry-After" if retry_after is not None else "configured backoff")
+            time.sleep(delay)
     try:
         aid, bvid = _submission_ids(output)
     except RuntimeError:
@@ -97,7 +112,7 @@ def upload_videos_to_bilibili(
 
 
 def _prepare_upload_command(
-    videos: Sequence[Path], *, title: str, description: str, source_url: str,
+    videos: Sequence[Path], *, title: str, source_url: str,
     tags: list[str], config: UploadConfig,
 ) -> tuple[list[str], Path]:
     if not videos:
@@ -117,16 +132,15 @@ def _prepare_upload_command(
     _wait_for_upload_cooldown(Path(config.throttle_state_file))
     description_prefix = config.description_prefix.replace("{youtube_url}", source_url)
     upload_description = _prepare_description(
-        description,
-        prefix=description_prefix,
-        max_chars=config.description_max_chars,
+        description_prefix, max_chars=config.description_max_chars,
     )
     logger.info(
         "Bilibili description: %d -> %d characters, %d UTF-16 units",
-        len(description_prefix + description),
+        len(description_prefix),
         len(upload_description),
         _utf16_units(upload_description),
     )
+    logger.info("Bilibili submission category: tid_v2=%d", config.tid_v2)
     command = [
         biliup,
         "--user-cookie",
@@ -134,8 +148,8 @@ def _prepare_upload_command(
         "upload",
         "--copyright",
         str(config.copyright),
-        "--tid",
-        str(config.tid),
+        "--extra-fields",
+        json.dumps({"tid_v2": config.tid_v2}),
         "--title",
         (config.title_prefix + title)[:80],
         "--desc",
@@ -195,7 +209,9 @@ def _run_biliup(command: Sequence[str]) -> str:
 
 
 def _bilibili_failure_code(output: str) -> int | None:
-    for code in (412, 429, 406):
+    if re.search(r'''["']?code["']?\s*[:=]\s*0\b''', output):
+        return None
+    for code in (412, 429, 406, 21566):
         patterns = (
             rf'["\']?code["\']?\s*[:=]\s*{code}\b',
             rf"\bHTTP(?: status)?\s*{code}\b",
@@ -287,51 +303,8 @@ def _bounded_prefix(value: str, *, max_chars: int, max_utf16_units: int) -> str:
     return _truncate_utf16(value[:max_chars], max_utf16_units)
 
 
-def _truncate_description_body(
-    value: str,
-    *,
-    max_chars: int,
-    max_utf16_units: int,
-) -> str:
-    candidate = _bounded_prefix(
-        value,
-        max_chars=max_chars,
-        max_utf16_units=max_utf16_units,
-    )
-    if candidate == value:
-        return candidate.rstrip()
-
-    minimum_boundary = int(len(candidate) * 0.65)
-    paragraph_end = candidate.rfind("\n\n")
-    if paragraph_end > 0:
-        return candidate[:paragraph_end].rstrip()
-
-    line_end = candidate.rfind("\n")
-    if line_end > 0:
-        return candidate[:line_end].rstrip()
-
-    sentence_end = max(candidate.rfind(mark) for mark in "。！？；.!?;")
-    if sentence_end >= minimum_boundary:
-        return candidate[: sentence_end + 1].rstrip()
-    return candidate.rstrip()
-
-
-def _prepare_description(description: str, *, prefix: str, max_chars: int) -> str:
-    body = description.replace("\r\n", "\n").replace("\r", "\n").strip()
+def _prepare_description(prefix: str, *, max_chars: int) -> str:
     clean_prefix = prefix.replace("\r\n", "\n").replace("\r", "\n").strip()
-    clean_prefix = _bounded_prefix(
-        clean_prefix,
-        max_chars=max_chars,
-        max_utf16_units=max_chars,
+    return _bounded_prefix(
+        clean_prefix, max_chars=max_chars, max_utf16_units=max_chars,
     ).rstrip()
-
-    separator = "\n\n" if body and clean_prefix else ""
-    reserved_chars = len(clean_prefix) + len(separator)
-    reserved_units = _utf16_units(clean_prefix + separator)
-    body = _truncate_description_body(
-        body,
-        max_chars=max(0, max_chars - reserved_chars),
-        max_utf16_units=max(0, max_chars - reserved_units),
-    )
-    separator = "\n\n" if body and clean_prefix else ""
-    return clean_prefix + separator + body

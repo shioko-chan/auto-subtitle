@@ -43,22 +43,8 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(result, "a" * 1999)
         self.assertEqual(len(result.encode("utf-16-le")) // 2, 1999)
 
-    def test_prepares_description_at_paragraph_boundary_and_preserves_prefix(self):
-        result = _prepare_description(
-            "first paragraph\n\n" + "x" * 80 + "\n\nlast paragraph",
-            prefix="generated subtitle",
-            max_chars=70,
-        )
-        self.assertEqual(result, "generated subtitle\n\nfirst paragraph")
-        self.assertLessEqual(len(result), 70)
-        self.assertLessEqual(_utf16_units(result), 70)
-
-    def test_prepares_description_with_unicode_under_both_limits(self):
-        result = _prepare_description(
-            "字幕🎶" * 100,
-            prefix="固定说明",
-            max_chars=80,
-        )
+    def test_prepares_header_with_unicode_under_both_limits(self):
+        result = _prepare_description("固定说明\n" + "字幕🎶" * 100, max_chars=80)
         self.assertTrue(result.startswith("固定说明"))
         self.assertLessEqual(len(result), 80)
         self.assertLessEqual(_utf16_units(result), 80)
@@ -85,7 +71,7 @@ class UploadTests(unittest.TestCase):
                 upload_to_bilibili(
                     video,
                     title="A title",
-                    description="Description",
+
                     source_url="https://youtube.test/watch?v=1",
                     tags=["中字", "自动生成"],
                     config=config,
@@ -95,9 +81,11 @@ class UploadTests(unittest.TestCase):
                 command[:4], ["/bin/biliup", "--user-cookie", str(cookie), "upload"]
             )
             self.assertEqual(command[command.index("--source") + 1], "https://youtube.test/watch?v=1")
+            self.assertNotIn("--tid", command)
+            self.assertEqual(json.loads(command[command.index("--extra-fields") + 1]), {"tid_v2": 2047})
             self.assertIn("中字,自动生成", command)
             description = command[command.index("--desc") + 1]
-            self.assertEqual(description, "Description")
+            self.assertEqual(description, "")
             self.assertEqual(command[-1], str(video))
 
     def test_expands_youtube_url_placeholder_in_description_prefix(self):
@@ -125,7 +113,7 @@ class UploadTests(unittest.TestCase):
                 upload_to_bilibili(
                     root / "video.mp4",
                     title="title",
-                    description="正文",
+
                     source_url=source_url,
                     tags=["中字"],
                     config=config,
@@ -134,7 +122,7 @@ class UploadTests(unittest.TestCase):
             description = command[command.index("--desc") + 1]
             self.assertEqual(
                 description,
-                f"原视频：{source_url}\n字幕说明\n\n正文",
+                f"原视频：{source_url}\n字幕说明",
             )
 
     def test_builds_one_multi_part_command_in_supplied_order(self):
@@ -159,7 +147,7 @@ class UploadTests(unittest.TestCase):
                 upload_videos_to_bilibili(
                     parts,
                     title="合集",
-                    description="简介",
+
                     source_url="https://youtube.test/video",
                     tags=["切片"],
                     config=config,
@@ -173,50 +161,50 @@ class UploadTests(unittest.TestCase):
             upload_videos_to_bilibili(
                 [],
                 title="empty",
-                description="",
+
                 source_url="https://youtube.test/video",
                 tags=["切片"],
                 config=UploadConfig(),
             )
 
-    def test_does_not_retry_rate_limited_publication_without_resolution(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            cookie = root / "cookies.json"
-            cookie.write_text("{}", encoding="utf-8")
-            config = UploadConfig(
-                cookie_file=str(cookie),
-                rate_limit_retry_delays_seconds=[2, 5],
-                throttle_state_file=str(root / "throttle.json"),
-                pause_marker_file=str(root / "paused.json"),
-            )
-            failures = [
-                BiliupCommandError(1, '{"code":406,"message":"too fast"}'),
-                BiliupCommandError(1, "HTTP 429 Retry-After: 7"),
-                self.BILIUP_SUCCESS,
-            ]
-            with (
-                patch(
-                    "subtitle_pipeline.upload.require_command",
-                    return_value="/bin/biliup",
-                ),
-                patch(
-                    "subtitle_pipeline.upload._run_biliup", side_effect=failures
-                ) as run,
-                patch("subtitle_pipeline.upload.time.sleep") as sleep,
-                patch("subtitle_pipeline.upload._record_upload_cooldown"),
-            ):
-                with self.assertRaises(BiliupCommandError):
-                    upload_to_bilibili(
-                    root / "video.mp4",
-                    title="title",
-                    description="description",
-                    source_url="https://youtube.test/video",
-                    tags=["中字"],
-                    config=config,
-                )
-            self.assertEqual(run.call_count, 1)
-            sleep.assert_not_called()
+    def test_rate_limit_retry_and_pause_policy(self):
+        cases = [
+            ('recover', [BiliupCommandError(1, '{"code":406}'),
+                         BiliupCommandError(1, 'HTTP 429 Retry-After: 7'),
+                         self.BILIUP_SUCCESS], [2, 7], False, False),
+            ('exhausted', [BiliupCommandError(1, 'ResponseData { code: 21566, data: None }')] * 3,
+             [2, 5], True, True),
+            ('timeout', [BiliupCommandError(1, 'connection timed out')], [], True, False),
+            ('success_then_error', [BiliupCommandError(1,
+                'ResponseData { code: 0, data: Some(x) } HTTP 429 Retry-After: 7')], [], True, False),
+        ]
+        for name, responses, waits, fails, paused in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                cookie = root / 'cookies.json'
+                cookie.write_text('{}')
+                marker = root / 'paused.json'
+                config = UploadConfig(cookie_file=str(cookie),
+                    rate_limit_retry_delays_seconds=[2, 5],
+                    throttle_state_file=str(root / 'throttle.json'),
+                    pause_marker_file=str(marker))
+                with patch('subtitle_pipeline.upload.require_command', return_value='/bin/biliup'), \
+                     patch('subtitle_pipeline.upload._run_biliup', side_effect=responses) as run, \
+                     patch('subtitle_pipeline.upload.time.sleep') as sleep, \
+                     patch('subtitle_pipeline.upload._record_upload_cooldown'):
+                    def upload():
+                        return upload_to_bilibili(root / 'video.mp4', title='title',
+                            source_url='https://youtube.test/video', tags=['中字'], config=config)
+                    if fails:
+                        with self.assertRaises(BiliupCommandError):
+                            upload()
+                    else:
+                        self.assertEqual(upload().bvid, 'BV123')
+                self.assertEqual(run.call_count, len(responses))
+                self.assertEqual([call.args[0] for call in sleep.call_args_list], waits)
+                self.assertEqual(marker.exists(), paused)
+                if paused:
+                    self.assertEqual(json.loads(marker.read_text())['code'], 21566)
 
     def test_412_writes_pause_marker_and_aborts(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -241,7 +229,7 @@ class UploadTests(unittest.TestCase):
                     upload_to_bilibili(
                         root / "video.mp4",
                         title="title",
-                        description="description",
+
                         source_url="https://youtube.test/video",
                         tags=["中字"],
                         config=config,

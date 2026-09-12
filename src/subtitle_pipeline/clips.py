@@ -157,11 +157,11 @@ def _run_clips_locked(
             raise RuntimeError("clip analysis has no upload metadata")
         tags = _upload_tags(required["translated metadata"], config.upload.tags)
         submission = publish_once(upload_path, {
-            "title": metadata["title"], "description": metadata["description"],
+            "title": metadata["title"],
             "parts": [str(path.relative_to(job_dir)) for path in part_paths],
         }, lambda: upload_videos_to_bilibili(
             part_paths, title=_required_text(metadata, "title"),
-            description=_required_text(metadata, "description"), source_url=url,
+            source_url=url,
             tags=tags, config=config.upload,
         ))
         aid, bvid, uploaded = submission.aid, submission.bvid, True
@@ -684,7 +684,6 @@ def _merge_speech_parts(
 def _upload_metadata(metadata: dict[str, object]) -> dict[str, str]:
     return {
         "title": _required_text(metadata, "translated_title"),
-        "description": _required_text(metadata, "translated_description"),
     }
 
 

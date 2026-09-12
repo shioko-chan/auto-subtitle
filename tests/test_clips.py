@@ -74,16 +74,15 @@ class ClipsTests(unittest.TestCase):
         self.assertGreater(peak.zscore, 0)
         self.assertTrue(any(window.start == 5 for window in windows))
 
-    def test_upload_metadata_reuses_complete_video_title_and_description(self):
+    def test_upload_metadata_reuses_complete_video_title(self):
         metadata = {
             "translated_title": "完整翻译视频",
-            "translated_description": "完整翻译视频的简介\n包含原有链接",
         }
 
         result = _upload_metadata(metadata)
 
         self.assertEqual(result["title"], metadata["translated_title"])
-        self.assertEqual(result["description"], metadata["translated_description"])
+        self.assertEqual(result, {"title": metadata["translated_title"]})
 
     def test_select_chat_peaks_merges_adjacent_qualifying_windows(self):
         windows = [
