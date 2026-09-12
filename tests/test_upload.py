@@ -27,6 +27,23 @@ from subtitle_pipeline.upload import (
 
 
 class UploadTests(unittest.TestCase):
+    def test_append_preserves_existing_metadata_and_targets_aid(self):
+        from subtitle_pipeline.upload import _prepare_upload_command
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            cookie = root / "cookies.json"
+            cookie.write_text("{}")
+            config = UploadConfig(cookie_file=str(cookie),
+                throttle_state_file=str(root / "throttle.json"),
+                pause_marker_file=str(root / "pause.json"))
+            with patch("subtitle_pipeline.upload.require_command", return_value="biliup"):
+                command, _ = _prepare_upload_command([root / "part.mp4"], title="ignored",
+                    source_url="url", tags=[], config=config, append_aid=123)
+            self.assertEqual(command[3:6], ["append", "--vid", "av123"])
+            self.assertNotIn("--title", command)
+            self.assertNotIn("--desc", command)
+            self.assertEqual(command[-1], str(root / "part.mp4"))
+
     BILIUP_SUCCESS = (
         'ResponseData { code: 0, data: Some(Object {"aid": Number(123), '
         '"bvid": String("BV123")}), message: "OK" }'

@@ -211,6 +211,8 @@ class ClipsTests(unittest.TestCase):
             root = Path(temp)
             job = root / "video123"
             job.mkdir()
+            (job / "manifest.json").write_text(json.dumps({
+                "uploaded": True, "aid": 123, "bvid": "BV123"}))
             (job / "translated.mp4").write_bytes(b"video")
             write_srt([Cue(0, 60, "字幕")], job / "translated.zh-CN.srt")
             (job / "translated.metadata.json").write_text(
@@ -268,6 +270,7 @@ class ClipsTests(unittest.TestCase):
             self.assertTrue(first.uploaded)
             self.assertTrue(second.uploaded)
             self.assertEqual(upload.call_count, 1)
+            self.assertEqual(upload.call_args.kwargs["append_aid"], 123)
             self.assertEqual(
                 [path.name for path in upload.call_args.args[0]],
                 ["001_first.mp4", "002_second.mp4"],

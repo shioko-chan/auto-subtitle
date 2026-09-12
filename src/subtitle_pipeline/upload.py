@@ -69,12 +69,13 @@ def upload_videos_to_bilibili(
     source_url: str,
     tags: list[str],
     config: UploadConfig,
+    append_aid: int | None = None,
 ) -> BilibiliSubmission:
     if not videos:
         raise UploadNotStartedError("at least one video is required for Bilibili upload")
     with _upload_lock(Path(config.throttle_state_file)):
         return _upload_videos_locked(
-            videos, title=title, source_url=source_url, tags=tags, config=config,
+            videos, title=title, source_url=source_url, tags=tags, config=config, append_aid=append_aid,
         )
 
 
@@ -99,12 +100,12 @@ def _upload_lock(state_path: Path) -> Iterator[None]:
 
 def _upload_videos_locked(
     videos: Sequence[Path], *, title: str, source_url: str,
-    tags: list[str], config: UploadConfig,
+    tags: list[str], config: UploadConfig, append_aid: int | None = None,
 ) -> BilibiliSubmission:
     try:
         command, pause_marker = _prepare_upload_command(
             videos, title=title, source_url=source_url,
-            tags=tags, config=config,
+            tags=tags, config=config, append_aid=append_aid,
         )
     except Exception as exc:
         raise UploadNotStartedError(str(exc)) from exc
@@ -137,7 +138,7 @@ def _upload_videos_locked(
         aid, bvid = _submission_ids(output)
     except RuntimeError:
         logger.warning("upload succeeded without parseable aid/bvid")
-        aid, bvid = None, None
+        aid, bvid = append_aid, None
     try:
         _record_upload_cooldown(config)
     except OSError as exc:
@@ -147,7 +148,7 @@ def _upload_videos_locked(
 
 def _prepare_upload_command(
     videos: Sequence[Path], *, title: str, source_url: str,
-    tags: list[str], config: UploadConfig,
+    tags: list[str], config: UploadConfig, append_aid: int | None = None,
 ) -> tuple[list[str], Path]:
     if not videos:
         raise ValueError("at least one video is required for Bilibili upload")
@@ -160,6 +161,16 @@ def _prepare_upload_command(
     pause_marker = Path(config.pause_marker_file)
     _check_upload_pause(pause_marker)
     _wait_for_upload_cooldown(Path(config.throttle_state_file))
+    if append_aid is not None:
+        if isinstance(append_aid, bool) or not isinstance(append_aid, int) or append_aid <= 0:
+            raise ValueError("append requires a positive AID")
+        command = [biliup, "--user-cookie", str(cookie_file), "append",
+                   "--vid", f"av{append_aid}", "--limit", str(config.limit)]
+        if config.line:
+            command.extend(["--line", config.line])
+        command.extend(str(video) for video in videos)
+        logger.info("appending %d clips to Bilibili aid=%d", len(videos), append_aid)
+        return command, pause_marker
     description_prefix = config.description_prefix.replace("{youtube_url}", source_url)
     upload_description = _prepare_description(
         description_prefix, max_chars=config.description_max_chars,

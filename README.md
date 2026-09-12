@@ -293,7 +293,7 @@ Playwright 和已登录的 Chromium 页面自动发布。每次发送前会分�
 uv run subtitle-pipeline --config config.toml clips --no-upload \
   'https://www.youtube.com/watch?v=...'
 
-# 生成后作为一个多 P 投稿上传
+# 生成后追加为完整视频稿件的分 P（需要 manifest.json 中的成功投稿 AID）
 uv run subtitle-pipeline --config config.toml clips --upload \
   'https://www.youtube.com/watch?v=...'
 ```

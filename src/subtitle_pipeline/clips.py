@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .cache import CacheStore, config_snapshot, restore_config, restore_llm_config, job_lock
-from .publication import publish_once
+from .publication import publish_once, read_record, completed
 from .chat_context import (
     YouTubeChatMessage,
     read_youtube_live_chat,
@@ -157,18 +157,26 @@ def _run_clips_locked(
     bvid: str | None = None
     uploaded = False
     if should_upload and part_paths:
-        metadata = analysis.get("upload_metadata")
-        if not isinstance(metadata, dict):
-            raise RuntimeError("clip analysis has no upload metadata")
-        tags = _upload_tags(required["translated metadata"], config.upload.tags)
+        parent = read_record(job_dir / "manifest.json")
+        target_aid = parent.get("bilibili_aid") or parent.get("aid")
+        target_bvid = parent.get("bilibili_bvid") or parent.get("bvid")
+        if not completed(parent) or type(target_aid) is not int or target_aid <= 0:
+            raise RuntimeError("clip append requires a successfully uploaded full video with an AID")
+        previous = read_record(upload_path)
+        if previous and previous.get("target_aid") != target_aid:
+            raise RuntimeError("clip publication record targets a different submission; resolve it before appending")
+
+        def append():
+            result = upload_videos_to_bilibili(
+                part_paths, title="", source_url=url, tags=[], config=config.upload,
+                append_aid=target_aid,
+            )
+            return replace(result, aid=target_aid, bvid=target_bvid)
+
         submission = publish_once(upload_path, {
-            "title": metadata["title"],
+            "target_aid": target_aid,
             "parts": [str(path.relative_to(job_dir)) for path in part_paths],
-        }, lambda: upload_videos_to_bilibili(
-            part_paths, title=_required_text(metadata, "title"),
-            source_url=url,
-            tags=tags, config=config.upload,
-        ))
+        }, append)
         aid, bvid, uploaded = submission.aid, submission.bvid, True
 
     return ClipsResult(job_dir, analysis_path, tuple(part_paths), uploaded, aid, bvid)
